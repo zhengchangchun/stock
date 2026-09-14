@@ -7,10 +7,12 @@ import json
 
 import pytest
 
-from stocklab.cli.main import _cmd_features_build, build_parser, cmd_features_build
+from stocklab.cli.main import (
+    _cmd_features_build, build_parser, cmd_features_build, cmd_ingest_actions,
+)
 from stocklab.config import paths
 from stocklab.config.universe import DEFAULT_UNIVERSE
-from stocklab.data.models import Bar
+from stocklab.data.models import Bar, CorpAction
 from stocklab.store import repo
 from stocklab.store.db import connect
 from stocklab.store.migrate import init_db
@@ -76,7 +78,7 @@ def test_features_build_writes_snapshot(tmp_db, monkeypatch, capsys):
     assert cmd_features_build(ASOF, None) == 0
     out = json.loads(capsys.readouterr().out)
     assert out == {"date": ASOF, "written": 1, "identical": 0, "conflicts": [],
-                   "skipped": []}
+                   "skipped": [], "feature_version": "v2"}
 
     conn = connect(tmp_db)
     row = conn.execute("SELECT code, date, feature_version, payload_hash,"
@@ -84,8 +86,8 @@ def test_features_build_writes_snapshot(tmp_db, monkeypatch, capsys):
     conn.close()
     assert row["code"] == "000333"
     assert row["date"] == ASOF
-    assert row["feature_version"] == "v1"
-    assert row["data_version"] == f"bars:{ASOF}"
+    assert row["feature_version"] == "v2"
+    assert row["data_version"] == f"bars:{ASOF};adj:0events"
     assert len(row["payload_hash"]) == 64
 
 
@@ -156,7 +158,7 @@ def test_features_build_ignores_revision_of_future_bars(tmp_db, monkeypatch,
     assert cmd_features_build(ASOF, None) == 0
     out = json.loads(capsys.readouterr().out)
     assert out == {"date": ASOF, "written": 0, "identical": 1, "conflicts": [],
-                   "skipped": []}
+                   "skipped": [], "feature_version": "v2"}
 
 
 # ---------- 缺失与过滤 ----------
@@ -208,3 +210,79 @@ def test_features_build_missing_db_returns_2(tmp_path, monkeypatch, capsys):
     monkeypatch.setattr(paths, "DB_PATH", tmp_path / "nope.db")
     assert cmd_features_build(ASOF, None) == 2
     assert "db init" in json.loads(capsys.readouterr().out)["error"]
+
+
+# ---------- ADR-004：特征在**复权价**上计算（v2） ----------
+
+def _seed_with_dividend(tmp_db):
+    """造一根除权日：前收 10.00，10 派 2 元 → 理论除权价 9.80，行情正好开在 9.80。
+
+    于是**真实收益为 0**；不复权序列看到的是 -2.00% 的假跌幅。
+    """
+    init_db(tmp_db)
+    conn = connect(tmp_db)
+    repo.upsert_instruments(
+        conn, tuple(i for i in DEFAULT_UNIVERSE if i.code == "000333"), now=NOW)
+    bars = _bars("000333", 76, base=8.0)      # 末根 = 2026-03-20（除权前一日）
+    ex_close = bars[-1].close - 0.2           # 理论除权价 = 前收 - 每股派息 0.2
+    bars.append(Bar(code="000333", date="2026-03-21", open=ex_close,
+                    high=ex_close * 1.001, low=ex_close * 0.999, close=ex_close,
+                    volume=1000, amount=None, turnover=None, source="test"))
+    repo.insert_bars(conn, bars, now=NOW)
+    repo.insert_corp_actions(conn, [CorpAction(
+        code="000333", cqr="2026-03-21", djr="2026-03-20",
+        content="10派2元", fh_sh=2.0)], now=NOW)
+    conn.close()
+    return bars
+
+
+def test_features_use_adjusted_prices_on_ex_dividend_day(tmp_db, monkeypatch, capsys):
+    """除权日快照的 `ret_1d` 必须是复权后的收益，不是 -2% 的假跌幅。
+
+    与 `test_adjust.py::test_ex_dividend_day_has_no_fake_drop` 是同一失效模式，
+    但这一条走**完整 CLI 路径**（读库 → 建链 → 复权 → 算特征 → 落快照），
+    证明「特征层真的切换到复权价了」，而不只是 adjust 模块本身正确。
+    """
+    bars = _seed_with_dividend(tmp_db)
+    monkeypatch.setattr(paths, "DB_PATH", tmp_db)
+    assert cmd_features_build("2026-03-21", None) == 0
+    out = json.loads(capsys.readouterr().out)
+    assert out["written"] == 1
+
+    conn = connect(tmp_db)
+    row = conn.execute(
+        "SELECT feature_version, ret_1d, close FROM features_daily").fetchone()
+    conn.close()
+    assert row["feature_version"] == "v2"
+    # 不复权：9.80/10.00 - 1 = -2.00%；复权后：9.80/(10.00-0.20) - 1 = 0
+    assert row["ret_1d"] == pytest.approx(0.0, abs=1e-9)
+    assert row["close"] == pytest.approx(bars[-1].close)   # asof 当日锚定真实价
+
+
+def test_features_skip_when_chain_is_unusable(tmp_db, monkeypatch, capsys):
+    """链不可用 → 记 skipped 并留痕，**绝不退回不复权价写快照**。
+
+    窗口跨越不可定价事件时，`adjust_bars` 报错（该日假跌幅无法还原），
+    CLI 必须把它记成**缺失**而不是退回不复权价。
+    """
+    _seed_with_dividend(tmp_db)
+    conn = connect(tmp_db)
+    repo.insert_corp_actions(conn, [CorpAction(
+        code="000333", cqr="2026-03-19", djr="2026-03-18",
+        content="", fh_sh=None)], now=NOW)                 # 无原文 → 不可定价
+    conn.close()
+    monkeypatch.setattr(paths, "DB_PATH", tmp_db)
+    assert cmd_features_build("2026-03-21", None) == 0
+    out = json.loads(capsys.readouterr().out)
+    assert out["written"] == 0 and out["skipped"] == ["000333"]
+    conn = connect(tmp_db)
+    assert conn.execute("SELECT COUNT(*) FROM features_daily").fetchone()[0] == 0
+    assert conn.execute("SELECT COUNT(*) FROM system_events").fetchone()[0] == 1
+    conn.close()
+
+
+def test_ingest_actions_subcommand():
+    args = build_parser().parse_args(["ingest", "actions", "--code", "000333"])
+    assert args.command == "ingest" and args.ingest_target == "actions"
+    assert args.code == ["000333"] and args.start == "1990-01-01"
+    assert args.func is cmd_ingest_actions

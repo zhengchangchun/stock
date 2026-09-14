@@ -53,13 +53,17 @@ class Quote:
 class CorpAction:
     """除权除息事件（ADR-001 D-01 的自建因子链输入）。
 
-    `fh_sh` 是「每 10 股派息（元）」，`cqr` 是除权日 ——
-    消费方只允许使用 `cqr <= T` 的事件（point-in-time）。
+    `cqr` 是除权日 —— 消费方只允许使用 `cqr <= T` 的事件（point-in-time）。
+
+    `fh_sh`（每 10 股派息，元）**可为 None，且不可作为条款真源**：探针实测
+    它有两处不可信（ADR-004）—— 2014/2015 的事件是**税后值**（20→19、10→9.5），
+    送转-only 事件直接是空串。条款一律以 `content` 原文解析，
+    `fh_sh` 只用于交叉校验并留痕（见 `adjust.parse_terms`）。
     """
 
     code: str
-    cqr: str               # 除权日
-    djr: str               # 股权登记日
-    fh_sh: float           # 每 10 股派息（元）
-    content: str           # 源站原文，如 "10派30元"
+    cqr: str                     # 除权日
+    djr: str                     # 股权登记日
+    content: str                 # 源站原文，如 "10派20元转15股"（条款真源）
+    fh_sh: float | None = None   # 每 10 股派息（元）；不可信，仅交叉校验
     source: str = "tencent"

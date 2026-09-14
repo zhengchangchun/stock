@@ -10,7 +10,8 @@ import sqlite3
 import pytest
 
 from stocklab.config.universe import Instrument
-from stocklab.data.models import Bar
+from stocklab.data.adjust import build_chain
+from stocklab.data.models import Bar, CorpAction
 from stocklab.quality.checks import Issue
 from stocklab.store import repo
 from stocklab.store.db import connect
@@ -178,3 +179,60 @@ def test_writes_do_not_leave_open_transaction(conn):
     with conn:                                # sqlite3 显式事务仍可用
         conn.execute("SELECT 1")
     assert conn.in_transaction is False
+
+
+# ---------- ADR-004：除权事件写入（幂等 + 修订留痕 + first_seen 不可重置） ----------
+
+def action(cqr="2026-06-29", content="10派38元", fh_sh=38.0, djr="2026-06-26"):
+    return CorpAction(code="000333", cqr=cqr, djr=djr, content=content, fh_sh=fh_sh)
+
+
+def test_insert_corp_actions_idempotent(conn):
+    """重复采集同一批事件：不新增行、`first_seen` 不被重置、修订数为 0。"""
+    assert repo.insert_corp_actions(conn, [action()], now=NOW) == (1, 0)
+    assert repo.insert_corp_actions(conn, [action()], now="2026-09-15T19:00:00+08:00") \
+        == (1, 0)
+    rows = conn.execute("SELECT * FROM corp_actions").fetchall()
+    assert len(rows) == 1
+    assert rows[0]["first_seen"] == NOW                  # 首次入库时间不可被覆盖
+
+
+def test_insert_corp_actions_counts_restatements(conn):
+    """源站改条款 → 更新且**计数**：改口径会改变复权价，下游必须看得见。"""
+    repo.insert_corp_actions(conn, [action(fh_sh=38.0, content="10派38元")], now=NOW)
+    written, restated = repo.insert_corp_actions(
+        conn, [action(fh_sh=36.1, content="10派38元")], now=NOW)
+    assert (written, restated) == (1, 1)
+    row = conn.execute("SELECT * FROM corp_actions").fetchone()
+    assert row["fh_sh"] == pytest.approx(36.1)
+
+
+def test_insert_corp_actions_allows_null_fh_sh(conn):
+    """送转-only 事件的 `fh_sh` 是空串 → 如实存 NULL，条款靠原文。"""
+    repo.insert_corp_actions(conn, [action(cqr="1994-04-04", content="10送3股",
+                                           fh_sh=None)], now=NOW)
+    row = conn.execute("SELECT * FROM corp_actions").fetchone()
+    assert row["fh_sh"] is None and row["content"] == "10送3股"
+
+
+def test_insert_adj_factors_writes_explicit_ones_for_no_event_stock(conn):
+    """ADR-001：无事件的标的也必须显式写 `factor = 1`，禁 NULL。"""
+    bars = [bar("2026-09-10"), bar("2026-09-11")]
+    chain = build_chain(bars, [])
+    n = repo.insert_adj_factors(conn, "000333", chain, source="test", now=NOW)
+    assert n == 2
+    rows = conn.execute("SELECT date, factor FROM adj_factors ORDER BY date").fetchall()
+    assert [(r["date"], r["factor"]) for r in rows] == [
+        ("2026-09-10", 1.0), ("2026-09-11", 1.0)]
+
+
+def test_insert_adj_factors_is_overwritable(conn):
+    """因子是纯函数：重算必须能修正（append-only 会让错误因子永久留库）。"""
+    bars = [bar("2026-09-10"), bar("2026-09-11")]
+    repo.insert_adj_factors(conn, "000333", build_chain(bars, []),
+                            source="test", now=NOW)
+    chain = build_chain(bars, [action(cqr="2026-09-11", content="10派2元")])
+    repo.insert_adj_factors(conn, "000333", chain, source="test", now=NOW)
+    rows = dict(conn.execute("SELECT date, factor FROM adj_factors").fetchall())
+    assert rows["2026-09-10"] == pytest.approx(1.0)
+    assert rows["2026-09-11"] < 1.0

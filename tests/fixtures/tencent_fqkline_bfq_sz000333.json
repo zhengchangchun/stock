@@ -1,0 +1,11 @@
+{
+  "source": "tencent",
+  "params_key": "probe_ca_page_sz000333_2026-09-16_bfq",
+  "url": "https://web.ifzq.gtimg.cn/appstock/app/fqkline/get?param=sz000333,day,,2026-09-16,2000,",
+  "encoding": "utf-8",
+  "fetched_at": "2026-09-15T01:22:37+08:00",
+  "sha256": "9bc09e009cba48db137171ba6a2c8452f222a6a144e5166737b2c031cc9fefd0",
+  "conflicts": [],
+  "note": "ADR-004 探针：不复权响应同样带除权事件行（2000 根/10 事件）",
+  "name": "tencent_fqkline_bfq_sz000333"
+}

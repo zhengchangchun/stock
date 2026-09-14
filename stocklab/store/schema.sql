@@ -44,6 +44,22 @@ CREATE TABLE IF NOT EXISTS bars_daily (
     PRIMARY KEY (code, date)
 );
 
+-- 除权除息事件（ADR-001 D-01 自建因子链的输入；ADR-004 记录实测依据）
+-- PK (code, cqr)：同一除权日同一标的在实测数据里只出现一条。
+-- `content` 是**唯一可信**的条款来源；`fh_sh` 实测有两处不可信（税后值 / 空串），
+-- 只作交叉校验用，故允许为 NULL。
+CREATE TABLE IF NOT EXISTS corp_actions (
+    code        TEXT NOT NULL,
+    cqr         TEXT NOT NULL,          -- 除权日
+    djr         TEXT,
+    fh_sh       REAL,                   -- 每 10 股派息（元）；源站此字段不可信，见 ADR-004
+    content     TEXT NOT NULL DEFAULT '',  -- 源站原文，如 "10派20元转15股"
+    source      TEXT NOT NULL,
+    first_seen  TEXT NOT NULL,          -- 首次入库时间，重采不重置
+    last_seen   TEXT NOT NULL,
+    PRIMARY KEY (code, cqr)
+);
+
 CREATE TABLE IF NOT EXISTS adj_factors (
     code        TEXT NOT NULL,
     date        TEXT NOT NULL,

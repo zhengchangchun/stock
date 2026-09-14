@@ -14,7 +14,12 @@ import pandas as pd
 
 from stocklab.features import indicators as ind
 
-FEATURE_VERSION = "v1"
+#: v2（2026-09-15 / ADR-004）：特征改为在**复权价**上计算。
+#: v1 的快照在**不复权价**上算 `ret_1d/ma/atr`，除权日含假跌幅（000333 的
+#: `10派20元转15股` 那天不复权跌 ~63%），已失真且不得被覆盖 ——
+#: `features_daily` 是 append-only + `UNIQUE(code,date,version,set)`，
+#: 升版本号即可让新旧快照并存、各自可追溯。
+FEATURE_VERSION = "v2"
 FEATURE_SET = "core"
 
 PARAMS: dict = {

@@ -25,6 +25,7 @@ from zoneinfo import ZoneInfo
 from stocklab.config import paths
 from stocklab.config.settings import load_settings
 from stocklab.config.universe import DEFAULT_UNIVERSE
+from stocklab.data.fetch import EARLIEST as EARLIEST_ACTION_START
 from stocklab.store import repo
 from stocklab.store.db import connect
 from stocklab.store.migrate import init_db
@@ -122,6 +123,81 @@ def cmd_ingest_bars(args: argparse.Namespace) -> int:
     return 0 if report.ok_count else 1
 
 
+# ---------- ingest actions（除权事件 + 因子链） ----------
+
+def cmd_ingest_actions(args: argparse.Namespace) -> int:
+    """采集除权除息事件并重建复权因子链（联网）。
+
+    两步都做：事件落 `corp_actions` → 由「不复权 K 线 + 事件」重算整条
+    PIT 因子链落 `adj_factors`。顺序不能反 —— 因子链的唯一输入是这两张表。
+
+    事件默认取**全历史**（`--start` 可覆盖）：`corp_actions` 里缺一条事件与
+    「该事件不存在」在库中无法区分，因子链会把缺席的事件当成没有，
+    于是那之后的整段复权价都错且无任何报错（ADR-004 §后果）。
+    """
+    from stocklab.data import adjust
+    from stocklab.data.fetch import fetch_corp_actions, policy_from_settings
+    from stocklab.data.http import HttpClient
+    from stocklab.data.raw_cache import RawCache
+
+    paths.ensure_dirs()
+    settings = load_settings()
+    now = datetime.now(TZ).isoformat(timespec="seconds")
+    end = _today()
+    universe = tuple(i for i in DEFAULT_UNIVERSE
+                     if not args.code or i.code in args.code)
+
+    cache = RawCache(paths.RAW_CACHE_DIR) if settings.cache_enabled else None
+    client = HttpClient(policy_from_settings(settings), cache=cache)
+    out: dict = {"end": end, "start": args.start, "codes": {}}
+    failed: list[str] = []
+
+    conn = connect(paths.DB_PATH)
+    try:
+        repo.upsert_instruments(conn, universe, now=now)
+        for inst in universe:
+            code = inst.code
+            try:
+                actions = fetch_corp_actions(client, code=inst.tencent_code,
+                                             start=args.start, end=end)
+            except Exception as exc:                   # noqa: BLE001 — 必须留痕
+                msg = f"{type(exc).__name__}: {exc}"
+                repo.log_event(conn, "ingest", "error",
+                               f"{code} 除权事件采集失败: {msg}",
+                               context={"code": code, "job": "ingest_actions"},
+                               now=now)
+                out["codes"][code] = {"error": msg}
+                failed.append(code)
+                continue
+            written, restated = repo.insert_corp_actions(conn, actions, now=now)
+            if restated:
+                repo.log_event(conn, "ingest", "warn",
+                               f"{code} 有 {restated} 条除权事件被源站修订",
+                               context={"code": code, "restated": restated}, now=now)
+            bars, chain = adjust.load_chain(conn, code)
+            n_factors = repo.insert_adj_factors(conn, code, chain, source="tencent",
+                                                now=now) if bars else 0
+            summary = adjust.chain_summary(chain)
+            out["codes"][code] = {"events": written, "restated": restated,
+                                  "factor_rows": n_factors, **summary}
+            if chain.unusable:
+                repo.log_event(conn, "ingest", "warn",
+                               f"{code} 有 {len(chain.unusable)} 条事件无法定价，"
+                               f"复权链在 {chain.usable_from} 之前不可用",
+                               context={"code": code,
+                                        "unusable": [u.cqr for u in chain.unusable]},
+                               now=now)
+        repo.finish_job(conn, repo.record_job(conn, "ingest_actions",
+                                              status="running", started_at=now),
+                        status="ok" if not failed else "failed", finished_at=now,
+                        detail=f"{len(universe) - len(failed)}/{len(universe)} ok")
+    finally:
+        conn.close()
+
+    print(json.dumps(out, ensure_ascii=False))
+    return 0 if not failed else 1
+
+
 # ---------- features ----------
 
 def _bar_from_row(row) -> "Bar":
@@ -135,17 +211,23 @@ def _bar_from_row(row) -> "Bar":
 
 
 def cmd_features_build(date: str, codes: list[str] | None) -> int:
-    """为指定日期构建全部标的的特征快照（**离线**，只读 `bars_daily`）。
+    """为指定日期构建全部标的的特征快照（**离线**，只读 `bars_daily` + `adj_factors`）。
+
+    **P3 起特征在复权价上计算**（ADR-004）：不复权价在除权日会产生假跌幅
+    （000333 的 `10派20元转15股` 那天不复权跌 ~63%），`ret_1d/ma/atr` 全部失真，
+    回测收益随之失真。复权在**读取层**做，库里永远只有不复权 OHLC。
 
     行为：
     - 幂等：同键同 hash 的快照已存在 → 计 `identical`，不重复写（可安全重试）。
     - 冲突：同键但 hash 不同（行情被修订 / 特征代码被改而没升版本）→ 计
       `conflicts`、留 warn 事件，**不覆盖**，并以退出码 1 上报。
-    - 缺失：历史不足或当日无 K 线 → 计 `skipped` + warn 事件（不写假快照）。
+    - 缺失：历史不足、当日无 K 线、或**复权链不可用** → 计 `skipped` + warn 事件
+      （不写假快照；绝不在复权不可用时退回不复权价 —— 那正是本任务要消灭的失真）。
 
     `regime_label` 暂为 NULL：市场状态需要指数行情，当前 `bars_daily` 里只有个股
     （见 docs/tasks/2026-09-15-p3-特征层-task17-20.md 的遗留问题）。
     """
+    from stocklab.data import adjust
     from stocklab.features import snapshot
 
     db = paths.DB_PATH
@@ -167,11 +249,25 @@ def cmd_features_build(date: str, codes: list[str] | None) -> int:
             code = row["code"]
             if codes and code not in codes:
                 continue
-            bars = [_bar_from_row(r) for r in conn.execute(
-                "SELECT * FROM bars_daily WHERE code=? AND date<=? ORDER BY date",
-                (code, date))]
-            snap = snapshot.build_snapshot(code, date, bars,
-                                           data_version=f"bars:{date}")
+            raw_bars, chain = adjust.load_chain(conn, code)
+            try:
+                # 窗口从 usable_from 起：早于它的一段跨越了无法定价的除权事件，
+                # 那几天的假跌幅无法还原 → 宁可少几天历史，也不交出失真的序列。
+                bars = adjust.adjust_bars(raw_bars, chain, date, code=code,
+                                          start=chain.usable_from)
+            except adjust.AdjustError as exc:
+                # 复权链缺因子 / 窗口仍跨越不可定价事件 → 记为缺失，**不退回不复权价**
+                skipped.append(code)
+                repo.log_event(conn, "features", "warn",
+                               f"{code} {date} 复权链不可用，已跳过（不写不复权失真快照）",
+                               context={"date": date, "reason": str(exc),
+                                        "usable_from": chain.usable_from,
+                                        "n_unusable": len(chain.unusable)},
+                               now=now)
+                continue
+            snap = snapshot.build_snapshot(
+                code, date, bars,
+                data_version=f"bars:{date};adj:{len(chain.events)}events")
             if snap is None:
                 skipped.append(code)
                 repo.log_event(conn, "features", "warn",
@@ -199,9 +295,16 @@ def cmd_features_build(date: str, codes: list[str] | None) -> int:
             written += 1
 
     print(json.dumps({"date": date, "written": written, "identical": identical,
-                      "conflicts": conflicts, "skipped": skipped},
+                      "conflicts": conflicts, "skipped": skipped,
+                      "feature_version": registry_version()},
                      ensure_ascii=False))
     return 1 if conflicts else 0
+
+
+def registry_version() -> str:
+    from stocklab.features import registry
+
+    return registry.FEATURE_VERSION
 
 
 def _cmd_features_build(args: argparse.Namespace) -> int:
@@ -248,6 +351,14 @@ def build_parser() -> argparse.ArgumentParser:
     ing_bars.add_argument("--code", action="append", default=None,
                           help="只采指定代码，可重复；默认全集")
     ing_bars.set_defaults(func=cmd_ingest_bars)
+
+    ing_act = ing_sub.add_parser(
+        "actions", help="采集除权除息事件并重建复权因子链（腾讯不复权 + 全历史）")
+    ing_act.add_argument("--code", action="append", default=None,
+                         help="只采指定代码，可重复；默认全集")
+    ing_act.add_argument("--start", default=EARLIEST_ACTION_START,
+                         help=f"事件回补起点（默认 {EARLIEST_ACTION_START} = 全历史）")
+    ing_act.set_defaults(func=cmd_ingest_actions)
 
     doctor = sub.add_parser("doctor", help="数据健康度报告（离线）")
     doctor.set_defaults(func=lambda _a: cmd_doctor())

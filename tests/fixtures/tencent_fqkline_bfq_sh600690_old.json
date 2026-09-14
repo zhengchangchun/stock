@@ -1,0 +1,11 @@
+{
+  "source": "tencent",
+  "params_key": "probe_ca_page_sh600690_2001-04-24_bfq",
+  "url": "https://web.ifzq.gtimg.cn/appstock/app/fqkline/get?param=sh600690,day,,2001-04-24,2000,",
+  "encoding": "utf-8",
+  "fetched_at": "2026-09-15T01:23:11+08:00",
+  "sha256": "e8dd2b517e3fbdc15e78ab12eb40cd90e828a2e2d6957b18c051c1f47daf85ab",
+  "conflicts": [],
+  "note": "ADR-004 探针：送转-only 事件 fh_sh 为空串（旧解析器会静默丢弃）",
+  "name": "tencent_fqkline_bfq_sh600690_old"
+}

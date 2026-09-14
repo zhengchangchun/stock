@@ -5,7 +5,7 @@ import pytest
 from stocklab.config.paths import SCHEMA_SQL
 
 EXPECTED_TABLES = {
-    "instruments", "bars_daily", "adj_factors", "money_flow_daily",
+    "instruments", "bars_daily", "adj_factors", "corp_actions", "money_flow_daily",
     "valuation_daily", "sector_daily", "market_state", "trading_calendar",
     "features_daily", "predictions", "verifications",
     "strategy_registry", "strategy_daily", "sim_portfolio", "sim_trades",

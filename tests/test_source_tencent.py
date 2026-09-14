@@ -272,7 +272,12 @@ def test_parse_kline_source_and_units(kline_payload):
 # ---------- 除权事件（ADR-001 D-01 的 PIT 地基） ----------
 
 def test_parse_corp_actions_from_real_fixture(kline_payload, kline_meta):
-    actions = tencent.parse_corp_actions(kline_payload, "000333")
+    """旧 fixture 只有 `qfqday` 节点：显式指定 qfq 口径仍应解析出同一批事件。
+
+    ADR-004 起默认口径改为 `none`（不复权流也带事件，且不受 800 根上限限制），
+    故此处**显式**传 `adj_mode="qfq"` 以继续覆盖这条历史路径。
+    """
+    actions = tencent.parse_corp_actions(kline_payload, "000333", adj_mode="qfq")
     assert len(actions) == kline_meta["n_events"] == 4
     assert [a.cqr for a in actions] == [
         d for d in ADR001_CQR if d >= kline_meta["first_date"]
@@ -287,19 +292,21 @@ def test_corp_action_rows_carry_the_event_dict(kline_payload):
     """事件是 kline 行上的第 7 个元素（dict）—— 不是独立的顶层字段。"""
     rows = kline_payload["data"]["sz000333"]["qfqday"]
     with_event = [r for r in rows if len(r) > 6 and isinstance(r[6], dict)]
-    assert [r[6]["cqr"] for r in with_event] == [a.cqr for a in
-                                                tencent.parse_corp_actions(kline_payload, "000333")]
+    assert [r[6]["cqr"] for r in with_event] == [
+        a.cqr for a in tencent.parse_corp_actions(kline_payload, "000333",
+                                                  adj_mode="qfq")]
 
 
 def test_corp_action_cqr_is_a_real_bar_date(kline_payload):
     """除权日必须落在日K 序列里，否则事件无法与行情对齐。"""
     dates = {r[0] for r in kline_payload["data"]["sz000333"]["qfqday"]}
-    assert all(a.cqr in dates for a in tencent.parse_corp_actions(kline_payload, "000333"))
+    assert all(a.cqr in dates for a in tencent.parse_corp_actions(
+        kline_payload, "000333", adj_mode="qfq"))
 
 
 def test_corp_action_never_has_null_factor_inputs(kline_payload):
-    """ADR-001 D-01：无事件时因子必须显式默认，禁止 NULL 混进因子链。"""
-    for a in tencent.parse_corp_actions(kline_payload, "000333"):
+    """除权日与登记日必须有值；`fh_sh` 允许缺失（送转-only 事件源站就是空串）。"""
+    for a in tencent.parse_corp_actions(kline_payload, "000333", adj_mode="qfq"):
         assert a.fh_sh is not None and a.fh_sh >= 0
         assert a.cqr and a.djr
 
@@ -309,11 +316,87 @@ def test_parse_corp_actions_empty_returns_empty_list():
     assert tencent.parse_corp_actions({}, "000333") == []
 
 
-def test_parse_corp_actions_skips_malformed_event():
-    payload = {"data": {"sz000333": {"qfqday": [
+def test_parse_corp_actions_requires_cqr_only():
+    """事件的存在性**只以 `cqr` 判定**：缺 `fh_sh` 不得丢弃（ADR-004）。
+
+    改为「要求 fh_sh 非空」的旧实现，会把送转-only 事件整条丢掉 ——
+    600690 实测被丢 9/36 条（含 `10送3股`），复权链随即失效。
+    """
+    payload = {"data": {"sz000333": {"day": [
         ["2026-09-11", "10.00", "10.50", "10.80", "9.90", "123", {"cqr": "2026-09-11"}],
         ["2026-09-14", "10.50", "10.30", "10.60", "10.20", "234",
          {"cqr": "2026-09-14", "djr": "2026-09-13", "fh_sh": "5", "FHcontent": "10派5元"}],
     ]}}}
     actions = tencent.parse_corp_actions(payload, "000333")
-    assert [a.cqr for a in actions] == ["2026-09-14"]     # 缺 fh_sh 的事件被跳过
+    assert [a.cqr for a in actions] == ["2026-09-11", "2026-09-14"]
+    assert actions[0].fh_sh is None                       # 缺失如实为 None
+    assert actions[0].content == ""                       # 原文缺失也不编造
+
+
+def test_parse_corp_actions_skips_rows_without_cqr():
+    """真正该跳过的畸形行：事件 dict 里没有 `cqr`（无法定位除权日）。"""
+    payload = {"data": {"sz000333": {"day": [
+        ["2026-09-14", "10.50", "10.30", "10.60", "10.20", "234", {"fh_sh": "5"}],
+        ["2026-09-15", "10.50", "10.30", "10.60", "10.20", "234", "not-a-dict"],
+        ["2026-09-16", "10.50", "10.30", "10.60", "10.20", "234"],
+    ]}}}
+    assert tencent.parse_corp_actions(payload, "000333") == []
+
+
+# ---------- ADR-004：真实**不复权**响应里的事件行（探针录下的原始响应） ----------
+
+BFQ_FIXTURE = "tencent_fqkline_bfq_sz000333"
+BFQ_OLD_FIXTURE = "tencent_fqkline_bfq_sh600690_old"
+
+
+@pytest.fixture(scope="module")
+def bfq_payload() -> dict:
+    body, _ = load_fixture(FIXTURE_DIR, BFQ_FIXTURE)
+    return json.loads(body.decode("utf-8"))
+
+
+@pytest.fixture(scope="module")
+def bfq_old_payload() -> dict:
+    body, _ = load_fixture(FIXTURE_DIR, BFQ_OLD_FIXTURE)
+    return json.loads(body.decode("utf-8"))
+
+
+def test_bfq_stream_carries_events(bfq_payload):
+    """ADR-004 P1：**不复权**响应同样带事件行，条数与 qfq 口径一致。
+
+    这是「事件采集不继承 qfq 800 根上限」的前提 ——
+    该 fixture 本身就是一个 2000 根的 `day` 节点，请求量是 qfq 路径的 1/2~1/3。
+    """
+    node = bfq_payload["data"]["sz000333"]
+    assert "day" in node and "qfqday" not in node      # 确认这是不复权响应
+    rows = node["day"]
+    with_event = [r for r in rows if len(r) > 6 and isinstance(r[6], dict)]
+    actions = tencent.parse_corp_actions(bfq_payload, "000333")
+    assert len(rows) == 2000                           # 不复权单次上限
+    assert len(with_event) == len(actions) == 10
+    assert [r[6]["cqr"] for r in with_event] == [a.cqr for a in actions]
+
+
+def test_bfq_events_have_all_terms_for_the_chain(bfq_payload):
+    """事件必须带 `cqr` 与原文（`FHcontent`），否则因子链无法计算条款。"""
+    for a in tencent.parse_corp_actions(bfq_payload, "000333"):
+        assert a.cqr and a.djr
+        assert a.content.startswith("10")              # 形如 "10派35元"
+        assert "派" in a.content
+
+
+def test_old_events_without_fh_sh_are_not_dropped(bfq_old_payload):
+    """ADR-004 的核心回归：送转-only 事件的 `fh_sh` 是**空串**，不得被丢掉。
+
+    改为「要求 fh_sh 非空」的旧实现，在 600690 上会静默丢弃 9/36 条事件
+    （实测，见 ADR-004 证据 JSON），本用例锁死这个失效模式。
+    """
+    actions = tencent.parse_corp_actions(bfq_old_payload, "600690")
+    blank = [a for a in actions if a.fh_sh is None]
+    assert blank, "该 fixture 必须包含 fh_sh 缺失的事件，否则本测试没有鉴别力"
+    # 缺 fh_sh 的事件仍然带原文/除权日 → 条款仍可解析
+    assert all(a.cqr for a in actions)
+    assert any(a.fh_sh is None and a.content for a in actions), \
+        "既有缺 fh_sh 又有原文的事件（如 10送3股）必须保留"
+    assert any(a.fh_sh is None and not a.content for a in actions), \
+        "既缺 fh_sh 又缺原文的事件同样不得静默丢弃 —— 交给链层显式报不可定价"

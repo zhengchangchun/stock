@@ -24,7 +24,7 @@ from typing import Mapping, Sequence
 from zoneinfo import ZoneInfo
 
 from stocklab.config.universe import Instrument
-from stocklab.data.models import Bar
+from stocklab.data.models import Bar, CorpAction
 from stocklab.quality.checks import Issue
 
 TZ = ZoneInfo("Asia/Shanghai")
@@ -79,6 +79,63 @@ def insert_bars(conn: sqlite3.Connection, bars: Sequence[Bar], *, now: str) -> i
         " close=excluded.close, volume=excluded.volume, amount=excluded.amount,"
         " turnover=excluded.turnover, adj_mode=excluded.adj_mode,"
         " is_suspended=excluded.is_suspended, source=excluded.source,"
+        " fetched_at=excluded.fetched_at",
+        rows,
+    )
+    conn.commit()
+    return len(rows)
+
+
+def insert_corp_actions(conn: sqlite3.Connection, actions: Sequence[CorpAction], *,
+                        now: str) -> tuple[int, int]:
+    """写入除权除息事件，返回 `(写入条数, 被修订条数)`。
+
+    幂等：`PRIMARY KEY (code, cqr)` 冲突时更新条款列，**`first_seen` 永不重置**
+    （`INSERT OR REPLACE` 会删行重插并把未列出的列打回默认值 —— ERROR_DIARY
+    2026-09-15 记过这个坑，故此处一律用 `ON CONFLICT DO UPDATE` 并显式列出列）。
+
+    修订数是刻意返回的：源站改口径（例如把税后 `fh_sh` 改成税前）会**改变复权价**，
+    下游必须能看见「这条事件被动过」，而不是无声地换掉历史因子。
+    """
+    rows = [(a.code, a.cqr, a.djr, a.fh_sh, a.content, a.source, now, now)
+            for a in actions]
+    existing = {r["cqr"]: r for r in conn.execute(
+        "SELECT cqr, djr, fh_sh, content FROM corp_actions WHERE code=?",
+        (actions[0].code,))} if actions else {}
+    restated = 0
+    for a in actions:
+        old = existing.get(a.cqr)
+        if old is not None and (old["djr"], old["fh_sh"], old["content"]) != (
+                a.djr, a.fh_sh, a.content):
+            restated += 1
+    conn.executemany(
+        "INSERT INTO corp_actions (code, cqr, djr, fh_sh, content, source,"
+        " first_seen, last_seen) VALUES (?,?,?,?,?,?,?,?)"
+        " ON CONFLICT(code, cqr) DO UPDATE SET"
+        " djr=excluded.djr, fh_sh=excluded.fh_sh, content=excluded.content,"
+        " source=excluded.source, last_seen=excluded.last_seen",
+        rows,
+    )
+    conn.commit()
+    return len(rows), restated
+
+
+def insert_adj_factors(conn: sqlite3.Connection, code: str, chain, *,
+                       source: str, now: str) -> int:
+    """把因子链落 `adj_factors`（每个 K 线日一行，`factor` 显式、禁 NULL）。
+
+    允许覆盖（与 `bars_daily` 同理由）：因子是**纯函数**——
+    由不复权 K 线 + 事件链算出，重算结果必须能落库修正；若做成 append-only，
+    源站修订分红后错误的旧因子会永久留在库里（比允许覆盖危险得多，ADR-001 §5 同款取舍）。
+
+    无事件的标的也会写入全 1 行 —— ADR-001 明确要求显式默认值，禁止用 NULL 表示。
+    """
+    rows = [(code, d, f, source, now) for d, f in sorted(chain.factors.items())]
+    conn.executemany(
+        "INSERT INTO adj_factors (code, date, factor, source, fetched_at)"
+        " VALUES (?,?,?,?,?)"
+        " ON CONFLICT(code, date) DO UPDATE SET"
+        " factor=excluded.factor, source=excluded.source,"
         " fetched_at=excluded.fetched_at",
         rows,
     )

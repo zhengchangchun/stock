@@ -134,28 +134,38 @@ def parse_kline(payload: dict, code: str, *, adj_mode: str = "none") -> list[Bar
     return out
 
 
-def parse_corp_actions(payload: dict, code: str) -> list[CorpAction]:
+def parse_corp_actions(payload: dict, code: str, *,
+                       adj_mode: str = "none") -> list[CorpAction]:
     """解析除权除息事件（ADR-001 D-01 自建因子链的输入）。
 
-    事件挂在**行尾第 7 个元素**（dict）上；缺 `cqr`/`fh_sh` 的行跳过（由调用方留痕）。
+    事件挂在**行尾第 7 个元素**（dict）上。两个实测决定（ADR-004）：
+
+    ① 默认 `adj_mode="none"`：探针实测**不复权响应同样带事件行**，且事件内容与
+       qfq 完全一致（000333 14/14、600690 36/36）。走不复权流可用 2000/页
+       （000333 两次请求搞定），而 qfq 单次上限 800、需要 4~5 次翻页 —— 且
+       qfq 序列本身是**减法式**复权，历史价会变**负**（000333 2013-09-18 =
+       -12.649 元），根本不能用于比率类特征。
+    ② 事件的存在性**只以 `cqr` 判定**，不再要求 `fh_sh`。旧实现要求 `fh_sh`
+       非空，会**静默丢弃** 600690 的 9/36 条事件（送转-only 事件的 `fh_sh`
+       是空串），其中包含 `10送3股` —— 复权链少了这些事件，除权日的假跌幅
+       就会原样留在序列里（正是本任务要消灭的失效模式）。
     """
     out: list[CorpAction] = []
-    for row in _rows(payload, code, "qfq"):
+    for row in _rows(payload, code, adj_mode):
         if not isinstance(row, (list, tuple)) or len(row) <= _EVENT_INDEX:
             continue
         event = row[_EVENT_INDEX]
         if not isinstance(event, dict):
             continue
         cqr = str(event.get("cqr") or "")
-        fh_sh = to_float(event.get("fh_sh"))
-        if not cqr or fh_sh is None:
-            continue
+        if not cqr:
+            continue                            # 没有除权日 → 无法定位事件
         out.append(
             CorpAction(
                 code=code,
                 cqr=cqr,
                 djr=str(event.get("djr") or ""),
-                fh_sh=fh_sh,
+                fh_sh=to_float(event.get("fh_sh")),   # 可为 None：见 ②
                 content=str(event.get("FHcontent") or ""),
             )
         )

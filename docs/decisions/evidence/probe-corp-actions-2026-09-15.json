@@ -1,0 +1,2580 @@
+{
+  "probed_at": "2026-09-15",
+  "note": "腾讯 fqkline 除权除息事件行探针（ADR-004 证据）",
+  "P1_single_page_adj_compare": {
+    "none": {
+      "url": "https://web.ifzq.gtimg.cn/appstock/app/fqkline/get?param=sz000333,day,,2026-09-16,800,",
+      "requested": 800,
+      "adj": "none",
+      "count": 800,
+      "first": "2023-05-31",
+      "last": "2026-09-14",
+      "rows_with_event": 5,
+      "n_events": 5,
+      "events": [
+        {
+          "row_date": "2023-06-01",
+          "nd": "2022",
+          "fh_sh": "25",
+          "djr": "2023-05-31",
+          "cqr": "2023-06-01",
+          "FHcontent": "10派25元"
+        },
+        {
+          "row_date": "2024-05-15",
+          "nd": "2023",
+          "fh_sh": "30",
+          "djr": "2024-05-14",
+          "cqr": "2024-05-15",
+          "FHcontent": "10派30元"
+        },
+        {
+          "row_date": "2025-06-12",
+          "nd": "2024",
+          "fh_sh": "35",
+          "djr": "2025-06-11",
+          "cqr": "2025-06-12",
+          "FHcontent": "10派35元"
+        },
+        {
+          "row_date": "2025-11-18",
+          "nd": "2025",
+          "fh_sh": "5",
+          "djr": "2025-11-17",
+          "cqr": "2025-11-18",
+          "FHcontent": "10派5元"
+        },
+        {
+          "row_date": "2026-06-29",
+          "nd": "2025",
+          "fh_sh": "38",
+          "djr": "2026-06-26",
+          "cqr": "2026-06-29",
+          "FHcontent": "10派38元"
+        }
+      ],
+      "event_field_names": [
+        "FHcontent",
+        "cqr",
+        "djr",
+        "fh_sh",
+        "nd",
+        "row_date"
+      ],
+      "bytes": 53238,
+      "seconds": 0.0,
+      "sha256_16": "ca9846874567d1e6"
+    },
+    "qfq": {
+      "url": "https://web.ifzq.gtimg.cn/appstock/app/fqkline/get?param=sz000333,day,,2026-09-16,800,qfq",
+      "requested": 800,
+      "adj": "qfq",
+      "count": 800,
+      "first": "2023-05-31",
+      "last": "2026-09-14",
+      "rows_with_event": 5,
+      "n_events": 5,
+      "events": [
+        {
+          "row_date": "2023-06-01",
+          "nd": "2022",
+          "fh_sh": "25",
+          "djr": "2023-05-31",
+          "cqr": "2023-06-01",
+          "FHcontent": "10派25元"
+        },
+        {
+          "row_date": "2024-05-15",
+          "nd": "2023",
+          "fh_sh": "30",
+          "djr": "2024-05-14",
+          "cqr": "2024-05-15",
+          "FHcontent": "10派30元"
+        },
+        {
+          "row_date": "2025-06-12",
+          "nd": "2024",
+          "fh_sh": "35",
+          "djr": "2025-06-11",
+          "cqr": "2025-06-12",
+          "FHcontent": "10派35元"
+        },
+        {
+          "row_date": "2025-11-18",
+          "nd": "2025",
+          "fh_sh": "5",
+          "djr": "2025-11-17",
+          "cqr": "2025-11-18",
+          "FHcontent": "10派5元"
+        },
+        {
+          "row_date": "2026-06-29",
+          "nd": "2025",
+          "fh_sh": "38",
+          "djr": "2026-06-26",
+          "cqr": "2026-06-29",
+          "FHcontent": "10派38元"
+        }
+      ],
+      "event_field_names": [
+        "FHcontent",
+        "cqr",
+        "djr",
+        "fh_sh",
+        "nd",
+        "row_date"
+      ],
+      "bytes": 53273,
+      "seconds": 0.0,
+      "sha256_16": "a68be201806d5534"
+    }
+  },
+  "P3_qfq_count_cap": [
+    {
+      "url": "https://web.ifzq.gtimg.cn/appstock/app/fqkline/get?param=sz000333,day,,2026-09-16,800,qfq",
+      "requested": 800,
+      "adj": "qfq",
+      "count": 800,
+      "first": "2023-05-31",
+      "last": "2026-09-14",
+      "rows_with_event": 5,
+      "n_events": 5,
+      "events": [
+        {
+          "row_date": "2023-06-01",
+          "nd": "2022",
+          "fh_sh": "25",
+          "djr": "2023-05-31",
+          "cqr": "2023-06-01",
+          "FHcontent": "10派25元"
+        },
+        {
+          "row_date": "2024-05-15",
+          "nd": "2023",
+          "fh_sh": "30",
+          "djr": "2024-05-14",
+          "cqr": "2024-05-15",
+          "FHcontent": "10派30元"
+        },
+        {
+          "row_date": "2025-06-12",
+          "nd": "2024",
+          "fh_sh": "35",
+          "djr": "2025-06-11",
+          "cqr": "2025-06-12",
+          "FHcontent": "10派35元"
+        },
+        {
+          "row_date": "2025-11-18",
+          "nd": "2025",
+          "fh_sh": "5",
+          "djr": "2025-11-17",
+          "cqr": "2025-11-18",
+          "FHcontent": "10派5元"
+        },
+        {
+          "row_date": "2026-06-29",
+          "nd": "2025",
+          "fh_sh": "38",
+          "djr": "2026-06-26",
+          "cqr": "2026-06-29",
+          "FHcontent": "10派38元"
+        }
+      ],
+      "event_field_names": [
+        "FHcontent",
+        "cqr",
+        "djr",
+        "fh_sh",
+        "nd",
+        "row_date"
+      ],
+      "bytes": 53273,
+      "seconds": 0.0,
+      "sha256_16": "e1c761b4027ea875"
+    },
+    {
+      "url": "https://web.ifzq.gtimg.cn/appstock/app/fqkline/get?param=sz000333,day,,2026-09-16,801,qfq",
+      "requested": 801,
+      "adj": "qfq",
+      "count": 800,
+      "first": "2023-05-31",
+      "last": "2026-09-14",
+      "rows_with_event": 5,
+      "n_events": 5,
+      "events": [
+        {
+          "row_date": "2023-06-01",
+          "nd": "2022",
+          "fh_sh": "25",
+          "djr": "2023-05-31",
+          "cqr": "2023-06-01",
+          "FHcontent": "10派25元"
+        },
+        {
+          "row_date": "2024-05-15",
+          "nd": "2023",
+          "fh_sh": "30",
+          "djr": "2024-05-14",
+          "cqr": "2024-05-15",
+          "FHcontent": "10派30元"
+        },
+        {
+          "row_date": "2025-06-12",
+          "nd": "2024",
+          "fh_sh": "35",
+          "djr": "2025-06-11",
+          "cqr": "2025-06-12",
+          "FHcontent": "10派35元"
+        },
+        {
+          "row_date": "2025-11-18",
+          "nd": "2025",
+          "fh_sh": "5",
+          "djr": "2025-11-17",
+          "cqr": "2025-11-18",
+          "FHcontent": "10派5元"
+        },
+        {
+          "row_date": "2026-06-29",
+          "nd": "2025",
+          "fh_sh": "38",
+          "djr": "2026-06-26",
+          "cqr": "2026-06-29",
+          "FHcontent": "10派38元"
+        }
+      ],
+      "event_field_names": [
+        "FHcontent",
+        "cqr",
+        "djr",
+        "fh_sh",
+        "nd",
+        "row_date"
+      ],
+      "bytes": 53273,
+      "seconds": 0.0,
+      "sha256_16": "e1c761b4027ea875"
+    },
+    {
+      "url": "https://web.ifzq.gtimg.cn/appstock/app/fqkline/get?param=sz000333,day,,2026-09-16,900,qfq",
+      "requested": 900,
+      "adj": "qfq",
+      "count": 800,
+      "first": "2023-05-31",
+      "last": "2026-09-14",
+      "rows_with_event": 5,
+      "n_events": 5,
+      "events": [
+        {
+          "row_date": "2023-06-01",
+          "nd": "2022",
+          "fh_sh": "25",
+          "djr": "2023-05-31",
+          "cqr": "2023-06-01",
+          "FHcontent": "10派25元"
+        },
+        {
+          "row_date": "2024-05-15",
+          "nd": "2023",
+          "fh_sh": "30",
+          "djr": "2024-05-14",
+          "cqr": "2024-05-15",
+          "FHcontent": "10派30元"
+        },
+        {
+          "row_date": "2025-06-12",
+          "nd": "2024",
+          "fh_sh": "35",
+          "djr": "2025-06-11",
+          "cqr": "2025-06-12",
+          "FHcontent": "10派35元"
+        },
+        {
+          "row_date": "2025-11-18",
+          "nd": "2025",
+          "fh_sh": "5",
+          "djr": "2025-11-17",
+          "cqr": "2025-11-18",
+          "FHcontent": "10派5元"
+        },
+        {
+          "row_date": "2026-06-29",
+          "nd": "2025",
+          "fh_sh": "38",
+          "djr": "2026-06-26",
+          "cqr": "2026-06-29",
+          "FHcontent": "10派38元"
+        }
+      ],
+      "event_field_names": [
+        "FHcontent",
+        "cqr",
+        "djr",
+        "fh_sh",
+        "nd",
+        "row_date"
+      ],
+      "bytes": 53273,
+      "seconds": 0.0,
+      "sha256_16": "e1c761b4027ea875"
+    },
+    {
+      "url": "https://web.ifzq.gtimg.cn/appstock/app/fqkline/get?param=sz000333,day,,2026-09-16,2000,qfq",
+      "requested": 2000,
+      "adj": "qfq",
+      "count": 800,
+      "first": "2023-05-31",
+      "last": "2026-09-14",
+      "rows_with_event": 5,
+      "n_events": 5,
+      "events": [
+        {
+          "row_date": "2023-06-01",
+          "nd": "2022",
+          "fh_sh": "25",
+          "djr": "2023-05-31",
+          "cqr": "2023-06-01",
+          "FHcontent": "10派25元"
+        },
+        {
+          "row_date": "2024-05-15",
+          "nd": "2023",
+          "fh_sh": "30",
+          "djr": "2024-05-14",
+          "cqr": "2024-05-15",
+          "FHcontent": "10派30元"
+        },
+        {
+          "row_date": "2025-06-12",
+          "nd": "2024",
+          "fh_sh": "35",
+          "djr": "2025-06-11",
+          "cqr": "2025-06-12",
+          "FHcontent": "10派35元"
+        },
+        {
+          "row_date": "2025-11-18",
+          "nd": "2025",
+          "fh_sh": "5",
+          "djr": "2025-11-17",
+          "cqr": "2025-11-18",
+          "FHcontent": "10派5元"
+        },
+        {
+          "row_date": "2026-06-29",
+          "nd": "2025",
+          "fh_sh": "38",
+          "djr": "2026-06-26",
+          "cqr": "2026-06-29",
+          "FHcontent": "10派38元"
+        }
+      ],
+      "event_field_names": [
+        "FHcontent",
+        "cqr",
+        "djr",
+        "fh_sh",
+        "nd",
+        "row_date"
+      ],
+      "bytes": 53273,
+      "seconds": 0.0,
+      "sha256_16": "e1c761b4027ea875"
+    }
+  ],
+  "P2_pagination": {
+    "sz000333": {
+      "none": {
+        "adj": "none",
+        "page_size": 2000,
+        "n_pages": 3,
+        "pages": [
+          {
+            "url": "https://web.ifzq.gtimg.cn/appstock/app/fqkline/get?param=sz000333,day,,2026-09-16,2000,",
+            "requested": 2000,
+            "adj": "none",
+            "count": 2000,
+            "first": "2018-04-23",
+            "last": "2026-09-14",
+            "rows_with_event": 10,
+            "n_events": 10,
+            "event_field_names": [
+              "FHcontent",
+              "cqr",
+              "djr",
+              "fh_sh",
+              "nd",
+              "row_date"
+            ],
+            "bytes": 130600,
+            "seconds": 0.0,
+            "sha256_16": "9bc09e009cba48db",
+            "page": 0,
+            "end_anchor": "2026-09-16"
+          },
+          {
+            "url": "https://web.ifzq.gtimg.cn/appstock/app/fqkline/get?param=sz000333,day,,2018-04-22,2000,",
+            "requested": 2000,
+            "adj": "none",
+            "count": 1095,
+            "first": "2013-09-18",
+            "last": "2018-04-20",
+            "rows_with_event": 4,
+            "n_events": 4,
+            "event_field_names": [
+              "FHcontent",
+              "cqr",
+              "djr",
+              "fh_sh",
+              "nd",
+              "row_date"
+            ],
+            "bytes": 71921,
+            "seconds": 0.0,
+            "sha256_16": "54704a738fa91d0d",
+            "page": 1,
+            "end_anchor": "2018-04-22"
+          },
+          {
+            "url": "https://web.ifzq.gtimg.cn/appstock/app/fqkline/get?param=sz000333,day,,2013-09-17,2000,",
+            "requested": 2000,
+            "adj": "none",
+            "count": 0,
+            "first": null,
+            "last": null,
+            "rows_with_event": 0,
+            "n_events": 0,
+            "event_field_names": [],
+            "bytes": 1556,
+            "seconds": 0.0,
+            "sha256_16": "1f5d33408baace67",
+            "page": 2,
+            "end_anchor": "2013-09-17"
+          }
+        ],
+        "total_bars": 3095,
+        "coverage_first": "2013-09-18",
+        "coverage_last": "2026-09-14",
+        "n_events_distinct": 14,
+        "first_event": {
+          "row_date": "2014-04-30",
+          "nd": "2013",
+          "fh_sh": "19",
+          "djr": "2014-04-29",
+          "cqr": "2014-04-30",
+          "FHcontent": "10派20元转15股"
+        },
+        "last_event": {
+          "row_date": "2026-06-29",
+          "nd": "2025",
+          "fh_sh": "38",
+          "djr": "2026-06-26",
+          "cqr": "2026-06-29",
+          "FHcontent": "10派38元"
+        },
+        "events_distinct": [
+          {
+            "row_date": "2014-04-30",
+            "nd": "2013",
+            "fh_sh": "19",
+            "djr": "2014-04-29",
+            "cqr": "2014-04-30",
+            "FHcontent": "10派20元转15股"
+          },
+          {
+            "row_date": "2015-04-30",
+            "nd": "2014",
+            "fh_sh": "9.5",
+            "djr": "2015-04-29",
+            "cqr": "2015-04-30",
+            "FHcontent": "10派10元"
+          },
+          {
+            "row_date": "2016-05-06",
+            "nd": "2015",
+            "fh_sh": "12",
+            "djr": "2016-05-05",
+            "cqr": "2016-05-06",
+            "FHcontent": "10派12元转5股"
+          },
+          {
+            "row_date": "2017-05-10",
+            "nd": "2016",
+            "fh_sh": "10",
+            "djr": "2017-05-09",
+            "cqr": "2017-05-10",
+            "FHcontent": "10派10元"
+          },
+          {
+            "row_date": "2018-05-04",
+            "nd": "2017",
+            "fh_sh": "12",
+            "djr": "2018-05-03",
+            "cqr": "2018-05-04",
+            "FHcontent": "10派12元"
+          },
+          {
+            "row_date": "2019-05-30",
+            "nd": "2018",
+            "fh_sh": "13.0396",
+            "djr": "2019-05-29",
+            "cqr": "2019-05-30",
+            "FHcontent": "10派13.0396元"
+          },
+          {
+            "row_date": "2020-06-02",
+            "nd": "2019",
+            "fh_sh": "16",
+            "djr": "2020-06-01",
+            "cqr": "2020-06-02",
+            "FHcontent": "10派16元"
+          },
+          {
+            "row_date": "2021-06-02",
+            "nd": "2020",
+            "fh_sh": "16.0058",
+            "djr": "2021-06-01",
+            "cqr": "2021-06-02",
+            "FHcontent": "10派16.0058元"
+          },
+          {
+            "row_date": "2022-06-02",
+            "nd": "2021",
+            "fh_sh": "17.0089",
+            "djr": "2022-06-01",
+            "cqr": "2022-06-02",
+            "FHcontent": "10派17.0089元"
+          },
+          {
+            "row_date": "2023-06-01",
+            "nd": "2022",
+            "fh_sh": "25",
+            "djr": "2023-05-31",
+            "cqr": "2023-06-01",
+            "FHcontent": "10派25元"
+          },
+          {
+            "row_date": "2024-05-15",
+            "nd": "2023",
+            "fh_sh": "30",
+            "djr": "2024-05-14",
+            "cqr": "2024-05-15",
+            "FHcontent": "10派30元"
+          },
+          {
+            "row_date": "2025-06-12",
+            "nd": "2024",
+            "fh_sh": "35",
+            "djr": "2025-06-11",
+            "cqr": "2025-06-12",
+            "FHcontent": "10派35元"
+          },
+          {
+            "row_date": "2025-11-18",
+            "nd": "2025",
+            "fh_sh": "5",
+            "djr": "2025-11-17",
+            "cqr": "2025-11-18",
+            "FHcontent": "10派5元"
+          },
+          {
+            "row_date": "2026-06-29",
+            "nd": "2025",
+            "fh_sh": "38",
+            "djr": "2026-06-26",
+            "cqr": "2026-06-29",
+            "FHcontent": "10派38元"
+          }
+        ]
+      },
+      "qfq": {
+        "adj": "qfq",
+        "page_size": 800,
+        "n_pages": 5,
+        "pages": [
+          {
+            "url": "https://web.ifzq.gtimg.cn/appstock/app/fqkline/get?param=sz000333,day,,2026-09-16,800,qfq",
+            "requested": 800,
+            "adj": "qfq",
+            "count": 800,
+            "first": "2023-05-31",
+            "last": "2026-09-14",
+            "rows_with_event": 5,
+            "n_events": 5,
+            "event_field_names": [
+              "FHcontent",
+              "cqr",
+              "djr",
+              "fh_sh",
+              "nd",
+              "row_date"
+            ],
+            "bytes": 53273,
+            "seconds": 0.0,
+            "sha256_16": "8ce790826464de5b",
+            "page": 0,
+            "end_anchor": "2026-09-16"
+          },
+          {
+            "url": "https://web.ifzq.gtimg.cn/appstock/app/fqkline/get?param=sz000333,day,,2023-05-30,800,qfq",
+            "requested": 800,
+            "adj": "qfq",
+            "count": 800,
+            "first": "2020-02-14",
+            "last": "2023-05-30",
+            "rows_with_event": 3,
+            "n_events": 3,
+            "event_field_names": [
+              "FHcontent",
+              "cqr",
+              "djr",
+              "fh_sh",
+              "nd",
+              "row_date"
+            ],
+            "bytes": 53105,
+            "seconds": 0.0,
+            "sha256_16": "0091089f883e43c8",
+            "page": 1,
+            "end_anchor": "2023-05-30"
+          },
+          {
+            "url": "https://web.ifzq.gtimg.cn/appstock/app/fqkline/get?param=sz000333,day,,2020-02-13,800,qfq",
+            "requested": 800,
+            "adj": "qfq",
+            "count": 800,
+            "first": "2016-08-26",
+            "last": "2020-02-13",
+            "rows_with_event": 3,
+            "n_events": 3,
+            "event_field_names": [
+              "FHcontent",
+              "cqr",
+              "djr",
+              "fh_sh",
+              "nd",
+              "row_date"
+            ],
+            "bytes": 52648,
+            "seconds": 0.0,
+            "sha256_16": "535994089a1afc8d",
+            "page": 2,
+            "end_anchor": "2020-02-13"
+          },
+          {
+            "url": "https://web.ifzq.gtimg.cn/appstock/app/fqkline/get?param=sz000333,day,,2016-08-25,800,qfq",
+            "requested": 800,
+            "adj": "qfq",
+            "count": 695,
+            "first": "2013-09-18",
+            "last": "2016-08-25",
+            "rows_with_event": 3,
+            "n_events": 3,
+            "event_field_names": [
+              "FHcontent",
+              "cqr",
+              "djr",
+              "fh_sh",
+              "nd",
+              "row_date"
+            ],
+            "bytes": 46463,
+            "seconds": 0.0,
+            "sha256_16": "1fd0787196c12cd4",
+            "page": 3,
+            "end_anchor": "2016-08-25"
+          },
+          {
+            "url": "https://web.ifzq.gtimg.cn/appstock/app/fqkline/get?param=sz000333,day,,2013-09-17,800,qfq",
+            "requested": 800,
+            "adj": "qfq",
+            "count": 0,
+            "first": null,
+            "last": null,
+            "rows_with_event": 0,
+            "n_events": 0,
+            "event_field_names": [],
+            "bytes": 1556,
+            "seconds": 0.0,
+            "sha256_16": "3053b9337f13f042",
+            "page": 4,
+            "end_anchor": "2013-09-17"
+          }
+        ],
+        "total_bars": 3095,
+        "coverage_first": "2013-09-18",
+        "coverage_last": "2026-09-14",
+        "n_events_distinct": 14,
+        "first_event": {
+          "row_date": "2014-04-30",
+          "nd": "2013",
+          "fh_sh": "19",
+          "djr": "2014-04-29",
+          "cqr": "2014-04-30",
+          "FHcontent": "10派20元转15股"
+        },
+        "last_event": {
+          "row_date": "2026-06-29",
+          "nd": "2025",
+          "fh_sh": "38",
+          "djr": "2026-06-26",
+          "cqr": "2026-06-29",
+          "FHcontent": "10派38元"
+        },
+        "events_distinct": [
+          {
+            "row_date": "2014-04-30",
+            "nd": "2013",
+            "fh_sh": "19",
+            "djr": "2014-04-29",
+            "cqr": "2014-04-30",
+            "FHcontent": "10派20元转15股"
+          },
+          {
+            "row_date": "2015-04-30",
+            "nd": "2014",
+            "fh_sh": "9.5",
+            "djr": "2015-04-29",
+            "cqr": "2015-04-30",
+            "FHcontent": "10派10元"
+          },
+          {
+            "row_date": "2016-05-06",
+            "nd": "2015",
+            "fh_sh": "12",
+            "djr": "2016-05-05",
+            "cqr": "2016-05-06",
+            "FHcontent": "10派12元转5股"
+          },
+          {
+            "row_date": "2017-05-10",
+            "nd": "2016",
+            "fh_sh": "10",
+            "djr": "2017-05-09",
+            "cqr": "2017-05-10",
+            "FHcontent": "10派10元"
+          },
+          {
+            "row_date": "2018-05-04",
+            "nd": "2017",
+            "fh_sh": "12",
+            "djr": "2018-05-03",
+            "cqr": "2018-05-04",
+            "FHcontent": "10派12元"
+          },
+          {
+            "row_date": "2019-05-30",
+            "nd": "2018",
+            "fh_sh": "13.0396",
+            "djr": "2019-05-29",
+            "cqr": "2019-05-30",
+            "FHcontent": "10派13.0396元"
+          },
+          {
+            "row_date": "2020-06-02",
+            "nd": "2019",
+            "fh_sh": "16",
+            "djr": "2020-06-01",
+            "cqr": "2020-06-02",
+            "FHcontent": "10派16元"
+          },
+          {
+            "row_date": "2021-06-02",
+            "nd": "2020",
+            "fh_sh": "16.0058",
+            "djr": "2021-06-01",
+            "cqr": "2021-06-02",
+            "FHcontent": "10派16.0058元"
+          },
+          {
+            "row_date": "2022-06-02",
+            "nd": "2021",
+            "fh_sh": "17.0089",
+            "djr": "2022-06-01",
+            "cqr": "2022-06-02",
+            "FHcontent": "10派17.0089元"
+          },
+          {
+            "row_date": "2023-06-01",
+            "nd": "2022",
+            "fh_sh": "25",
+            "djr": "2023-05-31",
+            "cqr": "2023-06-01",
+            "FHcontent": "10派25元"
+          },
+          {
+            "row_date": "2024-05-15",
+            "nd": "2023",
+            "fh_sh": "30",
+            "djr": "2024-05-14",
+            "cqr": "2024-05-15",
+            "FHcontent": "10派30元"
+          },
+          {
+            "row_date": "2025-06-12",
+            "nd": "2024",
+            "fh_sh": "35",
+            "djr": "2025-06-11",
+            "cqr": "2025-06-12",
+            "FHcontent": "10派35元"
+          },
+          {
+            "row_date": "2025-11-18",
+            "nd": "2025",
+            "fh_sh": "5",
+            "djr": "2025-11-17",
+            "cqr": "2025-11-18",
+            "FHcontent": "10派5元"
+          },
+          {
+            "row_date": "2026-06-29",
+            "nd": "2025",
+            "fh_sh": "38",
+            "djr": "2026-06-26",
+            "cqr": "2026-06-29",
+            "FHcontent": "10派38元"
+          }
+        ]
+      }
+    },
+    "sh600690": {
+      "none": {
+        "adj": "none",
+        "page_size": 2000,
+        "n_pages": 5,
+        "pages": [
+          {
+            "url": "https://web.ifzq.gtimg.cn/appstock/app/fqkline/get?param=sh600690,day,,2026-09-16,2000,",
+            "requested": 2000,
+            "adj": "none",
+            "count": 2000,
+            "first": "2018-06-19",
+            "last": "2026-09-14",
+            "rows_with_event": 9,
+            "n_events": 9,
+            "event_field_names": [
+              "FHcontent",
+              "cqr",
+              "djr",
+              "fh_sh",
+              "nd",
+              "row_date"
+            ],
+            "bytes": 130517,
+            "seconds": 0.21,
+            "sha256_16": "b126d2f1c0944bfa",
+            "page": 0,
+            "end_anchor": "2026-09-16"
+          },
+          {
+            "url": "https://web.ifzq.gtimg.cn/appstock/app/fqkline/get?param=sh600690,day,,2018-06-18,2000,",
+            "requested": 2000,
+            "adj": "none",
+            "count": 2000,
+            "first": "2009-10-27",
+            "last": "2018-06-15",
+            "rows_with_event": 9,
+            "n_events": 9,
+            "event_field_names": [
+              "FHcontent",
+              "cqr",
+              "djr",
+              "fh_sh",
+              "nd",
+              "row_date"
+            ],
+            "bytes": 128944,
+            "seconds": 0.27,
+            "sha256_16": "44e24a97eb545a28",
+            "page": 1,
+            "end_anchor": "2018-06-18"
+          },
+          {
+            "url": "https://web.ifzq.gtimg.cn/appstock/app/fqkline/get?param=sh600690,day,,2009-10-26,2000,",
+            "requested": 2000,
+            "adj": "none",
+            "count": 2000,
+            "first": "2001-04-25",
+            "last": "2009-10-26",
+            "rows_with_event": 8,
+            "n_events": 8,
+            "event_field_names": [
+              "FHcontent",
+              "cqr",
+              "djr",
+              "fh_sh",
+              "nd",
+              "row_date"
+            ],
+            "bytes": 124278,
+            "seconds": 0.34,
+            "sha256_16": "de96ab46b38bd68c",
+            "page": 2,
+            "end_anchor": "2009-10-26"
+          },
+          {
+            "url": "https://web.ifzq.gtimg.cn/appstock/app/fqkline/get?param=sh600690,day,,2001-04-24,2000,",
+            "requested": 2000,
+            "adj": "none",
+            "count": 1807,
+            "first": "1993-11-19",
+            "last": "2001-04-24",
+            "rows_with_event": 10,
+            "n_events": 10,
+            "event_field_names": [
+              "FHcontent",
+              "cqr",
+              "djr",
+              "fh_sh",
+              "nd",
+              "row_date"
+            ],
+            "bytes": 112998,
+            "seconds": 0.35,
+            "sha256_16": "e8dd2b517e3fbdc1",
+            "page": 3,
+            "end_anchor": "2001-04-24"
+          },
+          {
+            "url": "https://web.ifzq.gtimg.cn/appstock/app/fqkline/get?param=sh600690,day,,1993-11-18,2000,",
+            "requested": 2000,
+            "adj": "none",
+            "count": 0,
+            "first": null,
+            "last": null,
+            "rows_with_event": 0,
+            "n_events": 0,
+            "event_field_names": [],
+            "bytes": 1573,
+            "seconds": 0.28,
+            "sha256_16": "dd41621c7be27eb8",
+            "page": 4,
+            "end_anchor": "1993-11-18"
+          }
+        ],
+        "total_bars": 7807,
+        "coverage_first": "1993-11-19",
+        "coverage_last": "2026-09-14",
+        "n_events_distinct": 36,
+        "first_event": {
+          "row_date": "1994-04-04",
+          "nd": "1993",
+          "fh_sh": "",
+          "djr": "1994-04-01",
+          "cqr": "1994-04-04",
+          "FHcontent": "10送3股"
+        },
+        "last_event": {
+          "row_date": "2026-08-21",
+          "nd": "2025",
+          "fh_sh": "8.9151",
+          "djr": "2026-08-20",
+          "cqr": "2026-08-21",
+          "FHcontent": "10派8.9151元"
+        },
+        "events_distinct": [
+          {
+            "row_date": "1994-04-04",
+            "nd": "1993",
+            "fh_sh": "",
+            "djr": "1994-04-01",
+            "cqr": "1994-04-04",
+            "FHcontent": "10送3股"
+          },
+          {
+            "row_date": "1995-07-10",
+            "nd": "1994",
+            "fh_sh": "",
+            "djr": "1995-07-07",
+            "cqr": "1995-07-10",
+            "FHcontent": "10派3.5元"
+          },
+          {
+            "row_date": "1996-05-02",
+            "nd": "1995",
+            "fh_sh": "",
+            "djr": "1996-04-30",
+            "cqr": "1996-05-02"
+          },
+          {
+            "row_date": "1996-07-26",
+            "nd": "1995",
+            "fh_sh": "",
+            "djr": "1996-07-25",
+            "cqr": "1996-07-26",
+            "FHcontent": "10派1元送2股"
+          },
+          {
+            "row_date": "1997-06-16",
+            "nd": "1996",
+            "fh_sh": "",
+            "djr": "1997-06-13",
+            "cqr": "1997-06-16",
+            "FHcontent": "10派4.3元"
+          },
+          {
+            "row_date": "1997-10-21",
+            "nd": "1997",
+            "fh_sh": "",
+            "djr": "1997-10-20",
+            "cqr": "1997-10-21"
+          },
+          {
+            "row_date": "1998-06-08",
+            "nd": "1997",
+            "fh_sh": "3.86",
+            "djr": "1998-06-05",
+            "cqr": "1998-06-08",
+            "FHcontent": "10派4.7元"
+          },
+          {
+            "row_date": "1999-08-12",
+            "nd": "1999",
+            "fh_sh": "",
+            "djr": "1999-08-11",
+            "cqr": "1999-08-12"
+          },
+          {
+            "row_date": "2000-06-20",
+            "nd": "1999",
+            "fh_sh": "1.2",
+            "djr": "2000-06-19",
+            "cqr": "2000-06-20",
+            "FHcontent": "10派2元送2股"
+          },
+          {
+            "row_date": "2001-01-15",
+            "nd": "2001",
+            "fh_sh": "",
+            "djr": "2001-01-05",
+            "cqr": "2001-01-15"
+          },
+          {
+            "row_date": "2001-06-21",
+            "nd": "2000",
+            "fh_sh": "1.2",
+            "djr": "2001-06-20",
+            "cqr": "2001-06-21",
+            "FHcontent": "10派2元送2股"
+          },
+          {
+            "row_date": "2002-06-20",
+            "nd": "2001",
+            "fh_sh": "2.4",
+            "djr": "2002-06-19",
+            "cqr": "2002-06-20",
+            "FHcontent": "10派3元"
+          },
+          {
+            "row_date": "2003-07-10",
+            "nd": "2002",
+            "fh_sh": "2.4",
+            "djr": "2003-07-09",
+            "cqr": "2003-07-10",
+            "FHcontent": "10派3元"
+          },
+          {
+            "row_date": "2004-07-12",
+            "nd": "2003",
+            "fh_sh": "",
+            "djr": "2004-07-09",
+            "cqr": "2004-07-12",
+            "FHcontent": "10派0.5元送2股转3股"
+          },
+          {
+            "row_date": "2005-07-14",
+            "nd": "2004",
+            "fh_sh": "2.7",
+            "djr": "2005-07-13",
+            "cqr": "2005-07-14",
+            "FHcontent": "10派3元"
+          },
+          {
+            "row_date": "2006-07-20",
+            "nd": "2005",
+            "fh_sh": "0.9",
+            "djr": "2006-07-19",
+            "cqr": "2006-07-20",
+            "FHcontent": "10派1元"
+          },
+          {
+            "row_date": "2007-07-19",
+            "nd": "2006",
+            "fh_sh": "1.35",
+            "djr": "2007-07-18",
+            "cqr": "2007-07-19",
+            "FHcontent": "10派1.5元"
+          },
+          {
+            "row_date": "2009-07-13",
+            "nd": "2008",
+            "fh_sh": "1.35",
+            "djr": "2009-07-10",
+            "cqr": "2009-07-13",
+            "FHcontent": "10派1.5元"
+          },
+          {
+            "row_date": "2010-07-29",
+            "nd": "2009",
+            "fh_sh": "2.7",
+            "djr": "2010-07-28",
+            "cqr": "2010-07-29",
+            "FHcontent": "10派3元"
+          },
+          {
+            "row_date": "2011-07-18",
+            "nd": "2010",
+            "fh_sh": "0.9",
+            "djr": "2011-07-15",
+            "cqr": "2011-07-18",
+            "FHcontent": "10派1元转10股"
+          },
+          {
+            "row_date": "2012-06-12",
+            "nd": "2011",
+            "fh_sh": "1.53",
+            "djr": "2012-06-11",
+            "cqr": "2012-06-12",
+            "FHcontent": "10派1.7元"
+          },
+          {
+            "row_date": "2013-06-07",
+            "nd": "2012",
+            "fh_sh": "3.515",
+            "djr": "2013-06-06",
+            "cqr": "2013-06-07",
+            "FHcontent": "10派3.7元"
+          },
+          {
+            "row_date": "2014-06-18",
+            "nd": "2013",
+            "fh_sh": "4.37",
+            "djr": "2014-06-17",
+            "cqr": "2014-06-18",
+            "FHcontent": "10派4.6元"
+          },
+          {
+            "row_date": "2015-07-16",
+            "nd": "2014",
+            "fh_sh": "4.674",
+            "djr": "2015-07-15",
+            "cqr": "2015-07-16",
+            "FHcontent": "10派4.92元转10股"
+          },
+          {
+            "row_date": "2016-07-26",
+            "nd": "2015",
+            "fh_sh": "2.12",
+            "djr": "2016-07-25",
+            "cqr": "2016-07-26",
+            "FHcontent": "10派2.12元"
+          },
+          {
+            "row_date": "2017-08-01",
+            "nd": "2016",
+            "fh_sh": "2.48",
+            "djr": "2017-07-31",
+            "cqr": "2017-08-01",
+            "FHcontent": "10派2.48元"
+          },
+          {
+            "row_date": "2018-06-07",
+            "nd": "2017",
+            "fh_sh": "3.42",
+            "djr": "2018-06-06",
+            "cqr": "2018-06-07",
+            "FHcontent": "10派3.42元"
+          },
+          {
+            "row_date": "2019-08-08",
+            "nd": "2018",
+            "fh_sh": "3.51",
+            "djr": "2019-08-07",
+            "cqr": "2019-08-08",
+            "FHcontent": "10派3.51元"
+          },
+          {
+            "row_date": "2020-07-16",
+            "nd": "2019",
+            "fh_sh": "3.75",
+            "djr": "2020-07-15",
+            "cqr": "2020-07-16",
+            "FHcontent": "10派3.75元"
+          },
+          {
+            "row_date": "2021-08-23",
+            "nd": "2020",
+            "fh_sh": "3.66",
+            "djr": "2021-08-20",
+            "cqr": "2021-08-23",
+            "FHcontent": "10派3.66元"
+          },
+          {
+            "row_date": "2022-08-23",
+            "nd": "2021",
+            "fh_sh": "4.6136",
+            "djr": "2022-08-22",
+            "cqr": "2022-08-23",
+            "FHcontent": "10派4.6136元"
+          },
+          {
+            "row_date": "2023-08-25",
+            "nd": "2022",
+            "fh_sh": "5.6692",
+            "djr": "2023-08-24",
+            "cqr": "2023-08-25",
+            "FHcontent": "10派5.6692元"
+          },
+          {
+            "row_date": "2024-08-16",
+            "nd": "2023",
+            "fh_sh": "8.0131",
+            "djr": "2024-08-15",
+            "cqr": "2024-08-16",
+            "FHcontent": "10派8.0131元"
+          },
+          {
+            "row_date": "2025-07-25",
+            "nd": "2024",
+            "fh_sh": "9.6504",
+            "djr": "2025-07-24",
+            "cqr": "2025-07-25",
+            "FHcontent": "10派9.6504元"
+          },
+          {
+            "row_date": "2025-11-07",
+            "nd": "2025",
+            "fh_sh": "2.692",
+            "djr": "2025-11-06",
+            "cqr": "2025-11-07",
+            "FHcontent": "10派2.692元"
+          },
+          {
+            "row_date": "2026-08-21",
+            "nd": "2025",
+            "fh_sh": "8.9151",
+            "djr": "2026-08-20",
+            "cqr": "2026-08-21",
+            "FHcontent": "10派8.9151元"
+          }
+        ]
+      },
+      "qfq": {
+        "adj": "qfq",
+        "page_size": 800,
+        "n_pages": 11,
+        "pages": [
+          {
+            "url": "https://web.ifzq.gtimg.cn/appstock/app/fqkline/get?param=sh600690,day,,2026-09-16,800,qfq",
+            "requested": 800,
+            "adj": "qfq",
+            "count": 800,
+            "first": "2023-05-31",
+            "last": "2026-09-14",
+            "rows_with_event": 5,
+            "n_events": 5,
+            "event_field_names": [
+              "FHcontent",
+              "cqr",
+              "djr",
+              "fh_sh",
+              "nd",
+              "row_date"
+            ],
+            "bytes": 53336,
+            "seconds": 0.4,
+            "sha256_16": "7134fb5e0915259b",
+            "page": 0,
+            "end_anchor": "2026-09-16"
+          },
+          {
+            "url": "https://web.ifzq.gtimg.cn/appstock/app/fqkline/get?param=sh600690,day,,2023-05-30,800,qfq",
+            "requested": 800,
+            "adj": "qfq",
+            "count": 800,
+            "first": "2020-02-12",
+            "last": "2023-05-30",
+            "rows_with_event": 3,
+            "n_events": 3,
+            "event_field_names": [
+              "FHcontent",
+              "cqr",
+              "djr",
+              "fh_sh",
+              "nd",
+              "row_date"
+            ],
+            "bytes": 53097,
+            "seconds": 0.33,
+            "sha256_16": "c6ee870d931767fc",
+            "page": 1,
+            "end_anchor": "2023-05-30"
+          },
+          {
+            "url": "https://web.ifzq.gtimg.cn/appstock/app/fqkline/get?param=sh600690,day,,2020-02-11,800,qfq",
+            "requested": 800,
+            "adj": "qfq",
+            "count": 800,
+            "first": "2016-10-28",
+            "last": "2020-02-11",
+            "rows_with_event": 3,
+            "n_events": 3,
+            "event_field_names": [
+              "FHcontent",
+              "cqr",
+              "djr",
+              "fh_sh",
+              "nd",
+              "row_date"
+            ],
+            "bytes": 51880,
+            "seconds": 0.35,
+            "sha256_16": "aef3d9b2be21371c",
+            "page": 2,
+            "end_anchor": "2020-02-11"
+          },
+          {
+            "url": "https://web.ifzq.gtimg.cn/appstock/app/fqkline/get?param=sh600690,day,,2016-10-27,800,qfq",
+            "requested": 800,
+            "adj": "qfq",
+            "count": 800,
+            "first": "2013-03-04",
+            "last": "2016-10-27",
+            "rows_with_event": 4,
+            "n_events": 4,
+            "event_field_names": [
+              "FHcontent",
+              "cqr",
+              "djr",
+              "fh_sh",
+              "nd",
+              "row_date"
+            ],
+            "bytes": 50304,
+            "seconds": 0.36,
+            "sha256_16": "5bd6be81409bb079",
+            "page": 3,
+            "end_anchor": "2016-10-27"
+          },
+          {
+            "url": "https://web.ifzq.gtimg.cn/appstock/app/fqkline/get?param=sh600690,day,,2013-03-03,800,qfq",
+            "requested": 800,
+            "adj": "qfq",
+            "count": 800,
+            "first": "2009-10-27",
+            "last": "2013-03-01",
+            "rows_with_event": 3,
+            "n_events": 3,
+            "event_field_names": [
+              "FHcontent",
+              "cqr",
+              "djr",
+              "fh_sh",
+              "nd",
+              "row_date"
+            ],
+            "bytes": 51976,
+            "seconds": 0.37,
+            "sha256_16": "6324c9c6978cdde1",
+            "page": 4,
+            "end_anchor": "2013-03-03"
+          },
+          {
+            "url": "https://web.ifzq.gtimg.cn/appstock/app/fqkline/get?param=sh600690,day,,2009-10-26,800,qfq",
+            "requested": 800,
+            "adj": "qfq",
+            "count": 800,
+            "first": "2006-06-29",
+            "last": "2009-10-26",
+            "rows_with_event": 3,
+            "n_events": 3,
+            "event_field_names": [
+              "FHcontent",
+              "cqr",
+              "djr",
+              "fh_sh",
+              "nd",
+              "row_date"
+            ],
+            "bytes": 52795,
+            "seconds": 0.32,
+            "sha256_16": "5baa78917fff7f12",
+            "page": 5,
+            "end_anchor": "2009-10-26"
+          },
+          {
+            "url": "https://web.ifzq.gtimg.cn/appstock/app/fqkline/get?param=sh600690,day,,2006-06-28,800,qfq",
+            "requested": 800,
+            "adj": "qfq",
+            "count": 800,
+            "first": "2002-12-30",
+            "last": "2006-06-27",
+            "rows_with_event": 3,
+            "n_events": 3,
+            "event_field_names": [
+              "FHcontent",
+              "cqr",
+              "djr",
+              "fh_sh",
+              "nd",
+              "row_date"
+            ],
+            "bytes": 52107,
+            "seconds": 0.35,
+            "sha256_16": "071c172378bb635f",
+            "page": 6,
+            "end_anchor": "2006-06-28"
+          },
+          {
+            "url": "https://web.ifzq.gtimg.cn/appstock/app/fqkline/get?param=sh600690,day,,2002-12-29,800,qfq",
+            "requested": 800,
+            "adj": "qfq",
+            "count": 800,
+            "first": "1999-08-11",
+            "last": "2002-12-27",
+            "rows_with_event": 5,
+            "n_events": 5,
+            "event_field_names": [
+              "FHcontent",
+              "cqr",
+              "djr",
+              "fh_sh",
+              "nd",
+              "row_date"
+            ],
+            "bytes": 52258,
+            "seconds": 0.34,
+            "sha256_16": "6bfe484a6d4531dc",
+            "page": 7,
+            "end_anchor": "2002-12-29"
+          },
+          {
+            "url": "https://web.ifzq.gtimg.cn/appstock/app/fqkline/get?param=sh600690,day,,1999-08-10,800,qfq",
+            "requested": 800,
+            "adj": "qfq",
+            "count": 800,
+            "first": "1996-04-30",
+            "last": "1999-08-10",
+            "rows_with_event": 5,
+            "n_events": 5,
+            "event_field_names": [
+              "FHcontent",
+              "cqr",
+              "djr",
+              "fh_sh",
+              "nd",
+              "row_date"
+            ],
+            "bytes": 52150,
+            "seconds": 0.35,
+            "sha256_16": "5cd5e31ccec813de",
+            "page": 8,
+            "end_anchor": "1999-08-10"
+          },
+          {
+            "url": "https://web.ifzq.gtimg.cn/appstock/app/fqkline/get?param=sh600690,day,,1996-04-29,800,qfq",
+            "requested": 800,
+            "adj": "qfq",
+            "count": 608,
+            "first": "1993-11-19",
+            "last": "1996-04-29",
+            "rows_with_event": 2,
+            "n_events": 2,
+            "event_field_names": [
+              "FHcontent",
+              "cqr",
+              "djr",
+              "fh_sh",
+              "nd",
+              "row_date"
+            ],
+            "bytes": 39675,
+            "seconds": 0.34,
+            "sha256_16": "611932a5a863231e",
+            "page": 9,
+            "end_anchor": "1996-04-29"
+          },
+          {
+            "url": "https://web.ifzq.gtimg.cn/appstock/app/fqkline/get?param=sh600690,day,,1993-11-18,800,qfq",
+            "requested": 800,
+            "adj": "qfq",
+            "count": 0,
+            "first": null,
+            "last": null,
+            "rows_with_event": 0,
+            "n_events": 0,
+            "event_field_names": [],
+            "bytes": 1573,
+            "seconds": 0.32,
+            "sha256_16": "55718fac397c908f",
+            "page": 10,
+            "end_anchor": "1993-11-18"
+          }
+        ],
+        "total_bars": 7808,
+        "coverage_first": "1993-11-19",
+        "coverage_last": "2026-09-14",
+        "n_events_distinct": 36,
+        "first_event": {
+          "row_date": "1994-04-04",
+          "nd": "1993",
+          "fh_sh": "",
+          "djr": "1994-04-01",
+          "cqr": "1994-04-04",
+          "FHcontent": "10送3股"
+        },
+        "last_event": {
+          "row_date": "2026-08-21",
+          "nd": "2025",
+          "fh_sh": "8.9151",
+          "djr": "2026-08-20",
+          "cqr": "2026-08-21",
+          "FHcontent": "10派8.9151元"
+        },
+        "events_distinct": [
+          {
+            "row_date": "1994-04-04",
+            "nd": "1993",
+            "fh_sh": "",
+            "djr": "1994-04-01",
+            "cqr": "1994-04-04",
+            "FHcontent": "10送3股"
+          },
+          {
+            "row_date": "1995-07-10",
+            "nd": "1994",
+            "fh_sh": "",
+            "djr": "1995-07-07",
+            "cqr": "1995-07-10",
+            "FHcontent": "10派3.5元"
+          },
+          {
+            "row_date": "1996-05-02",
+            "nd": "1995",
+            "fh_sh": "",
+            "djr": "1996-04-30",
+            "cqr": "1996-05-02"
+          },
+          {
+            "row_date": "1996-07-26",
+            "nd": "1995",
+            "fh_sh": "",
+            "djr": "1996-07-25",
+            "cqr": "1996-07-26",
+            "FHcontent": "10派1元送2股"
+          },
+          {
+            "row_date": "1997-06-16",
+            "nd": "1996",
+            "fh_sh": "",
+            "djr": "1997-06-13",
+            "cqr": "1997-06-16",
+            "FHcontent": "10派4.3元"
+          },
+          {
+            "row_date": "1997-10-21",
+            "nd": "1997",
+            "fh_sh": "",
+            "djr": "1997-10-20",
+            "cqr": "1997-10-21"
+          },
+          {
+            "row_date": "1998-06-08",
+            "nd": "1997",
+            "fh_sh": "3.86",
+            "djr": "1998-06-05",
+            "cqr": "1998-06-08",
+            "FHcontent": "10派4.7元"
+          },
+          {
+            "row_date": "1999-08-12",
+            "nd": "1999",
+            "fh_sh": "",
+            "djr": "1999-08-11",
+            "cqr": "1999-08-12"
+          },
+          {
+            "row_date": "2000-06-20",
+            "nd": "1999",
+            "fh_sh": "1.2",
+            "djr": "2000-06-19",
+            "cqr": "2000-06-20",
+            "FHcontent": "10派2元送2股"
+          },
+          {
+            "row_date": "2001-01-15",
+            "nd": "2001",
+            "fh_sh": "",
+            "djr": "2001-01-05",
+            "cqr": "2001-01-15"
+          },
+          {
+            "row_date": "2001-06-21",
+            "nd": "2000",
+            "fh_sh": "1.2",
+            "djr": "2001-06-20",
+            "cqr": "2001-06-21",
+            "FHcontent": "10派2元送2股"
+          },
+          {
+            "row_date": "2002-06-20",
+            "nd": "2001",
+            "fh_sh": "2.4",
+            "djr": "2002-06-19",
+            "cqr": "2002-06-20",
+            "FHcontent": "10派3元"
+          },
+          {
+            "row_date": "2003-07-10",
+            "nd": "2002",
+            "fh_sh": "2.4",
+            "djr": "2003-07-09",
+            "cqr": "2003-07-10",
+            "FHcontent": "10派3元"
+          },
+          {
+            "row_date": "2004-07-12",
+            "nd": "2003",
+            "fh_sh": "",
+            "djr": "2004-07-09",
+            "cqr": "2004-07-12",
+            "FHcontent": "10派0.5元送2股转3股"
+          },
+          {
+            "row_date": "2005-07-14",
+            "nd": "2004",
+            "fh_sh": "2.7",
+            "djr": "2005-07-13",
+            "cqr": "2005-07-14",
+            "FHcontent": "10派3元"
+          },
+          {
+            "row_date": "2006-07-20",
+            "nd": "2005",
+            "fh_sh": "0.9",
+            "djr": "2006-07-19",
+            "cqr": "2006-07-20",
+            "FHcontent": "10派1元"
+          },
+          {
+            "row_date": "2007-07-19",
+            "nd": "2006",
+            "fh_sh": "1.35",
+            "djr": "2007-07-18",
+            "cqr": "2007-07-19",
+            "FHcontent": "10派1.5元"
+          },
+          {
+            "row_date": "2009-07-13",
+            "nd": "2008",
+            "fh_sh": "1.35",
+            "djr": "2009-07-10",
+            "cqr": "2009-07-13",
+            "FHcontent": "10派1.5元"
+          },
+          {
+            "row_date": "2010-07-29",
+            "nd": "2009",
+            "fh_sh": "2.7",
+            "djr": "2010-07-28",
+            "cqr": "2010-07-29",
+            "FHcontent": "10派3元"
+          },
+          {
+            "row_date": "2011-07-18",
+            "nd": "2010",
+            "fh_sh": "0.9",
+            "djr": "2011-07-15",
+            "cqr": "2011-07-18",
+            "FHcontent": "10派1元转10股"
+          },
+          {
+            "row_date": "2012-06-12",
+            "nd": "2011",
+            "fh_sh": "1.53",
+            "djr": "2012-06-11",
+            "cqr": "2012-06-12",
+            "FHcontent": "10派1.7元"
+          },
+          {
+            "row_date": "2013-06-07",
+            "nd": "2012",
+            "fh_sh": "3.515",
+            "djr": "2013-06-06",
+            "cqr": "2013-06-07",
+            "FHcontent": "10派3.7元"
+          },
+          {
+            "row_date": "2014-06-18",
+            "nd": "2013",
+            "fh_sh": "4.37",
+            "djr": "2014-06-17",
+            "cqr": "2014-06-18",
+            "FHcontent": "10派4.6元"
+          },
+          {
+            "row_date": "2015-07-16",
+            "nd": "2014",
+            "fh_sh": "4.674",
+            "djr": "2015-07-15",
+            "cqr": "2015-07-16",
+            "FHcontent": "10派4.92元转10股"
+          },
+          {
+            "row_date": "2016-07-26",
+            "nd": "2015",
+            "fh_sh": "2.12",
+            "djr": "2016-07-25",
+            "cqr": "2016-07-26",
+            "FHcontent": "10派2.12元"
+          },
+          {
+            "row_date": "2017-08-01",
+            "nd": "2016",
+            "fh_sh": "2.48",
+            "djr": "2017-07-31",
+            "cqr": "2017-08-01",
+            "FHcontent": "10派2.48元"
+          },
+          {
+            "row_date": "2018-06-07",
+            "nd": "2017",
+            "fh_sh": "3.42",
+            "djr": "2018-06-06",
+            "cqr": "2018-06-07",
+            "FHcontent": "10派3.42元"
+          },
+          {
+            "row_date": "2019-08-08",
+            "nd": "2018",
+            "fh_sh": "3.51",
+            "djr": "2019-08-07",
+            "cqr": "2019-08-08",
+            "FHcontent": "10派3.51元"
+          },
+          {
+            "row_date": "2020-07-16",
+            "nd": "2019",
+            "fh_sh": "3.75",
+            "djr": "2020-07-15",
+            "cqr": "2020-07-16",
+            "FHcontent": "10派3.75元"
+          },
+          {
+            "row_date": "2021-08-23",
+            "nd": "2020",
+            "fh_sh": "3.66",
+            "djr": "2021-08-20",
+            "cqr": "2021-08-23",
+            "FHcontent": "10派3.66元"
+          },
+          {
+            "row_date": "2022-08-23",
+            "nd": "2021",
+            "fh_sh": "4.6136",
+            "djr": "2022-08-22",
+            "cqr": "2022-08-23",
+            "FHcontent": "10派4.6136元"
+          },
+          {
+            "row_date": "2023-08-25",
+            "nd": "2022",
+            "fh_sh": "5.6692",
+            "djr": "2023-08-24",
+            "cqr": "2023-08-25",
+            "FHcontent": "10派5.6692元"
+          },
+          {
+            "row_date": "2024-08-16",
+            "nd": "2023",
+            "fh_sh": "8.0131",
+            "djr": "2024-08-15",
+            "cqr": "2024-08-16",
+            "FHcontent": "10派8.0131元"
+          },
+          {
+            "row_date": "2025-07-25",
+            "nd": "2024",
+            "fh_sh": "9.6504",
+            "djr": "2025-07-24",
+            "cqr": "2025-07-25",
+            "FHcontent": "10派9.6504元"
+          },
+          {
+            "row_date": "2025-11-07",
+            "nd": "2025",
+            "fh_sh": "2.692",
+            "djr": "2025-11-06",
+            "cqr": "2025-11-07",
+            "FHcontent": "10派2.692元"
+          },
+          {
+            "row_date": "2026-08-21",
+            "nd": "2025",
+            "fh_sh": "8.9151",
+            "djr": "2026-08-20",
+            "cqr": "2026-08-21",
+            "FHcontent": "10派8.9151元"
+          }
+        ]
+      }
+    }
+  },
+  "P4_event_factor_truth": {
+    "sz000333": [
+      {
+        "cqr": "2014-04-30",
+        "prev_trade_date": "2014-04-29",
+        "content": "10派20元转15股",
+        "fh_sh": "19",
+        "pre_close": 46.99,
+        "parsed_cash_per_share": 2.0,
+        "parsed_share_ratio": 1.5,
+        "k_true_from_qfq": 0.957555,
+        "k_cash_only": 0.957438,
+        "k_cash_plus_split": 0.382975,
+        "err_cash_only": 0.000117,
+        "err_cash_plus_split": 0.57458,
+        "fh_sh_matches_content_cash": false
+      },
+      {
+        "cqr": "2015-04-30",
+        "prev_trade_date": "2015-04-29",
+        "content": "10派10元",
+        "fh_sh": "9.5",
+        "pre_close": 37.45,
+        "parsed_cash_per_share": 1.0,
+        "parsed_share_ratio": 0.0,
+        "k_true_from_qfq": 0.855653,
+        "k_cash_only": 0.973298,
+        "k_cash_plus_split": 0.973298,
+        "err_cash_only": 0.117645,
+        "err_cash_plus_split": 0.117645,
+        "fh_sh_matches_content_cash": false
+      },
+      {
+        "cqr": "2016-05-06",
+        "prev_trade_date": "2016-05-05",
+        "content": "10派12元转5股",
+        "fh_sh": "12",
+        "pre_close": 32.99,
+        "parsed_cash_per_share": 1.2,
+        "parsed_share_ratio": 0.5,
+        "k_true_from_qfq": 0.232939,
+        "k_cash_only": 0.963625,
+        "k_cash_plus_split": 0.642417,
+        "err_cash_only": 0.730686,
+        "err_cash_plus_split": 0.409478,
+        "fh_sh_matches_content_cash": true
+      },
+      {
+        "cqr": "2017-05-10",
+        "prev_trade_date": "2017-05-09",
+        "content": "10派10元",
+        "fh_sh": "10",
+        "pre_close": 35.3,
+        "parsed_cash_per_share": 1.0,
+        "parsed_share_ratio": 0.0,
+        "k_true_from_qfq": 0.942181,
+        "k_cash_only": 0.971671,
+        "k_cash_plus_split": 0.971671,
+        "err_cash_only": 0.029491,
+        "err_cash_plus_split": 0.029491,
+        "fh_sh_matches_content_cash": true
+      },
+      {
+        "cqr": "2018-05-04",
+        "prev_trade_date": "2018-05-03",
+        "content": "10派12元",
+        "fh_sh": "12",
+        "pre_close": 53.2,
+        "parsed_cash_per_share": 1.2,
+        "parsed_share_ratio": 0.0,
+        "k_true_from_qfq": 1.028257,
+        "k_cash_only": 0.977444,
+        "k_cash_plus_split": 0.977444,
+        "err_cash_only": 0.050813,
+        "err_cash_plus_split": 0.050813,
+        "fh_sh_matches_content_cash": true
+      },
+      {
+        "cqr": "2019-05-30",
+        "prev_trade_date": "2019-05-29",
+        "content": "10派13.0396元",
+        "fh_sh": "13.0396",
+        "pre_close": 50.38,
+        "parsed_cash_per_share": 1.30396,
+        "parsed_share_ratio": 0.0,
+        "k_true_from_qfq": 0.988254,
+        "k_cash_only": 0.974118,
+        "k_cash_plus_split": 0.974118,
+        "err_cash_only": 0.014137,
+        "err_cash_plus_split": 0.014137,
+        "fh_sh_matches_content_cash": true
+      },
+      {
+        "cqr": "2020-06-02",
+        "prev_trade_date": "2020-06-01",
+        "content": "10派16元",
+        "fh_sh": "16",
+        "pre_close": 60.42,
+        "parsed_cash_per_share": 1.6,
+        "parsed_share_ratio": 0.0,
+        "k_true_from_qfq": 1.00307,
+        "k_cash_only": 0.973519,
+        "k_cash_plus_split": 0.973519,
+        "err_cash_only": 0.029552,
+        "err_cash_plus_split": 0.029552,
+        "fh_sh_matches_content_cash": true
+      },
+      {
+        "cqr": "2021-06-02",
+        "prev_trade_date": "2021-06-01",
+        "content": "10派16.0058元",
+        "fh_sh": "16.0058",
+        "pre_close": 80.17,
+        "parsed_cash_per_share": 1.60058,
+        "parsed_share_ratio": 0.0,
+        "k_true_from_qfq": 0.986092,
+        "k_cash_only": 0.980035,
+        "k_cash_plus_split": 0.980035,
+        "err_cash_only": 0.006057,
+        "err_cash_plus_split": 0.006057,
+        "fh_sh_matches_content_cash": true
+      },
+      {
+        "cqr": "2022-06-02",
+        "prev_trade_date": "2022-06-01",
+        "content": "10派17.0089元",
+        "fh_sh": "17.0089",
+        "pre_close": 54.27,
+        "parsed_cash_per_share": 1.70089,
+        "parsed_share_ratio": 0.0,
+        "k_true_from_qfq": 1.00104,
+        "k_cash_only": 0.968659,
+        "k_cash_plus_split": 0.968659,
+        "err_cash_only": 0.032381,
+        "err_cash_plus_split": 0.032381,
+        "fh_sh_matches_content_cash": true
+      },
+      {
+        "cqr": "2023-06-01",
+        "prev_trade_date": "2023-05-31",
+        "content": "10派25元",
+        "fh_sh": "25",
+        "pre_close": 51.33,
+        "parsed_cash_per_share": 2.5,
+        "parsed_share_ratio": 0.0,
+        "k_true_from_qfq": 0.999738,
+        "k_cash_only": 0.951296,
+        "k_cash_plus_split": 0.951296,
+        "err_cash_only": 0.048443,
+        "err_cash_plus_split": 0.048443,
+        "fh_sh_matches_content_cash": true
+      },
+      {
+        "cqr": "2024-05-15",
+        "prev_trade_date": "2024-05-14",
+        "content": "10派30元",
+        "fh_sh": "30",
+        "pre_close": 70.84,
+        "parsed_cash_per_share": 3.0,
+        "parsed_share_ratio": 0.0,
+        "k_true_from_qfq": 0.969405,
+        "k_cash_only": 0.957651,
+        "k_cash_plus_split": 0.957651,
+        "err_cash_only": 0.011754,
+        "err_cash_plus_split": 0.011754,
+        "fh_sh_matches_content_cash": true
+      },
+      {
+        "cqr": "2025-06-12",
+        "prev_trade_date": "2025-06-11",
+        "content": "10派35元",
+        "fh_sh": "35",
+        "pre_close": 75.49,
+        "parsed_cash_per_share": 3.5,
+        "parsed_share_ratio": 0.0,
+        "k_true_from_qfq": 0.99722,
+        "k_cash_only": 0.953636,
+        "k_cash_plus_split": 0.953636,
+        "err_cash_only": 0.043584,
+        "err_cash_plus_split": 0.043584,
+        "fh_sh_matches_content_cash": true
+      },
+      {
+        "cqr": "2025-11-18",
+        "prev_trade_date": "2025-11-17",
+        "content": "10派5元",
+        "fh_sh": "5",
+        "pre_close": 78.42,
+        "parsed_cash_per_share": 0.5,
+        "parsed_share_ratio": 0.0,
+        "k_true_from_qfq": 1.007193,
+        "k_cash_only": 0.993624,
+        "k_cash_plus_split": 0.993624,
+        "err_cash_only": 0.013569,
+        "err_cash_plus_split": 0.013569,
+        "fh_sh_matches_content_cash": true
+      },
+      {
+        "cqr": "2026-06-29",
+        "prev_trade_date": "2026-06-26",
+        "content": "10派38元",
+        "fh_sh": "38",
+        "pre_close": 78.55,
+        "parsed_cash_per_share": 3.8,
+        "parsed_share_ratio": 0.0,
+        "k_true_from_qfq": 0.968397,
+        "k_cash_only": 0.951623,
+        "k_cash_plus_split": 0.951623,
+        "err_cash_only": 0.016773,
+        "err_cash_plus_split": 0.016773,
+        "fh_sh_matches_content_cash": true
+      }
+    ],
+    "sh600690": [
+      {
+        "cqr": "1994-04-04",
+        "prev_trade_date": "1994-04-01",
+        "content": "10送3股",
+        "fh_sh": "",
+        "pre_close": 7.88,
+        "parsed_cash_per_share": 0.0,
+        "parsed_share_ratio": 0.3,
+        "k_true_from_qfq": 0.997229,
+        "k_cash_only": 1.0,
+        "k_cash_plus_split": 0.769231,
+        "err_cash_only": 0.002771,
+        "err_cash_plus_split": 0.227998,
+        "fh_sh_matches_content_cash": true
+      },
+      {
+        "cqr": "1995-07-10",
+        "prev_trade_date": "1995-07-07",
+        "content": "10派3.5元",
+        "fh_sh": "",
+        "pre_close": 5.28,
+        "parsed_cash_per_share": 0.35,
+        "parsed_share_ratio": 0.0,
+        "k_true_from_qfq": 0.99954,
+        "k_cash_only": 0.933712,
+        "k_cash_plus_split": 0.933712,
+        "err_cash_only": 0.065828,
+        "err_cash_plus_split": 0.065828,
+        "fh_sh_matches_content_cash": false
+      },
+      {
+        "cqr": "1996-05-02",
+        "prev_trade_date": "1996-04-30",
+        "content": null,
+        "fh_sh": "",
+        "pre_close": 6.59,
+        "parsed_cash_per_share": 0.0,
+        "parsed_share_ratio": 0.0,
+        "k_true_from_qfq": 0.999379,
+        "k_cash_only": 1.0,
+        "k_cash_plus_split": 1.0,
+        "err_cash_only": 0.000621,
+        "err_cash_plus_split": 0.000621,
+        "fh_sh_matches_content_cash": true
+      },
+      {
+        "cqr": "1996-07-26",
+        "prev_trade_date": "1996-07-25",
+        "content": "10派1元送2股",
+        "fh_sh": "",
+        "pre_close": 15.67,
+        "parsed_cash_per_share": 0.1,
+        "parsed_share_ratio": 0.2,
+        "k_true_from_qfq": 0.992366,
+        "k_cash_only": 0.993618,
+        "k_cash_plus_split": 0.828015,
+        "err_cash_only": 0.001252,
+        "err_cash_plus_split": 0.164351,
+        "fh_sh_matches_content_cash": false
+      },
+      {
+        "cqr": "1997-06-16",
+        "prev_trade_date": "1997-06-13",
+        "content": "10派4.3元",
+        "fh_sh": "",
+        "pre_close": 28.7,
+        "parsed_cash_per_share": 0.43,
+        "parsed_share_ratio": 0.0,
+        "k_true_from_qfq": 1.002986,
+        "k_cash_only": 0.985017,
+        "k_cash_plus_split": 0.985017,
+        "err_cash_only": 0.017969,
+        "err_cash_plus_split": 0.017969,
+        "fh_sh_matches_content_cash": false
+      },
+      {
+        "cqr": "1997-10-21",
+        "prev_trade_date": "1997-10-20",
+        "content": null,
+        "fh_sh": "",
+        "pre_close": 32.33,
+        "parsed_cash_per_share": 0.0,
+        "parsed_share_ratio": 0.0,
+        "k_true_from_qfq": 1.038181,
+        "k_cash_only": 1.0,
+        "k_cash_plus_split": 1.0,
+        "err_cash_only": 0.038181,
+        "err_cash_plus_split": 0.038181,
+        "fh_sh_matches_content_cash": true
+      },
+      {
+        "cqr": "1998-06-08",
+        "prev_trade_date": "1998-06-05",
+        "content": "10派4.7元",
+        "fh_sh": "3.86",
+        "pre_close": 23.43,
+        "parsed_cash_per_share": 0.47,
+        "parsed_share_ratio": 0.0,
+        "k_true_from_qfq": 1.005992,
+        "k_cash_only": 0.97994,
+        "k_cash_plus_split": 0.97994,
+        "err_cash_only": 0.026052,
+        "err_cash_plus_split": 0.026052,
+        "fh_sh_matches_content_cash": false
+      },
+      {
+        "cqr": "1999-08-12",
+        "prev_trade_date": "1999-08-11",
+        "content": null,
+        "fh_sh": "",
+        "pre_close": 19.84,
+        "parsed_cash_per_share": 0.0,
+        "parsed_share_ratio": 0.0,
+        "k_true_from_qfq": 0.970657,
+        "k_cash_only": 1.0,
+        "k_cash_plus_split": 1.0,
+        "err_cash_only": 0.029343,
+        "err_cash_plus_split": 0.029343,
+        "fh_sh_matches_content_cash": true
+      },
+      {
+        "cqr": "2000-06-20",
+        "prev_trade_date": "2000-06-19",
+        "content": "10派2元送2股",
+        "fh_sh": "1.2",
+        "pre_close": 22.84,
+        "parsed_cash_per_share": 0.2,
+        "parsed_share_ratio": 0.2,
+        "k_true_from_qfq": 0.994797,
+        "k_cash_only": 0.991243,
+        "k_cash_plus_split": 0.826036,
+        "err_cash_only": 0.003554,
+        "err_cash_plus_split": 0.168761,
+        "fh_sh_matches_content_cash": false
+      },
+      {
+        "cqr": "2001-01-15",
+        "prev_trade_date": "2001-01-05",
+        "content": null,
+        "fh_sh": "",
+        "pre_close": 20.55,
+        "parsed_cash_per_share": 0.0,
+        "parsed_share_ratio": 0.0,
+        "k_true_from_qfq": 0.964522,
+        "k_cash_only": 1.0,
+        "k_cash_plus_split": 1.0,
+        "err_cash_only": 0.035478,
+        "err_cash_plus_split": 0.035478,
+        "fh_sh_matches_content_cash": true
+      },
+      {
+        "cqr": "2001-06-21",
+        "prev_trade_date": "2001-06-20",
+        "content": "10派2元送2股",
+        "fh_sh": "1.2",
+        "pre_close": 20.03,
+        "parsed_cash_per_share": 0.2,
+        "parsed_share_ratio": 0.2,
+        "k_true_from_qfq": 1.010002,
+        "k_cash_only": 0.990015,
+        "k_cash_plus_split": 0.825012,
+        "err_cash_only": 0.019987,
+        "err_cash_plus_split": 0.18499,
+        "fh_sh_matches_content_cash": false
+      },
+      {
+        "cqr": "2002-06-20",
+        "prev_trade_date": "2002-06-19",
+        "content": "10派3元",
+        "fh_sh": "2.4",
+        "pre_close": 12.28,
+        "parsed_cash_per_share": 0.3,
+        "parsed_share_ratio": 0.0,
+        "k_true_from_qfq": 0.99941,
+        "k_cash_only": 0.97557,
+        "k_cash_plus_split": 0.97557,
+        "err_cash_only": 0.02384,
+        "err_cash_plus_split": 0.02384,
+        "fh_sh_matches_content_cash": false
+      },
+      {
+        "cqr": "2003-07-10",
+        "prev_trade_date": "2003-07-09",
+        "content": "10派3元",
+        "fh_sh": "2.4",
+        "pre_close": 9.66,
+        "parsed_cash_per_share": 0.3,
+        "parsed_share_ratio": 0.0,
+        "k_true_from_qfq": 1.001658,
+        "k_cash_only": 0.968944,
+        "k_cash_plus_split": 0.968944,
+        "err_cash_only": 0.032714,
+        "err_cash_plus_split": 0.032714,
+        "fh_sh_matches_content_cash": false
+      },
+      {
+        "cqr": "2004-07-12",
+        "prev_trade_date": "2004-07-09",
+        "content": "10派0.5元送2股转3股",
+        "fh_sh": "",
+        "pre_close": 8.78,
+        "parsed_cash_per_share": 0.05,
+        "parsed_share_ratio": 0.5,
+        "k_true_from_qfq": 0.995137,
+        "k_cash_only": 0.994305,
+        "k_cash_plus_split": 0.66287,
+        "err_cash_only": 0.000832,
+        "err_cash_plus_split": 0.332267,
+        "fh_sh_matches_content_cash": false
+      },
+      {
+        "cqr": "2005-07-14",
+        "prev_trade_date": "2005-07-13",
+        "content": "10派3元",
+        "fh_sh": "2.7",
+        "pre_close": 4.73,
+        "parsed_cash_per_share": 0.3,
+        "parsed_share_ratio": 0.0,
+        "k_true_from_qfq": 0.998098,
+        "k_cash_only": 0.936575,
+        "k_cash_plus_split": 0.936575,
+        "err_cash_only": 0.061523,
+        "err_cash_plus_split": 0.061523,
+        "fh_sh_matches_content_cash": false
+      },
+      {
+        "cqr": "2006-07-20",
+        "prev_trade_date": "2006-07-19",
+        "content": "10派1元",
+        "fh_sh": "0.9",
+        "pre_close": 4.43,
+        "parsed_cash_per_share": 0.1,
+        "parsed_share_ratio": 0.0,
+        "k_true_from_qfq": 1.00212,
+        "k_cash_only": 0.977427,
+        "k_cash_plus_split": 0.977427,
+        "err_cash_only": 0.024694,
+        "err_cash_plus_split": 0.024694,
+        "fh_sh_matches_content_cash": false
+      },
+      {
+        "cqr": "2007-07-19",
+        "prev_trade_date": "2007-07-18",
+        "content": "10派1.5元",
+        "fh_sh": "1.35",
+        "pre_close": 15.12,
+        "parsed_cash_per_share": 0.15,
+        "parsed_share_ratio": 0.0,
+        "k_true_from_qfq": 0.979908,
+        "k_cash_only": 0.990079,
+        "k_cash_plus_split": 0.990079,
+        "err_cash_only": 0.010172,
+        "err_cash_plus_split": 0.010172,
+        "fh_sh_matches_content_cash": false
+      },
+      {
+        "cqr": "2009-07-13",
+        "prev_trade_date": "2009-07-10",
+        "content": "10派1.5元",
+        "fh_sh": "1.35",
+        "pre_close": 14.06,
+        "parsed_cash_per_share": 0.15,
+        "parsed_share_ratio": 0.0,
+        "k_true_from_qfq": 1.009597,
+        "k_cash_only": 0.989331,
+        "k_cash_plus_split": 0.989331,
+        "err_cash_only": 0.020265,
+        "err_cash_plus_split": 0.020265,
+        "fh_sh_matches_content_cash": false
+      },
+      {
+        "cqr": "2010-07-29",
+        "prev_trade_date": "2010-07-28",
+        "content": "10派3元",
+        "fh_sh": "2.7",
+        "pre_close": 22.08,
+        "parsed_cash_per_share": 0.3,
+        "parsed_share_ratio": 0.0,
+        "k_true_from_qfq": 1.077369,
+        "k_cash_only": 0.986413,
+        "k_cash_plus_split": 0.986413,
+        "err_cash_only": 0.090956,
+        "err_cash_plus_split": 0.090956,
+        "fh_sh_matches_content_cash": false
+      },
+      {
+        "cqr": "2011-07-18",
+        "prev_trade_date": "2011-07-15",
+        "content": "10派1元转10股",
+        "fh_sh": "0.9",
+        "pre_close": 28.58,
+        "parsed_cash_per_share": 0.1,
+        "parsed_share_ratio": 1.0,
+        "k_true_from_qfq": 1.193483,
+        "k_cash_only": 0.996501,
+        "k_cash_plus_split": 0.498251,
+        "err_cash_only": 0.196982,
+        "err_cash_plus_split": 0.695232,
+        "fh_sh_matches_content_cash": false
+      },
+      {
+        "cqr": "2012-06-12",
+        "prev_trade_date": "2012-06-11",
+        "content": "10派1.7元",
+        "fh_sh": "1.53",
+        "pre_close": 11.9,
+        "parsed_cash_per_share": 0.17,
+        "parsed_share_ratio": 0.0,
+        "k_true_from_qfq": 1.008636,
+        "k_cash_only": 0.985714,
+        "k_cash_plus_split": 0.985714,
+        "err_cash_only": 0.022921,
+        "err_cash_plus_split": 0.022921,
+        "fh_sh_matches_content_cash": false
+      },
+      {
+        "cqr": "2013-06-07",
+        "prev_trade_date": "2013-06-06",
+        "content": "10派3.7元",
+        "fh_sh": "3.515",
+        "pre_close": 12.31,
+        "parsed_cash_per_share": 0.37,
+        "parsed_share_ratio": 0.0,
+        "k_true_from_qfq": 1.092937,
+        "k_cash_only": 0.969943,
+        "k_cash_plus_split": 0.969943,
+        "err_cash_only": 0.122994,
+        "err_cash_plus_split": 0.122994,
+        "fh_sh_matches_content_cash": false
+      },
+      {
+        "cqr": "2014-06-18",
+        "prev_trade_date": "2014-06-17",
+        "content": "10派4.6元",
+        "fh_sh": "4.37",
+        "pre_close": 15.44,
+        "parsed_cash_per_share": 0.46,
+        "parsed_share_ratio": 0.0,
+        "k_true_from_qfq": 1.098039,
+        "k_cash_only": 0.970207,
+        "k_cash_plus_split": 0.970207,
+        "err_cash_only": 0.127832,
+        "err_cash_plus_split": 0.127832,
+        "fh_sh_matches_content_cash": false
+      },
+      {
+        "cqr": "2015-07-16",
+        "prev_trade_date": "2015-07-15",
+        "content": "10派4.92元转10股",
+        "fh_sh": "4.674",
+        "pre_close": 28.95,
+        "parsed_cash_per_share": 0.492,
+        "parsed_share_ratio": 1.0,
+        "k_true_from_qfq": 1.036723,
+        "k_cash_only": 0.983005,
+        "k_cash_plus_split": 0.491503,
+        "err_cash_only": 0.053718,
+        "err_cash_plus_split": 0.545221,
+        "fh_sh_matches_content_cash": false
+      },
+      {
+        "cqr": "2016-07-26",
+        "prev_trade_date": "2016-07-25",
+        "content": "10派2.12元",
+        "fh_sh": "2.12",
+        "pre_close": 10.26,
+        "parsed_cash_per_share": 0.212,
+        "parsed_share_ratio": 0.0,
+        "k_true_from_qfq": 0.936741,
+        "k_cash_only": 0.979337,
+        "k_cash_plus_split": 0.979337,
+        "err_cash_only": 0.042597,
+        "err_cash_plus_split": 0.042597,
+        "fh_sh_matches_content_cash": true
+      },
+      {
+        "cqr": "2017-08-01",
+        "prev_trade_date": "2017-07-31",
+        "content": "10派2.48元",
+        "fh_sh": "2.48",
+        "pre_close": 14.04,
+        "parsed_cash_per_share": 0.248,
+        "parsed_share_ratio": 0.0,
+        "k_true_from_qfq": 0.994361,
+        "k_cash_only": 0.982336,
+        "k_cash_plus_split": 0.982336,
+        "err_cash_only": 0.012025,
+        "err_cash_plus_split": 0.012025,
+        "fh_sh_matches_content_cash": true
+      },
+      {
+        "cqr": "2018-06-07",
+        "prev_trade_date": "2018-06-06",
+        "content": "10派3.42元",
+        "fh_sh": "3.42",
+        "pre_close": 20.69,
+        "parsed_cash_per_share": 0.342,
+        "parsed_share_ratio": 0.0,
+        "k_true_from_qfq": 1.00248,
+        "k_cash_only": 0.98347,
+        "k_cash_plus_split": 0.98347,
+        "err_cash_only": 0.019009,
+        "err_cash_plus_split": 0.019009,
+        "fh_sh_matches_content_cash": true
+      },
+      {
+        "cqr": "2019-08-08",
+        "prev_trade_date": "2019-08-07",
+        "content": "10派3.51元",
+        "fh_sh": "3.51",
+        "pre_close": 15.41,
+        "parsed_cash_per_share": 0.351,
+        "parsed_share_ratio": 0.0,
+        "k_true_from_qfq": 0.991346,
+        "k_cash_only": 0.977223,
+        "k_cash_plus_split": 0.977223,
+        "err_cash_only": 0.014123,
+        "err_cash_plus_split": 0.014123,
+        "fh_sh_matches_content_cash": true
+      },
+      {
+        "cqr": "2020-07-16",
+        "prev_trade_date": "2020-07-15",
+        "content": "10派3.75元",
+        "fh_sh": "3.75",
+        "pre_close": 18.55,
+        "parsed_cash_per_share": 0.375,
+        "parsed_share_ratio": 0.0,
+        "k_true_from_qfq": 1.093947,
+        "k_cash_only": 0.979784,
+        "k_cash_plus_split": 0.979784,
+        "err_cash_only": 0.114162,
+        "err_cash_plus_split": 0.114162,
+        "fh_sh_matches_content_cash": true
+      },
+      {
+        "cqr": "2021-08-23",
+        "prev_trade_date": "2021-08-20",
+        "content": "10派3.66元",
+        "fh_sh": "3.66",
+        "pre_close": 26.11,
+        "parsed_cash_per_share": 0.366,
+        "parsed_share_ratio": 0.0,
+        "k_true_from_qfq": 0.980524,
+        "k_cash_only": 0.985982,
+        "k_cash_plus_split": 0.985982,
+        "err_cash_only": 0.005458,
+        "err_cash_plus_split": 0.005458,
+        "fh_sh_matches_content_cash": true
+      },
+      {
+        "cqr": "2022-08-23",
+        "prev_trade_date": "2022-08-22",
+        "content": "10派4.6136元",
+        "fh_sh": "4.6136",
+        "pre_close": 24.4,
+        "parsed_cash_per_share": 0.46136,
+        "parsed_share_ratio": 0.0,
+        "k_true_from_qfq": 0.98487,
+        "k_cash_only": 0.981092,
+        "k_cash_plus_split": 0.981092,
+        "err_cash_only": 0.003778,
+        "err_cash_plus_split": 0.003778,
+        "fh_sh_matches_content_cash": true
+      },
+      {
+        "cqr": "2023-08-25",
+        "prev_trade_date": "2023-08-24",
+        "content": "10派5.6692元",
+        "fh_sh": "5.6692",
+        "pre_close": 23.0,
+        "parsed_cash_per_share": 0.56692,
+        "parsed_share_ratio": 0.0,
+        "k_true_from_qfq": 0.992943,
+        "k_cash_only": 0.975351,
+        "k_cash_plus_split": 0.975351,
+        "err_cash_only": 0.017592,
+        "err_cash_plus_split": 0.017592,
+        "fh_sh_matches_content_cash": true
+      },
+      {
+        "cqr": "2024-08-16",
+        "prev_trade_date": "2024-08-15",
+        "content": "10派8.0131元",
+        "fh_sh": "8.0131",
+        "pre_close": 24.92,
+        "parsed_cash_per_share": 0.80131,
+        "parsed_share_ratio": 0.0,
+        "k_true_from_qfq": 0.995213,
+        "k_cash_only": 0.967845,
+        "k_cash_plus_split": 0.967845,
+        "err_cash_only": 0.027368,
+        "err_cash_plus_split": 0.027368,
+        "fh_sh_matches_content_cash": true
+      },
+      {
+        "cqr": "2025-07-25",
+        "prev_trade_date": "2025-07-24",
+        "content": "10派9.6504元",
+        "fh_sh": "9.6504",
+        "pre_close": 27.41,
+        "parsed_cash_per_share": 0.96504,
+        "parsed_share_ratio": 0.0,
+        "k_true_from_qfq": 1.025273,
+        "k_cash_only": 0.964792,
+        "k_cash_plus_split": 0.964792,
+        "err_cash_only": 0.060481,
+        "err_cash_plus_split": 0.060481,
+        "fh_sh_matches_content_cash": true
+      },
+      {
+        "cqr": "2025-11-07",
+        "prev_trade_date": "2025-11-06",
+        "content": "10派2.692元",
+        "fh_sh": "2.692",
+        "pre_close": 26.96,
+        "parsed_cash_per_share": 0.2692,
+        "parsed_share_ratio": 0.0,
+        "k_true_from_qfq": 1.003654,
+        "k_cash_only": 0.990015,
+        "k_cash_plus_split": 0.990015,
+        "err_cash_only": 0.013639,
+        "err_cash_plus_split": 0.013639,
+        "fh_sh_matches_content_cash": true
+      },
+      {
+        "cqr": "2026-08-21",
+        "prev_trade_date": "2026-08-20",
+        "content": "10派8.9151元",
+        "fh_sh": "8.9151",
+        "pre_close": 21.77,
+        "parsed_cash_per_share": 0.89151,
+        "parsed_share_ratio": 0.0,
+        "k_true_from_qfq": 1.001726,
+        "k_cash_only": 0.959049,
+        "k_cash_plus_split": 0.959049,
+        "err_cash_only": 0.042677,
+        "err_cash_plus_split": 0.042677,
+        "fh_sh_matches_content_cash": true
+      }
+    ]
+  }
+}
