@@ -2,8 +2,7 @@
 
 纪律：除 `stocklab/store/repo.py` 外，任何模块不得直接 INSERT/UPDATE 业务表。
 `bars_daily` 是本项目 append-only 规则的**刻意例外**（源站会修订历史行情），
-理由见 `docs/decisions/2026-09-14-ADR-002-verifications-允许有限更新.md` 同级的
-ADR-003 §「bars_daily 允许覆盖」补充。
+理由见 `docs/decisions/2026-09-14-ADR-001-评审决策.md` §8.1。
 """
 
 import sqlite3
