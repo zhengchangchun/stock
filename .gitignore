@@ -19,8 +19,10 @@ Thumbs.db
 venv/
 
 # 项目数据（SQLite / 缓存 / 备份）
-data/
-reports/
+# 必须用根锚定 `/data/`：裸 `data/` 会连 Python 包 `stocklab/data/` 一起忽略，
+# 导致该包的源码无法提交（见 ERROR_DIARY 2026-09-14「gitignore 裸 data/ 吞掉源码包」）。
+/data/
+/reports/
 
 # 测试与工具缓存
 .pytest_cache/
