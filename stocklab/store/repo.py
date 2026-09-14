@@ -9,6 +9,9 @@ append-only 的**刻意例外**：`bars_daily` 允许覆盖。
 `adj_mode` 是主键的一部分（`PRIMARY KEY (code, date)` 之外的口径区分见
 `insert_bars` 的 note）—— 不同复权口径**不得互相覆盖**。
 
+`features_daily` 则是**真正的 append-only**：同键重写直接拒绝（见
+`insert_feature_snapshot`），因为快照会被预测长期引用、必须不可变。
+
 失败留痕（铁律③）：本模块只负责写，问题由调用方检查返回值与异常。
 """
 
@@ -17,7 +20,7 @@ from __future__ import annotations
 import json
 import sqlite3
 from datetime import datetime
-from typing import Sequence
+from typing import Mapping, Sequence
 from zoneinfo import ZoneInfo
 
 from stocklab.config.universe import Instrument
@@ -81,6 +84,42 @@ def insert_bars(conn: sqlite3.Connection, bars: Sequence[Bar], *, now: str) -> i
     )
     conn.commit()
     return len(rows)
+
+
+FEATURE_SNAPSHOT_COLUMNS: tuple[str, ...] = (
+    "code", "date", "feature_version", "feature_set", "close", "ma20", "ma60",
+    "atr14", "vol_ratio_5_20", "ret_1d", "ret_5d", "main_net_5d", "pe_pct_3y",
+    "regime_label", "json_payload", "payload_hash", "params_hash",
+    "data_version", "created_at",
+)
+
+_INSERT_FEATURE_SQL = (
+    "INSERT INTO features_daily (" + ", ".join(FEATURE_SNAPSHOT_COLUMNS) + ")"
+    " VALUES (" + ", ".join(f":{c}" for c in FEATURE_SNAPSHOT_COLUMNS) + ")"
+)
+
+
+def insert_feature_snapshot(conn: sqlite3.Connection, row: Mapping[str, object]) -> int:
+    """写特征快照（`features_daily`），返回 `snapshot_id`。
+
+    **刻意不做 upsert**（与 `bars_daily` 的覆盖语义相反）：`features_daily` 是
+    append-only，`UNIQUE(code, date, feature_version, feature_set)` 冲突时直接抛
+    `IntegrityError`。理由：同一个 `snapshot_id` 必须永远对应同一组数值 ——
+    覆盖会让长期引用它的 `predictions.feature_snapshot_id` 无声地指向另一组数值。
+    要重算就升 `feature_version`（schema A1）。
+
+    列名做白名单校验：多传/漏传都报错，避免写入口静默丢字段。
+    """
+    unknown = sorted(set(row) - set(FEATURE_SNAPSHOT_COLUMNS))
+    if unknown:
+        raise ValueError(f"features_daily 未知列：{unknown}")
+    missing = [c for c in FEATURE_SNAPSHOT_COLUMNS if c not in row]
+    if missing:
+        raise ValueError(f"features_daily 缺少列：{missing}")
+    cur = conn.execute(_INSERT_FEATURE_SQL,
+                       {c: row[c] for c in FEATURE_SNAPSHOT_COLUMNS})
+    conn.commit()
+    return int(cur.lastrowid)
 
 
 def insert_quality_issues(conn: sqlite3.Connection, issues: Sequence[Issue], *,
