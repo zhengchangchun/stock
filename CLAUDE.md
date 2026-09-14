@@ -48,10 +48,18 @@
 ## 快速开始
 
 ```bash
-/opt/nanobot-venv/bin/python -m venv .venv   # 系统 python3 是 3.14，必须借 venv 建
-.venv/bin/pip install -e '.[dev]'
+# ① 建虚拟环境（系统 python3 是 3.14，套用 3.12 的解释器建）
+/opt/nanobot-venv/bin/python -m venv .venv
+
+# ② 装依赖（pyproject 当前**没有** [build-system]，所以 `pip install -e .` 不可用；
+#    测试靠“在仓库根目录跑”把包路径接入 sys.path，不需要可安装安装）
+.venv/bin/pip install requests pytest numpy pandas
+
+# ③ 初始化数据库
 .venv/bin/python -m stocklab.cli.main db init
 ```
+
+> ⚠️ 不要写 `.venv/bin/pip install -e '.[dev]'` —— `pyproject.toml` 里既无 `[build-system]` 也无 `[dev]` extra，这条命令必然报错（P2 实测）。
 
 ## 核心铁律
 
