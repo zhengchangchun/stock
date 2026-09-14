@@ -461,6 +461,203 @@ def cmd_backtest_walkforward(args: argparse.Namespace) -> int:
     return 0
 
 
+# ---------- backtest strategy（离线；注册表策略的 walk-forward 样本外绩效） ----------
+
+def _parse_param_overrides(items) -> dict:
+    """`--param fast=20` → `{"fast": 20}`（类型按字面量猜，真正的校验在 ParamSpec）。
+
+    「同一个参数给两次」直接报错：本项目的实验纪律是**一次只改一个变量**，
+    重复给值多半意味着调用方脚本拼错了命令行，静默取最后一个会掩盖它。
+    """
+    out: dict = {}
+    for item in items or []:
+        if "=" not in item:
+            raise ValueError(f"--param 需要 k=v 形式，收到 {item!r}")
+        key, raw = item.split("=", 1)
+        key = key.strip()
+        if key in out:
+            raise ValueError(f"--param {key} 重复给出（{out[key]!r} 与 {raw!r}）："
+                             "单变量原则要求一次只改一个参数，重复值多半是命令拼错")
+        try:
+            out[key] = int(raw)
+        except ValueError:
+            try:
+                out[key] = float(raw)
+            except ValueError:
+                out[key] = raw        # 交给 ParamSpec.coerce 报出可读的类型错
+    return out
+
+
+def _load_adjusted(conn, universe, wanted, *, as_of: str, start: str | None):
+    """按**复权链可用下界**读取各标的的复权 K 线。
+
+    对存在不可定价事件（`adj_factor_blackout`）的标的，必须显式传
+    `start = usable_from` —— `adjust.load_bars_adjusted` 的默认行为是「不缩窗口」，
+    一旦跨缺口就抛 `MissingFactor`（缺陷必须浮出来，不许静默放弃那段历史）。
+    本函数在**这里**做「放弃哪段历史」的决定，并把结果如实返回给调用方披露。
+
+    返回 `(bars_by_code, skipped, window)`；`window[code]` 是实际读取起点。
+    """
+    from stocklab.data import adjust
+
+    bars: dict = {}
+    skipped: dict = {}
+    window: dict = {}
+    for inst in wanted:
+        flo = adjust.usable_from(conn, inst.code)
+        begin = start or flo
+        if start and flo and flo > start:
+            begin = flo          # 请求更早 → 抬高到可用下界（并记录，见 window）
+        try:
+            loaded = adjust.load_bars_adjusted(conn, inst.code, as_of, start=begin)
+        except adjust.AdjustError as exc:
+            skipped[inst.code] = f"{type(exc).__name__}: {exc}"
+            continue
+        if loaded:
+            bars[inst.code] = loaded
+            window[inst.code] = {"first_bar": loaded[0].date,
+                                 "requested_start": start,
+                                 "usable_from": flo,
+                                 "clipped": bool(start and flo and flo > start)}
+    return bars, skipped, window
+
+
+def cmd_backtest_strategy(args: argparse.Namespace) -> int:
+    """跑注册表里某个策略的 **walk-forward 样本外**绩效，并落报告（离线）。
+
+    这条链第一次把四件事串起来：
+      ① 策略来自**注册表**（未注册直接失败，不允许评估）；
+      ② 价格来自复权读取层（跨缺口的标的被显式跳过，**不回退**）；
+      ③ 逐折调用 `engine.run_backtest`，只取样本外段并复利拼接；
+      ④ 同区间输出 `index_300` 与 `buy_and_hold` 对照，并明确写「是否跑赢」。
+
+    **不做参数搜索**：`--param` 是给单变量实验用的显式入口；
+    本命令的默认值就是文档默认值，报告里会把实际生效参数原样列出。
+    """
+    from stocklab.backtest.benchmark import compare_to_benchmark, resolve_benchmark
+    from stocklab.backtest.metrics import annualize
+    from stocklab.backtest.walkforward import (InsufficientData, split_walk_forward,
+                                               threshold_arithmetic)
+    from stocklab.calendar.trading_calendar import Calendar
+    from stocklab.config.costs import CostModel
+    from stocklab.strategies.base import ParamError
+    from stocklab.strategies.evaluate import evaluate_walk_forward, render_markdown
+    from stocklab.strategies.registry import NotRegistered, strategy_registry
+
+    try:
+        overrides = _parse_param_overrides(args.param)
+    except ValueError as exc:
+        print(f"❌ {exc}", file=sys.stderr)
+        return 3
+    try:
+        strategy_registry.meta(args.strategy)     # 未注册在这里就失败
+        # 参数校验**前置**：越界/写错名必须在读数据之前报出来，
+        # 而不是跑了 131 折之后才抛栈（那时报告已经写了一半）。
+        strategy_registry.get(args.strategy, **overrides)
+    except NotRegistered as exc:
+        print(f"❌ {exc}", file=sys.stderr)
+        return 3
+    except ParamError as exc:
+        print(f"❌ 策略参数不合法：{exc}", file=sys.stderr)
+        return 3
+
+    as_of = args.as_of or args.end or _today()
+    conn = connect(paths.DB_PATH)
+    try:
+        universe = _load_universe(conn)
+        wanted = [i for i in universe if not args.code or i.code in args.code]
+        bars, skipped, window = _load_adjusted(conn, universe, wanted, as_of=as_of,
+                                               start=args.start)
+        if not bars:
+            print(json.dumps({"error": "没有可用标的（全部被复权链拒绝）",
+                              "skipped": skipped}, ensure_ascii=False))
+            return 1
+
+        calendar = Calendar.load(conn)
+        # 会话轴 = 各标的复权行情的**公共交易日** ∩ 日历（口径一致，折与折可比）
+        axis = sorted(set.intersection(*(set(b.date for b in v) for v in bars.values())))
+        axis = [d for d in axis if calendar.is_open(d)]
+        if args.end:
+            axis = [d for d in axis if d <= args.end]
+        try:
+            folds = split_walk_forward(axis, train=args.train, test=args.test,
+                                       step=args.step, embargo=args.embargo)
+        except InsufficientData as exc:
+            print(f"❌ {exc}", file=sys.stderr)
+            return 2
+
+        costs = CostModel()
+        kw = dict(folds=folds, bars_by_code=bars, calendar=calendar,
+                  universe=tuple(i for i in universe if i.code in bars),
+                  initial_cash=args.cash, costs=costs)
+        perf = evaluate_walk_forward(args.strategy, **overrides, **kw)
+        component = None
+        if args.strategy != "buy_and_hold":
+            component = evaluate_walk_forward("buy_and_hold", **kw)
+        bench = resolve_benchmark(conn, args.benchmark,
+                                  start=perf.oos_start, end=perf.oos_end)
+        cmp = compare_to_benchmark(perf.stitched_nav, args.cash, bench, costs)
+        if cmp.benchmark_metrics:
+            # 基准的年化也补上（与策略同一把尺子；指数本身不含成本，已在报告披露）
+            cmp.benchmark_metrics["annualized_return"] = annualize(
+                cmp.benchmark_metrics["total_return"],
+                cmp.benchmark_metrics["n_sessions"])
+    finally:
+        conn.close()
+
+    report = {
+        "generated": _today(),
+        "session_axis": {"start": axis[0], "end": axis[-1], "n_sessions": len(axis),
+                         "mode": "intersection∩calendar"},
+        "read_window": window,
+        "skipped": skipped,
+        "params_requested": overrides,
+        "threshold": threshold_arithmetic(
+            train=args.train, test=args.test, step=args.step, n_sessions=len(axis),
+            oos_trading_days=perf.sample_size.get("effective_n", 0),
+            threshold=args.threshold),
+        "performance": perf.as_dict(),
+        "component_buy_and_hold": component.as_dict() if component else None,
+        "benchmark": cmp.as_dict(),
+    }
+    out_md = Path(args.out) if args.out else (
+        paths.REPORT_DIR / f"{_today()}-{args.strategy}-walkforward.md")
+    out_json = out_md.with_suffix(".json")
+    out_md.parent.mkdir(parents=True, exist_ok=True)
+    out_md.write_text(render_markdown(perf, comparison=cmp, component=component,
+                                      generated=_today()), encoding="utf-8")
+    out_json.write_text(json.dumps(report, ensure_ascii=False, indent=2),
+                        encoding="utf-8")
+
+    m = perf.metrics
+    ss = perf.sample_size
+    print(f"策略: {args.strategy} | 参数: {perf.params}")
+    print(f"折数: {len(perf.folds)} | 样本外: {perf.oos_start} ~ {perf.oos_end}")
+    print(f"样本外交易日(effective_n): {ss.get('effective_n')} | "
+          f"标的-日行数(不得当样本量): {ss.get('oos_rows')} | 标的数: {ss.get('n_codes')}")
+    print(f"总收益: {m['total_return'] * 100:.2f}% | 年化: {m.get('annualized_return', 0) * 100:.2f}%"
+          f" | 最大回撤: {m['max_drawdown'] * 100:.2f}% | Sharpe: {m['sharpe']:.3f}")
+    print(f"成交笔数: {perf.n_trades} / 预热 {perf.n_trades_warmup}"
+          f" | 换手: {perf.turnover_x:.3f}×"
+          f" | 成本（样本外已扣）: {perf.costs_total:.2f} 元"
+          f"（另有预热窗 {perf.costs_warmup:.2f}，不计入曲线）"
+          f" | 被拒信号: {perf.n_rejected}")
+    if component is not None:
+        gap = perf.metrics["total_return"] - component.metrics["total_return"]
+        print(f"对照 buy_and_hold（同一 walk-forward 口径）: "
+              f"{component.metrics['total_return'] * 100:.2f}%"
+              f" | 超额 {gap * 100:+.2f}pp → {'✅ 跑赢' if gap > 0 else '❌ 跑不赢'}")
+    if cmp.status == "OK":
+        verdict = "✅ 跑赢" if cmp.excess_return > 0 else "❌ 跑不赢"
+        print(f"对照 {cmp.benchmark}: {cmp.benchmark_return * 100:.2f}% | "
+              f"超额: {cmp.excess_return * 100:.2f}% → {verdict}")
+    else:
+        print(f"⚠️ 基准不可得（{cmp.note}）—— 不比较不等于跑赢")
+    print(f"跳过（复权链拒绝，不回退）: {skipped or '无'}")
+    print(f"📄 {out_md}\n📄 {out_json}")
+    return 0
+
+
 # ---------- features ----------
 
 def _bar_from_row(row) -> "Bar":
@@ -675,6 +872,36 @@ def build_parser() -> argparse.ArgumentParser:
     bt_wf.add_argument("--out", default=None,
                        help="报告输出路径（默认 reports/<日期>-walkforward.md）")
     bt_wf.set_defaults(func=cmd_backtest_walkforward)
+
+    bt_st = bt_sub.add_parser(
+        "strategy", help="注册表策略的 walk-forward **样本外**绩效 + 基准对照（离线）")
+    bt_st.add_argument("--strategy", default="trend_ma",
+                       help="策略 id（必须在 strategy_registry 里注册过；默认 trend_ma）")
+    bt_st.add_argument("--code", action="append", default=None,
+                       help="标的（默认全部 active 股票），可重复")
+    bt_st.add_argument("--start", default=None,
+                       help="读取起点（默认各标的的复权链可用下界；有缺口的标的须显式给）")
+    bt_st.add_argument("--end", default=None, help="会话轴结束日期")
+    bt_st.add_argument("--as-of", default=None, help="复权锚点日期（默认=end/今天）")
+    bt_st.add_argument("--train", type=int, default=250,
+                       help="训练窗长度（交易日，默认 250 ≈ 1 年；**只用于指标预热**）")
+    bt_st.add_argument("--test", type=int, default=21,
+                       help="测试窗长度（交易日，默认 21 ≈ 1 月）")
+    bt_st.add_argument("--step", type=int, default=None,
+                       help="相邻折步进（默认 = --test，测试窗首尾相接）")
+    bt_st.add_argument("--embargo", type=int, default=5,
+                       help="训练窗末尾剔除的交易日数（默认 5 ≈ 1 周）")
+    bt_st.add_argument("--threshold", type=int, default=120,
+                       help="样本外交易日硬门槛（默认 120，见 CLAUDE.md 度量纪律）")
+    bt_st.add_argument("--cash", type=float, default=1_000_000.0,
+                       help="初始本金（默认 100 万）")
+    bt_st.add_argument("--benchmark", default="index_300",
+                       help="基准名（默认 index_300）")
+    bt_st.add_argument("--param", action="append", default=None, metavar="K=V",
+                       help="策略参数覆盖（可重复；**不做搜索**，仅供单变量实验）")
+    bt_st.add_argument("--out", default=None,
+                       help="报告输出路径（默认 reports/<日期>-<策略>-walkforward.md）")
+    bt_st.set_defaults(func=cmd_backtest_strategy)
 
     doctor = sub.add_parser("doctor", help="数据健康度报告（离线）")
     doctor.set_defaults(func=lambda _a: cmd_doctor())

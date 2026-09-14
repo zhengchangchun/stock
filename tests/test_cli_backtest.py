@@ -1,11 +1,13 @@
 """`adj rebuild` / `backtest run` 子命令：离线、只读库、复权价 + 成本 + 基准。"""
 
 import json
+import math
 
 import pytest
 
 from stocklab.cli.main import (build_parser, cmd_adj_rebuild, cmd_backtest_run,
-                               cmd_backtest_walkforward, cmd_ingest_index)
+                               cmd_backtest_strategy, cmd_backtest_walkforward,
+                               cmd_ingest_index)
 from stocklab.config import paths
 from stocklab.config.universe import DEFAULT_UNIVERSE
 from stocklab.data.models import Bar, CorpAction
@@ -265,3 +267,111 @@ def test_walkforward_refuses_unusable_chain_without_fallback(tmp_db, monkeypatch
     # 且错误信息必须给出可执行的补救（usable_from 提示），而不是一句「失败了」。
     assert out["skipped"]["000333"].startswith("MissingFactor")
     assert "start >=" in out["skipped"]["000333"]
+
+
+# ---------- backtest strategy（Task 28：注册表策略的样本外绩效 + 基准对照） ----------
+
+def _long_dates(n=140):
+    return [f"2026-{1 + i // 28:02d}-{1 + i % 28:02d}" for i in range(n)]
+
+
+def _seed_long(tmp_db, n=140):
+    """足够切出多折的行情（正弦，均线会反复交叉 → 策略有成交）。"""
+    init_db(tmp_db)
+    conn = connect(tmp_db)
+    repo.upsert_instruments(conn, DEFAULT_UNIVERSE, now=NOW)
+    ds = _long_dates(n)
+    closes = [round(10.0 + 2.0 * math.sin(i / 7.0), 4) for i in range(n)]
+    repo.insert_bars(conn, [Bar(code="000333", date=d, open=c, high=c * 1.01,
+                                low=c * 0.99, close=c, volume=10_000,
+                                amount=c * 10_000, turnover=1.0, source="test")
+                            for d, c in zip(ds, closes)], now=NOW)
+    repo.insert_bars(conn, [Bar(code="sh000300", date=d, open=4000.0 + i * 2.0,
+                                high=4000.0 + i * 2.0, low=4000.0 + i * 2.0,
+                                close=4000.0 + i * 2.0, volume=1000, amount=None,
+                                turnover=None, source="test", adj_mode="none")
+                            for i, d in enumerate(ds)], now=NOW)
+    with conn:
+        conn.executemany(
+            "INSERT OR IGNORE INTO trading_calendar (date, is_open, source,"
+            " created_at) VALUES (?,1,'test',?)", [(d, NOW) for d in ds])
+    conn.close()
+    return ds
+
+
+def _bt_args(**kw):
+    base = dict(strategy="trend_ma", code=["000333"], start=None,
+                end=_long_dates()[-1], as_of=_long_dates()[-1], train=60,
+                test=20, step=None, embargo=0, threshold=120, cash=100_000.0,
+                benchmark="index_300", param=None, out=None)
+    base.update(kw)
+    return _args(**base)
+
+
+def test_backtest_strategy_subcommand_defaults():
+    args = build_parser().parse_args(["backtest", "strategy"])
+    assert args.strategy == "trend_ma"
+    assert args.train == 250 and args.test == 21
+    assert args.func is cmd_backtest_strategy
+
+
+def test_backtest_strategy_end_to_end_offline(tmp_db, monkeypatch, capsys, tmp_path):
+    monkeypatch.setattr(paths, "DB_PATH", tmp_db)
+    monkeypatch.setattr(paths, "REPORT_DIR", tmp_path)
+    _seed_long(tmp_db)
+    out_md = tmp_path / "wf.md"
+    assert cmd_backtest_strategy(_bt_args(out=str(out_md))) == 0
+    assert out_md.exists() and out_md.with_suffix(".json").exists()
+    report = json.loads(out_md.with_suffix(".json").read_text(encoding="utf-8"))
+    perf = report["performance"]
+
+    assert perf["strategy_id"] == "trend_ma"
+    assert perf["params"] == {"fast": 20, "slow": 60, "atr_mult": 2.0}   # 未搜索
+    assert perf["n_folds"] == 4
+    assert perf["oos_start"] == _long_dates()[60]
+    assert perf["oos_end"] == _long_dates()[139]
+    # 样本量口径：交易日，不是标的-日行数
+    assert perf["sample_size"]["unit"] == "trading_day"
+    assert perf["sample_size"]["effective_n"] == 80
+    assert perf["sample_size"]["oos_rows"] == 80          # 单标的 → 两者相等
+    # 样本外 + 扣成本 + 复权价：三项披露缺一不可
+    assert perf["disclosure"]["insample"] is False
+    assert perf["disclosure"]["costs_included"] is True
+    assert perf["disclosure"]["adjusted_prices"] is True
+    # 基准同区间对照（指数已入库 → OK，且给出明确的胜负判断）
+    assert report["benchmark"]["status"] == "OK"
+    assert report["benchmark"]["excess_return"] is not None
+    md = out_md.read_text(encoding="utf-8")
+    assert "跑赢" in md or "跑不赢" in md
+    assert "样本外" in md
+    capsys.readouterr()
+
+
+def test_backtest_strategy_rejects_unregistered(tmp_db, monkeypatch, capsys):
+    monkeypatch.setattr(paths, "DB_PATH", tmp_db)
+    _seed_long(tmp_db)
+    assert cmd_backtest_strategy(_bt_args(strategy="no_such")) == 3
+    assert "未注册" in capsys.readouterr().err
+
+
+def test_backtest_strategy_rejects_out_of_range_param(tmp_db, monkeypatch, capsys):
+    """参数越界必须在**读数据之前**报出来，且是干净退出码而不是抛栈。"""
+    monkeypatch.setattr(paths, "DB_PATH", tmp_db)
+    _seed_long(tmp_db)
+    assert cmd_backtest_strategy(_bt_args(param=["fast=9999"])) == 3
+    err = capsys.readouterr().err
+    assert "越界" in err and "clamp" in err
+
+
+def test_backtest_strategy_rejects_duplicate_param(tmp_db, monkeypatch, capsys):
+    monkeypatch.setattr(paths, "DB_PATH", tmp_db)
+    _seed_long(tmp_db)
+    assert cmd_backtest_strategy(_bt_args(param=["fast=20", "fast=30"])) == 3
+    assert "重复" in capsys.readouterr().err
+
+
+def test_backtest_strategy_insufficient_data_exit_code_2(tmp_db, monkeypatch, capsys):
+    monkeypatch.setattr(paths, "DB_PATH", tmp_db)
+    _seed_long(tmp_db)
+    assert cmd_backtest_strategy(_bt_args(train=200, test=200)) == 2
+    assert "会话数不足" in capsys.readouterr().err

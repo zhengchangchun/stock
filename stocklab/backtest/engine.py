@@ -50,16 +50,22 @@ class Signal:
 
 
 class Strategy(Protocol):
-    """策略协议：`generate(date, history, features) -> {code: Signal}`。
+    """策略协议：`generate(date, history, features_by_date) -> {code: Signal}`。
 
     `history[code]` 只含 `date <= T` 的复权 K 线（引擎保证），
-    `features` 是 `date` 当日的特征快照（P3 产物，可为空 dict）。
+    `features_by_date` 是**日期键控**的特征快照 `{date: {code: {...}}}`，
+    且引擎只累积 `<= T` 的日期（P5 起；此前只传当日快照，
+    策略层无从自行判断 PIT）。
+
+    **双重防线**：引擎这一侧不把未来日期的快照放进来，
+    `strategies.base.Strategy` 那一侧还会再裁一次 —— 策略会被多个 harness
+    调用（回测 / P6 预测），把「不许看未来」放在策略接口本身才不依赖调用方。
     """
 
     name: str
 
     def generate(self, date: str, history: dict[str, list],
-                 features: dict) -> dict[str, Signal]:
+                 features_by_date: dict) -> dict[str, Signal]:
         ...
 
 
@@ -118,6 +124,8 @@ def run_backtest(bars_by_code: dict[str, list], strategy, *, start: str, end: st
     result = BacktestResult()
     pending: dict[str, Signal] = {}
     history: dict[str, list] = {c: [] for c in bars_by_code}
+    #: 只累积 `<= 当前日` 的特征快照 —— 引擎侧的 PIT 防线（见 Strategy 协议说明）。
+    pit_features: dict[str, dict] = {}
     last_close: dict[str, float] = {}
     n_missing = 0
     rejected: list[str] = []
@@ -173,9 +181,11 @@ def run_backtest(bars_by_code: dict[str, list], strategy, *, start: str, end: st
         # ---- 2) 收盘后：把 ≤T 的行追加进历史，再让策略出 T 日信号 ----
         for code, bar in todays.items():
             history.setdefault(code, []).append(bar)
+        snap = (features_by_date or {}).get(date)
+        if snap is not None:
+            pit_features[date] = snap        # 只有当日的快照进入视图，未来日期进不来
         if i < len(sessions) - 1:              # 最后一天不必出信号（无次日可成交）
-            feats = (features_by_date or {}).get(date, {})
-            signals = strategy.generate(date, history, feats) or {}
+            signals = strategy.generate(date, history, pit_features) or {}
             for code, sig in signals.items():
                 if sig.action != "hold":
                     pending[code] = sig

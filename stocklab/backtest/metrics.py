@@ -52,6 +52,22 @@ def summarize(nav_points: list[NavPoint], initial_cash: float) -> dict:
             "volatility": vol, "sharpe": sharpe, "n_sessions": len(navs)}
 
 
+def annualize(total_return: float, n_sessions: int, *,
+              trading_days: int = TRADING_DAYS) -> float:
+    """区间总收益 → 年化（几何）。`n_sessions` 必须是**交易日**数。
+
+    用几何而非算术：算术年化会把一段短窗口的高收益放大成不可能长期维持的数字，
+    而本项目所有对外结论都要经过「能不能长期成立」这一问。
+    区间非正收益（本金亏光）时返回 -1.0，不做负数开方的复数运算。
+    """
+    if n_sessions <= 0:
+        return 0.0
+    base = 1.0 + total_return
+    if base <= 0:
+        return -1.0
+    return base ** (trading_days / n_sessions) - 1.0
+
+
 def excess_return(strategy_return: float, benchmark_return: float) -> float:
     """R5：跑不赢躺平就没有存在价值 —— 超额 = 策略 − 基准。"""
     return strategy_return - benchmark_return
