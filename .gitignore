@@ -14,6 +14,18 @@ Thumbs.db
 .env.local
 .env.*.local
 
+# Python venv
+.venv/
+venv/
+
+# 项目数据（SQLite / 缓存 / 备份）
+data/
+reports/
+
+# 测试与工具缓存
+.pytest_cache/
+.ruff_cache/
+
 # Build
 dist/
 build/
