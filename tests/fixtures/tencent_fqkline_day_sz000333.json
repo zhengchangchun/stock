@@ -1,0 +1,46 @@
+{
+  "source": "tencent_fqkline",
+  "url": "https://web.ifzq.gtimg.cn/appstock/app/fqkline/get?param=sz000333,day,,,900,qfq",
+  "encoding": "utf-8",
+  "fetched_at": "2026-09-14T23:48:31+08:00",
+  "code": "sz000333",
+  "adj": "qfq",
+  "requested_count": 900,
+  "n_bars": 641,
+  "first_date": "2024-01-22",
+  "last_date": "2026-09-14",
+  "n_events": 4,
+  "events": [
+    {
+      "nd": "2023",
+      "fh_sh": "30",
+      "djr": "2024-05-14",
+      "cqr": "2024-05-15",
+      "FHcontent": "10派30元"
+    },
+    {
+      "nd": "2024",
+      "fh_sh": "35",
+      "djr": "2025-06-11",
+      "cqr": "2025-06-12",
+      "FHcontent": "10派35元"
+    },
+    {
+      "nd": "2025",
+      "fh_sh": "5",
+      "djr": "2025-11-17",
+      "cqr": "2025-11-18",
+      "FHcontent": "10派5元"
+    },
+    {
+      "nd": "2025",
+      "fh_sh": "38",
+      "djr": "2026-06-26",
+      "cqr": "2026-06-29",
+      "FHcontent": "10派38元"
+    }
+  ],
+  "warning": "qfq 价格序列仅用于行序校验/除权事件提取/交叉校验；禁止作为 bars_raw 落库（ADR-001 D-01）",
+  "sha256": "59ec5457731ff2835dfa77e30bf75e93ad551cbfc56cd3ad70bfc5681e838046",
+  "name": "tencent_fqkline_day_sz000333"
+}

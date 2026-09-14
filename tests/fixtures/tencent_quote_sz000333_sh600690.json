@@ -1,0 +1,14 @@
+{
+  "source": "tencent_quote",
+  "url": "https://qt.gtimg.cn/q=sz000333,sh600690",
+  "encoding": "gbk",
+  "fetched_at": "2026-09-14T23:48:31+08:00",
+  "codes": [
+    "sz000333",
+    "sh600690"
+  ],
+  "n_quotes": 2,
+  "note": "快照为「当前」值，非历史序列；仅用于解析与单位换算测试",
+  "sha256": "627f532fd98b5b16c2f0a445a346fc6036a0017c84c34ca008225cebbcf6f65d",
+  "name": "tencent_quote_sz000333_sh600690"
+}
