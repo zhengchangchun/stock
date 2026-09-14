@@ -199,6 +199,15 @@ CREATE TABLE IF NOT EXISTS predictions (
 
 CREATE INDEX IF NOT EXISTS idx_predictions_target ON predictions (target_date);
 
+-- 预测的身份键（P6）：同 (code, asof_date, model_version) 只能有一条。
+-- 这是**结构性**防线而不是代码检查：即便将来有别的写入方绕开
+-- `predict.store.insert_prediction` 直接写 SQL，「同一天同一模型被静默覆盖」
+-- 仍然做不到 —— 配合 append-only 的 DELETE 触发器，连
+-- `INSERT OR REPLACE`（隐式删行重插）也会被 ABORT。
+-- 要改预测就升 model_version（与 features_daily 要改就升 feature_version 同款纪律）。
+CREATE UNIQUE INDEX IF NOT EXISTS uq_predictions_identity
+    ON predictions (code, asof_date, model_version);
+
 CREATE TABLE IF NOT EXISTS verifications (
     verification_id   INTEGER PRIMARY KEY AUTOINCREMENT,
     pred_id           INTEGER NOT NULL REFERENCES predictions (pred_id),

@@ -16,6 +16,13 @@ def connect(db_path: Path | str, *, read_only: bool = False) -> sqlite3.Connecti
     conn.execute("PRAGMA foreign_keys = ON")
     conn.execute("PRAGMA journal_mode = WAL")
     conn.execute("PRAGMA busy_timeout = 5000")
+    # append-only 的**结构性**防线要靠这一行（P6 实测发现）。
+    # SQLite 默认 recursive_triggers=OFF，而 `INSERT OR REPLACE` 解决唯一冲突的
+    # 方式是**隐式删行再插入** —— 隐式 DELETE **不触发** DELETE 触发器，
+    # 于是 `RAISE(ABORT, 'xxx is append-only')` 根本不跑，静默覆盖成功：
+    # 实测 predictions 的 pred_id 从 1 变成 2、未列出的列被重置为 NULL。
+    # 打开后，隐式 DELETE 会触发 append-only 触发器并 ABORT。
+    conn.execute("PRAGMA recursive_triggers = ON")
     return conn
 
 

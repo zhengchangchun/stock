@@ -34,14 +34,21 @@ def _seed_feature(conn):
     )
 
 
-def _seed_prediction(conn):
+def _seed_prediction(conn, *, model_version="v0.1.0"):
+    """写一条预测。
+
+    `model_version` 可覆盖：P6 给 `predictions` 加了身份唯一键
+    `(code, asof_date, model_version)`（`uq_predictions_identity`），
+    同键第二条会被 UNIQUE 挡下 —— 需要「两条各不相同」的测试必须换版本号，
+    这本身就是该唯一键的设计意图（要改预测就升 `model_version`）。
+    """
     conn.execute(
         "INSERT INTO predictions (code, asof_date, target_date, direction_up,"
         " direction_flat, direction_down, action, size_pct, invalidate_if,"
         " strategy_mix_json, model_version, created_at)"
         " VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
         ("000333", "2026-09-14", "2026-09-15", 0.4, 0.3, 0.3, "hold", 50,
-         "跌破 85.00", "{}", "v0.1.0", NOW),
+         "跌破 85.00", "{}", model_version, NOW),
     )
 
 
@@ -125,7 +132,10 @@ def test_insert_still_works_after_failed_update(conn):
     with pytest.raises(sqlite3.IntegrityError):
         conn.execute("UPDATE predictions SET size_pct = 0")
     with transaction(conn):
-        _seed_prediction(conn)
+        # 换 model_version：身份键 (code, asof_date, model_version) 是 P6 新增的，
+        # 同键第二条本就该被挡（见 _seed_prediction docstring）。
+        # 本断言要的是「ABORT 之后连接仍可用」，不是「同键能写两条」。
+        _seed_prediction(conn, model_version="v0.1.1")
     assert conn.execute("SELECT COUNT(*) FROM predictions").fetchone()[0] == 2
 
 

@@ -1,0 +1,304 @@
+"""预测服务（Task 31，P6）：取数 → 策略证据 → 模型 → 载荷 → 落库。
+
+## 这个模块负责的三道「不许」的防线
+
+1. **不许看未来**。历史取数走 `adjust.load_bars_adjusted(conn, code, asof)`，
+   `asof` 是**字面写在这里**的唯一上限；模型再做一次「最后一根必须是 asof」的校验。
+   两道都在，是因为本项目的教训是「防线要放在结构上，不能指望每个调用点都记得裁」
+   —— 但**取数层**这道是真正生效的那道（模型那道只挡「拿最近一根冒充今日」）。
+2. **不许在复权缺口上回退**。`load_pit_bars` 先查 `usable_from`：
+   `asof` 早于可用下界 → 抛 `UnusableWindow`。**没有**「取不到复权价就用不复权价」
+   这条分支，因为不复权价在除权日是假跌幅，会让模型算出一个**数字合法、结论全错**
+   的预测（ERROR_DIARY 2026-09-14「宽松回退」同款）。
+3. **不许假装有集成**。`strategy_evidence` 逐个已注册策略给出**身份**：
+   `active` / `excluded_falsified` / `benchmark_only` / `inactive_unproven`。
+   权重**只**从 `ACTIVE_STRATEGIES` 白名单（当前为空）里来，
+   所以 `weights` 必然是 `{}`、`degenerate=True` 必然写进载荷 ——
+   这不是硬编码，而是「注册 ≠ 有 edge」这条规则算出来的结果。
+
+## 历史回放
+
+整条链只依赖「库里 <= asof 的行」，没有任何 `datetime.now()` 参与计算
+（`now` 只用于 `created_at` 落库）。所以对任意过去的 `asof` 都能算出**当时该给的**
+预测 —— 这是日后测准确率的前提。
+"""
+
+from __future__ import annotations
+
+import sqlite3
+from typing import Sequence
+
+from stocklab.calendar.trading_calendar import Calendar
+from stocklab.data import adjust
+from stocklab.data.models import Bar
+from stocklab.predict.model import (DegenerateInput, compute_forecast,
+                                    degenerate_strategy_mix, payload_hash)
+from stocklab.predict.version import (ACTIVE_STRATEGIES,
+                                      BENCHMARK_ONLY_STRATEGIES,
+                                      FALSIFIED_STRATEGIES, MODEL_VERSION)
+from stocklab.strategies.registry import strategy_registry
+
+
+class UnusableWindow(RuntimeError):
+    """该标的在 `asof` **没有可用的复权窗口**（早于 `adj_factor_blackout` 的可用下界）。
+
+    刻意是异常而不是「返回空列表」：空列表会被调用方当成「这只票今天没数据」，
+    而真相是「这只票的这段历史在复权口径下**不可用**」。两者必须能区分
+    （ERROR_DIARY 2026-09-15：「这个字段为空时，是『没有』还是『没填』？」）。
+    """
+
+
+class NotASession(RuntimeError):
+    """`asof` 不是「日历 ∩ 行情」双重口径下的交易日。"""
+
+
+# ---------- 交易日判定与 target_date ----------
+
+def session_axis(conn: sqlite3.Connection, codes: Sequence[str]) -> set[str]:
+    """行情轴：给定标的在 `bars_daily` 里**真的出现过 K 线**的日期。
+
+    刻意读不复权的 `bars_daily`：日期是否存在与复权口径无关，
+    而 `adj_factors` 只覆盖到因子链算得出的日期。
+    """
+    if not codes:
+        return set()
+    marks = ",".join("?" * len(codes))
+    return {r["date"] for r in conn.execute(
+        f"SELECT DISTINCT date FROM bars_daily WHERE code IN ({marks})", tuple(codes))}
+
+
+def market_axis(conn: sqlite3.Connection) -> set[str]:
+    """全市场行情轴：`instruments` 里所有在用标的在 `bars_daily` 出现过的日期。
+
+    用于判「**市场**那天开不开市」。刻意与「请求的标的当天有没有 K 线」分开：
+    后者是**单只票停牌**，该跳过的是那只票，不是整批预测。
+    把两者混在一个判据里，会让一只停牌票把当天的全部预测打掉。
+    """
+    return session_axis(conn, [r["code"] for r in conn.execute(
+        "SELECT code FROM instruments WHERE active=1 AND type='stock'")])
+
+
+def assert_session(conn: sqlite3.Connection, calendar: Calendar, asof: str) -> None:
+    """`asof` 必须同时落在日历与**市场**行情轴上（**取交集**）。
+
+    - 不在日历 → 「那天根本不开市」；
+    - 在日历但整个市场当天都没有 K 线 → 「日历说开市、库里却没有那天的行情」，
+      多半是采集缺口。此时出预测等于拿旧数据冒充今天，必须拒绝。
+    """
+    cal_dates = set(calendar.all_dates)
+    if asof not in cal_dates:
+        raise NotASession(
+            f"{asof} 不在 trading_calendar（日历最早 {calendar.all_dates[0]}、"
+            f"最晚 {calendar.all_dates[-1]}）—— 非交易日，拒绝出预测"
+        )
+    if asof not in market_axis(conn):
+        raise NotASession(
+            f"{asof} 在日历里是交易日，但库里没有任何标的当天有 K 线"
+            "（采集缺口）—— 拒绝出预测"
+        )
+
+
+def resolve_target_date(calendar: Calendar, asof: str) -> tuple[str, str]:
+    """下一个交易日 = 日历中**严格大于** `asof` 的第一个日期。
+
+    返回 `(date, source)`，`source ∈ {"trading_calendar", "weekday_fallback"}`。
+
+    **为什么不与行情轴取交集**：未来的交易日必然还没有 K 线，取交集恒为空。
+    故 `target_date` 只用日历 —— 而日历**今天就是耗尽态**
+    （`trading_calendar` 最晚 = `2026-09-14`），此时退化为「下一个工作日（周一~周五）」，
+    `source` 记为 `weekday_fallback`。这个退化会原样进载荷与报告：
+    它是本任务**最弱的字段**，不许被当成真实交易日历。
+    """
+    later = [d for d in calendar.all_dates if d > asof]
+    if later:
+        return later[0], "trading_calendar"
+    y, m, d = (int(x) for x in asof.split("-"))
+    o = y * 372 + m * 31 + d
+    while True:
+        o += 1
+        yy, rem = divmod(o, 372)
+        mm, dd = divmod(rem, 31)
+        if mm < 1 or mm > 12 or dd < 1 or dd > 31:
+            continue
+        if _weekday(yy, mm, dd) < 5:
+            break
+    return f"{yy:04d}-{mm:02d}-{dd:02d}", "weekday_fallback"
+
+
+def _weekday(y: int, m: int, d: int) -> int:
+    """0=周一 … 6=周日（Sakamoto 公式，不引第三方库）。"""
+    t = (0, 3, 2, 5, 0, 3, 5, 1, 4, 6, 2, 4)
+    yy = y - (1 if m < 3 else 0)
+    return (yy + yy // 4 - yy // 100 + yy // 400 + t[m - 1] + d) % 7
+
+
+# ---------- PIT 取数 ----------
+
+def load_pit_bars(conn: sqlite3.Connection, code: str, asof: str) -> list[Bar]:
+    """读 `code` 在 `asof`（含）之前的**复权**日 K。
+
+    复权链不可用的区间 → `UnusableWindow`（**硬拒绝，无回退分支**）。
+    """
+    floor = adjust.usable_from(conn, code)
+    if floor is not None and asof < floor:
+        raise UnusableWindow(
+            f"{code} 在 {asof} 没有可用的复权窗口：该标的复权链的可用下界是 {floor}"
+            "（此前有无法定价的除权事件，不复权序列在那一段残留假跌幅）。"
+            "**拒绝回退到不复权价** —— 那会算出一个数字合法、结论全错的预测"
+        )
+    # start=floor：把窗口显式挪到可用下界（None 时表示全历史都可用）
+    return adjust.load_bars_adjusted(conn, code, asof, start=floor)
+
+
+# ---------- 策略证据 ----------
+
+def strategy_evidence(asof: str, history_by_code: dict[str, list[Bar]]) -> list[dict]:
+    """逐个**已注册**策略给出身份与（若有）当日信号。
+
+    四类身份（**注册 ≠ 有 edge**，见 `version.ACTIVE_STRATEGIES`）：
+      - `active`：在 `ACTIVE_STRATEGIES` 白名单里（**当前为空**）→ 唯一的权重来源；
+      - `excluded_falsified`：样本外绩效被否证（见 `version.FALSIFIED_STRATEGIES`）；
+      - `benchmark_only`：只作对照，不提供次日方向信息；
+      - `inactive_unproven`：已注册但**没有任何样本外正向证据**。
+
+    最后一类是本函数的关键：`strategy_registry` 只证明「能被评估」。
+    把「已注册」当成「可参与集成」，任何新写的策略都会**自动**拿到权重 ——
+    一份「多策略集成」会在零证据下凭空出现。所以**只有白名单里的才 `generate`**，
+    未证明的策略连跑都不跑（跑它还可能因状态副作用污染别的标的）。
+
+    信号由 `Strategy.generate` 产出 —— 它内部先 `clip_history` 再派发，
+    所以即使传进去的历史含未来行，策略也**读不到**（策略层自己的防线）。
+    """
+    out: list[dict] = []
+    for sid in strategy_registry.ids():
+        entry: dict = {"strategy_id": sid, "signal": None, "weight": 0.0}
+        if sid in FALSIFIED_STRATEGIES:
+            entry.update(status="excluded_falsified",
+                         reason=FALSIFIED_STRATEGIES[sid])
+        elif sid in BENCHMARK_ONLY_STRATEGIES:
+            entry.update(status="benchmark_only",
+                         reason="只作对照，不提供次日方向信息；给它权重 = 假装有集成")
+        elif sid in ACTIVE_STRATEGIES:
+            entry.update(status="active", reason="")
+            sigs = strategy_registry.get(sid).generate(asof, history_by_code)
+            entry["signal"] = {c: s.action for c, s in sorted(sigs.items())}
+        else:
+            entry.update(status="inactive_unproven", reason=(
+                "已注册但**没有样本外正向证据**：注册只说明「能被评估」，"
+                "不说明有 edge。加入 version.ACTIVE_STRATEGIES 才能参与集成"
+            ))
+        out.append(entry)
+    return out
+
+
+def active_weights(evidence: Sequence[dict]) -> dict[str, float]:
+    """`active` 策略的等权权重。
+
+    **当前必然是空 dict**（`ACTIVE_STRATEGIES` 为空：`trend_ma` 被否证、
+    `buy_and_hold` 只作对照、其余注册策略无样本外证据）。
+    留这个函数是为了让「将来加了新策略会怎样」有一个**唯一**的落点，
+    而不是散在组装逻辑里 —— 也为了让 `weights == {}` 这件事来自代码而非硬编码。
+    """
+    actives = [e["strategy_id"] for e in evidence if e["status"] == "active"]
+    if not actives:
+        return {}
+    w = 1.0 / len(actives)
+    return {sid: w for sid in actives}
+
+
+# ---------- 组装 ----------
+
+def build_predictions(conn: sqlite3.Connection, asof: str,
+                      codes: Sequence[str] | None = None) -> dict:
+    """算出 `asof` 的全部预测载荷（**不写库**；落库由 CLI/调用方决定）。
+
+    返回一份可直接落盘的报告 dict，**不含任何时间戳** ——
+    同一 `asof` + 同一 `model_version` 重复运行必须逐字节一致。
+    """
+    from stocklab.config.universe import Instrument
+
+    if codes is None:
+        codes = [r["code"] for r in conn.execute(
+            "SELECT code FROM instruments WHERE active=1 AND type='stock'"
+            " ORDER BY code")]
+    codes = list(codes)
+    calendar = Calendar.load(conn)
+    assert_session(conn, calendar, asof)
+    target_date, td_source = resolve_target_date(calendar, asof)
+
+    history: dict[str, list[Bar]] = {}
+    skipped: dict[str, str] = {}
+    for code in codes:
+        try:
+            rows = load_pit_bars(conn, code, asof)
+        except (adjust.AdjustError, UnusableWindow) as exc:
+            skipped[code] = f"{type(exc).__name__}: {exc}"
+            continue
+        # 显式区分「没有数据」与「有数据但今天这根不在」——两者都不出预测，
+        # 但原因必须能读出来（ERROR_DIARY：「为空时是『没有』还是『没填』？」）
+        if not rows or rows[-1].date != asof:
+            last = rows[-1].date if rows else "无"
+            skipped[code] = (
+                f"NoBarOnAsof: {code} 在 {asof} 无 K 线（最后一根 {last}）"
+                "—— 停牌或采集缺口，拒绝用旧价冒充今日"
+            )
+            continue
+        history[code] = rows
+
+    evidence = strategy_evidence(asof, history)
+    weights = active_weights(evidence)
+    mix = degenerate_strategy_mix(
+        weights=weights,
+        excluded={e["strategy_id"]: e["reason"] for e in evidence
+                  if e["status"] == "excluded_falsified"},
+        benchmark_only=[e["strategy_id"] for e in evidence
+                        if e["status"] == "benchmark_only"],
+    )
+
+    predictions: list[dict] = []
+    per_code_evidence: dict[str, dict] = {}
+    for code in sorted(history):
+        try:
+            p = compute_forecast(code=code, asof=asof, bars=history[code],
+                                 target_date=target_date, strategy_mix=mix)
+        except DegenerateInput as exc:
+            skipped[code] = f"DegenerateInput: {exc}"
+            continue
+        predictions.append(p)
+        ev = dict(p["evidence"])
+        ev["target_date_source"] = td_source
+        per_code_evidence[code] = ev
+
+    return {
+        "asof_date": asof,
+        "target_date": target_date,
+        "target_date_source": td_source,
+        "model_version": MODEL_VERSION,
+        "session_check": {"axis": "trading_calendar ∩ bars_daily",
+                          "asof": asof, "codes": codes},
+        "predictions": predictions,
+        "payload_sha256": {p["code"]: payload_hash(p) for p in predictions},
+        "evidence": per_code_evidence,
+        "strategies": evidence,
+        "strategy_weights": weights,
+        "skipped": skipped,
+        "notes": {
+            "target_date": (
+                "target_date 取自 trading_calendar 的下一交易日；"
+                "日历耗尽时为「下一个工作日」外推（source=weekday_fallback）—— "
+                "**那是工作日外推，不是交易日历**，它是最弱的一个字段"
+                if td_source == "weekday_fallback" else
+                "target_date 取自 trading_calendar，非外推"
+            ),
+            "integration": (
+                "当前集成是**退化**的："
+                + (f"仅 {sorted(weights)} 参与" if weights else
+                   "没有任何未被否证的方向性策略参与，方向概率 100% 来自统计模型")
+                + "；`buy_and_hold` 只作对照，`trend_ma` 已被样本外绩效否证"
+            ),
+            "accuracy": (
+                "本报告**不含任何准确率数字**：预测准不准要由 P7 的次日验证器按 "
+                "§8.2 评分后才可上报，且必须先满足「样本外 + 按日聚类 + 样本量门槛」"
+            ),
+        },
+    }

@@ -16,6 +16,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import sys
 from datetime import date, datetime, timedelta
@@ -670,6 +671,90 @@ def _bar_from_row(row) -> "Bar":
                adj_mode=row["adj_mode"])
 
 
+def cmd_predict_run(args: argparse.Namespace) -> int:
+    """产出并落库 `asof` 的预测载荷（**离线**，只读 bars/features/adj 与本表）。
+
+    **本命令不产出任何准确率数字**：预测准不准要由 P7 的次日验证器按 §8.2 评分后
+    才可上报。这里的验收标准是「可证伪、可复现、可回放」三件事：
+
+      - **可证伪**：`invalidate_if` 由算出来的关键位导出，P7 直接读它判 `invalidated`；
+      - **可复现**：同 `asof` + 同 `model_version` 重复运行 → 载荷**逐字节一致**
+        （报告文件里刻意不放任何时间戳，并打印 `payload_sha256` 供比对）；
+      - **可回放**：整条链只依赖库里 `<= asof` 的行，任意历史 `asof` 都能算出
+        「当时该给的」预测 —— 这是日后测准确率的前提。
+
+    退出码：0 全部落库（含幂等 `identical`）；1 有 `conflict`（同键不同载荷，**不覆盖**）；
+    2 非交易日 / 没有任何可出预测的标的。
+    """
+    from stocklab.predict.service import NotASession, build_predictions
+    from stocklab.predict.store import PredictionConflict, insert_prediction
+
+    db = Path(args.db) if args.db else paths.DB_PATH
+    if not db.exists():
+        print(json.dumps({"error": "db not found; run `stocklab db init`"},
+                         ensure_ascii=False), file=sys.stderr)
+        return 2
+    report_dir = Path(args.report_dir) if args.report_dir else paths.REPORT_DIR
+    report_dir.mkdir(parents=True, exist_ok=True)
+    now = datetime.now(TZ).isoformat(timespec="seconds")
+
+    conn = connect(db)
+    try:
+        try:
+            rep = build_predictions(conn, args.asof, args.code)
+        except NotASession as exc:
+            print(f"❌ {exc}", file=sys.stderr)
+            return 2
+        except ValueError as exc:            # 日历为空等
+            print(f"❌ {exc}", file=sys.stderr)
+            return 2
+
+        if not rep["predictions"]:
+            print(json.dumps({"asof_date": rep["asof_date"], "skipped": rep["skipped"]},
+                             ensure_ascii=False), file=sys.stderr)
+            print(f"❌ {rep['asof_date']} 没有任何可出预测的标的", file=sys.stderr)
+            return 2
+
+        states: dict[str, str] = {}
+        conflicts: dict[str, str] = {}
+        for p in rep["predictions"]:
+            try:
+                state, pred_id = insert_prediction(conn, p, now=now)
+                states[p["code"]] = f"{state}:{pred_id}"
+            except PredictionConflict as exc:
+                conflicts[p["code"]] = str(exc)
+    finally:
+        conn.close()
+
+    path = Path(args.report) if args.report else \
+        report_dir / f"{_today()}-predict-{args.asof}.json"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    # 逐字节可复现：报告里**不放**任何随运行变化的东西 —— 时间戳
+    # （created_at 只落库）与落库状态（`inserted` vs `identical`）都不写进文件。
+    # 于是「同 asof + 同 model_version 两次运行」的文件 sha256 天然相等，
+    # 文件本身就成了可复现性的证据；落库状态只出现在 stdout 与库里。
+    blob = json.dumps(rep, ensure_ascii=False, sort_keys=True, indent=2) + "\n"
+    path.write_text(blob, encoding="utf-8")
+    digest = hashlib.sha256(blob.encode("utf-8")).hexdigest()
+
+    print(json.dumps({"report": str(path), "sha256": digest,
+                      "asof_date": rep["asof_date"], "target_date": rep["target_date"],
+                      "target_date_source": rep["target_date_source"],
+                      "model_version": rep["model_version"],
+                      "payload_sha256": rep["payload_sha256"],
+                      "storage": states},
+                     ensure_ascii=False, indent=2))
+    for code, p in sorted(rep["payload_sha256"].items()):
+        print(f"  {code}: payload_sha256={p}")
+    if conflicts:
+        for code, msg in sorted(conflicts.items()):
+            print(f"❌ {code} 预测落库冲突：{msg}", file=sys.stderr)
+        return 1
+    for code, reason in sorted(rep["skipped"].items()):
+        print(f"⚠️  {code} 跳过：{reason}", file=sys.stderr)
+    return 0
+
+
 def cmd_features_build(date: str, codes: list[str] | None) -> int:
     """为指定日期构建全部标的的特征快照（**离线**，只读 `bars_daily` + `adj_factors`）。
 
@@ -902,6 +987,19 @@ def build_parser() -> argparse.ArgumentParser:
     bt_st.add_argument("--out", default=None,
                        help="报告输出路径（默认 reports/<日期>-<策略>-walkforward.md）")
     bt_st.set_defaults(func=cmd_backtest_strategy)
+
+    pred = sub.add_parser("predict", help="预测器（离线；载荷落库 + 可复现 + 可回放）")
+    pred_sub = pred.add_subparsers(dest="predict_cmd", required=True)
+    pred_run = pred_sub.add_parser(
+        "run", help="产出并落库 asof 的预测载荷（PIT：只用 <= asof 的数据）")
+    pred_run.add_argument("--asof", required=True,
+                          help="预测基准日（必须是日历 ∩ 行情轴上的交易日）")
+    pred_run.add_argument("--code", action="append",
+                          help="只跑指定标的（可重复）；默认全部在用标的")
+    pred_run.add_argument("--report", help="报告输出路径（默认 reports/<today>-predict-<asof>.json）")
+    pred_run.add_argument("--report-dir", dest="report_dir", help="报告目录")
+    pred_run.add_argument("--db", help="数据库路径（默认 data/stocklab.db）")
+    pred_run.set_defaults(func=cmd_predict_run)
 
     doctor = sub.add_parser("doctor", help="数据健康度报告（离线）")
     doctor.set_defaults(func=lambda _a: cmd_doctor())
