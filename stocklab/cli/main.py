@@ -122,6 +122,93 @@ def cmd_ingest_bars(args: argparse.Namespace) -> int:
     return 0 if report.ok_count else 1
 
 
+# ---------- features ----------
+
+def _bar_from_row(row) -> "Bar":
+    from stocklab.data.models import Bar
+
+    return Bar(code=row["code"], date=row["date"], open=row["open"],
+               high=row["high"], low=row["low"], close=row["close"],
+               volume=row["volume"], amount=row["amount"],
+               turnover=row["turnover"], source=row["source"],
+               adj_mode=row["adj_mode"])
+
+
+def cmd_features_build(date: str, codes: list[str] | None) -> int:
+    """为指定日期构建全部标的的特征快照（**离线**，只读 `bars_daily`）。
+
+    行为：
+    - 幂等：同键同 hash 的快照已存在 → 计 `identical`，不重复写（可安全重试）。
+    - 冲突：同键但 hash 不同（行情被修订 / 特征代码被改而没升版本）→ 计
+      `conflicts`、留 warn 事件，**不覆盖**，并以退出码 1 上报。
+    - 缺失：历史不足或当日无 K 线 → 计 `skipped` + warn 事件（不写假快照）。
+
+    `regime_label` 暂为 NULL：市场状态需要指数行情，当前 `bars_daily` 里只有个股
+    （见 docs/tasks/2026-09-15-p3-特征层-task17-20.md 的遗留问题）。
+    """
+    from stocklab.features import snapshot
+
+    db = paths.DB_PATH
+    if not db.exists():
+        print(json.dumps({"error": "db not found; run `stocklab db init`"},
+                         ensure_ascii=False))
+        return 2
+    paths.ensure_dirs()
+    init_db(db)
+    now = datetime.now(TZ).isoformat(timespec="seconds")
+    written = identical = 0
+    skipped: list[str] = []
+    conflicts: list[str] = []
+
+    with connect(db) as conn:
+        rows = conn.execute(
+            "SELECT code FROM instruments WHERE active=1 ORDER BY code").fetchall()
+        for row in rows:
+            code = row["code"]
+            if codes and code not in codes:
+                continue
+            bars = [_bar_from_row(r) for r in conn.execute(
+                "SELECT * FROM bars_daily WHERE code=? AND date<=? ORDER BY date",
+                (code, date))]
+            snap = snapshot.build_snapshot(code, date, bars,
+                                           data_version=f"bars:{date}")
+            if snap is None:
+                skipped.append(code)
+                repo.log_event(conn, "features", "warn",
+                               f"{code} 无法构建 {date} 快照（历史不足或当日无K线）",
+                               context={"date": date,
+                                        "last_bar": bars[-1].date if bars else None},
+                               now=now)
+                continue
+            existing = snapshot.find_snapshot(conn, code, date)
+            if existing is not None:
+                if existing["payload_hash"] == snap.payload_hash:
+                    identical += 1
+                else:
+                    conflicts.append(code)
+                    repo.log_event(
+                        conn, "features", "warn",
+                        f"{code} {date} 已有快照与重算结果不一致"
+                        f"（行情修订或特征改动未升版本）",
+                        context={"date": date,
+                                 "existing": existing["payload_hash"],
+                                 "recomputed": snap.payload_hash},
+                        now=now)
+                continue
+            snapshot.save_snapshot(conn, snap, now=now)
+            written += 1
+
+    print(json.dumps({"date": date, "written": written, "identical": identical,
+                      "conflicts": conflicts, "skipped": skipped},
+                     ensure_ascii=False))
+    return 1 if conflicts else 0
+
+
+def _cmd_features_build(args: argparse.Namespace) -> int:
+    """argparse 名字空间 → 领域参数（保持 `cmd_*` 可直接单测）。"""
+    return cmd_features_build(args.date, args.code)
+
+
 def _cmd_fixture_record(args: argparse.Namespace) -> int:
     """把 raw_cache 里的一份响应登记为可回放 fixture（离线脚本，不联网）。"""
     from stocklab.data.raw_cache import record_fixture
@@ -164,6 +251,14 @@ def build_parser() -> argparse.ArgumentParser:
 
     doctor = sub.add_parser("doctor", help="数据健康度报告（离线）")
     doctor.set_defaults(func=lambda _a: cmd_doctor())
+
+    feat = sub.add_parser("features", help="特征层（离线，只读 bars_daily）")
+    feat_sub = feat.add_subparsers(dest="feat_action")
+    feat_build = feat_sub.add_parser("build", help="为指定日期构建特征快照")
+    feat_build.add_argument("--date", required=True, help="asof 日期 YYYY-MM-DD")
+    feat_build.add_argument("--code", action="append", default=None,
+                            help="只构建指定代码，可重复；默认全部 active 标的")
+    feat_build.set_defaults(func=_cmd_features_build)
 
     fixture = sub.add_parser("fixture", help="fixture 管理（离线）")
     fx_sub = fixture.add_subparsers(dest="fixture_action")
