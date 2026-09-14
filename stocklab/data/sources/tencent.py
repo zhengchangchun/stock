@@ -31,12 +31,21 @@ _FIELDS = {
 _MIN_FIELDS = 47
 
 
-def kline_url(code: str, count: int = 320, adj: str = "") -> str:
+# 单次请求的条数硬上限（Task 12 实测：>2000 返回 `{"msg":"param error"}`）
+MAX_COUNT = 2000
+
+
+def kline_url(code: str, count: int = 320, adj: str = "", *,
+              beg: str = "", end: str = "") -> str:
     """构造日K URL。`adj=""` = 不复权（默认，铁律①），`"qfq"` = 前复权。
+
+    `end`（YYYY-MM-DD）是**向后翻页**的锚点：接口按「end 往前数 count 根」返回，
+    `beg` 被服务端忽略。这是取全量历史（可回溯至上市首日）的唯一方式 ——
+    见 ADR-003。`count` 上限 `MAX_COUNT`。
 
     注意：qfq 请求仅限「取除权事件 / 交叉校验」用途。
     """
-    return f"{KLINE_URL}?param={code},day,,,{count},{adj}"
+    return f"{KLINE_URL}?param={code},day,{beg},{end},{count},{adj}"
 
 
 def quote_url(codes: list[str]) -> str:

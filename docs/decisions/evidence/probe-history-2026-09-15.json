@@ -1,0 +1,238 @@
+{
+  "probed_at": "2026-09-15",
+  "code": "sz000333",
+  "count_cap": [
+    {
+      "url": "https://web.ifzq.gtimg.cn/appstock/app/fqkline/get?param=sz000333,day,,,320,",
+      "count": 320,
+      "first": "2025-05-27",
+      "last": "2026-09-14",
+      "bytes": 22327,
+      "seconds": 0.14,
+      "sha256_16": "3f7412b72b2077fe",
+      "requested": 320,
+      "adj": "none"
+    },
+    {
+      "url": "https://web.ifzq.gtimg.cn/appstock/app/fqkline/get?param=sz000333,day,,,320,qfq",
+      "count": 320,
+      "first": "2025-05-27",
+      "last": "2026-09-14",
+      "bytes": 22362,
+      "seconds": 0.3,
+      "sha256_16": "2300cbf5fd70d989",
+      "requested": 320,
+      "adj": "qfq"
+    },
+    {
+      "url": "https://web.ifzq.gtimg.cn/appstock/app/fqkline/get?param=sz000333,day,,,640,",
+      "count": 640,
+      "first": "2024-01-23",
+      "last": "2026-09-14",
+      "bytes": 42905,
+      "seconds": 0.36,
+      "sha256_16": "8974a9e090e7d9cf",
+      "requested": 640,
+      "adj": "none"
+    },
+    {
+      "url": "https://web.ifzq.gtimg.cn/appstock/app/fqkline/get?param=sz000333,day,,,800,",
+      "count": 800,
+      "first": "2023-05-31",
+      "last": "2026-09-14",
+      "bytes": 53238,
+      "seconds": 0.39,
+      "sha256_16": "7425c96d98fbda63",
+      "requested": 800,
+      "adj": "none"
+    },
+    {
+      "url": "https://web.ifzq.gtimg.cn/appstock/app/fqkline/get?param=sz000333,day,,,800,qfq",
+      "count": 800,
+      "first": "2023-05-31",
+      "last": "2026-09-14",
+      "bytes": 53273,
+      "seconds": 0.3,
+      "sha256_16": "40a871a7bf62548c",
+      "requested": 800,
+      "adj": "qfq"
+    },
+    {
+      "url": "https://web.ifzq.gtimg.cn/appstock/app/fqkline/get?param=sz000333,day,,,801,",
+      "count": 801,
+      "first": "2023-05-30",
+      "last": "2026-09-14",
+      "bytes": 53302,
+      "seconds": 0.37,
+      "sha256_16": "aa859219e017d033",
+      "requested": 801,
+      "adj": "none"
+    },
+    {
+      "url": "https://web.ifzq.gtimg.cn/appstock/app/fqkline/get?param=sz000333,day,,,900,",
+      "count": 900,
+      "first": "2022-12-28",
+      "last": "2026-09-14",
+      "bytes": 59637,
+      "seconds": 0.34,
+      "sha256_16": "b289274b5200f820",
+      "requested": 900,
+      "adj": "none"
+    },
+    {
+      "url": "https://web.ifzq.gtimg.cn/appstock/app/fqkline/get?param=sz000333,day,,,1200,",
+      "count": 1200,
+      "first": "2021-10-08",
+      "last": "2026-09-14",
+      "bytes": 78944,
+      "seconds": 0.33,
+      "sha256_16": "756d977879b6516c",
+      "requested": 1200,
+      "adj": "none"
+    },
+    {
+      "url": "https://web.ifzq.gtimg.cn/appstock/app/fqkline/get?param=sz000333,day,,,2000,",
+      "count": 2000,
+      "first": "2018-04-23",
+      "last": "2026-09-14",
+      "bytes": 130600,
+      "seconds": 0.37,
+      "sha256_16": "2b56fe3fcc20d3f8",
+      "requested": 2000,
+      "adj": "none"
+    },
+    {
+      "url": "https://web.ifzq.gtimg.cn/appstock/app/fqkline/get?param=sz000333,day,,,2000,qfq",
+      "count": 640,
+      "first": "2024-01-23",
+      "last": "2026-09-14",
+      "bytes": 42940,
+      "seconds": 0.31,
+      "sha256_16": "23efd81ea4b57d83",
+      "requested": 2000,
+      "adj": "qfq"
+    },
+    {
+      "url": "https://web.ifzq.gtimg.cn/appstock/app/fqkline/get?param=sz000333,day,,,2500,",
+      "error": "服务端 msg='param error'",
+      "seconds": 0.32,
+      "sha256_16": "bff8ad6cf8c375a4",
+      "requested": 2500,
+      "adj": "none"
+    },
+    {
+      "url": "https://web.ifzq.gtimg.cn/appstock/app/fqkline/get?param=sz000333,day,,,2500,qfq",
+      "error": "服务端 msg='param error'",
+      "seconds": 0.35,
+      "sha256_16": "bff8ad6cf8c375a4",
+      "requested": 2500,
+      "adj": "qfq"
+    }
+  ],
+  "pagination": [
+    {
+      "url": "https://web.ifzq.gtimg.cn/appstock/app/fqkline/get?param=sz000333,day,,2026-09-16,2000,",
+      "count": 2000,
+      "first": "2018-04-23",
+      "last": "2026-09-14",
+      "bytes": 130600,
+      "seconds": 0.43,
+      "sha256_16": "2b56fe3fcc20d3f8",
+      "page": 0,
+      "end_anchor": "2026-09-16"
+    },
+    {
+      "url": "https://web.ifzq.gtimg.cn/appstock/app/fqkline/get?param=sz000333,day,,2018-04-22,2000,",
+      "count": 1095,
+      "first": "2013-09-18",
+      "last": "2018-04-20",
+      "bytes": 71921,
+      "seconds": 0.34,
+      "sha256_16": "d7ce9de125af9324",
+      "page": 1,
+      "end_anchor": "2018-04-22"
+    },
+    {
+      "url": "https://web.ifzq.gtimg.cn/appstock/app/fqkline/get?param=sz000333,day,,2013-09-17,2000,",
+      "count": 0,
+      "first": null,
+      "last": null,
+      "bytes": 1556,
+      "seconds": 0.29,
+      "sha256_16": "7078f69a7c690888",
+      "page": 2,
+      "end_anchor": "2013-09-17"
+    }
+  ],
+  "eastmoney": [
+    {
+      "tag": "beg=0",
+      "url": "https://push2his.eastmoney.com/api/qt/stock/kline/get?secid=0.000333&klt=101&fqt=0&beg=0&end=20500101&fields1=f1,f2,f3,f4,f5,f6&fields2=f51,f52,f53,f54,f55,f56,f57,f58,f59,f60,f61",
+      "error": "FetchError: 请求异常: ('Connection aborted.', RemoteDisconnected('Remote end closed connection without res",
+      "seconds": 0.76
+    },
+    {
+      "tag": "beg=19900101",
+      "url": "https://push2his.eastmoney.com/api/qt/stock/kline/get?secid=0.000333&klt=101&fqt=0&beg=19900101&end=20260914&fields1=f1,f2,f3,f4,f5,f6&fields2=f51,f52,f53,f54,f55,f56,f57,f58,f59,f60,f61",
+      "error": "FetchError: 请求异常: ('Connection aborted.', RemoteDisconnected('Remote end closed connection without res",
+      "seconds": 0.97
+    }
+  ],
+  "pagination_old_stock": [
+    {
+      "url": "https://web.ifzq.gtimg.cn/appstock/app/fqkline/get?param=sh600000,day,,2026-09-16,2000,",
+      "count": 2000,
+      "first": "2018-06-21",
+      "last": "2026-09-14",
+      "bytes": 126244,
+      "seconds": 0.14,
+      "sha256_16": "82f3533e08199834",
+      "page": 0,
+      "end_anchor": "2026-09-16"
+    },
+    {
+      "url": "https://web.ifzq.gtimg.cn/appstock/app/fqkline/get?param=sh600000,day,,2018-06-20,2000,",
+      "count": 2000,
+      "first": "2010-01-15",
+      "last": "2018-06-20",
+      "bytes": 128268,
+      "seconds": 0.34,
+      "sha256_16": "82357fa81417de74",
+      "page": 1,
+      "end_anchor": "2018-06-20"
+    },
+    {
+      "url": "https://web.ifzq.gtimg.cn/appstock/app/fqkline/get?param=sh600000,day,,2010-01-14,2000,",
+      "count": 2000,
+      "first": "2001-07-04",
+      "last": "2010-01-14",
+      "bytes": 127147,
+      "seconds": 0.33,
+      "sha256_16": "b38860b6faf2dc6e",
+      "page": 2,
+      "end_anchor": "2010-01-14"
+    },
+    {
+      "url": "https://web.ifzq.gtimg.cn/appstock/app/fqkline/get?param=sh600000,day,,2001-07-03,2000,",
+      "count": 388,
+      "first": "1999-11-10",
+      "last": "2001-07-03",
+      "bytes": 26085,
+      "seconds": 0.29,
+      "sha256_16": "e67f18a7af38c197",
+      "page": 3,
+      "end_anchor": "2001-07-03"
+    },
+    {
+      "url": "https://web.ifzq.gtimg.cn/appstock/app/fqkline/get?param=sh600000,day,,1999-11-09,2000,",
+      "count": 0,
+      "first": null,
+      "last": null,
+      "bytes": 1574,
+      "seconds": 0.35,
+      "sha256_16": "68b33261f870cb12",
+      "page": 4,
+      "end_anchor": "1999-11-09"
+    }
+  ]
+}
