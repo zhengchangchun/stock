@@ -44,7 +44,9 @@ elif [ -f pytest.ini ] || [ -f pyproject.toml ]; then
   if [ ! -x "$PY" ]; then
     echo "  ❌ 缺少 $PY —— 请先运行: /opt/nanobot-venv/bin/python -m venv .venv"; fail=1
   else
-    echo "  ▶ $PY -m pytest -q"; "$PY" -m pytest -q || fail=1
+    # 不要再加 `-q`：pyproject 的 `addopts` 已有 `-q`，叠加成 `-qq` 会把
+    # `N passed` 汇总行整个吃掉，导致「贴不出通过条数」（见 ERROR_DIARY 2026-09-15）。
+    echo "  ▶ $PY -m pytest"; "$PY" -m pytest || fail=1
   fi
 elif [ -f Makefile ] && grep -qE '^test:' Makefile; then
   echo "  ▶ make test"; make test || fail=1

@@ -371,6 +371,96 @@ def cmd_backtest_run(args: argparse.Namespace) -> int:
     return 0
 
 
+# ---------- backtest walkforward（离线；样本量实证，无策略结论） ----------
+
+def cmd_backtest_walkforward(args: argparse.Namespace) -> int:
+    """用**真实数据**切一次 walk-forward，回答「样本外样本量够不够」。
+
+    **本命令不产生任何策略绩效结论**：它只报折分与样本量（交易日口径），
+    不做预测、不评估策略、不比较基准。目的是在写第一个策略之前，
+    先知道现有数据能不能支撑 120 个样本外交易日（R6 硬门槛）。
+
+    数据入口沿用回测的硬规则：价格必须来自 `adjust.load_bars_adjusted`
+    （复权读取层），复权链不可用的标的进 `skipped` 且**不回退**到不复权。
+    """
+    from stocklab.backtest.walkforward import (InsufficientData, build_report,
+                                               render_markdown)
+    from stocklab.calendar.trading_calendar import Calendar
+    from stocklab.data import adjust
+
+    as_of = args.as_of or args.end or _today()
+    conn = connect(paths.DB_PATH)
+    try:
+        universe = _load_universe(conn)
+        wanted = [i for i in universe if not args.code or i.code in args.code]
+        dates_by_code: dict[str, list[str]] = {}
+        skipped: dict[str, str] = {}
+        for inst in wanted:
+            try:
+                loaded = adjust.load_bars_adjusted(conn, inst.code, as_of,
+                                                   start=args.start or None)
+            except adjust.AdjustError as exc:
+                skipped[inst.code] = f"{type(exc).__name__}: {exc}"
+                continue
+            if loaded:
+                dates_by_code[inst.code] = [b.date for b in loaded]
+        if not dates_by_code:
+            print(json.dumps({"error": "没有可用标的（全部被复权链拒绝）",
+                              "skipped": skipped}, ensure_ascii=False))
+            return 1
+
+        calendar = Calendar.load(conn)
+        # 会话轴 = 各标的行情日期的**交集**（公共交易日）。
+        # 用交集而非并集：并集会让某些折的样本外窗口里「只有一部分标的有数据」，
+        # 各折的标的集合不一致 → 折与折之间不可比。交集保证每折口径相同。
+        # 代价是短历史标的会拉窄全局窗口 —— 所以下面把「被裁掉多少」如实报出来。
+        per_code = {c: sorted(d) for c, d in dates_by_code.items()}
+        axis = sorted(set.intersection(*(set(v) for v in per_code.values())))
+        dropped = {c: len(v) - len(set(v) & set(axis)) for c, v in per_code.items()}
+        if args.start:
+            axis = [d for d in axis if d >= args.start]
+        if args.end:
+            axis = [d for d in axis if d <= args.end]
+        # 交叉核对：轴上的日期必须是真交易日（日历没覆盖到的日期不算样本）
+        axis = [d for d in axis if calendar.is_open(d)]
+
+        report = build_report(
+            generated=_today(), axis=axis, dates_by_code=dates_by_code,
+            train=args.train, test=args.test, step=args.step, embargo=args.embargo,
+            skipped=skipped, threshold=args.threshold,
+        )
+        # 公共轴把各标的的私有区间裁掉了多少（如实报出，不静默）
+        report["session_axis"]["mode"] = "intersection"
+        report["session_axis"]["dropped_by_code"] = dropped
+
+    except InsufficientData as exc:
+        # 显式失败：0 折不是「没有结论」，是「没跑」。退出码 2 让调度方能把
+        # 「跑完了但样本量未达标」与「根本没跑成」区分开。
+        print(f"❌ {exc}", file=sys.stderr)
+        return 2
+    finally:
+        conn.close()
+
+    out_md = Path(args.out) if args.out else (paths.REPORT_DIR / f"{_today()}-walkforward.md")
+    out_json = out_md.with_suffix(".json")
+    out_md.parent.mkdir(parents=True, exist_ok=True)
+    out_md.write_text(render_markdown(report), encoding="utf-8")
+    out_json.write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
+
+    ss, th = report["sample_size"], report["threshold"]
+    print(f"折数: {len(report['folds'])}")
+    print(f"会话轴: {report['session_axis']['start']} ~ {report['session_axis']['end']}"
+          f"（{report['session_axis']['n_sessions']} 个交易日）")
+    print(f"样本外交易日: {ss['effective_n']} | 标的-日行数: {ss['oos_rows']}"
+          f" | 标的数: {ss['n_codes']}")
+    print(f"门槛 {th['threshold']} 交易日: {'✅ 达标' if th['meets'] else '❌ 未达标'}"
+          f"（差 {th['deficit_days']} 日 / 还需 {th['extra_sessions_needed']} 个交易日"
+          f" ≈ {th['extra_years_needed']:.2f} 年）")
+    print(f"跳过（复权链拒绝，不回退）: {skipped or '无'}")
+    print(f"📄 {out_md}\n📄 {out_json}")
+    return 0
+
+
 # ---------- features ----------
 
 def _bar_from_row(row) -> "Bar":
@@ -564,6 +654,27 @@ def build_parser() -> argparse.ArgumentParser:
     bt_run.add_argument("--benchmark", default="index_300",
                         help="基准键（默认 index_300；无数据则报 UNDETERMINED）")
     bt_run.set_defaults(func=cmd_backtest_run)
+
+    bt_wf = bt_sub.add_parser(
+        "walkforward", help="walk-forward 折分 + 样本量实证（不产生策略结论）")
+    bt_wf.add_argument("--code", action="append", default=None,
+                       help="标的（默认全部 active 股票），可重复")
+    bt_wf.add_argument("--start", default=None, help="会话轴起始日期")
+    bt_wf.add_argument("--end", default=None, help="会话轴结束日期")
+    bt_wf.add_argument("--as-of", default=None, help="复权锚点日期（默认=end/今天）")
+    bt_wf.add_argument("--train", type=int, default=250,
+                       help="训练窗长度（交易日，默认 250 ≈ 1 年）")
+    bt_wf.add_argument("--test", type=int, default=21,
+                       help="测试窗长度（交易日，默认 21 ≈ 1 月）")
+    bt_wf.add_argument("--step", type=int, default=None,
+                       help="相邻折步进（默认 = --test，测试窗首尾相接）")
+    bt_wf.add_argument("--embargo", type=int, default=5,
+                       help="训练窗末尾剔除的交易日数（默认 5 ≈ 1 周，防标签跨切分点泄漏）")
+    bt_wf.add_argument("--threshold", type=int, default=120,
+                       help="样本外交易日硬门槛（默认 120，见 CLAUDE.md 度量纪律）")
+    bt_wf.add_argument("--out", default=None,
+                       help="报告输出路径（默认 reports/<日期>-walkforward.md）")
+    bt_wf.set_defaults(func=cmd_backtest_walkforward)
 
     doctor = sub.add_parser("doctor", help="数据健康度报告（离线）")
     doctor.set_defaults(func=lambda _a: cmd_doctor())

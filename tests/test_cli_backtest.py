@@ -5,7 +5,7 @@ import json
 import pytest
 
 from stocklab.cli.main import (build_parser, cmd_adj_rebuild, cmd_backtest_run,
-                               cmd_ingest_index)
+                               cmd_backtest_walkforward, cmd_ingest_index)
 from stocklab.config import paths
 from stocklab.config.universe import DEFAULT_UNIVERSE
 from stocklab.data.models import Bar, CorpAction
@@ -194,3 +194,74 @@ def test_backtest_run_reports_benchmark_when_index_present(tmp_db, monkeypatch,
     assert out["benchmark"]["status"] == "OK"
     assert out["benchmark"]["benchmark_return"] == pytest.approx(0.025)
     assert out["benchmark"]["excess_return"] is not None
+
+
+# ---------- backtest walkforward（Task 24：样本量实证，不产生策略结论） ----------
+
+def test_walkforward_subcommand_defaults():
+    args = build_parser().parse_args(["backtest", "walkforward"])
+    assert args.func is cmd_backtest_walkforward
+    assert (args.train, args.test, args.step, args.embargo) == (250, 21, None, 5)
+    assert args.threshold == 120          # R6 硬门槛
+    assert args.out is None               # 默认落到 reports/<日期>-walkforward.md
+
+
+def test_walkforward_writes_report_and_is_reproducible(tmp_db, monkeypatch,
+                                                       capsys, tmp_path):
+    monkeypatch.setattr(paths, "DB_PATH", tmp_db)
+    _seed(tmp_db)
+
+    def run(out):
+        args = _args(code=["000333"], start=None, end=None, as_of=DATES[-1],
+                     out=str(out), train=2, test=2, step=None, embargo=1,
+                     threshold=120)
+        assert cmd_backtest_walkforward(args) == 0
+        capsys.readouterr()
+        return json.loads(out.with_suffix(".json").read_text(encoding="utf-8"))
+
+    a = run(tmp_path / "a.md")
+    b = run(tmp_path / "b.md")
+    assert a == b, "同一输入必须得到同一折分（可复现）"
+    assert a["sample_size"]["unit"] == "trading_day"
+    assert a["disclosure"]["strategy_conclusion"] is None
+    md = (tmp_path / "a.md").read_text(encoding="utf-8")
+    assert "样本外**交易日**" in md
+    assert "标的-日行数" in md
+
+
+def test_walkforward_insufficient_data_exits_2(tmp_db, monkeypatch, capsys,
+                                               tmp_path):
+    """数据太短必须**显式失败**（退出码 2），不得静默产出 0 折报告。"""
+    monkeypatch.setattr(paths, "DB_PATH", tmp_db)
+    _seed(tmp_db)
+    args = _args(code=["000333"], start=None, end=None, as_of=DATES[-1],
+                 out=str(tmp_path / "x.md"), train=10, test=5, step=None,
+                 embargo=0, threshold=120)
+    assert cmd_backtest_walkforward(args) == 2
+    err = capsys.readouterr().err
+    assert "会话数不足" in err
+    assert not (tmp_path / "x.md").exists(), "失败时不允许留下半成品报告"
+
+
+def test_walkforward_refuses_unusable_chain_without_fallback(tmp_db, monkeypatch,
+                                                             capsys, tmp_path):
+    """复权链不可用的标的进 skipped 且不回退到不复权（与 backtest run 同规则）。"""
+    from stocklab.data.models import CorpAction
+
+    monkeypatch.setattr(paths, "DB_PATH", tmp_db)
+    _seed(tmp_db)
+    conn = connect(tmp_db)
+    # content="" → 条款解析不出来 → 该事件不可定价 → 整条链对跨窗口拒绝
+    repo.insert_corp_actions(conn, [CorpAction("000333", DATES[2], DATES[1], "",
+                                               None, "test")], now=NOW)
+    conn.close()
+    args = _args(code=["000333"], start=None, end=None, as_of=DATES[-1],
+                 out=str(tmp_path / "y.md"), train=2, test=2, step=None,
+                 embargo=0, threshold=120)
+    assert cmd_backtest_walkforward(args) == 1
+    out = json.loads(capsys.readouterr().out)
+    assert "000333" in out["skipped"]
+    # 实测抛出的是 MissingFactor（读取层对「跨缺口窗口」的拒绝），
+    # 且错误信息必须给出可执行的补救（usable_from 提示），而不是一句「失败了」。
+    assert out["skipped"]["000333"].startswith("MissingFactor")
+    assert "start >=" in out["skipped"]["000333"]
