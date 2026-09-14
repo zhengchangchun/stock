@@ -78,7 +78,8 @@ def market_axis(conn: sqlite3.Connection) -> set[str]:
         "SELECT code FROM instruments WHERE active=1 AND type='stock'")])
 
 
-def assert_session(conn: sqlite3.Connection, calendar: Calendar, asof: str) -> None:
+def assert_session(conn: sqlite3.Connection, calendar: Calendar, asof: str, *,
+                   cache: PitCache | None = None) -> None:
     """`asof` 必须同时落在日历与**市场**行情轴上（**取交集**）。
 
     - 不在日历 → 「那天根本不开市」；
@@ -91,7 +92,8 @@ def assert_session(conn: sqlite3.Connection, calendar: Calendar, asof: str) -> N
             f"{asof} 不在 trading_calendar（日历最早 {calendar.all_dates[0]}、"
             f"最晚 {calendar.all_dates[-1]}）—— 非交易日，拒绝出预测"
         )
-    if asof not in market_axis(conn):
+    axis = cache.market_axis(conn) if cache is not None else market_axis(conn)
+    if asof not in axis:
         raise NotASession(
             f"{asof} 在日历里是交易日，但库里没有任何标的当天有 K 线"
             "（采集缺口）—— 拒绝出预测"
@@ -134,12 +136,79 @@ def _weekday(y: int, m: int, d: int) -> int:
 
 # ---------- PIT 取数 ----------
 
-def load_pit_bars(conn: sqlite3.Connection, code: str, asof: str) -> list[Bar]:
+class PitCache:
+    """批量回放期的**只读记忆化**（默认为 `None`，单日 `predict` 不用它）。
+
+    ## 为什么需要
+
+    `load_chain` 要把该标的**全部** K 线读出来并按事件累乘因子（600690 有 7807 根），
+    `market_axis` 要扫全表 DISTINCT 日期，`Calendar.load` 要读整张日历 ——
+    这些量**都不随 `asof` 变化**。单日预测各算一次没问题，但历史回放要跑几千天，
+    实测单日 0.16 秒里绝大部分花在重算这些不变量上（3000 天 ≈ 8 分钟）。
+
+    ## 为什么它不改变结果
+
+    缓存的只是「输入不变则输出不变」的**只读派生量**（因子链、日历、行情轴、原始 K 线）；
+    每次仍然重新 `assert_blackout_current`（它会因库变化而报错，不能缓存判断结果）
+    并重新 `adjust_bars(as_of)`。`test_backfill_payloads_match_predict_run`
+    逐日比对 `payload_sha256`，把「缓存版 == 非缓存版」钉死。
+    """
+
+    def __init__(self) -> None:
+        self._chains: dict[str, tuple] = {}
+        self._usable: dict[str, str | None] = {}
+        self._raw: dict[str, tuple] = {}
+        self._calendar: Calendar | None = None
+        self._axis: set[str] | None = None
+
+    def chain(self, conn: sqlite3.Connection, code: str) -> tuple:
+        if code not in self._chains:
+            self._chains[code] = adjust.load_chain(conn, code)
+        return self._chains[code]
+
+    def usable_from(self, conn: sqlite3.Connection, code: str) -> str | None:
+        if code not in self._usable:
+            self._usable[code] = adjust.usable_from(conn, code)
+        return self._usable[code]
+
+    def raw_bars(self, conn: sqlite3.Connection, code: str) -> tuple[list[Bar], set[str]]:
+        """该标的**全量**不复权 K 线 + 停牌日集合（读一次，之后按日期过滤）。"""
+        if code not in self._raw:
+            self._raw[code] = _read_raw(conn, code)
+        return self._raw[code]
+
+    def calendar(self, conn: sqlite3.Connection) -> Calendar:
+        if self._calendar is None:
+            self._calendar = Calendar.load(conn)
+        return self._calendar
+
+    def market_axis(self, conn: sqlite3.Connection) -> set[str]:
+        if self._axis is None:
+            self._axis = market_axis(conn)
+        return self._axis
+
+
+def _read_raw(conn: sqlite3.Connection, code: str) -> tuple[list[Bar], set[str]]:
+    """全量不复权 K 线 + 停牌日集合（`PitCache.raw_bars` 的底层读取）。"""
+    rows = conn.execute(
+        "SELECT date, open, high, low, close, volume, amount, turnover, source,"
+        " adj_mode, is_suspended FROM bars_daily WHERE code=? ORDER BY date",
+        (code,)).fetchall()
+    bars = [Bar(code=code, date=r["date"], open=r["open"], high=r["high"],
+                low=r["low"], close=r["close"], volume=r["volume"],
+                amount=r["amount"], turnover=r["turnover"], source=r["source"],
+                adj_mode=r["adj_mode"]) for r in rows]
+    return bars, {r["date"] for r in rows if r["is_suspended"]}
+
+
+def load_pit_bars(conn: sqlite3.Connection, code: str, asof: str, *,
+                  cache: PitCache | None = None) -> list[Bar]:
     """读 `code` 在 `asof`（含）之前的**复权**日 K。
 
     复权链不可用的区间 → `UnusableWindow`（**硬拒绝，无回退分支**）。
     """
-    floor = adjust.usable_from(conn, code)
+    floor = (cache.usable_from(conn, code) if cache is not None
+             else adjust.usable_from(conn, code))
     if floor is not None and asof < floor:
         raise UnusableWindow(
             f"{code} 在 {asof} 没有可用的复权窗口：该标的复权链的可用下界是 {floor}"
@@ -147,7 +216,13 @@ def load_pit_bars(conn: sqlite3.Connection, code: str, asof: str) -> list[Bar]:
             "**拒绝回退到不复权价** —— 那会算出一个数字合法、结论全错的预测"
         )
     # start=floor：把窗口显式挪到可用下界（None 时表示全历史都可用）
-    return adjust.load_bars_adjusted(conn, code, asof, start=floor)
+    if cache is None:
+        return adjust.load_bars_adjusted(conn, code, asof, start=floor)
+    bars, chain = cache.chain(conn, code)
+    # 不缓存这个判断：它会在「库里的缺口记录与链不同源」时报错，
+    # 那是个**应当被重新发现**的事实，不是不变量。
+    adjust.assert_blackout_current(conn, code, chain)
+    return adjust.adjust_bars(bars, chain, asof, code=code, start=floor)
 
 
 # ---------- 策略证据 ----------
@@ -209,7 +284,8 @@ def active_weights(evidence: Sequence[dict]) -> dict[str, float]:
 # ---------- 组装 ----------
 
 def build_predictions(conn: sqlite3.Connection, asof: str,
-                      codes: Sequence[str] | None = None) -> dict:
+                      codes: Sequence[str] | None = None, *,
+                      cache: PitCache | None = None) -> dict:
     """算出 `asof` 的全部预测载荷（**不写库**；落库由 CLI/调用方决定）。
 
     返回一份可直接落盘的报告 dict，**不含任何时间戳** ——
@@ -222,15 +298,15 @@ def build_predictions(conn: sqlite3.Connection, asof: str,
             "SELECT code FROM instruments WHERE active=1 AND type='stock'"
             " ORDER BY code")]
     codes = list(codes)
-    calendar = Calendar.load(conn)
-    assert_session(conn, calendar, asof)
+    calendar = cache.calendar(conn) if cache is not None else Calendar.load(conn)
+    assert_session(conn, calendar, asof, cache=cache)
     target_date, td_source = resolve_target_date(calendar, asof)
 
     history: dict[str, list[Bar]] = {}
     skipped: dict[str, str] = {}
     for code in codes:
         try:
-            rows = load_pit_bars(conn, code, asof)
+            rows = load_pit_bars(conn, code, asof, cache=cache)
         except (adjust.AdjustError, UnusableWindow) as exc:
             skipped[code] = f"{type(exc).__name__}: {exc}"
             continue

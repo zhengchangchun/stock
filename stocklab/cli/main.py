@@ -755,6 +755,151 @@ def cmd_predict_run(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_verify_run(args: argparse.Namespace) -> int:
+    """给 `target_date` 的全部预测打分并落库（**离线只读** bars/adj + 写 verifications）。
+
+    三件必须显式说出来的事（都不许静默）：
+
+      - **不可评分**：结果列全空 + `attribution_auto=DATA` + 原因码；照样落库，
+        但不进任何成功分母。目标日还没产生 K 线时这是**正常结论**，不是错误；
+      - **归因**：程序只写 `DATA`；`SIGNAL/STRATEGY/MODEL/NOISE` 一律 `UNDETERMINED`，
+        等人工在 `attribution_manual` 列回填（§9）；
+      - **补分**：上次不可评分、这次数据到了 → 更新结果列并打印 ⚠️（唯一允许的更新）。
+
+    退出码：0 全部落库（含幂等 `identical`）/ 2 该日没有任何预测 / 1 内容冲突（**不覆盖**）。
+    """
+    from stocklab.verify.service import NoPredictions, verify_target
+    from stocklab.verify.store import VerificationConflict
+
+    db = Path(args.db) if args.db else paths.DB_PATH
+    if not db.exists():
+        print(json.dumps({"error": "db not found; run `stocklab db init`"},
+                         ensure_ascii=False), file=sys.stderr)
+        return 2
+    report_dir = Path(args.report_dir) if args.report_dir else paths.REPORT_DIR
+    report_dir.mkdir(parents=True, exist_ok=True)
+    now = datetime.now(TZ).isoformat(timespec="seconds")
+
+    conn = connect(db)
+    try:
+        try:
+            rep = verify_target(conn, args.target_date, codes=args.code, now=now)
+        except NoPredictions as exc:
+            print(f"❌ {exc}", file=sys.stderr)
+            return 2
+        except VerificationConflict as exc:
+            print(f"❌ {exc}", file=sys.stderr)
+            return 1
+    finally:
+        conn.close()
+
+    path = Path(args.report) if args.report else \
+        report_dir / f"{_today()}-verify-{args.target_date}.json"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    # 与 `predict run` 同纪律：文件里**不放运行态**（storage 在两次运行间会变：
+    # inserted → identical），所以「同输入两次运行 sha256 相等」本身就是幂等证据。
+    blob = json.dumps(_strip_run_state(rep), ensure_ascii=False, sort_keys=True,
+                      indent=2) + "\n"
+    path.write_text(blob, encoding="utf-8")
+    digest = hashlib.sha256(blob.encode("utf-8")).hexdigest()
+
+    print(json.dumps({"report": str(path), "sha256": digest,
+                      "target_date": rep["target_date"],
+                      "storage": rep["storage"],
+                      "by_model_version": rep["by_model_version"]},
+                     ensure_ascii=False, indent=2))
+    for code in rep["unscorable"]:
+        print(f"⚠️  {code['code']} [{code['model_version']}] 不可评分："
+              f"{code['reason_code']} —— {code['reason']}", file=sys.stderr)
+    for pred_id, state in sorted(rep["storage"].items()):
+        if state.startswith("rescored_after_data_gap"):
+            print(f"⚠️  pred_id={pred_id} 上次不可评分（数据未到），本次已补分"
+                  f"（{state}）—— 这是 ADR-002 允许的唯一一种结果列更新",
+                  file=sys.stderr)
+    return 0
+
+
+def cmd_verify_backfill(args: argparse.Namespace) -> int:
+    """历史回放：逐日 `predict` + 次日打分，产出**第一份准确率报告**（**离线只读**）。
+
+    报告里的每个数字都来自库里的 `verifications` 行（不是内存里攒的），
+    所以「同 `--from/--to` 重复跑 → 报告逐字节一致」是结构性的，不是碰巧。
+
+    退出码：0 完成（含全部幂等 `identical`）/ 2 用法或数据库问题 / 1 有预测冲突。
+    """
+    from stocklab.predict.service import PitCache
+    from stocklab.verify.replay import backfill, load_verification_rows
+    from stocklab.verify.report import render_markdown, summarize
+
+    db = Path(args.db) if args.db else paths.DB_PATH
+    if not db.exists():
+        print(json.dumps({"error": "db not found; run `stocklab db init`"},
+                         ensure_ascii=False), file=sys.stderr)
+        return 2
+    report_dir = Path(args.report_dir) if args.report_dir else paths.REPORT_DIR
+    report_dir.mkdir(parents=True, exist_ok=True)
+
+    conn = connect(db)
+    try:
+        rep = backfill(conn, args.from_date, args.to_date, codes=args.code,
+                       cache=PitCache(), progress=_progress)
+        if rep["conflicts"]:
+            for key, msg in sorted(rep["conflicts"].items()):
+                print(f"❌ {key} 预测落库冲突：{msg}", file=sys.stderr)
+            return 1
+        rows = load_verification_rows(conn, args.from_date, args.to_date)
+    finally:
+        conn.close()
+
+    summary = summarize(rows, from_date=args.from_date, to_date=args.to_date)
+    md = render_markdown(summary)
+    path = Path(args.report) if args.report else (
+        report_dir / f"{_today()}-accuracy-{args.from_date}-{args.to_date}.md")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    # 逐字节可复现：正文**不含**生成时间，只含区间与数字（见 verify/report.py）
+    path.write_text(md, encoding="utf-8")
+    digest = hashlib.sha256(md.encode("utf-8")).hexdigest()
+    json_path = path.with_suffix(".json")
+    json_path.write_text(json.dumps(summary, ensure_ascii=False, sort_keys=True,
+                                    indent=2) + "\n", encoding="utf-8")
+
+    print(json.dumps({
+        "report": str(path), "summary_json": str(json_path), "sha256": digest,
+        "from": args.from_date, "to": args.to_date,
+        "n_targets": rep["n_sessions_in_range"],
+        "n_verified_days": len({r["target_date"] for r in rows}),
+        "n_rows": len(rows),
+        "skipped": rep["skipped"],
+        "by_model_version": {
+            mv: {"n": g["n_predictions"], "scorable": g["n_scorable"],
+                 "unscorable": g["n_unscorable"],
+                 "effective_n_days": g["effective_n"],
+                 "direction_accuracy_row": g["direction"]["accuracy_row"],
+                 "direction_accuracy_daily": g["direction"]["accuracy_daily"],
+                 "brier_row": g["direction"]["brier_row"],
+                 "range_coverage_row": g["range"]["coverage_row"],
+                 "sample_gate": g["sample_gate"]["label"]}
+            for mv, g in summary["model_versions"].items()},
+    }, ensure_ascii=False, indent=2))
+    return 0
+
+
+def _progress(target: str, done: int, total: int) -> None:
+    if done % 250 == 0 or done == total:
+        print(f"  … 回放 {done}/{total} 天（最近 {target}）", file=sys.stderr)
+
+
+def _strip_run_state(rep: dict) -> dict:
+    """去掉「这次跑成什么样」的信息（storage / verification_id 之外的运行态）。
+
+    留下的只有**内容**：预测 id、分数、原因、分组。两次运行内容一致 → 文件一致。
+    """
+    out = {k: v for k, v in rep.items() if k != "storage"}
+    out["rows"] = [{k: v for k, v in row.items() if k != "storage"}
+                   for row in rep["rows"]]
+    return out
+
+
 def cmd_features_build(date: str, codes: list[str] | None) -> int:
     """为指定日期构建全部标的的特征快照（**离线**，只读 `bars_daily` + `adj_factors`）。
 
@@ -1000,6 +1145,31 @@ def build_parser() -> argparse.ArgumentParser:
     pred_run.add_argument("--report-dir", dest="report_dir", help="报告目录")
     pred_run.add_argument("--db", help="数据库路径（默认 data/stocklab.db）")
     pred_run.set_defaults(func=cmd_predict_run)
+
+    ver = sub.add_parser("verify", help="验证器（离线只读；次日打分 + 归因 + 落库）")
+    ver_sub = ver.add_subparsers(dest="verify_cmd", required=True)
+    ver_run = ver_sub.add_parser(
+        "run", help="给 target_date 的全部预测打分并落库（PIT：只用 <= target_date 的行）")
+    ver_run.add_argument("--target-date", dest="target_date", required=True,
+                         help="被验证的目标交易日 YYYY-MM-DD")
+    ver_run.add_argument("--code", action="append",
+                         help="只验证指定标的（可重复）；默认全部")
+    ver_run.add_argument("--report", help="报告输出路径（默认 reports/<today>-verify-<target>.json）")
+    ver_run.add_argument("--report-dir", dest="report_dir", help="报告目录")
+    ver_run.add_argument("--db", help="数据库路径（默认 data/stocklab.db）")
+    ver_run.set_defaults(func=cmd_verify_run)
+
+    ver_bf = ver_sub.add_parser(
+        "backfill", help="历史回放：逐日 predict + 次日打分，产出准确率报告")
+    ver_bf.add_argument("--from", dest="from_date", required=True,
+                        help="回放起点（按 **target_date** 计）")
+    ver_bf.add_argument("--to", dest="to_date", required=True,
+                        help="回放终点（按 **target_date** 计）")
+    ver_bf.add_argument("--code", action="append", help="只跑指定标的（可重复）")
+    ver_bf.add_argument("--report", help="报告输出路径（默认 reports/<today>-accuracy-<from>-<to>.md）")
+    ver_bf.add_argument("--report-dir", dest="report_dir", help="报告目录")
+    ver_bf.add_argument("--db", help="数据库路径（默认 data/stocklab.db）")
+    ver_bf.set_defaults(func=cmd_verify_backfill)
 
     doctor = sub.add_parser("doctor", help="数据健康度报告（离线）")
     doctor.set_defaults(func=lambda _a: cmd_doctor())

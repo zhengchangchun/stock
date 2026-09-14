@@ -231,6 +231,14 @@ CREATE TABLE IF NOT EXISTS verifications (
     created_at        TEXT NOT NULL
 );
 
+-- 结构性第二道防线（P7）：一个 `pred_id` 只能有**一条**验证记录。
+-- `verifications` 是准确率的账本：同一份预测同一根 bar 出现两行，
+-- 统计时就得去重，而「当前成绩是什么」会变成谁也说不清的事。
+-- 补分（不可评分 → 可评分）走 UPDATE 结果列、**不新增行**，故与唯一索引不冲突
+-- （ADR-002：身份列不可变 + 结果列可更新 + DELETE 全禁）。
+CREATE UNIQUE INDEX IF NOT EXISTS uq_verifications_identity
+    ON verifications (pred_id);
+
 -- ---------- 策略 ----------
 CREATE TABLE IF NOT EXISTS strategy_registry (
     strategy_id   TEXT NOT NULL,
