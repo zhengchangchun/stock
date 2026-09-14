@@ -10,7 +10,7 @@ EXPECTED_TABLES = {
     "features_daily", "predictions", "verifications",
     "strategy_registry", "strategy_daily", "sim_portfolio", "sim_trades",
     "real_trades", "decisions", "data_quality", "system_events",
-    "raw_fetch_cache", "job_runs",
+    "raw_fetch_cache", "job_runs", "adj_factor_blackout",
 }
 
 

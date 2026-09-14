@@ -15,6 +15,8 @@
 
 from __future__ import annotations
 
+import re
+from dataclasses import replace
 from datetime import date, timedelta
 
 from stocklab.config.settings import Settings
@@ -103,6 +105,32 @@ def fetch_daily_bars(
 
     out = [b for d, b in sorted(collected.items()) if start <= d <= end]
     return out
+
+
+#: 指数符号：源站形式（沪深300 = `sh000300`），**不是** 6 位数字。
+#: `000300` 在 A 股同时是基金代码，用 6 位会把指数与基金混进同一个键空间。
+_INDEX_SYMBOL = re.compile(r"^(sh|sz|bj)\d{6}$")
+
+
+def fetch_index_daily(client, *, symbol: str, start: str, end: str,
+                      page: int = MAX_COUNT, max_pages: int = MAX_PAGES) -> list[Bar]:
+    """抓取**指数**日线（Task 23 的 index_300 基准，复用腾讯 `fqkline` 不复权口径）。
+
+    - 指数无复权概念（无分红送转）→ 一律 `adj_mode="none"`（铁律①，正好一致）；
+    - `Bar.code` 用源站符号（`sh000300`），不用 6 位数字 —— 见 `_INDEX_SYMBOL`；
+    - 翻页/上限/静默降级守卫全部复用 `fetch_daily_bars`（同一份实测结论）。
+    - 指数的 `volume` 是源站口径 ×100（手→股），**只作停牌判据**，不用于成交额。
+
+    基准缺失时的正确姿势是显式 `UNDETERMINED`（见 `backtest.benchmark`），
+    而不是拿个股行情凑一个「指数」。
+    """
+    if not _INDEX_SYMBOL.match(symbol or ""):
+        raise ValueError(
+            f"指数符号必须形如 sh000300（市场前缀 + 6 位数字），得到 {symbol!r}"
+        )
+    bars = fetch_daily_bars(client, code=symbol, start=start, end=end, adj="",
+                            page=page, max_pages=max_pages)
+    return [replace(b, code=symbol) for b in bars]
 
 
 def _loads(text: str) -> dict:

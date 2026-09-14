@@ -139,6 +139,15 @@ def insert_adj_factors(conn: sqlite3.Connection, code: str, chain, *,
         " fetched_at=excluded.fetched_at",
         rows,
     )
+    # 不可用区间与因子**同批重写**（两者必须同源）：只写因子不写 blackout，
+    # 或反之，都会让「库里的可用性记录」与「链的真实缺口」不一致 ——
+    # 读取层会因此对一段算不出收益的历史放行（静默假收益）。
+    conn.execute("DELETE FROM adj_factor_blackout WHERE code=?", (code,))
+    conn.executemany(
+        "INSERT INTO adj_factor_blackout (code, cqr, reason, source, fetched_at)"
+        " VALUES (?,?,?,?,?)",
+        [(code, u.cqr, u.reason, source, now) for u in chain.unusable],
+    )
     conn.commit()
     return len(rows)
 

@@ -198,6 +198,179 @@ def cmd_ingest_actions(args: argparse.Namespace) -> int:
     return 0 if not failed else 1
 
 
+# ---------- ingest index（基准行情） ----------
+
+def cmd_ingest_index(args: argparse.Namespace) -> int:
+    """采集**指数**日线（联网；index_300 基准锚）。
+
+    落库口径固定 `adj_mode='none'`：指数没有分红送转，无复权概念 ——
+    这正好与「抓取层只落不复权」的铁律①一致（不用为指数开例外）。
+    代码用源站符号（`sh000300`），避免与 6 位基金/个股代码撞键。
+    """
+    from stocklab.calendar.trading_calendar import Calendar
+    from stocklab.data.fetch import fetch_index_daily, policy_from_settings
+    from stocklab.data.http import HttpClient
+    from stocklab.data.raw_cache import RawCache
+
+    paths.ensure_dirs()
+    settings = load_settings()
+    now = datetime.now(TZ).isoformat(timespec="seconds")
+    start = args.start or (date.today() - timedelta(days=args.days)).isoformat()
+    end = args.end or _today()
+    cache = RawCache(paths.RAW_CACHE_DIR) if settings.cache_enabled else None
+    client = HttpClient(policy_from_settings(settings), cache=cache)
+
+    conn = connect(paths.DB_PATH)
+    try:
+        bars = fetch_index_daily(client, symbol=args.symbol, start=start, end=end)
+        if not bars:
+            repo.log_event(conn, "ingest", "error",
+                           f"{args.symbol} 指数行情为空（{start}~{end}）",
+                           context={"symbol": args.symbol}, now=now)
+            print(json.dumps({"symbol": args.symbol, "bars": 0, "error": "empty"},
+                             ensure_ascii=False))
+            return 1
+        written = repo.insert_bars(conn, bars, now=now)
+        # 交易日历的唯一来源是指数日线的日期集合（ADR-001 B4）：抓到更长历史时
+        # 顺带把日历前滚到同一窗口，否则回测的「交易日」仍被旧日历卡在 900 天里，
+        # 更早的 K 线会静默不参与（看着像「策略没交易」，实则日历没覆盖）。
+        n_cal = Calendar.from_dates(b.date for b in bars).save(
+            conn, source=f"tencent:{args.symbol}", now=now)
+        out = {"symbol": args.symbol, "bars": written, "calendar_rows": n_cal,
+               "start": start, "end": end,
+               "first_date": bars[0].date, "last_date": bars[-1].date,
+               "adj_mode": bars[0].adj_mode}
+    finally:
+        conn.close()
+    print(json.dumps(out, ensure_ascii=False))
+    return 0
+
+
+# ---------- adj rebuild（离线重算因子链 + 缺口） ----------
+
+def cmd_adj_rebuild(args: argparse.Namespace) -> int:
+    """由 `bars_daily` + `corp_actions` **离线**重算复权因子链与不可用区间。
+
+    幂等且无网络：因子是纯函数（ADR-004），源站修订分红后必须能重算覆盖。
+    同时重写 `adj_factor_blackout`（两者同源，缺一都会让读取层拒绝服务）。
+    只处理 6 位股票代码 —— 指数（源站符号）没有复权概念，不写因子行。
+    """
+    from stocklab.data import adjust
+
+    now = datetime.now(TZ).isoformat(timespec="seconds")
+    conn = connect(paths.DB_PATH)
+    out: dict = {"codes": {}}
+    try:
+        if args.code:
+            codes = list(args.code)
+        else:
+            codes = [r["code"] for r in conn.execute(
+                "SELECT DISTINCT code FROM bars_daily"
+                " WHERE code GLOB '[0-9][0-9][0-9][0-9][0-9][0-9]' ORDER BY code")]
+        for code in codes:
+            bars, chain = adjust.load_chain(conn, code)
+            if not bars:
+                out["codes"][code] = {"error": "bars_daily 无该标的数据"}
+                continue
+            n = repo.insert_adj_factors(conn, code, chain, source=args.source, now=now)
+            out["codes"][code] = {"factor_rows": n,
+                                  **adjust.chain_summary(chain)}
+    finally:
+        conn.close()
+    print(json.dumps(out, ensure_ascii=False))
+    return 0
+
+
+# ---------- backtest run（离线；复权价 + 成本 + 基准对照） ----------
+
+def _load_universe(conn) -> tuple:
+    from stocklab.config.universe import Instrument
+
+    return tuple(Instrument(r["code"], r["name"], r["market"], r["board"])
+                 for r in conn.execute(
+                     "SELECT code, name, market, board FROM instruments"
+                     " WHERE active=1 AND type='stock' ORDER BY code"))
+
+
+def cmd_backtest_run(args: argparse.Namespace) -> int:
+    """跑一次 buy_and_hold 回测并给出基准对照（**离线**，只读库）。
+
+    三条硬约束都在这里被真正执行：
+      ① 价格来自 `adjust.load_bars_adjusted`（复权读取层）→ 引擎再强制
+         `adj_mode='qfq'`，不复权价一行都进不来；
+      ② 复权链不可用（跨缺口）→ 读取层抛错，本命令把该标的记进 `skipped` 并**不**回退；
+      ③ 成本走 `CostModel`（含最低 5 元佣金），T+1 与涨跌停由 `Portfolio` 执行，
+         板别取自 `instruments.board`。
+    """
+    from stocklab.backtest.benchmark import compare_to_benchmark, resolve_benchmark
+    from stocklab.backtest.engine import run_backtest
+    from stocklab.backtest.strategies import BuyAndHold
+    from stocklab.calendar.trading_calendar import Calendar
+    from stocklab.config.costs import CostModel
+    from stocklab.data import adjust
+
+    as_of = args.as_of or args.end or _today()
+    conn = connect(paths.DB_PATH)
+    try:
+        universe = _load_universe(conn)
+        wanted = [i for i in universe if not args.code or i.code in args.code]
+        bars: dict = {}
+        skipped: dict = {}
+        for inst in wanted:
+            try:
+                loaded = adjust.load_bars_adjusted(conn, inst.code, as_of,
+                                                   start=args.start or None)
+            except adjust.AdjustError as exc:
+                skipped[inst.code] = f"{type(exc).__name__}: {exc}"
+                continue
+            if loaded:
+                bars[inst.code] = loaded
+        if not bars:
+            print(json.dumps({"error": "没有可用标的（全部被复权链拒绝）",
+                              "skipped": skipped}, ensure_ascii=False))
+            return 1
+
+        calendar = Calendar.load(conn)
+        strategy_code = args.code[0] if args.code else sorted(bars)[0]
+        start = args.start or bars[strategy_code][0].date
+        end = args.end or bars[strategy_code][-1].date
+        sessions = calendar.sessions(start, end)
+        # **实际成交窗口**可能比请求窗口窄（日历没覆盖到的日期不是交易日）：
+        # 报出真实区间，避免「请求 2001 年、实际只跑了 2013 年」这类看不出的错位。
+        eff_start = sessions[0] if sessions else None
+        eff_end = sessions[-1] if sessions else None
+        costs = CostModel()
+        res = run_backtest(bars, BuyAndHold(strategy_code), start=start, end=end,
+                           initial_cash=args.cash, costs=costs, calendar=calendar,
+                           universe=tuple(i for i in universe if i.code in bars))
+        bench = resolve_benchmark(conn, args.benchmark, start=start, end=end)
+        cmp = compare_to_benchmark(res.nav_points, args.cash, bench, costs)
+        out = {
+            "strategy": "buy_and_hold",
+            "code": strategy_code,
+            "start": start, "end": end,
+            "session_start": eff_start, "session_end": eff_end,
+            "initial_cash": args.cash,
+            "final_nav": res.nav_points[-1].nav,
+            "n_trades": len(res.trades),
+            "costs_total": res.costs_total,
+            "metrics": res.metrics,
+            "trades_sample": [vars(t) for t in res.trades[:3]],
+            "benchmark": cmp.as_dict(),
+            "skipped": skipped,
+            "disclosure": {
+                "costs_included": True,
+                "adjusted_prices": True,
+                "insample": True,
+                "note": "单标的 buy_and_hold 联通验证，非策略绩效结论（无 walk-forward）",
+            },
+        }
+    finally:
+        conn.close()
+    print(json.dumps(out, ensure_ascii=False, indent=2))
+    return 0
+
+
 # ---------- features ----------
 
 def _bar_from_row(row) -> "Bar":
@@ -359,6 +532,38 @@ def build_parser() -> argparse.ArgumentParser:
     ing_act.add_argument("--start", default=EARLIEST_ACTION_START,
                          help=f"事件回补起点（默认 {EARLIEST_ACTION_START} = 全历史）")
     ing_act.set_defaults(func=cmd_ingest_actions)
+
+    ing_idx = ing_sub.add_parser(
+        "index", help="采集指数日线（基准 index_300，adj_mode='none'）")
+    ing_idx.add_argument("--symbol", default="sh000300",
+                         help="指数符号（默认 sh000300 = 沪深300）")
+    ing_idx.add_argument("--days", type=int, default=4000,
+                         help="回补的日历天数（默认 4000 ≈ 11 年）")
+    ing_idx.add_argument("--start", default=None, help="起始日期 YYYY-MM-DD")
+    ing_idx.add_argument("--end", default=None, help="结束日期 YYYY-MM-DD")
+    ing_idx.set_defaults(func=cmd_ingest_index)
+
+    adj = sub.add_parser("adj", help="复权因子链（离线，只读 bars_daily + corp_actions）")
+    adj_sub = adj.add_subparsers(dest="adj_action")
+    adj_rebuild = adj_sub.add_parser(
+        "rebuild", help="重算因子链与不可用区间（幂等、离线）")
+    adj_rebuild.add_argument("--code", action="append", default=None,
+                             help="只重建指定代码，可重复；默认全部 6 位股票代码")
+    adj_rebuild.add_argument("--source", default="tencent")
+    adj_rebuild.set_defaults(func=cmd_adj_rebuild)
+
+    bt = sub.add_parser("backtest", help="回测（离线；复权价 + 成本 + 基准对照）")
+    bt_sub = bt.add_subparsers(dest="bt_action")
+    bt_run = bt_sub.add_parser("run", help="buy_and_hold 端到端回测 + 基准对照")
+    bt_run.add_argument("--code", action="append", default=None,
+                        help="回测标的（第一个作为策略标的），可重复")
+    bt_run.add_argument("--start", default=None, help="起始日期（默认由复权链可用下界决定）")
+    bt_run.add_argument("--end", default=None, help="结束日期")
+    bt_run.add_argument("--as-of", default=None, help="复权锚点日期（默认=end/今天）")
+    bt_run.add_argument("--cash", type=float, default=100_000.0, help="初始资金")
+    bt_run.add_argument("--benchmark", default="index_300",
+                        help="基准键（默认 index_300；无数据则报 UNDETERMINED）")
+    bt_run.set_defaults(func=cmd_backtest_run)
 
     doctor = sub.add_parser("doctor", help="数据健康度报告（离线）")
     doctor.set_defaults(func=lambda _a: cmd_doctor())

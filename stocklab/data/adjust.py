@@ -47,6 +47,14 @@ class MissingFactor(AdjustError):
     """请求的日期没有因子 —— 禁止回退到不复权。"""
 
 
+class StaleFactorTable(AdjustError):
+    """`adj_factor_blackout` 与复权链的真实缺口不一致（库里的可用性记录过期）。
+
+    读取层**宁可拒绝服务**也不放行：缺口记录一旦与链不同源，一段算不出收益的
+    历史就会被当成正常数据算进净值 —— 这是「非 NULL 的错误值」能活到下游的原因。
+    """
+
+
 @dataclass(frozen=True)
 class Terms:
     """每**股**的条款（已从「每 10 股」换算）。"""
@@ -295,9 +303,62 @@ def load_bars_adjusted(conn: sqlite3.Connection, code: str, as_of: str, *,
     一旦跨越不可定价事件就抛 `MissingFactor`（缺陷必须浮出来）。
     要主动放弃那段历史，调用方须**显式**传 `start=chain.usable_from` ——
     缩窗口是一个决定，不能由本函数替调用方默默做掉。
+
+    调用前先核对 `adj_factor_blackout` 与链的缺口**同源**：不一致时抛
+    `StaleFactorTable`，绝不放行。这样「库里有一堆非 NULL 的错误因子」这件事
+    不可能被静默消费（ADR-004 §无法定价事件）。
     """
     bars, chain = load_chain(conn, code)
+    assert_blackout_current(conn, code, chain)
     return adjust_bars(bars, chain, as_of, code=code, start=start)
+
+
+def load_blackouts(conn: sqlite3.Connection, code: str) -> dict[str, str]:
+    """读该标的的不可用区间：`{除权日: 原因}`。"""
+    return {r["cqr"]: r["reason"] for r in conn.execute(
+        "SELECT cqr, reason FROM adj_factor_blackout WHERE code=? ORDER BY cqr",
+        (code,))}
+
+
+def usable_from(conn: sqlite3.Connection, code: str) -> str | None:
+    """该标的复权链的可用下界（= 最晚一条黑名单事件的除权日）；无缺口返回 None。
+
+    语义：**早于**该日期的行情不可用于收益计算；`>=` 该日期的窗口可用
+    （窗口判据见 `adjust_bars`：`t_min < cqr <= base` 才算跨越）。
+    """
+    row = conn.execute(
+        "SELECT MAX(cqr) AS u FROM adj_factor_blackout WHERE code=?", (code,)
+    ).fetchone()
+    return row["u"] if row and row["u"] else None
+
+
+def assert_blackout_current(conn: sqlite3.Connection, code: str, chain: Chain) -> None:
+    """库里的缺口记录必须与链的真实缺口**完全一致**（不多、不少）。
+
+    少一条 = 一段算不出收益的历史被当成正常数据（静默假收益）；
+    多一条 = 记录过期，可能把可用区间误判为不可用。两者都拒绝服务，
+    并给出「怎么修」的指令。
+
+    **只在库里存有该标的因子行时才核对**：`adj_factor_blackout` 是
+    `adj_factors` 的可用性记录，没有因子行就无所谓「记录过期」；
+    而链本身的窗口校验（`adjust_bars`）在任何情况下都生效 ——
+    所以这个「跳过」不会放过任何跨缺口的窗口。
+    """
+    has_factors = conn.execute(
+        "SELECT 1 FROM adj_factors WHERE code=? LIMIT 1", (code,)).fetchone()
+    if has_factors is None:
+        return
+    stored = set(load_blackouts(conn, code))
+    declared = {u.cqr for u in chain.unusable}
+    if stored != declared:
+        missing = sorted(declared - stored)
+        extra = sorted(stored - declared)
+        raise StaleFactorTable(
+            f"{code} 的 adj_factor_blackout 与复权链缺口不一致："
+            f"链有而库中缺 {missing}，库中有而链没有 {extra}。"
+            "在修复前拒绝返回复权价（跨缺口的收益无法计算）。"
+            "修复：跑 `stocklab adj rebuild` 由 bars_daily + corp_actions 重算因子链"
+        )
 
 
 def chain_summary(chain: Chain) -> dict:

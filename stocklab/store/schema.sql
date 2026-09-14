@@ -69,6 +69,30 @@ CREATE TABLE IF NOT EXISTS adj_factors (
     PRIMARY KEY (code, date)
 );
 
+-- ---------- 复权链的「不可用区间」（ADR-004 §无法定价事件）----------
+-- 一行 = 一个**无法定价**的除权事件（`FHcontent` 为空 / 含配股 → 算不出复权系数 k）。
+-- 这类事件的 k 不进因子链，于是 `adj_factors` 在它之后的行**缺乘了一个 k**
+-- （数值非 NULL、看着正常，但拿它算跨越该事件的收益就是假的）。
+-- 600690 有 5 个此类事件，导致其 2001-01-15 之前的 1745 根 K 线不可用于收益计算。
+--
+-- 可用性判据（与 `adjust.adjust_bars` 共用同一语义，**不是**逐行标记）：
+--   窗口 [t_min, base] 可用  ⟺  不存在 blackout.cqr ∈ (t_min, base]
+-- 逐行打标无法表达这个判据（第 500 行的可用性取决于窗口起点），所以这里存
+-- **事件**而不是存「行的好坏」——语义精确，且不会出现「标记看着对、算法另算」。
+CREATE TABLE IF NOT EXISTS adj_factor_blackout (
+    code        TEXT NOT NULL,
+    cqr         TEXT NOT NULL,          -- 无法定价的除权日
+    reason      TEXT NOT NULL,          -- 为什么算不出来（原文/原因）
+    source      TEXT NOT NULL,
+    fetched_at  TEXT NOT NULL,
+    PRIMARY KEY (code, cqr)
+);
+
+-- 每个标的的可用下界：usable_from 之前的行情不可用于收益计算。
+CREATE VIEW IF NOT EXISTS v_adj_usable AS
+SELECT code, MAX(cqr) AS usable_from, COUNT(*) AS n_unusable
+FROM adj_factor_blackout GROUP BY code;
+
 CREATE TABLE IF NOT EXISTS money_flow_daily (
     code        TEXT NOT NULL,
     date        TEXT NOT NULL,
