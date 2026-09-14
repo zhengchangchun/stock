@@ -1,0 +1,25 @@
+{
+  "$schema": "https://json.schemastore.org/claude-code-settings.json",
+  "permissions": {
+    "allow": [
+      "Read",
+      "Glob",
+      "Grep",
+      "Edit",
+      "Write",
+      "Bash",
+      "Task",
+      "TodoWrite"
+    ],
+    "deny": [
+      "Bash(curl:*169.254.*)",
+      "Bash(curl:*10.*)",
+      "Bash(curl:*192.168.*)",
+      "Bash(curl:*127.*)",
+      "Bash(rm -rf /*)"
+    ]
+  },
+  "env": {
+    "PATH": "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/root/.claude/plugins/cache/superpowers-marketplace/claude-session-driver/4.0.0/bin:/root/.claude/plugins/cache/claude-plugins-official/superpowers/6.3.0/bin"
+  }
+}
