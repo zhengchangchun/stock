@@ -1,0 +1,12 @@
+{
+  "source": "tencent_fqkline",
+  "url": "https://web.ifzq.gtimg.cn/appstock/app/fqkline/get?param=sz000333,day,,2026-09-16,2000,",
+  "encoding": "utf-8",
+  "fetched_at": "2026-09-15T00:18:22+08:00",
+  "code": "sz000333",
+  "adj": "",
+  "requested_count": 2000,
+  "note": "真实网络响应（2026-09-15 Task 12 探针），非合成样本",
+  "sha256": "2b56fe3fcc20d3f868c0409cf6eb22b94ced7c3e1eabddd3d02709637657125f",
+  "name": "tencent_fqkline_day_sz000333_p2000"
+}
