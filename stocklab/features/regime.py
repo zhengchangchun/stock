@@ -37,7 +37,6 @@ def classify(close: pd.Series, *, ma_short: int = 20, ma_long: int = 60,
             f"ma_short({ma_short}) 必须小于 ma_long({ma_long})；"
             "写反会静默产出完全相反的标签"
         )
-    _ = vol_window
     fast = sma(close, ma_short)
     slow = sma(close, ma_long)
     spread = (fast - slow) / slow
