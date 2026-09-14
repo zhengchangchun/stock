@@ -1,0 +1,34 @@
+# OS
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+
+# IDE
+.vscode/
+.idea/
+*.iml
+
+# Environment
+.env
+.env.local
+.env.*.local
+
+# Build
+dist/
+build/
+*.tsbuildinfo
+
+# Dependencies
+node_modules/
+vendor/
+__pycache__/
+*.pyc
+
+# Logs
+*.log
+
+# Claude Code - local/user-specific (keep skills symlink)
+.claude/settings.local.json
+.claude/scheduled_tasks.json
+.claude/session-state/
