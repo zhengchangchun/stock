@@ -39,11 +39,31 @@ echo "--- 4. 项目测试 ---"
 if [ -f package.json ] && grep -q '"test"' package.json 2>/dev/null; then
   echo "  ▶ npm test"; npm test --silent || fail=1
 elif [ -f pytest.ini ] || [ -f pyproject.toml ]; then
-  echo "  ▶ pytest -q"; python3 -m pytest -q || fail=1
+  # 必须用项目 venv（系统 python3 是 3.14 且无法创建 venv）
+  PY=".venv/bin/python"
+  if [ ! -x "$PY" ]; then
+    echo "  ❌ 缺少 $PY —— 请先运行: /opt/nanobot-venv/bin/python -m venv .venv"; fail=1
+  else
+    echo "  ▶ $PY -m pytest -q"; "$PY" -m pytest -q || fail=1
+  fi
 elif [ -f Makefile ] && grep -qE '^test:' Makefile; then
   echo "  ▶ make test"; make test || fail=1
 else
   echo "  ⚠️  未发现测试命令，请手动确认或补充本项目测试命令"
+fi
+
+echo ""
+echo "--- 4b. 必须被 git 忽略的路径 ---"
+if git rev-parse --git-dir >/dev/null 2>&1; then
+  for p in .venv/ data/ reports/; do
+    if git check-ignore -q "$p" 2>/dev/null; then
+      echo "  ✅ $p 已忽略"
+    else
+      echo "  ❌ $p 未被忽略（会把虚拟环境/数据提交进仓库）"; fail=1
+    fi
+  done
+else
+  echo "  ⚠️  不是 git 仓库，跳过"
 fi
 
 echo ""
