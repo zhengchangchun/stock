@@ -40,12 +40,22 @@ def _blocked_create_connection(*args, **kwargs):
     raise AssertionError(_NET_BLOCKED)
 
 
+def _blocked_getaddrinfo(*args, **kwargs):
+    raise AssertionError(_NET_BLOCKED)
+
+
 @pytest.fixture(autouse=True)
 def no_network(monkeypatch):
-    """全测试套默认离线：任何真实 socket 连接都直接失败。
+    """全测试套默认离线：DNS 解析与真实连接都直接失败。
+
+    必须**同时**拦住 getaddrinfo：只拦 socket 的话，在 DNS 不可用的环境里
+    urllib3 会先在解析阶段抛出 gaierror，永远走不到我们的守卫，
+    「守卫有效」的测试就变成了「本机 DNS 恰好可用」的巧合
+    （在 `unshare -n` 无网络命名空间下实测暴露）。见 ERROR_DIARY 2026-09-14。
 
     数据层测试必须走 fixture 回放（`tests/fixtures/`）或注入的假 session，
     不允许依赖网络。需要真实网络的一次性动作放在 `scripts/`（手工运行，非测试）。
     """
     monkeypatch.setattr(socket, "socket", _BlockedSocket)
     monkeypatch.setattr(socket, "create_connection", _blocked_create_connection)
+    monkeypatch.setattr(socket, "getaddrinfo", _blocked_getaddrinfo)

@@ -51,8 +51,15 @@ def test_guard_does_not_break_ssl_import_in_fresh_interpreter():
     assert "ok" in proc.stdout
 
 
+def test_dns_resolution_is_blocked():
+    """必须拦住解析阶段：否则在 DNS 不可用的环境里，urllib3 会先抛 gaierror，
+    永远走不到守卫 —— 测试就退化成「本机 DNS 恰好可用」的巧合。"""
+    with pytest.raises(AssertionError, match="禁止真实联网"):
+        socket.getaddrinfo("qt.gtimg.cn", 443)
+
+
 def test_requests_cannot_reach_network():
-    """requests 走完整链路也出不去（异常类型由 urllib3 包装，只要求「必然失败」）。"""
+    """requests 走完整链路也出不去，且失败原因确定是本守卫（而非环境恰好断网）。"""
     with pytest.raises(Exception) as exc:
         requests.get(WHITELISTED_URL, timeout=5)
     assert "禁止真实联网" in repr(exc.value) + repr(exc.value.__cause__)

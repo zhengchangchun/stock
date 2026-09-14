@@ -2,6 +2,10 @@
 name = "stocklab"
 version = "0.1.0"
 requires-python = ">=3.12"
+dependencies = [
+    # 出网唯一入口 stocklab/data/http.py 使用；P1 的录制脚本也依赖它
+    "requests>=2.31",
+]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
