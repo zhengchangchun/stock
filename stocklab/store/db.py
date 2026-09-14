@@ -4,8 +4,14 @@ from pathlib import Path
 
 
 def connect(db_path: Path | str, *, read_only: bool = False) -> sqlite3.Connection:
-    """打开连接并设置所有必需 PRAGMA。read_only 不影响文件创建。"""
-    conn = sqlite3.connect(str(db_path))
+    """打开连接并设置所有必需 PRAGMA。read_only 不影响文件创建。
+
+    isolation_level=None 关闭 sqlite3 的隐式事务管理：连接处于 autocommit，
+    只有显式 ``transaction()`` 才开启事务。否则一条被触发器 ABORT 的语句会
+    留下未关闭的隐式事务，导致下一次 BEGIN 报
+    「cannot start a transaction within a transaction」。
+    """
+    conn = sqlite3.connect(str(db_path), isolation_level=None)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA foreign_keys = ON")
     conn.execute("PRAGMA journal_mode = WAL")
@@ -15,7 +21,9 @@ def connect(db_path: Path | str, *, read_only: bool = False) -> sqlite3.Connecti
 
 @contextmanager
 def transaction(conn: sqlite3.Connection):
-    """显式事务；异常回滚并重抛。"""
+    """显式事务；异常回滚并重抛。禁止嵌套（嵌套说明调用方漏了 commit/rollback）。"""
+    if conn.in_transaction:
+        raise RuntimeError("已有未结束的事务，禁止嵌套 transaction()")
     try:
         conn.execute("BEGIN")
         yield conn
