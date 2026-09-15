@@ -44,6 +44,60 @@ def _blocked_getaddrinfo(*args, **kwargs):
     raise AssertionError(_NET_BLOCKED)
 
 
+# ---------- 回环放行（P15：真起服务用 http.client 打请求） ----------
+#
+# `no_network` 是 autouse 的，会连回环一起挡掉。P15 要求「**真起服务**（随机端口）
+# 用 `http.client` 打请求」，所以需要一个**只放开回环**的窄口：
+# 仍然挡掉任何非回环目标（换回 `_NET_BLOCKED`），否则「测试能连上」就又变成了
+# 环境巧合（ERROR_DIARY 2026-09-14 的教训：守卫只拦一半 = 没拦）。
+#
+# 在模块导入时抓真实实现：conftest 的 autouse fixture 是在**测试时**才替换的，
+# 导入时拿到的还是标准库原件。
+_REAL_SOCKET = socket.socket
+_REAL_CREATE_CONNECTION = socket.create_connection
+_REAL_GETADDRINFO = socket.getaddrinfo
+
+_LOOPBACK = ("127.0.0.1", "::1", "localhost")
+
+
+class _LoopbackOnlySocket(_REAL_SOCKET):
+    """能构造、能 bind/listen，但 `connect` 只允许回环。"""
+
+    def connect(self, address, *args, **kwargs):
+        host = address[0] if isinstance(address, tuple) else address
+        if host not in _LOOPBACK:
+            raise AssertionError(_NET_BLOCKED)
+        return super().connect(address, *args, **kwargs)
+
+    def connect_ex(self, address, *args, **kwargs):
+        host = address[0] if isinstance(address, tuple) else address
+        if host not in _LOOPBACK:
+            raise AssertionError(_NET_BLOCKED)
+        return super().connect_ex(address, *args, **kwargs)
+
+
+def _loopback_create_connection(address, *args, **kwargs):
+    host = address[0] if isinstance(address, tuple) else address
+    if host not in _LOOPBACK:
+        raise AssertionError(_NET_BLOCKED)
+    return _REAL_CREATE_CONNECTION(address, *args, **kwargs)
+
+
+def _loopback_getaddrinfo(host, *args, **kwargs):
+    if host is not None and str(host) not in _LOOPBACK:
+        raise AssertionError(_NET_BLOCKED)
+    return _REAL_GETADDRINFO(host, *args, **kwargs)
+
+
+@pytest.fixture
+def loopback_http(monkeypatch):
+    """**只**放开回环网络：允许本机起服务并用 `http.client` 打它。"""
+    monkeypatch.setattr(socket, "socket", _LoopbackOnlySocket)
+    monkeypatch.setattr(socket, "create_connection", _loopback_create_connection)
+    monkeypatch.setattr(socket, "getaddrinfo", _loopback_getaddrinfo)
+    yield
+
+
 @pytest.fixture(autouse=True)
 def no_network(monkeypatch):
     """全测试套默认离线：DNS 解析与真实连接都直接失败。

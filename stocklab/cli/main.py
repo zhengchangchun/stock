@@ -1538,12 +1538,12 @@ def _dashboard_provider(args):
             # 没有持仓 → risk=None；`build_summary` 的 docstring 说清了
             # `None` 是「未接入」而不是「风险为零」，页面分开渲染这两种情况。
             from stocklab.portfolio.view import build_portfolio
+            from stocklab.risk.panel import risk_subject
             view = build_portfolio(conn, asof)
-            held = sorted((p for p in view["positions"] if p["qty"]),
-                          key=lambda p: (-(p["market_value"] or 0.0), p["code"]))
-            risk = (build_risk_block(conn, held[0]["code"], asof=asof,
-                                     price=held[0]["price"])
-                    if held else None)
+            subject = risk_subject(view)
+            risk = (build_risk_block(conn, subject["code"], asof=asof,
+                                     price=subject["price"])
+                    if subject else None)
             return build_summary(conn, asof, risk_block=risk)
         finally:
             conn.close()
@@ -1620,6 +1620,58 @@ def cmd_dashboard_serve(args: argparse.Namespace) -> int:
           f"{summary['freshness']['bars_latest_date']} · 告警 {len(summary['alarms'])} 条")
     print("   停止：Ctrl-C。本项目**不常驻**服务（ADR-001 D-05），常驻由 nanobot 调度侧负责。")
     dash.serve_forever(httpd)
+    return 0
+
+
+# ---------- 持仓管理 Web 应用（P15） ----------
+
+def cmd_lab_serve(args: argparse.Namespace) -> int:
+    """起**持仓管理 Web 应用**（可查看 + 可管理真实持仓）。**只绑回环**。
+
+    与 `dashboard serve` 的区别：那个是**只读快照服务**，这个是**应用**——
+    带表单写入（录入成交 / 冲正 / 录入本金），写路径全程走 P12 的账本函数。
+    """
+    from stocklab.labweb import app as labweb
+
+    try:
+        labweb.assert_loopback(args.host)
+        base_path = labweb.normalize_base_path(args.base_path)
+    except (labweb.NonLoopbackHost, labweb.BadBasePath) as exc:
+        print(json.dumps({"error": str(exc), "kind": type(exc).__name__},
+                         ensure_ascii=False), file=sys.stderr)
+        return 2
+
+    db = Path(args.db) if args.db else paths.DB_PATH
+    if not db.exists():
+        print(json.dumps({"error": "db not found; run `stocklab db init`"},
+                         ensure_ascii=False), file=sys.stderr)
+        return 2
+    ctx = labweb.Context(lab=labweb.Lab(db, asof=args.asof),
+                         signer=labweb.TokenSigner(labweb.new_secret()),
+                         base_path=base_path)
+    try:
+        ctx.lab.overview()          # 起服务前先算一次：算不出来就别占端口
+    except Exception as exc:        # noqa: BLE001（错误必须变成可读的退出码）
+        print(json.dumps({"error": f"{type(exc).__name__}: {exc}"},
+                         ensure_ascii=False), file=sys.stderr)
+        return 2
+    try:
+        httpd = labweb.make_server(args.host, args.port, ctx=ctx)
+    except OSError as exc:
+        print(json.dumps({"error": f"绑定 {args.host}:{args.port} 失败：{exc}"},
+                         ensure_ascii=False), file=sys.stderr)
+        return 1
+
+    host, port = args.host, httpd.server_port
+    print(f"✅ 持仓管理应用已启动：{host}:{port}（仅回环；可读可写）")
+    print(f"   总览    http://{host}:{port}{base_path}/")
+    print(f"   成交    http://{host}:{port}{base_path}/trades")
+    print(f"   健康    http://{host}:{port}{base_path}/health")
+    print(f"   库      {db}")
+    print("   ⚠️  写操作会**直接改真实账本**（append-only，改错只能冲正）。")
+    print("   对外请走 nginx 反代 + Basic Auth；本项目**不常驻**（ADR-001 D-05）。")
+    print("   停止：Ctrl-C")
+    labweb.serve_forever(httpd)
     return 0
 
 
@@ -1947,6 +1999,21 @@ def build_parser() -> argparse.ArgumentParser:
     dash_serve.add_argument("--db", help="数据库路径（默认 data/stocklab.db）")
     dash_serve.add_argument("--now", help="保留参数（服务按请求真实时间渲染）")
     dash_serve.set_defaults(func=cmd_dashboard_serve)
+
+    lab = sub.add_parser(
+        "lab", help="持仓管理 Web 应用（P15）：浏览器里查看 + 管理真实持仓")
+    lab_sub = lab.add_subparsers(dest="lab_action")
+    lab_serve = lab_sub.add_parser(
+        "serve", help="起 Web 应用（**只绑回环**；0.0.0.0 直接报错退出）")
+    lab_serve.add_argument("--host", default="127.0.0.1",
+                           help="绑定地址（只允许回环；默认 127.0.0.1）")
+    lab_serve.add_argument("--port", type=int, default=8791,
+                           help="端口（默认 8791；0 = 由内核分配）")
+    lab_serve.add_argument("--base-path", default="/lab",
+                           help="子路径前缀（默认 /lab；所有链接与表单 action 都带它）")
+    lab_serve.add_argument("--db", help="数据库路径（默认 data/stocklab.db）")
+    lab_serve.add_argument("--asof", help="固定 asof 日期（默认每次请求取今天）")
+    lab_serve.set_defaults(func=cmd_lab_serve)
 
     doctor = sub.add_parser("doctor", help="数据健康度报告（离线）")
     doctor.set_defaults(func=lambda _a: cmd_doctor())

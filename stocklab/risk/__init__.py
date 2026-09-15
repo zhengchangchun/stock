@@ -18,7 +18,7 @@
 """
 
 from stocklab.risk.kelly import EdgeStats, evaluate, verdict_label
-from stocklab.risk.panel import build_risk_block
+from stocklab.risk.panel import build_risk_block, risk_subject
 from stocklab.risk.rules import RULES, RuleReplay, replay
 from stocklab.risk.sizing import size_position
 

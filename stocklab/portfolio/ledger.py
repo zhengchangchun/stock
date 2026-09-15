@@ -38,7 +38,8 @@ __all__ = [
     "LedgerError", "TradeValidationError", "CashFlowValidationError",
     "DuplicateTradeError", "CASH_KINDS", "INFLOW_KINDS", "OUTFLOW_KINDS",
     "latest_closed_trading_day", "validate_trade", "record_trade",
-    "record_cash_flow", "reverse_trade",
+    "record_cash_flow", "reverse_trade", "find_identical_trade",
+    "find_identical_cash_flow", "find_idem",
 ]
 
 #: 收盘时刻（本地时间）。≥ 它，当日才算「已收盘」。
@@ -123,7 +124,13 @@ def _check_date(conn: sqlite3.Connection, date: str, now: str, exc_cls) -> None:
 
 # ---------- 幂等键 ----------
 
-def _find_idem(conn: sqlite3.Connection, key: str, scope: str) -> int | None:
+def find_idem(conn: sqlite3.Connection, key: str, scope: str) -> int | None:
+    """该幂等键已写下的 `row_id`（没有 → `None`）。
+
+    公开的：Web 层要在**重复预检查之前**问一句「这个 `_form_id` 是不是已经落过库」——
+    是的话这次就是重试（双击 / 刷新重发），不该弹「疑似重复」吓人一跳。
+    判据只能有一处，否则两处迟早一个说重试、一个说重复。
+    """
     row = conn.execute(
         "SELECT row_id FROM ledger_idem WHERE idem_key = ? AND scope = ?",
         (key, scope)).fetchone()
@@ -186,13 +193,29 @@ def _all_trades(conn: sqlite3.Connection) -> list[dict]:
         "SELECT trade_id, date, code, side, price, qty, fee FROM real_trades")]
 
 
-def _find_identical_trade(conn: sqlite3.Connection, *, date: str, code: str,
-                          side: str, price: float, qty: int, fee: float) -> int | None:
+def find_identical_trade(conn: sqlite3.Connection, *, date: str, code: str,
+                         side: str, price: float, qty: int, fee: float) -> int | None:
+    """已存在的**完全相同**那一笔的 `trade_id`（没有 → `None`）。
+
+    公开的：Web 层的「疑似重复」确认页要拿它显示「和哪一笔撞了」。
+    判据只有这一处 —— 页面若自己写一遍 WHERE，两处迟早会不一致，
+    而不一致的后果是「页面说重复、写入说没重复」。
+    """
     row = conn.execute(
         "SELECT trade_id FROM real_trades WHERE date=? AND code=? AND side=?"
         " AND price=? AND qty=? AND fee=?",
         (date, code, side, float(price), qty, float(fee))).fetchone()
     return int(row["trade_id"]) if row else None
+
+
+def find_identical_cash_flow(conn: sqlite3.Connection, *, date: str, kind: str,
+                             amount: float, note: str | None) -> int | None:
+    """已存在的**完全相同**那一笔现金流的 `flow_id`（没有 → `None`）。"""
+    row = conn.execute(
+        "SELECT flow_id FROM cash_flows WHERE date=? AND kind=? AND amount=?"
+        " AND IFNULL(note,'') = IFNULL(?,'')",
+        (date, kind, float(amount), note)).fetchone()
+    return int(row["flow_id"]) if row else None
 
 
 def record_trade(conn: sqlite3.Connection, *, date: str, code: str, side: str,
@@ -209,14 +232,14 @@ def record_trade(conn: sqlite3.Connection, *, date: str, code: str, side: str,
                    fee=fee, now=now, require_lot=_require_lot)
 
     if idem_key:
-        hit = _find_idem(conn, idem_key, "trade")
+        hit = find_idem(conn, idem_key, "trade")
         if hit is not None:
             return {"state": "identical", "trade_id": hit, "idem_key": idem_key,
                     "date": date, "code": code, "side": side, "qty": qty}
 
     if not idem_key and not allow_duplicate:
-        same = _find_identical_trade(conn, date=date, code=code, side=side,
-                                     price=price, qty=qty, fee=fee)
+        same = find_identical_trade(conn, date=date, code=code, side=side,
+                                    price=price, qty=qty, fee=fee)
         if same is not None:
             raise DuplicateTradeError(
                 f"{date} {code} {side} {qty}@{price} 费{fee} 与已存在的 "
@@ -297,19 +320,17 @@ def record_cash_flow(conn: sqlite3.Connection, *, date: str, kind: str,
     _check_date(conn, date, now, CashFlowValidationError)
 
     if idem_key:
-        hit = _find_idem(conn, idem_key, "cash")
+        hit = find_idem(conn, idem_key, "cash")
         if hit is not None:
             return {"state": "identical", "flow_id": hit, "idem_key": idem_key,
                     "date": date, "kind": kind, "amount": amount}
 
     if not idem_key and not allow_duplicate:
-        same = conn.execute(
-            "SELECT flow_id FROM cash_flows WHERE date=? AND kind=? AND amount=?"
-            " AND IFNULL(note,'') = IFNULL(?,'')",
-            (date, kind, amount, note)).fetchone()
+        same = find_identical_cash_flow(conn, date=date, kind=kind,
+                                        amount=amount, note=note)
         if same is not None:
             raise CashFlowValidationError(
-                f"{date} {kind} {amount} 与已存在的 flow_id={same['flow_id']} 完全相同。"
+                f"{date} {kind} {amount} 与已存在的 flow_id={same} 完全相同。"
                 "若确实是另一笔，请加 `--allow-duplicate`；若是重试，请用 "
                 "`--idempotency-key`。")
 

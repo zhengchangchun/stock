@@ -26,7 +26,8 @@ import sqlite3
 from stocklab.portfolio.discipline import lines_for
 from stocklab.risk.kelly import evaluate
 from stocklab.risk.metrics import build_metrics
-from stocklab.risk.rules import DEFAULT_RULE, load_qfq_bars, replay
+from stocklab.risk.rules import (DEFAULT_RULE, load_qfq_bars, ma_pair, replay,
+                                 trend_state)
 from stocklab.risk.stops import stop_levels
 
 #: 面板结构版本。字段增删要同时改这里与 `docs/architecture/dashboard-json.md`。
@@ -59,6 +60,7 @@ def build_risk_block(conn: sqlite3.Connection, code: str, *, asof: str,
         "kelly": None,
         "metrics": None,
         "stops": None,
+        "trend": None,
     }
 
     bars = None
@@ -101,6 +103,22 @@ def build_risk_block(conn: sqlite3.Connection, code: str, *, asof: str,
     else:
         block["notes"].append("复权 K 线取不到 —— 风险预算指标（RV/VaR/MDD）无法计算")
 
+    # ---- 趋势状态（**只做波动分层，不预测方向**，见 risk/rules.py 与 P14 定论） ----
+    if bars:
+        closes = [float(b.close) for b in bars]
+        i = len(closes) - 1
+        pair = ma_pair(closes, i)
+        block["trend"] = {
+            "state": trend_state(closes, i),
+            "ma20": None if pair is None else round(pair[0], 4),
+            "ma60": None if pair is None else round(pair[1], 4),
+            "asof": bars[-1].date,
+            "note": "趋势状态只用于波动分层，**不是方向预测**",
+        }
+    else:
+        block["trend"] = {"state": None, "ma20": None, "ma60": None, "asof": None,
+                          "note": "无复权 K 线 → 趋势状态未知（不猜）"}
+
     # ---- 止损位并列（纪律线来自该标的的入场价，不是全局常数） ----
     try:
         block["stops"] = stop_levels(bars or [], lines=lines_for(code), price=price)
@@ -112,4 +130,16 @@ def build_risk_block(conn: sqlite3.Connection, code: str, *, asof: str,
     return block
 
 
-__all__ = ["PANEL_VERSION", "UNDETERMINED", "build_risk_block"]
+def risk_subject(view: dict) -> dict | None:
+    """风险面板挂在**哪只**标的上：按市值最大的持仓。没有持仓 → `None`。
+
+    「挂在哪只」是一个**展示选择**，不是口径 —— 但它必须是**同一个**选择，
+    否则 CLI 与页面会对同一账户给出不同标的的风险结论。所以放在这里共用。
+    """
+    held = [p for p in view["positions"] if p["qty"]]
+    if not held:
+        return None
+    return max(held, key=lambda p: ((p["market_value"] or 0.0), p["code"]))
+
+
+__all__ = ["PANEL_VERSION", "UNDETERMINED", "build_risk_block", "risk_subject"]
