@@ -24,3 +24,5 @@
 | 日期 | 实验 | 假设 | 结论 | 采纳 |
 |------|------|------|------|------|
 | 2026-09-15 | [trend_ma 默认参数 · walk-forward 样本外基线](2026-09-15-trend_ma-default-walkforward.md) | trend_ma 样本外总收益 > buy_and_hold | **否证**：510.79% vs 881.75%，输 370.96pp（2751 交易日，已扣成本） | ❌ 不采纳 |
+| 2026-09-15 | [rw-mu0（把漂移 mu 置 0）](2026-09-15-rw-mu0.md) | `mu := 0` 提升样本外方向准确率、降低 Brier | **否证**（`falsified`）：validate 方向 **0.3310 vs 基线 0.3687**（Δ=-0.0376，CI 下界 ≤ 0，符号错）；Brier 改善落在噪声内。pre-registered gate 记 `LOSE` → **不打开 test** | ❌ 不采纳 |
+| 2026-09-15 | [index-mom-dir（用沪深300 当日方向定漂移符号）](2026-09-15-index-mom-dir.md) | 指数 `asof` 方向对次日个股方向有信息量 | **否证**（`falsified`）：validate 方向 **0.3372 vs 基线 0.3687**（Δ=-0.0315，CI 下界 ≤ 0，符号错）；Brier 改善落在噪声内。pre-registered gate 记 `LOSE` → **不打开 test** | ❌ 不采纳 |
