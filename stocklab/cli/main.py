@@ -1423,6 +1423,103 @@ def cmd_portfolio_show(args: argparse.Namespace) -> int:
     return 1 if alarm else 0
 
 
+# ---------- 看板 + 本地服务（P14） ----------
+
+def _dashboard_provider(args):
+    """返回一个「每次调用重新读库」的摘要提供者。
+
+    **每次请求重算**（不缓存）：看板显示的是账本与行情的当前状态，
+    缓存 30 秒就多一个「页面显示的和库里的不一样」的时段，而且没人知道是哪个。
+    读库是只读的局部查询，代价远小于一次误读。
+    """
+    from stocklab.dashboard.summary import build_summary
+
+    db = Path(args.db) if args.db else paths.DB_PATH
+    fixed_asof = getattr(args, "asof", None)
+
+    def provider() -> dict:
+        asof = fixed_asof or datetime.now(TZ).date().isoformat()
+        conn = connect(db)
+        try:
+            return build_summary(conn, asof)
+        finally:
+            conn.close()
+
+    return db, provider
+
+
+def cmd_dashboard_build(args: argparse.Namespace) -> int:
+    """生成**单文件** HTML 看板（零外部依赖，离线可双击）。"""
+    from stocklab.dashboard.html import html_sha256, render_html
+
+    db, provider = _dashboard_provider(args)
+    if not db.exists():
+        print(json.dumps({"error": "db not found; run `stocklab db init`"},
+                         ensure_ascii=False), file=sys.stderr)
+        return 2
+    summary = provider()
+    now = args.now or datetime.now(TZ).isoformat(timespec="seconds")
+    doc = render_html(summary, built_at=now)
+    out = Path(args.out)
+    out.parent.mkdir(parents=True, exist_ok=True)
+    out.write_text(doc, encoding="utf-8")
+    payload = {"out": str(out), "bytes": len(doc.encode("utf-8")),
+               "sha256": html_sha256(doc), "asof": summary["asof"],
+               "alarms": len(summary["alarms"])}
+    _emit(args, payload,
+          f"✅ 已生成单文件看板 {out}\n"
+          f"   字节数 {payload['bytes']:,}   sha256 {payload['sha256'][:16]}…\n"
+          f"   asof {payload['asof']}   告警 {payload['alarms']} 条")
+    return 0
+
+
+def cmd_dashboard_serve(args: argparse.Namespace) -> int:
+    """起**只读**看板服务。**只绑回环**；非回环 host 直接报错退出。
+
+    `0.0.0.0` 在**代码层**被拒绝（`assert_loopback`，先于 bind）。对外访问走 nginx。
+    """
+    from stocklab.dashboard import server as dash
+
+    try:
+        dash.assert_loopback(args.host)
+    except dash.NonLoopbackHost as exc:
+        print(json.dumps({"error": str(exc), "kind": "NonLoopbackHost"},
+                         ensure_ascii=False), file=sys.stderr)
+        return 2
+
+    db, provider = _dashboard_provider(args)
+    if not db.exists():
+        print(json.dumps({"error": "db not found; run `stocklab db init`"},
+                         ensure_ascii=False), file=sys.stderr)
+        return 2
+    try:
+        summary = provider()          # 起服务前先算一次：算不出来就别占端口
+    except Exception as exc:          # noqa: BLE001（错误必须变成可读的退出码）
+        print(json.dumps({"error": f"{type(exc).__name__}: {exc}"},
+                         ensure_ascii=False), file=sys.stderr)
+        return 2
+
+    ctx = dash.Context(summary_provider=provider,
+                       health_provider=dash.summary_health(provider, db),
+                       db_path=db)
+    try:
+        httpd = dash.make_server(args.host, args.port, ctx)
+    except OSError as exc:
+        print(json.dumps({"error": f"绑定 {args.host}:{args.port} 失败：{exc}"},
+                         ensure_ascii=False), file=sys.stderr)
+        return 1
+    host, port = args.host, httpd.server_port
+    print(f"✅ 看板服务已启动：{host}:{port}（只读；仅回环）")
+    print(f"   页面    http://{host}:{port}/lab/")
+    print(f"   健康    http://{host}:{port}/health")
+    print(f"   JSON    http://{host}:{port}/api/summary")
+    print(f"   asof {summary['asof']} · bars 最新 "
+          f"{summary['freshness']['bars_latest_date']} · 告警 {len(summary['alarms'])} 条")
+    print("   停止：Ctrl-C。本项目**不常驻**服务（ADR-001 D-05），常驻由 nanobot 调度侧负责。")
+    dash.serve_forever(httpd)
+    return 0
+
+
 # ---------- parser ----------
 
 def build_parser() -> argparse.ArgumentParser:
@@ -1694,6 +1791,29 @@ def build_parser() -> argparse.ArgumentParser:
     pf_show.add_argument("--now", help="覆盖当前时刻（测试用）")
     pf_show.add_argument("--json", action="store_true", help="输出稳定 JSON（P13 的接口）")
     pf_show.set_defaults(func=cmd_portfolio_show)
+
+    dash = sub.add_parser("dashboard", help="单文件看板 + 本地只读服务（P14）")
+    dash_sub = dash.add_subparsers(dest="dashboard_action")
+    dash_build = dash_sub.add_parser(
+        "build", help="生成单文件 HTML 看板（零外部依赖，离线可双击）")
+    dash_build.add_argument("--out", default="reports/dashboard.html",
+                            help="输出路径（默认 reports/dashboard.html）")
+    dash_build.add_argument("--asof", help="asof 日期 YYYY-MM-DD（默认今天）")
+    dash_build.add_argument("--db", help="数据库路径（默认 data/stocklab.db）")
+    dash_build.add_argument("--now", help="页面上的生成时刻（默认当前时间）")
+    dash_build.add_argument("--json", action="store_true", help="输出机器可读结果")
+    dash_build.set_defaults(func=cmd_dashboard_build)
+
+    dash_serve = dash_sub.add_parser(
+        "serve", help="起只读看板服务（**只绑回环**；0.0.0.0 直接报错退出）")
+    dash_serve.add_argument("--host", default="127.0.0.1",
+                            help="绑定地址（只允许回环；默认 127.0.0.1）")
+    dash_serve.add_argument("--port", type=int, default=8791,
+                            help="端口（默认 8791；0 = 由内核分配）")
+    dash_serve.add_argument("--asof", help="固定 asof 日期（默认每次请求取今天）")
+    dash_serve.add_argument("--db", help="数据库路径（默认 data/stocklab.db）")
+    dash_serve.add_argument("--now", help="保留参数（服务按请求真实时间渲染）")
+    dash_serve.set_defaults(func=cmd_dashboard_serve)
 
     doctor = sub.add_parser("doctor", help="数据健康度报告（离线）")
     doctor.set_defaults(func=lambda _a: cmd_doctor())
