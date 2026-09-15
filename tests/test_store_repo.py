@@ -24,6 +24,11 @@ NOW = "2026-09-14T19:00:00+08:00"
 def conn(tmp_db):
     init_db(tmp_db)
     c = connect(tmp_db)
+    # P17：复权链的写入口按 `instruments.type` 判口径（白名单），未登记一律拒绝 ——
+    # 本文件的标的一律按股票口径登记。
+    c.execute("INSERT INTO instruments (code, name, market, board, type, added_at)"
+              " VALUES ('000333','美的集团','sz','main','stock',?)", (NOW,))
+    c.commit()
     yield c
     c.close()
 

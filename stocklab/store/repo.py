@@ -23,7 +23,8 @@ from datetime import datetime
 from typing import Mapping, Sequence
 from zoneinfo import ZoneInfo
 
-from stocklab.config.universe import Instrument
+from stocklab.config.universe import Instrument, instrument_type
+from stocklab.data.adjust import ADJUSTABLE_TYPES
 from stocklab.data.models import Bar, CorpAction
 from stocklab.quality.checks import Issue
 
@@ -148,7 +149,17 @@ def insert_adj_factors(conn: sqlite3.Connection, code: str, chain, *,
     源站修订分红后错误的旧因子会永久留在库里（比允许覆盖危险得多，ADR-001 §5 同款取舍）。
 
     无事件的标的也会写入全 1 行 —— ADR-001 明确要求显式默认值，禁止用 NULL 表示。
+    **但那只对「事件源可信」的标的成立**：ETF 的分红事件不在数据源里（ADR-008），
+    给它写全 1 行就是拿未复权价冒充复权价 —— 所以非股票标的一律拒绝写入。
+    与 `adjust.assert_adjustable` 同一判据、同一白名单，两处一起改才可能漏。
     """
+    kind = instrument_type(conn, code)
+    if kind not in ADJUSTABLE_TYPES:
+        raise ValueError(
+            f"insert_adj_factors 拒绝非股票标的：{code} 的口径是 {kind!r}，"
+            f"不在 {sorted(ADJUSTABLE_TYPES)} 中 —— 该类型的除权事件不在数据源里，"
+            f"写全 1 因子链 = 未复权价冒充复权价（ADR-008）"
+        )
     rows = [(code, d, f, source, now) for d, f in sorted(chain.factors.items())]
     conn.executemany(
         "INSERT INTO adj_factors (code, date, factor, source, fetched_at)"

@@ -15,6 +15,7 @@ import sqlite3
 import pytest
 
 from stocklab.config.paths import SCHEMA_SQL
+from stocklab.config.universe import Instrument
 from stocklab.data import adjust
 from stocklab.data.models import Bar, CorpAction
 from stocklab.store import repo
@@ -30,6 +31,14 @@ def conn():
     c = sqlite3.connect(":memory:")
     c.row_factory = sqlite3.Row
     c.executescript(SCHEMA_SQL.read_text(encoding="utf-8"))
+    # P17：复权链的读/写入口按 `instruments.type` 判口径（白名单），
+    # 未登记的代码会被拒绝 —— 本文件的标的一律按股票口径登记。
+    c.executemany(
+        "INSERT INTO instruments (code, name, market, board, type, added_at)"
+        " VALUES (?,?,?,?, 'stock', ?)",
+        [(code, code, "sz", "main", NOW)
+         for code in ("000001", "000002", "600690")])
+    c.commit()
     yield c
     c.close()
 
@@ -173,6 +182,8 @@ def test_usable_from_of_real_gap_shape():
     conn.row_factory = sqlite3.Row
     conn.executescript(SCHEMA_SQL.read_text(encoding="utf-8"))
     try:
+        repo.upsert_instruments(
+            conn, [Instrument("600690", "海尔智家", "sh", "main")], now=NOW)
         repo.insert_bars(conn, bars_of("600690"), now=NOW)
         repo.insert_corp_actions(conn, [
             CorpAction("600690", "2020-01-03", "2019-12-31", "", None, "test"),

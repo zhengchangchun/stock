@@ -23,6 +23,7 @@ import sqlite3
 from dataclasses import dataclass
 from math import prod
 
+from stocklab.config.universe import instrument_type
 from stocklab.data.models import Bar, CorpAction
 
 #: 源站原文里的条款词（配股需要配股价，本模块不支持 → 必须显式报错）
@@ -53,6 +54,47 @@ class StaleFactorTable(AdjustError):
     读取层**宁可拒绝服务**也不放行：缺口记录一旦与链不同源，一段算不出收益的
     历史就会被当成正常数据算进净值 —— 这是「非 NULL 的错误值」能活到下游的原因。
     """
+
+
+class EtfChainUnsupported(AdjustError):
+    """该标的的复权链**无法被证明完整** → 拒绝服务（ADR-008）。
+
+    场内 ETF 会分红除息（实测：510300 的 qfq 与不复权在 2023-06-01 差 7.4%），
+    但当前唯一合法数据源（腾讯 `fqkline`）**不返回 ETF 的除权事件行**
+    （四只 ETF 在 2000 根 K 线内 0 条事件）。事件不可见 → 枚举不出 `cqr`
+    → 连 `adj_factor_blackout`（它需要 `cqr`）都填不出来 → 链的缺口无法表达。
+
+    此时写 `factor = 1.0` 就是**拿未复权价冒充复权价**：跨界收益会凭空多出
+    一段假跌幅，且数值看着完全正常。所以本层拒绝服务，把「算不出来」变成
+    **显式异常**，而不是一条看着正常的错误序列。
+    """
+
+
+#: 允许进复权链的标的类型 —— **白名单**：不在其中的一律拒绝。
+#: 白名单而非黑名单是刻意的：将来新增标的类型（可转债 / 商品 / 外盘 ETF…）
+#: 默认落到「拒绝服务」，不会因为没人记得加判断而默认被放行（ADR-008 §后果）。
+ADJUSTABLE_TYPES: frozenset[str] = frozenset({"stock"})
+
+
+def assert_adjustable(conn: sqlite3.Connection, code: str) -> None:
+    """`code` 是否可用于复权链；不可用 → 抛 `EtfChainUnsupported`（含修法）。
+
+    **未登记代码同样拒绝**：把「不知道是什么」当成「是股票」，正是最难查的一类
+    错误 —— 下游会拿股票口径去算一个它并不了解的标的。
+    """
+    kind = instrument_type(conn, code)
+    if kind in ADJUSTABLE_TYPES:
+        return
+    raise EtfChainUnsupported(
+        f"{code} 的标的口径是 {kind!r}（不在 {sorted(ADJUSTABLE_TYPES)} 中），"
+        f"复权链无法被证明完整 —— 拒绝返回复权价（ADR-008）。"
+        f"原因：该类型标的的除权除息事件不在当前数据源里（腾讯 fqkline 对 ETF "
+        f"返回 0 条事件行，而 qfq 与不复权确实不同 → 分红真实存在、事件不可见）。"
+        f"写 factor=1.0 等于拿未复权价冒充复权价，故本层宁可拒绝服务。"
+        f"该标的只能用于**估值/展示**（adj_mode='none'，见 portfolio.prices）。"
+        f"修法：拿到可信的事件源 → 落 corp_actions → `adj rebuild` → "
+        f"把该类型加进 ADJUSTABLE_TYPES。"
+    )
 
 
 @dataclass(frozen=True)
@@ -275,6 +317,16 @@ def load_chain(conn: sqlite3.Connection, code: str) -> tuple[list[Bar], Chain]:
     的 `cqr <= date` 过滤器保证，**不依赖调用方裁剪**——
     这正是「as-of 语义」唯一可靠的位置（与 Task 19 的教训一致：
     防线要放在结构上，不能指望每个调用点都记得裁）。
+
+    **非股票标的一律拒绝**（`assert_adjustable`，ADR-008）：ETF 的事件源不可见，
+    链无法被证明完整。这个判断放在**唯一的读链入口**上 —— 而不是放在每个调用点，
+    否则新增一个调用点就多一条静默放行的路。
+
+    **判序：先看有没有行情，再判口径。** 「库里没有这只标的的 K 线」是比
+    「标的口径不可复权」**更具体、也更常见**的诊断（写错代码 / 还没采集），
+    必须让它先说话。顺序反了的话，一个尚未采集的代码会得到一长串关于
+    ETF 事件源的说明 —— 把人引向完全错误的方向（P17 实测：这正是
+    `predict run --code 600690` 的既有断言抓到的）。
     """
     bars = [Bar(code=r["code"], date=r["date"], open=r["open"], high=r["high"],
                 low=r["low"], close=r["close"], volume=r["volume"],
@@ -282,6 +334,10 @@ def load_chain(conn: sqlite3.Connection, code: str) -> tuple[list[Bar], Chain]:
                 adj_mode=r["adj_mode"])
             for r in conn.execute(
                 "SELECT * FROM bars_daily WHERE code=? ORDER BY date", (code,))]
+    if not bars:
+        # 没有行情 → 没有链可建（也无可复权之物）。返回空链而不是抛口径错误。
+        return bars, Chain({}, (), (), None)
+    assert_adjustable(conn, code)
     events = [CorpAction(code=r["code"], cqr=r["cqr"], djr=r["djr"] or "",
                          content=r["content"] or "", fh_sh=r["fh_sh"],
                          source=r["source"])
@@ -307,6 +363,9 @@ def load_bars_adjusted(conn: sqlite3.Connection, code: str, as_of: str, *,
     调用前先核对 `adj_factor_blackout` 与链的缺口**同源**：不一致时抛
     `StaleFactorTable`，绝不放行。这样「库里有一堆非 NULL 的错误因子」这件事
     不可能被静默消费（ADR-004 §无法定价事件）。
+
+    `load_chain` 里还会先过 `assert_adjustable`：ETF 之类的非股票标的连链都不构建，
+    直接抛 `EtfChainUnsupported`（ADR-008）。
     """
     bars, chain = load_chain(conn, code)
     assert_blackout_current(conn, code, chain)

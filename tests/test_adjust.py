@@ -12,6 +12,7 @@ import json
 import pytest
 
 from stocklab.config.paths import FIXTURE_DIR
+from stocklab.config.universe import Instrument
 from stocklab.data import adjust
 from stocklab.data.adjust import (
     AdjustError,
@@ -253,6 +254,13 @@ def _seed_db(tmp_path, bars, actions, code="000333"):
     db = tmp_path / "t.db"
     init_db(db)
     conn = connect(db)
+    # P17：复权链的读写入口按 `instruments.type` 判口径（白名单），未登记会被拒绝。
+    # 走 `repo.upsert_instruments` 而**不是**裸 INSERT：本函数会被同一个 `tmp_path`
+    # 调用两次（`test_load_bars_adjusted_is_pit_when_future_events_are_stored`），
+    # 裸 INSERT 第二次必撞 `instruments.code` 主键；upsert 的 ON CONFLICT 让它幂等，
+    # 与 `insert_bars`/`insert_corp_actions` 在这条路径上的行为一致。
+    repo.upsert_instruments(
+        conn, [Instrument(code, code, "sz", "main")], now=NOW)
     repo.insert_bars(conn, bars, now=NOW)
     if actions:
         repo.insert_corp_actions(conn, actions, now=NOW)
