@@ -884,6 +884,81 @@ def cmd_verify_backfill(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_experiment_run(args: argparse.Namespace) -> int:
+    """跑一个具名变体并产出实验报告（**离线**；**不写任何生产表**）。
+
+    三件必须显式说出来的事：
+
+      - **不落库**：变体不是模型版本。实验全程在内存里评估，
+        `predictions` / `verifications` 一行都不写 —— 只有 `promoted` 才允许
+        另开 ADR 与新 `model_version`（那是下一次决策的事）；
+      - **口径一致**：打分/聚合/呈现三层全部复用 P7 的函数（见
+        `stocklab/experiments/runner.py` 的模块 docstring），唯一替换的是「预测从哪来」；
+      - **test 封存**：第一趟循环的范围里**根本没有 test 那些日期**；
+        只有 validate `WIN` 才跑第二趟去读 test，读一次。
+
+    退出码：0 完成 / 2 用法、数据库或切分问题 / 1 结论为 `falsified`（**不是错误**，
+    但让 CI/脚本能区分「跑通了且否证」与「跑通了且晋级」）。
+    """
+    from stocklab.experiments.metrics import TestSetLeak
+    from stocklab.experiments.runner import (NoReplayDays, run_experiment,
+                                             write_report, write_report_at)
+    from stocklab.experiments.split import SplitConfig, SplitConfigError
+    from stocklab.experiments.variants import (MultiVariableVariant,
+                                               UnknownVariant)
+
+    db = Path(args.db) if args.db else paths.DB_PATH
+    if not db.exists():
+        print(json.dumps({"error": "db not found; run `stocklab db init`"},
+                         ensure_ascii=False), file=sys.stderr)
+        return 2
+    report_dir = Path(args.report_dir) if args.report_dir else paths.REPORT_DIR
+    try:
+        cfg = SplitConfig(train=args.train_ratio, validate=args.validate_ratio,
+                          test=args.test_ratio)
+    except SplitConfigError as exc:
+        print(f"❌ 切分配置不合法：{exc}", file=sys.stderr)
+        return 2
+
+    conn = connect(db)
+    try:
+        rep = run_experiment(conn, variant_name=args.variant,
+                             from_date=args.from_date, to_date=args.to_date,
+                             codes=args.code, split_config=cfg,
+                             selection_split=args.selection_split,
+                             progress=_progress)
+    except (UnknownVariant, MultiVariableVariant, TestSetLeak) as exc:
+        print(f"❌ 实验被拒绝：{type(exc).__name__}: {exc}", file=sys.stderr)
+        return 2
+    except (NoReplayDays, SplitConfigError) as exc:
+        print(f"❌ {exc}", file=sys.stderr)
+        return 2
+    finally:
+        conn.close()
+
+    written = (write_report_at(rep, Path(args.report)) if args.report
+               else write_report(rep, report_dir, _today()))
+
+    print(json.dumps({
+        "report": written["markdown"], "summary_json": written["json"],
+        "sha256_md": written["sha256_md"], "sha256_json": written["sha256_json"],
+        "metric_version": rep["metric_version"],
+        "variant": rep["variant"]["name"],
+        "changed_fields": rep["variant"]["changed_fields"],
+        "range": rep["range"],
+        "split_boundaries": rep["split_boundaries"],
+        "selection_split": rep["selection_split"],
+        "test_evaluated": rep["test_evaluated"],
+        "gates": {name: s["gate"]["status"] for name, s in rep["splits"].items()},
+        "verdict": rep["verdict"]["status"],
+        "verdict_reasons": rep["verdict"]["reasons"],
+        "counts": rep["counts"],
+    }, ensure_ascii=False, indent=2))
+    if not rep["test_evaluated"]:
+        print(f"🔒 test 段未打开：{rep['test_not_evaluated_reason']}", file=sys.stderr)
+    return 1 if rep["verdict"]["status"] == "falsified" else 0
+
+
 def _progress(target: str, done: int, total: int) -> None:
     if done % 250 == 0 or done == total:
         print(f"  … 回放 {done}/{total} 天（最近 {target}）", file=sys.stderr)
@@ -1170,6 +1245,34 @@ def build_parser() -> argparse.ArgumentParser:
     ver_bf.add_argument("--report-dir", dest="report_dir", help="报告目录")
     ver_bf.add_argument("--db", help="数据库路径（默认 data/stocklab.db）")
     ver_bf.set_defaults(func=cmd_verify_backfill)
+
+    exp = sub.add_parser(
+        "experiment", help="单变量实验（离线；复用 P7 打分口径，**不写任何生产表**）")
+    exp_sub = exp.add_subparsers(dest="experiment_cmd", required=True)
+    exp_run = exp_sub.add_parser(
+        "run", help="跑一个已注册的具名变体，产出样本外实验报告")
+    exp_run.add_argument("--variant", required=True,
+                         help="变体名（见 stocklab/experiments/variants.VARIANTS）")
+    exp_run.add_argument("--from", dest="from_date", required=True,
+                         help="回放起点（按 target_date 计）")
+    exp_run.add_argument("--to", dest="to_date", required=True,
+                         help="回放终点（按 target_date 计）")
+    exp_run.add_argument(
+        "--selection-split", dest="selection_split", default="validate",
+        choices=["train", "validate"],
+        help="用哪一段做**选择**依据；默认 validate。刻意**不提供 test** —— "
+             "test 是封存段，只能被晋级评审读取一次")
+    exp_run.add_argument("--train-ratio", type=float, default=0.60,
+                         help="train 段比例（默认 0.60）")
+    exp_run.add_argument("--validate-ratio", type=float, default=0.20,
+                         help="validate 段比例（默认 0.20）")
+    exp_run.add_argument("--test-ratio", type=float, default=0.20,
+                         help="test 段比例（默认 0.20）")
+    exp_run.add_argument("--code", action="append", help="只跑指定标的（可重复）")
+    exp_run.add_argument("--report", help="报告输出路径（默认 reports/<today>-exp-<variant>.md）")
+    exp_run.add_argument("--report-dir", dest="report_dir", help="报告目录")
+    exp_run.add_argument("--db", help="数据库路径（默认 data/stocklab.db）")
+    exp_run.set_defaults(func=cmd_experiment_run)
 
     doctor = sub.add_parser("doctor", help="数据健康度报告（离线）")
     doctor.set_defaults(func=lambda _a: cmd_doctor())

@@ -26,11 +26,13 @@
 
 from __future__ import annotations
 
+import dataclasses
 import hashlib
 import json
 import math
 import statistics
 from collections.abc import Mapping, Sequence
+from dataclasses import dataclass
 
 from stocklab.data.models import Bar
 from stocklab.predict.version import MODEL_ID, MODEL_SPEC, MODEL_VERSION
@@ -55,6 +57,69 @@ CONTRACT_FIELDS: tuple[str, ...] = (
     "code", "asof_date", "target_date", "direction", "range_80", "key_levels",
     "action", "size_pct", "invalidate_if", "strategy_mix", "model_version",
 )
+
+
+#: `mu_mode` 的合法取值。**这是唯一的变体旋钮**（P8 单变量实验用）。
+#:
+#: - `sample_mean`：基线 `pit-rw-v1.0.1` —— `mu = fmean(最近 WINDOW 日对数收益)`；
+#: - `zero`：漂移项取 0（其余一律不变）；
+#: - `index_sign`：`mu = |mu_sample| × s`，`s` 由**指数在 `asof` 当日**的方向给出
+#:   （`index_dir` 作为**数据**传入，不是配置项 —— 见 `ForecastSpec` 的 docstring）。
+MU_MODES: tuple[str, ...] = ("sample_mean", "zero", "index_sign")
+
+#: 基线口径的 spec。**`compute_forecast(spec=None)` 与 `spec=BASELINE_SPEC` 必须逐字节等价**，
+#: 这条由 `tests/test_predict_model.py` 钉住。
+BASELINE_SPEC: "ForecastSpec"
+
+
+@dataclass(frozen=True)
+class ForecastSpec:
+    """一次预测的**显式**输入配置（P8 单变量实验的载体）。
+
+    ## 为什么要有它，而不是给 `compute_forecast` 加几个布尔开关
+
+    实验流水线的整套纪律建立在「**一次只改一个变量**」上。若变体靠模块级开关
+    （环境变量 / 全局配置）注入，那么「这次跑的是哪个口径」就变成**隐式**的了：
+    忘了复位就静默串味，而且 `payload_hash` 里看不出来。把口径做成一个 frozen
+    dataclass、**按调用显式传入**，才有两件结构性的保证：
+
+    1. `assert_single_variable` 能**数出**它相对基线改了几个字段（必须恰好 1 个）；
+    2. 同一个进程里可以同时算基线与变体，互不污染。
+
+    ## 为什么「指数方向」不是本类的字段
+
+    `index_dir` 是**当日的事实**（`sh000300` 在 `asof` 的涨跌方向），不是「模型配置」。
+    把它塞进 spec 会让「改了一个变量」的计数变成 2（`mu_mode` 与 `index_dir`），
+    「单变量」这条纪律就没法机械校验了。所以它作为**数据**参数传进
+    `compute_forecast`，与 `bars` 同级。
+
+    ## 字段只有 `mu_mode` 一个
+
+    标签带（`FLAT_BAND`）、窗口（`WINDOW` / `LEVEL_WINDOW`）、关键位口径**不在本类里**，
+    因此「用某个变体把标签带改成 ±1%」在结构上不可能发生 ——
+    口径冻结靠的是「没有那个旋钮」，不是靠自觉（见 `docs/plans/2026-09-15-p8-实验流水线.md` §1.5）。
+    """
+
+    mu_mode: str = "sample_mean"
+
+    def __post_init__(self) -> None:
+        if self.mu_mode not in MU_MODES:
+            raise ValueError(
+                f"未知 mu_mode={self.mu_mode!r}；合法取值 {MU_MODES}。"
+                "拒绝静默回退到基线口径 —— 那会让一次实验跑出「看起来是变体、其实是基线」的数字"
+            )
+
+    @property
+    def is_baseline(self) -> bool:
+        return self.mu_mode == "sample_mean"
+
+    def changed_fields(self) -> tuple[str, ...]:
+        """相对基线**被改掉的字段名**（供单变量校验）。"""
+        return tuple(f.name for f in dataclasses.fields(self)
+                     if getattr(self, f.name) != getattr(BASELINE_SPEC, f.name))
+
+
+BASELINE_SPEC = ForecastSpec()
 
 
 class DegenerateInput(ValueError):
@@ -112,16 +177,25 @@ def degenerate_strategy_mix(*, excluded: Mapping[str, str] | None = None,
 
 
 def compute_forecast(*, code: str, asof: str, bars: Sequence[Bar], target_date: str,
-                     strategy_mix: Mapping) -> dict:
+                     strategy_mix: Mapping, spec: ForecastSpec | None = None,
+                     index_dir: int | None = None) -> dict:
     """算出 `code` 在 `asof` 收盘后应给出的次日预测载荷。
 
     `bars` 必须是**复权**日 K 且**全部 `<= asof`**（调用方负责，见
     `service.load_pit_bars`）；本函数只做最后一道校验：最后一根必须正好是 `asof`。
 
+    `spec` 为 `None`（默认）时走**基线口径 `pit-rw-v1.0.1`**，代码路径与 P6 逐字节一致。
+    传入非基线 spec 即得到一个**单变量变体**（P8 实验用）。
+
+    `index_dir` 只在 `spec.mu_mode == "index_sign"` 时被读取，是**数据**不是配置：
+    `sh000300` 在 `asof` 当日的方向（`+1` / `-1` / `0`）。**缺失即拒绝** ——
+    不允许静默当成 0（那是把「不知道」写成「没有」，ERROR_DIARY 2026-09-14）。
+
     返回 §8.1 契约字段 + 一个 `evidence` 块（`evidence` **不**进 `payload_hash`：
     它是解释，不是预测本身；把它算进去会让「同一天同一模型」因为多打印一个
     中间量就变成另一个载荷）。
     """
+    mode = (spec or BASELINE_SPEC).mu_mode
     usable = [b for b in bars if b.date <= asof]
     if not usable or usable[-1].date != asof:
         raise DegenerateInput(
@@ -137,7 +211,28 @@ def compute_forecast(*, code: str, asof: str, bars: Sequence[Bar], target_date: 
 
     closes = [b.close for b in usable[-(WINDOW + 1):]]
     rets = [math.log(cur / prev) for prev, cur in zip(closes, closes[1:])]
-    mu = statistics.fmean(rets)
+    mu_sample = statistics.fmean(rets)
+    # ---- 漂移项：`mu_mode` 是唯一的变体旋钮（默认路径下 `mu = mu_sample`，逐字节不变）----
+    if mode == "sample_mean":
+        mu = mu_sample
+    elif mode == "zero":
+        mu = 0.0
+    elif mode == "index_sign":
+        if index_dir is None:
+            raise DegenerateInput(
+                f"{code} 在 {asof} 缺 `sh000300` 的当日方向（index_dir=None）—— "
+                "`index_sign` 变体**拒绝静默退化成 mu=0 或基线**：那是把「不知道」写成「没有」，"
+                "会让报告里的样本量悄悄变少而没人知道"
+            )
+        if index_dir not in (-1, 0, 1):
+            raise DegenerateInput(
+                f"index_dir={index_dir!r} 非法（只接受 -1 / 0 / +1）—— 拒绝猜"
+            )
+        # 只换**方向的来源**（指数前一日方向），漂移的**幅度**仍是基线那个 |mu_sample|。
+        # 直接指数收益当漂移会连尺度一起改掉，那就不是一个变量了（见 P8 计划 §1.3）。
+        mu = abs(mu_sample) * index_dir
+    else:                                        # pragma: no cover - 构造期已挡
+        raise DegenerateInput(f"未知 mu_mode={mode!r}")
     sigma = statistics.stdev(rets)
     if not (sigma > 0.0):
         raise DegenerateInput(
@@ -194,6 +289,25 @@ def compute_forecast(*, code: str, asof: str, bars: Sequence[Bar], target_date: 
     else:
         action, size_pct = "trim", round(100.0 * (1.0 - p_up), 2)
 
+    evidence_inputs = {
+        "close": close,
+        "mu": mu,
+        "sigma": sigma,
+        "n_returns": len(rets),
+        "drift_t": mu / (sigma / math.sqrt(len(rets))),
+        "up_ext": up_ext,
+        "dn_ext": dn_ext,
+        "first_bar": usable[0].date,
+        "last_bar": usable[-1].date,
+        "n_bars_used": len(usable),
+    }
+    if mode != "sample_mean":
+        # **只在变体口径下**追加这三个键：基线的 evidence 必须逐字节不变
+        # （`reports/2026-09-15-predict-2026-09-14.json` 的 sha256 是回归红线）。
+        evidence_inputs["mu_sample"] = mu_sample
+        evidence_inputs["mu_mode"] = mode
+        evidence_inputs["index_dir"] = index_dir
+
     return {
         "code": code,
         "asof_date": asof,
@@ -213,18 +327,7 @@ def compute_forecast(*, code: str, asof: str, bars: Sequence[Bar], target_date: 
             "model_id": MODEL_ID,
             "model_version": MODEL_VERSION,
             "model_spec": MODEL_SPEC,
-            "inputs": {
-                "close": close,
-                "mu": mu,
-                "sigma": sigma,
-                "n_returns": len(rets),
-                "drift_t": mu / (sigma / math.sqrt(len(rets))),
-                "up_ext": up_ext,
-                "dn_ext": dn_ext,
-                "first_bar": usable[0].date,
-                "last_bar": usable[-1].date,
-                "n_bars_used": len(usable),
-            },
+            "inputs": evidence_inputs,
             "features_used": [],
             "notes": {
                 "mu": (
