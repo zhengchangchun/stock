@@ -80,6 +80,25 @@ def test_assert_adjustable_refuses_etf_and_unknown(conn):
     adjust.assert_adjustable(conn, STOCK)            # 股票通过（不抛）
 
 
+def test_refusal_names_a_usable_starting_point(conn):
+    """「拒绝」必须带路：错误信息要给出**可用起点**，否则等于把人堵死在门口。
+
+    两层起点都要在信息里，缺一层都会让下一个人重新踩一遍：
+      ① **当下**能拿 ETF 干什么 —— 估值/展示走 `adj_mode='none'`（这本来就是
+         正确的估值口径，ETF 并非「不可用」，只是「不可复权」）；
+      ② **恢复**复权要做什么 —— 可信事件源 → 落 `corp_actions` → `adj rebuild`
+         → 放开 `ADJUSTABLE_TYPES`（与 ADR-008 §怎么改回来 同一串步骤）。
+
+    只写「不支持 ETF」的信息是**不合格**的：使用者无法区分「设计如此」与「还没做完」。
+    """
+    with pytest.raises(adjust.EtfChainUnsupported) as exc:
+        adjust.load_bars_adjusted(conn, ETF, "2026-09-14")
+    msg = str(exc.value)
+    assert "adj_mode='none'" in msg                          # ① 当下可用
+    assert "corp_actions" in msg and "adj rebuild" in msg     # ② 恢复路径
+    assert "修法" in msg and "ADJUSTABLE_TYPES" in msg
+
+
 def test_adjustable_types_is_a_whitelist():
     """白名单语义：将来新增标的类型默认被拒，而不是默认被放行。"""
     assert adjust.ADJUSTABLE_TYPES == frozenset({"stock"})
