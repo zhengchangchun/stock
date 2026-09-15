@@ -1,12 +1,15 @@
-# 实验：resid-quantile（区间构造改取「训练窗标准化残差经验分位」，**预注册 · 待跑**）
+# 实验：resid-quantile（区间构造改取「训练窗标准化残差经验分位」，**已收尾 · `falsified`**）
 
 > **本文件在跑数据之前写死并 commit。** 第 1–4 节是假设与判据，不是结果的复述；
 > 第 5 节起才是跑完之后贴回来的**真实 CLI 原始输出**。
 > 判据一旦落到这里，事后**不许改**（红线 R7 / 台账规则 6）。
 
 - **日期**：2026-09-15 ｜ **提出人**：user（P10-a）
-- **状态**：**预注册 · 待跑**（跑完按判据写 `falsified` 或 `WIN`）
+- **状态**：**已收尾 · `falsified`**（不采纳，基线 `pit-rw-v1.0.1` 保持不表；test 封存未读）
 - **口径版本**：`p8-metrics-v1`（比较前先 `assert_metric_version`，不一致直接报错）
+- **完整报告**：`reports/2026-09-15-exp-residual-quantile-interval.{md,json}`
+  （`reports/` 被 gitignore，故此处只登记路径与 sha256：报告 md `88195ac9…be22`、
+  json `14f93af2…331a`）
 - **预注册文件**：本文件；**计划**：`docs/plans/2026-09-15-p10a-残差分位区间.md`
 - **冻结项**（本实验**不许**改）：`FLAT_BAND=0.005`、`WINDOW=60`、`LEVEL_WINDOW=20`、
   `SIGMA_SCALE_MIN/MAX=0.5/1.5`（**本轮根本不走缩放**）、`sigma_mode="const"`、
@@ -208,6 +211,10 @@ range_80 = [close·exp(mu + sigma·Q(0.10)),  close·exp(mu + sigma·Q(0.90))]
 按用户指令「口径不一致时保守取值」，最后一行（`falsified`）为**本实验的正式结论**；
 三个词都不等于「采纳」，`test` 段均不打开。train 段 gate 同为 `FLAT`。
 
+落库后 `experiment_decisions` 里本轮 4 行的 `gate_status` 一律 `FLAT`、`decision` 一律
+`inconclusive`（机器口径），与上表第一、二行一致；本台账的 `falsified` 是**预注册口径**，
+不覆盖、也不改写机器行（append-only）。
+
 ## 6. 结论
 
 **`falsified` —— 假设未被证实，不采纳，基线 `pit-rw-v1.0.1` 保持不表。**
@@ -243,8 +250,49 @@ test 段**未打开**（`test_evaluated = false`），且按 §0 预注册**不�
 ### 7.1 CLI 原始输出（决策落库）
 
 ```text
-（跑完后贴回 —— 见下方追加块）
+$ .venv/bin/python -m stocklab.cli.main experiment run \
+    --variant residual-quantile-interval --from 2013-04-16 --to 2026-09-14 --keep-test-sealed
+
+🔒 test 段未打开：validate 段 gate=FLAT（未达 WIN）→ 封存段不打开。这正是纪律要求的：
+validate 输了就不许再看 test，否则「用 test 挑变体」会以「我只是看一眼」的形式发生
+另外，本轮预注册也声明了「即使 WIN 也封存 test」（`--keep-test-sealed`）——
+但**这不是**本次封存的主因，主因是 gate=FLAT。
+
+  "report": "/root/.nanobot/workspace/projects/stock-lab/reports/2026-09-15-exp-residual-quantile-interval.md",
+  "sha256_md": "88195ac968d7a9f0ea21c9a9ff1eac71c7809fc606c1083b7ac78449e7e7be22",
+  "sha256_json": "14f93af2b0bf428b2082ae7a6708804e569f4f06bf80e2a60ccd96fea4cc331a",
+  "metric_version": "p8-metrics-v1",
+  "variant": "residual-quantile-interval",
+  "changed_fields": ["dist_mode"],
+  "split_boundaries": {train 1955 / validate 651 / test 653},
+  "selection_split": "validate",
+  "test_evaluated": false,
+  "gates": {"train": "FLAT", "validate": "FLAT"},
+  "verdict": "inconclusive",
+  "verdict_reasons": ["validate 段未达显著 → 不打开 test；「差一点」不是结论，也不许挪口径"],
+  "counts": {"baseline_rows": 4898, "variant_rows": 4898},
+  "decisions_recorded": {"inserted": 4, "identical": 0}   ← 退出码 0
 ```
+
+`experiment_decisions` 落库结果（既有 CLI，`decision_id` 21–24；表内总行数 **20 → 24**）：
+
+```text
+decision_id  split     metric     delta        ci_low      ci_high     gate_status  decision
+21           train     direction  +0.0036027   -0.0035303  +0.0107356  FLAT         inconclusive
+22           train     brier      -0.0005347   -0.0021565  +0.0010871  FLAT         inconclusive
+23           validate  direction  +0.0030722   -0.0144953  +0.0206397  FLAT         inconclusive
+24           validate  brier      -0.0016935   -0.0047959  +0.0014090  FLAT         inconclusive
+report_sha256 = 14f93af2…331a（4 行同）
+```
+
+`decision_id=24` 的 `delta / ci_low / ci_high` 与 §5.1 的 (a1) 行**逐位相同** ——
+验证「报告里的数字 = 落库的数字」。
+
+**插桩跑 vs CLI 跑**：为拿到判据 (a2) 的配对行，本轮在**不改仓库代码**的前提下先用一层
+wrapper 复用 `run_experiment` + `metrics.bootstrap_daily_ci`（内存、不落库）跑了一次，
+再用 CLI 正式跑一次。两次的 `splits.*.paired` / `splits.*.gate` / `splits.*.summary` /
+`residual_fit` / `counts` 全部**逐位一致**（`==` 比较为 `True`），所以 §5 的数字与
+报告、落库三者同源。
 
 ### 7.2 复现
 
