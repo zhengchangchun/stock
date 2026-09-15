@@ -15,17 +15,23 @@ P8 上半的实验结论只活在**报告文件**里。文件是不可查询的�
 
 ## 幂等语义（**读清楚再用**）
 
-幂等键 = `(variant_id, split, metric, metric_version, report_sha256)`。
+幂等键 = `(variant_id, split, metric, metric_version, gate_status, delta,
+ci_low, ci_high)` —— **取语义（决策内容），不取呈现（报告文本）**。
+措辞 / 时间戳 / 排版 / `report_sha256` 都不在键里。
 
 | 情形 | 行为 |
 |------|------|
 | 库里没有该键 | `inserted` |
-| 有该键，且**全部字段**逐字段相等 | `identical`：不写，成功返回（重跑同一场实验不会刷出一堆重复行） |
-| 有该键，但字段不同 | 抛 `DecisionConflict` —— 同一个报告 sha256 对应两份不同判定，只能是「哈希撞了」或「有人绕过本模块改了行」，**不覆盖**、不静默 |
+| 有该键，且语义字段逐字段相等 | `identical`：不写，成功返回（重跑同一场实验不会刷出一堆重复行） |
+| 有该键，但 `decision` 不同 | 抛 `DecisionConflict` —— 闸门数字全同却给出不同 verdict，只能是「键撞了」或「有人绕过本模块改了行」，**不覆盖**、不静默 |
 
-**换了区间/切分配置/数据快照 → 报告 sha256 不同 → 追加新行**，旧结论原样保留。
+**换了区间/切分配置/数据快照 → 闸门数字变 → 追加新行**，旧结论原样保留。
 这是 append-only 的本意：结论被推翻时追加新的，不改旧的
 （`docs/experiments/README.md` 规则 7）。
+
+**`report_sha256` 仍照写、照可查**（审计要它指回报告文件），只是不参与身份判定：
+它哈希的是**整份报告字典**，连给人看的原因串都在内 —— 拿它当键，
+**改一个错别字就多判一条决策**（ERROR_DIARY #17，实际污染过 4 行台账）。
 
 ## 为什么比的是「库里的样子」
 
@@ -48,10 +54,21 @@ DECISION_FIELDS: tuple[str, ...] = (
     "delta", "ci_low", "ci_high", "gate_status", "decision", "report_sha256",
 )
 
-#: 幂等键（与 `schema.sql` 的 UNIQUE 约束**同源**，改一处必须改两处）。
+#: 幂等键 = **语义**（决策内容）。（与 `schema.sql` 的 UNIQUE 约束**同源**，
+#: 改一处必须改两处。）
+#:
+#: 措辞 / 时间戳 / 排版 / `report_sha256` 一律不进键：它们是「呈现」，
+#: 改一个标点不该产生新决策行（ERROR_DIARY #17）。
 IDEMPOTENCY_KEY: tuple[str, ...] = (
-    "variant_id", "split", "metric", "metric_version", "report_sha256",
+    "variant_id", "split", "metric", "metric_version",
+    "gate_status", "delta", "ci_low", "ci_high",
 )
+
+#: 命中键之后，用来判「identical 还是冲突」的比较集 = 键 + `decision`。
+#: `decision`（整场 verdict）是决策内容，但不在键里：它由 `selection_split` /
+#: `test_evaluated` 这类开关决定，这些开关不进键 → 数字全同而 verdict 不同是可能的，
+#: 那是**矛盾**（结论来源不同），必须报错而不是静默当成同一条。
+COMPARED_FIELDS: tuple[str, ...] = IDEMPOTENCY_KEY + ("decision",)
 
 _INSERT_SQL = (
     "INSERT INTO experiment_decisions (variant_id, split, metric, metric_version,"
@@ -115,6 +132,8 @@ def record_decisions(conn: sqlite3.Connection, rows: list[Mapping],
                      *, now: str | None = None) -> dict[str, int]:
     """把决策行写进 `experiment_decisions`。返回 `{"inserted": n, "identical": m}`。
 
+    键取语义（决策内容），不取呈现（报告文本）；改一个标点不得产生新决策行。
+
     单事务：要么全部写入，要么一行都不写（部分写入的台账比不写更糟 ——
     它会让人以为「只判了这两段」）。
     """
@@ -123,23 +142,26 @@ def record_decisions(conn: sqlite3.Connection, rows: list[Mapping],
     with transaction(conn):
         for row in rows:
             key = {k: row[k] for k in IDEMPOTENCY_KEY}
-            where = " AND ".join(f"{k} = :{k}" for k in IDEMPOTENCY_KEY)
+            # `IS` 而非 `=`：`delta` / CI 可以是 NULL（INSUFFICIENT 段无 CI），
+            # 而 SQLite 里 `NULL = NULL` 为假 —— 用 `=` 会让「同一条决策」查不到
+            # 而重复插入。`IS` 是 null-safe 等值。
+            where = " AND ".join(f"{k} IS :{k}" for k in IDEMPOTENCY_KEY)
             existing = conn.execute(
                 f"{_SELECT_SQL} WHERE {where}", key).fetchall()
             if existing:
-                # 幂等键含 report_sha256（覆盖全部闸门数字），所以「同键多行」
-                # 在 UNIQUE 约束下不可能；这里仍逐行比，防的是**哈希撞了**。
+                # 键是语义键 → 查到的行**数字必然相同**；还能不同的只剩 `decision`
+                # （整场 verdict），那说明结论来源矛盾，不是同一条决策。
                 for prev in existing:
                     if all(_canonical(prev[f]) == _canonical(row[f])
-                           for f in DECISION_FIELDS):
+                           for f in COMPARED_FIELDS):
                         identical += 1
                         break
                 else:
                     raise DecisionConflict(
                         f"幂等键 {key} 下已有内容不同的决策行 "
                         f"(decision_id={existing[0]['decision_id']}) —— "
-                        "报告 sha256 相同却判定不同，只能是哈希冲突或被绕过写入；"
-                        "拒绝覆盖（append-only）"
+                        "同样一串闸门数字却给出不同 verdict，只能是键冲突或"
+                        "被绕过写入；拒绝覆盖（append-only）"
                     )
                 continue
             conn.execute(_INSERT_SQL, {**{f: row[f] for f in DECISION_FIELDS},

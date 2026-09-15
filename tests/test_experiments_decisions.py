@@ -21,6 +21,7 @@ from stocklab.experiments.decisions import (DecisionConflict,
                                             decisions_for,
                                             decisions_from_report,
                                             record_decisions)
+from stocklab.experiments.runner import write_report_at
 from stocklab.store.db import connect
 from tests.test_experiments_runner import CODE, N, _days, _env, _run
 
@@ -145,30 +146,50 @@ def test_record_decisions_is_idempotent_for_the_same_report(tmp_path):
 
 
 def test_a_changed_report_appends_new_rows_instead_of_rewriting(tmp_path):
-    """换了区间/配置 → 新 sha256 → **追加**。旧结论原样保留（append-only 的本意）。"""
+    """换了区间/配置 → 闸门数字变 → **追加**。旧结论原样保留（append-only 的本意）。
+
+    注意触发条件是**数字**，不是报告文本：文本变化已由
+    `test_wording_only_change_is_idempotent_not_a_new_decision` 钉成幂等
+    （ERROR_DIARY #17 —— 以前这里拿 sha256 当「换配置」的替身，键一改就失效）。
+    """
     rep = _report(tmp_path)
     conn = _conn(tmp_path)
     try:
         record_decisions(conn, decisions_from_report(rep, report_sha256="sha-A"))
         n1 = len(decisions_for(conn))
-        record_decisions(conn, decisions_from_report(rep, report_sha256="sha-B"))
-        n2 = len(decisions_for(conn))
-        assert n2 == 2 * n1
-        assert {r["report_sha256"] for r in decisions_for(conn)} == {"sha-A", "sha-B"}
+        # 真换配置 = 闸门数字真变（这里把 delta 平移，模拟另一段区间/另一套参数的结果）
+        shifted = [{**r, "delta": (r["delta"] or 0.0) + 0.5} for r in
+                   decisions_from_report(rep, report_sha256="sha-B")]
+        record_decisions(conn, shifted)
+        rows = decisions_for(conn)
+        assert len(rows) == 2 * n1
+        assert {r["report_sha256"] for r in rows} == {"sha-A", "sha-B"}
+        # 旧结论逐位保留：sha-A 那批的 delta 没被改写
+        old = {(r["split"], r["metric"]): r["delta"]
+               for r in rows if r["report_sha256"] == "sha-A"}
+        want = {(r["split"], r["metric"]): r["delta"]
+                for r in decisions_from_report(rep, report_sha256="ignored")}
+        assert old == want
     finally:
         conn.close()
 
 
 def test_same_key_with_different_content_is_refused_not_overwritten(tmp_path):
     """幂等键相同、内容不同 → 抛错。这是「哈希撞了 / 有人绕过本模块」的信号，
-    静默覆盖会让台账失去可信度。"""
+    静默覆盖会让台账失去可信度。
+
+    键取语义后，「同键」= 闸门数字全同；此时唯一还能不同的内容是 `decision`
+    （整场 verdict，来自 `selection_split` / `test_evaluated` 这类不进键的开关）。
+    数字全同却 verdict 不同 = 结论来源矛盾 → 拒绝。
+    """
     rep = _report(tmp_path)
     rows = decisions_from_report(rep, report_sha256="sha-A")
     conn = _conn(tmp_path)
     try:
         record_decisions(conn, rows)
         tampered = [dict(r) for r in rows]
-        tampered[0]["delta"] = (tampered[0]["delta"] or 0.0) + 1.0
+        tampered[0]["decision"] = ("promoted" if tampered[0]["decision"] != "promoted"
+                                   else "falsified")
         with pytest.raises(DecisionConflict):
             record_decisions(conn, tampered)
         # 事务整体回滚：原有行数不变，被篡改的那一行也没有进去
@@ -184,16 +205,96 @@ def test_conflict_rolls_back_the_whole_batch(tmp_path):
     conn = _conn(tmp_path)
     try:
         record_decisions(conn, rows)
-        fresh = decisions_from_report(rep, report_sha256="sha-B")
-        fresh[-1] = {**fresh[-1], "metric_version": fresh[0]["metric_version"]}
-        # 让最后一行与已有行撞键（同 sha-A、同 split/metric/version）但内容不同
-        fresh[-1]["report_sha256"] = "sha-A"
-        fresh[-1]["gate_status"] = ("LOSE" if fresh[-1]["gate_status"] != "LOSE"
-                                    else "WIN")
+        # 前面几行：数字变了 → 新键（会插入）；最后一行：数字全同、verdict 不同 → 撞键报错
+        fresh = [{**r, "delta": (r["delta"] or 0.0) + 0.25}
+                 for r in decisions_from_report(rep, report_sha256="sha-B")]
+        fresh[-1] = dict(decisions_from_report(rep, report_sha256="sha-B")[-1])
+        fresh[-1]["decision"] = ("promoted" if fresh[-1]["decision"] != "promoted"
+                                 else "falsified")
         before = len(decisions_for(conn))
         with pytest.raises(DecisionConflict):
             record_decisions(conn, fresh)
         assert len(decisions_for(conn)) == before       # 前面几行也没写进去
+    finally:
+        conn.close()
+
+
+# ---------- 3b. 幂等键取语义、不取呈现（ERROR_DIARY #17 回归） ----------
+
+def test_wording_only_change_is_idempotent_not_a_new_decision(tmp_path):
+    """**ERROR_DIARY #17 的回归测试**：只改报告里给人看的那句话 → 哈希变，但决策没变。
+
+    上一轮修一句谎报的文案，`sigma-vol-z` 台账就从 4 行涨到 8 行（16 → 20）。
+    判据：`report_sha256` 变了，**闸门数字一个没动** → 第二次必须是
+    `inserted: 0, identical: n`，且台账行数不变。改一个标点不得产生新决策行。
+    """
+    rep = _report(tmp_path)
+    worded = json.loads(json.dumps(rep))                # 深拷贝
+    # 只动「呈现」：改给人看的原因串措辞，不碰任何闸门数字
+    worded["verdict"]["reasons"][0] += "（措辞修正：只是把话说清楚，数字一个没动）"
+    for s in worded["splits"].values():
+        s["gate"]["reasons"][0] += "。"
+
+    a = write_report_at(rep, tmp_path / "a" / "r.md")
+    b = write_report_at(worded, tmp_path / "b" / "r.md")
+    # 先证明「哈希真的变了」——否则本测试是空转
+    assert b["sha256_json"] != a["sha256_json"]
+
+    rows_a = decisions_from_report(rep, report_sha256=a["sha256_json"])
+    rows_b = decisions_from_report(worded, report_sha256=b["sha256_json"])
+    # 再证明「决策内容真的一样」——只有 sha 与措辞不同
+    semantic = lambda rs: [{k: v for k, v in r.items() if k != "report_sha256"}
+                           for r in rs]
+    assert semantic(rows_a) == semantic(rows_b)
+
+    conn = _conn(tmp_path)
+    try:
+        assert record_decisions(conn, rows_a) == {"inserted": len(rows_a),
+                                                  "identical": 0}
+        assert record_decisions(conn, rows_b) == {"inserted": 0,
+                                                  "identical": len(rows_a)}
+        assert len(decisions_for(conn)) == len(rows_a)
+    finally:
+        conn.close()
+
+
+def _bump(value):
+    return (value or 0.0) + 0.5
+
+
+#: 幂等键的每一个**闸门**字段。任一变化都必须判成新决策（不是新措辞）。
+_GATE_MUTATIONS = [
+    pytest.param("delta", _bump, id="delta"),
+    pytest.param("ci_low", _bump, id="ci_low"),
+    pytest.param("ci_high", _bump, id="ci_high"),
+    pytest.param("gate_status", lambda v: "WIN" if v != "WIN" else "LOSE",
+                 id="gate_status"),
+    pytest.param("metric", lambda v: "brier" if v != "brier" else "direction",
+                 id="metric"),
+    pytest.param("split", lambda v: "train" if v != "train" else "validate",
+                 id="split"),
+]
+
+
+@pytest.mark.parametrize("field,mutate", _GATE_MUTATIONS)
+def test_every_gate_number_is_part_of_the_key(tmp_path, field, mutate):
+    """键的另一半：**闸门数字**变了就必须是新决策。
+
+    这条防的是「键改窄了」——若键只剩 (variant, split, metric, version)，
+    换了区间/参数但 split 名相同就会被误判成同一条决策，历史被静默吞掉。
+    """
+    rep = _report(tmp_path)
+    rows = [r for r in decisions_from_report(rep, report_sha256="sha-A")
+            if r["split"] == "validate" and r["metric"] == "direction"]
+    assert len(rows) == 1
+    changed = [{**rows[0], field: mutate(rows[0][field])}]
+    assert changed[0][field] != rows[0][field]          # 变异必须真的发生
+
+    conn = _conn(tmp_path)
+    try:
+        assert record_decisions(conn, rows) == {"inserted": 1, "identical": 0}
+        assert record_decisions(conn, changed) == {"inserted": 1, "identical": 0}
+        assert len(decisions_for(conn)) == 2            # 追加，不是覆盖
     finally:
         conn.close()
 

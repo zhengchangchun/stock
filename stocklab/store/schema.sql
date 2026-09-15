@@ -425,9 +425,15 @@ BEGIN SELECT RAISE(ABORT, 'verifications is append-only (delete)'); END;
 -- 所以同段的两行共享一个 `gate_status`。`decision` 是**整场实验**的结论
 -- （`promoted` / `falsified` / `inconclusive`），同一次运行的所有行相同。
 --
--- 幂等键 = (variant_id, split, metric, metric_version, report_sha256)。
--- 报告 sha256 覆盖了全部闸门数字，所以「同一份报告重跑」= 同一行 → 幂等跳过；
--- 换了区间/配置 → 新 sha256 → **追加新行**（历史结论不被改写）。
+-- 幂等键 = (variant_id, split, metric, metric_version, gate_status, delta,
+-- ci_low, ci_high) —— **取语义（决策内容），不取呈现（报告文本）**（P9-b / ADR-005）。
+-- 同一串闸门数字重跑 → 同一行 → 幂等跳过；换了区间/配置 → 数字变 → **追加新行**
+-- （历史结论不被改写）。`report_sha256` 仍照写、照可查（指回报告文件），但不进键 ——
+-- 它哈希的是整份报告字典，连给人看的原因串都在内，拿它当键则「改一个错别字
+-- 就多判一条决策」（ERROR_DIARY #17，实际污染过 4 行）。
+--
+-- **老库不迁移**（append-only：改 UNIQUE 要重建表 = 改写历史）。P9-b 之前建的库
+-- 保留老约束 `UNIQUE(..., report_sha256)`，其中同语义重复的行是新键生效前的历史遗留。
 CREATE TABLE IF NOT EXISTS experiment_decisions (
     decision_id     INTEGER PRIMARY KEY AUTOINCREMENT,
     variant_id      TEXT NOT NULL,
@@ -443,7 +449,8 @@ CREATE TABLE IF NOT EXISTS experiment_decisions (
                     CHECK (decision IN ('promoted', 'falsified', 'inconclusive')),
     report_sha256   TEXT NOT NULL,
     created_at      TEXT NOT NULL,
-    UNIQUE (variant_id, split, metric, metric_version, report_sha256)
+    UNIQUE (variant_id, split, metric, metric_version,
+            gate_status, delta, ci_low, ci_high)
 );
 
 CREATE TRIGGER IF NOT EXISTS trg_experiment_decisions_no_update
