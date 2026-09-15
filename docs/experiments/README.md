@@ -17,6 +17,18 @@
 
 `YYYY-MM-DD-<short-name>.md`，从 `TEMPLATE.md` 复制。
 
+## 台账（`experiment_decisions`）的两处口径注意
+
+1. **幂等键取语义，不取呈现**（ADR-005）：键 = `(variant_id, split, metric,
+   metric_version, gate_status, delta, ci_low, ci_high)`。措辞 / 时间戳 / 排版 /
+   `report_sha256` 都不进键 —— 修报告里的一句话**不会**产生新决策行
+   （以前会：ERROR_DIARY #17 曾把 `sigma-vol-z` 的 4 行刷成 8 行）。
+2. **历史遗留：老键下的 4 行同语义重复（append-only，不清算）。**
+   `variant_id='sigma-vol-z'` 有 8 行，其中 4 行 `report_sha256='a192a6d6…'`
+   与另 4 行 `'c32941fc…'` **语义完全相同**（同一串闸门数字，只是报告文案改过一版）。
+   这是 **P9-b 新键生效前**的产物，按 append-only 纪律**不删不改**。
+   凡按行数统计决策条数的查询，请按上面的语义键去重（或排除老 sha 那批）。
+
 ## 索引
 
 （每新增一条，在下面追加一行：日期 / 假设 / 结论 / 是否采纳）

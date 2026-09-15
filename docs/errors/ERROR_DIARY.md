@@ -980,3 +980,11 @@ metrics 层那道闸被拆掉后，runner 层那道**仍然拦得住**，
 
 **本次不改代码**：改幂等键属于口径变更，须与既有 20 行台账做兼容评审；
 且 #16 的修复已让这 4 行落库，回删违反 append-only。先记在案，下一轮再议。
+
+**已修复（2026-09-15，P9-b）**：幂等键改取**语义**，`report_sha256` 退出键（ADR-005）。
+键 = `(variant_id, split, metric, metric_version, gate_status, delta, ci_low, ci_high)`；
+命中后按 `键 + decision` 判 identical（`report_sha256` 仍照写、照可查，只是不参与身份判定）。
+老库不迁移、既有 20 行一行不动（4 行同语义重复记在 `docs/experiments/README.md` 为历史遗留）。
+两条测试钉住两侧：只改措辞/`report_sha256` → `inserted: 0`；任一闸门数字变 → `inserted: 1`。
+改键时顺手修掉一个被老键掩盖的坑：`delta`/CI 可为 NULL，`NULL = NULL` 为假 →
+比较改 null-safe 的 `IS`。自证：重跑 `sigma-vol-z` → `inserted: 0, identical: 4`，台账仍 20 行。
