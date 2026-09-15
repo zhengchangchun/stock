@@ -19,6 +19,7 @@ import pytest
 from stocklab.labweb.app import (Context, assert_loopback, make_server,
                                  normalize_base_path)
 from stocklab.labweb.data import Lab
+from stocklab.labweb.render import _discipline_glance
 from stocklab.labweb.tokens import TokenSigner
 from stocklab.portfolio.ledger import record_trade
 from stocklab.portfolio.positions import replay_trades
@@ -639,3 +640,242 @@ def test_original_ledger_row_is_never_updated(db):
             conn.execute("UPDATE real_trades SET qty = 1")
     finally:
         conn.close()
+
+
+# ---------- P17 / T4：「查看详细」分层（默认只看「怎么做」） ----------
+#
+# 用户原话：「我想看详细的时候，可以点击查看详细」。
+# 于是页面分两层：首屏给**结论**（买什么/买多少/什么价/下一步），
+# 长文（判据逐条、成本逐项、口径与限制）收进「查看详细」。
+# 用原生 `<details>` —— 零 JS、离线可看、键盘/读屏可用、内容仍在 DOM 里。
+
+
+def _overview(server, base):
+    status, body, _ = request(server, "GET", base + "/")
+    assert status == 200
+    return body
+
+
+def test_overview_leads_with_how_to_act(server, base):
+    """首屏第一块结论是「怎么做」，且它排在所有折叠块之前。"""
+    body = _overview(server, base)
+    assert '<h2 class="sec__h">怎么做' in body
+    assert body.index("怎么做") < body.index("净值曲线")
+
+
+def test_how_to_act_block_is_visible_not_collapsed(server, base):
+    """「怎么做」的**结论**必须在折叠块外面 —— 它就是默认视图。
+
+    注意：这一块**也**配了「查看详细」（成本与口径），所以断言的不是
+    「没有 details」，而是「可操作的那几句在 details **之前**」。
+    """
+    body = _overview(server, base)
+    how = body[body.index("怎么做"):]
+    how = how[:how.index("</section>")]
+    visible = how[:how.index("<details")]        # 折叠块之前的可见部分
+    assert '<ul class="list">' in visible        # 买什么/买多少的清单常显
+    assert "查看详细" in how                      # 深度入口也在这一块上
+
+
+def test_every_conclusion_block_offers_a_detail_entry(server, base):
+    """每块结论都配「查看详细」入口；`<summary>` 是原生可点控件。"""
+    body = _overview(server, base)
+    blocks = body.count('<details class="more">')
+    assert blocks >= 4, f"只有 {blocks} 个折叠块，结论块没配齐入口"
+    assert body.count('<summary class="more__s">查看详细') == blocks
+
+
+def test_details_default_to_collapsed(server, base):
+    """默认**收起**：首屏只放「怎么做」，不是一屏长文。"""
+    body = _overview(server, base)
+    assert '<details class="more" open' not in body
+
+
+def test_collapsed_content_is_still_rendered_in_dom(server, base):
+    """折叠 ≠ 不渲染：长文必须在 HTML 里（Ctrl+F / 读屏 / 打印都还覆盖得到）。
+
+    换成「点了才 fetch」就会丢掉这些性质 —— 这是选 `<details>` 而不是
+    懒加载的原因，用测试把它钉住。
+    """
+    body = _overview(server, base)
+    assert 'class="disc"' in body          # 纪律逐条
+    assert 'class="tbl"' in body           # 持仓/覆盖表
+    assert "price_policy" not in body      # 口径文案以正文出现，不是字段名
+
+
+def test_overview_is_reachable_under_a_nondefault_base_path(ctx, loopback_http):
+    """base path 参数化：换个前缀照样可达，且**没有**硬编码的 `/lab` 泄漏。"""
+    import threading
+    from stocklab.labweb.app import Context as _Ctx, make_server as _mk
+    alt = _Ctx(lab=Lab(ctx.lab.db_path, asof=ASOF), signer=TokenSigner(SECRET),
+               base_path="/x/y")
+    httpd = _mk("127.0.0.1", 0, ctx=alt)
+    t = threading.Thread(target=httpd.serve_forever, daemon=True)
+    t.start()
+    try:
+        status, body, _ = request(httpd, "GET", "/x/y/")
+        assert status == 200
+        assert '<details class="more">' in body            # 折叠块在新前缀下同样生成
+        assert 'href="/x/y/static/app.css"' in body        # 静态资源跟着 base 走
+        assert 'href="/lab/' not in body                   # 没有硬编码的默认前缀
+    finally:
+        httpd.shutdown()
+        httpd.server_close()
+        t.join(timeout=5)
+
+
+def test_page_has_no_external_resources(server, base):
+    """离线可看：页面**不引任何外部资源**（无 CDN / 无外链字体 / 无框架）。"""
+    body = _overview(server, base)
+    for m in re.finditer(r'(?:href|src)="([^"]+)"', body):
+        url = m.group(1)
+        assert not url.startswith(("http://", "https://", "//")), url
+
+
+def test_mobile_tap_target_is_declared_in_css(server, base):
+    """390 宽要能点：可点区域下限写在 CSS 里，不靠调用点自觉。"""
+    status, css, _ = request(server, "GET", base + "/static/app.css")
+    assert status == 200
+    assert "min-height: 44px" in css
+    assert ".more__s" in css
+    assert ".glance" in css
+
+
+# ---------- P17 / T5：已落库标的的现价 + 来源日期 ----------
+
+def _add_etf(db, *, with_bars=True):
+    conn = connect(db)
+    try:
+        conn.execute(
+            "INSERT INTO instruments (code, name, market, board, type, added_at)"
+            " VALUES ('510300','沪深300ETF','sh','main','etf',?)", (NOW,))
+        if with_bars:
+            conn.executemany(
+                "INSERT INTO bars_daily (code, date, open, high, low, close,"
+                " volume, adj_mode, source, fetched_at) VALUES (?,?,?,?,?,?,?,?,?,?)",
+                [("510300", d, 4.5, 4.56, 4.49, 4.523, 1000, "none", "tencent", NOW)
+                 for d in CAL_DATES])
+        conn.execute(
+            "INSERT INTO instruments (code, name, market, board, type, added_at)"
+            " VALUES ('518880','黄金ETF','sh','main','etf',?)", (NOW,))
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def test_coverage_gives_price_and_source_date_for_etf(server, db, base):
+    """ETF 也要能给出**现价 + 来源 + 来源日期**（T5），而不是只有持仓股票能。"""
+    _add_etf(db)
+    body = _overview(server, base)
+    assert "510300" in body
+    assert "4.52" in body                      # ETF 现价（money() 统一两位小数）
+    assert "日线" in body                      # 来源
+    assert "2026-09-14" in body                # 来源日期（价格实际所属的那天）
+
+
+def test_coverage_marks_etf_as_not_adjustable(server, db, base):
+    """ADR-008 的限制要**上页面**：不能复权就明说，且指出它仍可用于估值展示。"""
+    _add_etf(db)
+    body = _overview(server, base)
+    assert "不可复权" in body
+    assert "ADR-008" in body
+
+
+def test_coverage_says_unknown_price_instead_of_zero(server, db, base):
+    """拿不到价 → 写「无现价」，**不用 0 也不用成本价冒充**。"""
+    _add_etf(db, with_bars=False)          # 518880 无 K 线、无快照
+    body = _overview(server, base)
+    assert "无现价" in body
+    assert "518880" in body
+
+
+def test_coverage_lists_instruments_not_only_holdings(server, db, base):
+    """覆盖表列的是**已登记标的**（含未持仓），不是只列持仓。"""
+    _add_etf(db)
+    body = _overview(server, base)
+    assert "已登记" in body
+    assert "可复权" in body                    # 000333 是股票
+
+
+def _add_bars(db, code, close, dates):
+    conn = connect(db)
+    try:
+        conn.executemany(
+            "INSERT INTO bars_daily (code, date, open, high, low, close, volume,"
+            " adj_mode, source, fetched_at) VALUES (?,?,?,?,?,?,?,?,?,?)",
+            [(code, d, close, close, close, close, 1000, "none", "tencent", NOW)
+             for d in dates])
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def _glance_of(body):
+    """纪律块里**折叠块之前**的那部分 = 首屏可见的摘要。"""
+    tail = body[body.index('<h2 class="sec__h">纪律'):]
+    return tail[:tail.index("<details")]
+
+
+def test_discipline_glance_never_claims_pass_when_a_check_fails(server, db, base):
+    """首屏摘要**不许**在正文挂着 FAIL 时说「全部通过」。
+
+    这条是从一个真实 bug 来的：摘要取错了键（`checks` 而非 `discipline`），
+    取不到就落到「纪律全部通过」分支，而同一屏的纪律块里明明有 FAIL。
+    **首屏说「没事」而正文里有事**是这类页面最坏的失效模式 —— 钉住它。
+    """
+    _add_bars(db, "000333", 87.23, CAL_DATES)     # 有现价，纪律判据才会跑
+    body = _overview(server, base)
+    visible = _glance_of(body)
+    assert "FAIL" in body                         # 正文里确实有出格项
+    assert "不通过" in visible                     # 摘要必须说出来
+    assert "全部" not in visible
+
+
+def test_discipline_glance_does_not_fake_pass_when_there_is_no_check():
+    """**没有判据**时也不能说「全部通过」—— 那是拿「不知道」冒充「没事」。
+
+    与全项目口径一致：没有数的地方写「未知」，不写 0。
+    直接测摘要构造器（不是页面），因为「一条判据都没有」这个状态在真库里
+    很难自然构造出来，而它恰恰是最危险的那个分支。
+    """
+    lines = _discipline_glance({"discipline": []})
+    assert "没有可判定的纪律条目" in lines[0]
+    # 断言的是「**明确否认**通过」，而不是「不出现『通过』二字」——
+    # 后者会把「这不是「通过」」这句正确的免责声明也一起判失败。
+    assert "不是「通过」" in lines[0]
+
+
+def test_discipline_glance_counts_fails_and_warns():
+    """摘要按状态分档：FAIL 优先于 WARN，条数与正文一致。"""
+    fails = _discipline_glance({"discipline": [
+        {"status": "FAIL", "detail": "超上限"},
+        {"status": "PASS", "detail": "ok"},
+        {"status": "WARN", "detail": "偏离"}]})
+    assert "1 条不通过" in fails[0] and "超上限" in fails[0]
+
+    warns = _discipline_glance({"discipline": [
+        {"status": "WARN", "detail": "偏离"},
+        {"status": "PASS", "detail": "ok"}]})
+    assert "1 条偏离" in warns[0]
+
+    ok = _discipline_glance({"discipline": [{"status": "PASS", "detail": "ok"}]})
+    assert "全部 1 条判据通过" in ok[0]
+
+
+def test_discipline_glance_ignores_a_wrong_key(server, base):
+    """取错键时**不许**退化成「全部通过」—— 真库这条路径已经踩过一次。"""
+    assert "没有可判定" in _discipline_glance({"checks": [
+        {"status": "FAIL", "detail": "键名不对"}]})[0]
+
+
+def test_glance_text_is_never_double_escaped(server, db, base):
+    """首屏摘要里不许出现**双重转义**的字面量。
+
+    真页面上出现过 `&lt;b&gt;超&lt;/b&gt;`：摘要构造器先 `rich()` 了一次，
+    `glance()` 又 `rich()` 一次 → 二次转义。单元测试当时没抓住
+    （只断言了字符串内容），是打开真页面才看到的 —— 这条补上网。
+    """
+    _add_bars(db, "000333", 87.23, CAL_DATES)
+    body = _overview(server, base)
+    assert "&lt;b&gt;" not in body
+    assert "&amp;lt;" not in body

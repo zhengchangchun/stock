@@ -25,6 +25,7 @@ from pathlib import Path
 from zoneinfo import ZoneInfo
 
 from stocklab.dashboard.summary import build_summary
+from stocklab.portfolio.prices import resolve_prices
 from stocklab.portfolio.view import build_portfolio, nav_series
 from stocklab.risk.panel import build_risk_block, risk_subject
 from stocklab.session.review import freshness
@@ -75,11 +76,12 @@ class Lab:
     # ---------- 各页面 ----------
 
     def overview(self) -> dict:
-        """总览：`build_summary` 的全部分 + 净值曲线。"""
+        """总览：`build_summary` 的全部分 + 净值曲线 + 标的覆盖。"""
         with self.conn() as c:
             summary = build_summary(c, self.asof)
             summary["nav"] = nav_series(c, self.asof, n_sessions=NAV_SESSIONS)
-            return summary
+        summary["coverage"] = self.coverage()
+        return summary
 
     def trades(self, *, code: str | None = None) -> dict:
         """成交流水。`code` 是**显示筛选**，不改任何口径。
@@ -164,6 +166,45 @@ class Lab:
             "calendar": {"latest_open": cal["d"], "n_open_days": cal["n"]},
             "bars": {"n_rows": bars["n"], "latest": bars["d"]},
             "snapshots": {"n_rows": snaps["n"], "latest_ts": snaps["t"]},
+        }
+
+    def coverage(self) -> dict:
+        """标的覆盖：每只已登记标的的**现价 + 来源 + 来源日期**（P17 / T5）。
+
+        定价口径**完全复用** `portfolio.prices.resolve_prices`
+        （同日快照 → 日线最近收盘 → 没有），本方法不产生第二个口径 ——
+        它只负责把「标的清单」和「定价结果」并起来展示。
+
+        `adjustable` 来自 `adjust.ADJUSTABLE_TYPES`（**同一个白名单对象**，
+        不是抄一份）：ETF 为 `False`，页面据此显示 ADR-008 的复权口径限制。
+        两处共用同一判据，才不会出现「页面说能算、代码说不能算」。
+        """
+        from stocklab.data.adjust import ADJUSTABLE_TYPES
+
+        with self.conn() as c:
+            insts = [dict(r) for r in c.execute(
+                "SELECT code, name, type FROM instruments ORDER BY code")]
+            prices = resolve_prices(c, [i["code"] for i in insts], self.asof)
+            n_bars = {r["code"]: r["n"] for r in c.execute(
+                "SELECT code, COUNT(*) AS n FROM bars_daily GROUP BY code")}
+
+        rows = []
+        for i in insts:
+            p = prices.get(i["code"])
+            rows.append({
+                **i,
+                "bars_rows": n_bars.get(i["code"], 0),
+                # 拿不到就是 None —— 不用成本价冒充、不插值（prices 模块铁律）
+                "price": None if p is None else p.price,
+                "source": None if p is None else p.source,
+                "price_asof": None if p is None else p.price_asof,
+                "adjustable": i["type"] in ADJUSTABLE_TYPES,
+            })
+        return {
+            "asof": self.asof,
+            "rows": rows,
+            "missing": [r["code"] for r in rows if r["price"] is None],
+            "unadjustable": [r["code"] for r in rows if not r["adjustable"]],
         }
 
     def health(self) -> dict:

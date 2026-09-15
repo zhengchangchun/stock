@@ -468,6 +468,47 @@ dialog.confirm::backdrop { background: rgba(18, 24, 31, .38); }
   .field.w-note { flex: 1 1 100%; }
 }
 
+/* ---------- 「查看详细」折叠块（P17/T4，原生 details，零 JS） ----------
+   首屏只放结论；长文（判据逐条、成本逐项、口径与限制）在这里。
+   触摸目标 ≥44px 是手机可用性的硬底线，不靠调用点自觉。            */
+
+.more { margin: 10px 0 0; border-top: 1px dashed var(--rule); }
+.more__s {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-height: 44px;              /* 390 宽下的可点区域下限 */
+  padding: 6px 2px;
+  font-size: 12.5px;
+  color: var(--ink);
+  cursor: pointer;
+  list-style: none;              /* 去掉默认三角，换成自绘的 */
+  user-select: none;
+}
+.more__s::-webkit-details-marker { display: none; }
+.more__s::after {
+  content: "▾";
+  font-size: 10px;
+  color: var(--ink2);
+  transition: transform 0.15s ease;
+}
+.more[open] > .more__s::after { transform: rotate(180deg); }
+.more__s:hover { color: var(--ink); text-decoration: underline; }
+.more__s:focus-visible { outline: 2px solid var(--ink); outline-offset: 2px; }
+.more__b { padding: 4px 0 2px; }
+.more__b > *:first-child { margin-top: 0; }
+/* 折叠块里的表格仍要能横向滚动，不能在 390 宽下把页面撑破 */
+.more__b .scroll-x { overflow-x: auto; }
+
+/* 首屏摘要：一行一条，不加框 */
+.glance { margin: 2px 0 0; padding-left: 18px; font-size: 13px; line-height: 1.7; }
+.glance li { margin: 0; }
+.glance .num { font-variant-numeric: tabular-nums; }
+
+@media (prefers-reduced-motion: reduce) {
+  .more__s::after { transition: none; }
+}
+
 /* ---------- 打印：对账单本来就该能打 ---------- */
 
 @media print {

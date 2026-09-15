@@ -202,11 +202,79 @@ def alert(text: str, kind: str = "bad") -> str:
     return f'<p class="alert s-{esc(kind)}" role="alert">{rich(text)}</p>'
 
 
-def section(title: str, inner: str, *, note: str = "", right: str = "") -> str:
+def section(title: str, inner: str, *, note: str = "", right: str = "",
+            detail: str = "") -> str:
+    """一个结论块。
+
+    `detail` 非空时追加一个「查看详细」折叠块（P17/T4）——
+    `inner` 是**首屏就要看到的结论**，`detail` 是长文。
+    两者是分开的入参而不是一个字符串，是为了让调用点自己交代
+    「哪句是结论、哪句是细节」，避免把关键结论顺手塞进折叠里。
+    """
     r = f'<span class="sec__n">{rich(right)}</span>' if right else ""
     n = f'<p class="note">{rich(note)}</p>' if note else ""
     return (f'<section class="sec"><h2 class="sec__h">{esc(title)}{r}</h2>'
-            f'{inner}{n}</section>')
+            f'{inner}{n}{detail}</section>')
+
+
+def more(inner: str, *, label: str = "查看详细", note: str = "") -> str:
+    """「查看详细」折叠块（P17 / T4）—— **零 JS**，用原生 `<details>`。
+
+    ## 为什么是 `<details>` 而不是 JS 展开 / 独立详情页
+
+    1. **零依赖、离线可看**：原生元素，没有脚本也能展开；`app.js` 是渐进增强，
+       它挂了本块照样能用（这是本项目对前端的既有纪律）。
+    2. **内容在 HTML 里**：折叠 ≠ 不渲染。长文进了 DOM，浏览器内查找（Ctrl+F）、
+       打印、朗读都仍覆盖得到 —— 换成「点了才 fetch」就丢掉这些。
+    3. **手机可点**：`<summary>` 是原生控件，390 宽下命中区域由 CSS 保底
+       （`.more__s` 的 `min-height:44px`），不用自己算触摸目标。
+    4. **键盘 / 读屏可用**：`<summary>` 自带 `aria-expanded` 语义，不用补 ARIA。
+
+    默认**收起**：首屏只放「怎么做」，深度内容一次点击可达。
+    """
+    n = f'<p class="note">{rich(note)}</p>' if note else ""
+    return (f'<details class="more"><summary class="more__s">{esc(label)}</summary>'
+            f'<div class="more__b">{inner}{n}</div></details>')
+
+
+def glance(lines: Sequence[str]) -> str:
+    """首屏「怎么做」摘要：一行一条，不加框不加图。空列表 → 空串。"""
+    if not lines:
+        return ""
+    return ('<ul class="glance">'
+            + "".join(f"<li>{rich(x)}</li>" for x in lines) + "</ul>")
+
+
+def coverage_table(cov: Mapping, *, base: str = "") -> str:
+    """标的覆盖表：**现价 + 来源 + 来源日期**（P17 / T5）。
+
+    「来源日期」是价格**实际所属**的日期，不是页面的 asof —— 停牌时会指向更早的
+    交易日，页面必须如实显示，否则「这个数字是哪天的」就追不了。
+
+    拿不到价 → 显式写「无现价」，**不用成本价冒充**（`prices` 模块铁律）。
+    """
+    head = ("<tr><th>代码</th><th>名称</th><th>口径</th><th>现价</th>"
+            "<th>来源</th><th>来源日期</th><th>K 线</th></tr>")
+    rows = []
+    for r in cov["rows"]:
+        price = ("<span class=\"mut\">无现价</span>" if r["price"] is None
+                 else money(r["price"]))
+        src = {"snapshot": "快照", "bars": "日线"}.get(str(r["source"]), "—")
+        adjust = ("可复权" if r["adjustable"]
+                  else '<span class="s-warn" title="ADR-008：事件源不可见">不可复权</span>')
+        rows.append(
+            f'<tr><td><code>{esc(r["code"])}</code></td><td>{esc(r["name"])}</td>'
+            f'<td>{esc(r["type"])}</td><td class="num">{price}</td>'
+            f'<td>{esc(src)}</td><td>{esc(r["price_asof"] or "—")}</td>'
+            f'<td class="num">{r["bars_rows"]}</td></tr>')
+        if not r["adjustable"]:
+            rows.append(
+                f'<tr><td></td><td colspan="6" class="note">'
+                f'{esc(r["code"])} 的复权链不可用：除权除息事件不在数据源里，'
+                f'写全 1 因子等于拿未复权价冒充复权价（ADR-008）。'
+                f'该标的只用于估值展示（adj_mode=none）。</td></tr>')
+    return (f'<div class="scroll-x"><table class="tbl">{head}{"".join(rows)}</table>'
+            f'</div>')
 
 
 def cell(k: str, v_html: str, note: str = "", *, small: bool = False,
@@ -648,39 +716,54 @@ def overview_page(summary: Mapping, *, base: str, built_at: str) -> str:
         # 告警条排在 CANONICAL 数字**之后**：首屏第一个视觉落点是大数字，
         # 第二个就是纪律条里那块红的。告警条抢在数字前面会把数字挤出首屏。
         alarms_banner(summary["alarms"]),
-        section("纪律", discipline_rail(view), right="出格项标红，逐条给判据"),
-        section("持仓", positions_table(view, base=base), note=view["price_policy"]),
-        section("净值曲线", f'<figure class="chart">'
-                          f'{nav_svg(nav["points"], net_invested=view["net_invested"])}'
-                          f'<figcaption>按日 mark-to-market，共 {nav["n_sessions"]} 个交易日'
-                          f'（{esc(nav["window"]["start"] if "window" in nav else nav["points"][0]["date"])}'
-                          f' ~ {esc(nav["points"][-1]["date"])}）　虚线为本金 '
-                          f'{view["net_invested"]:,.2f}　{rich(nav["policy"])}'
-                          f'</figcaption></figure>',
-                note=("缺现价 → 断点：" + "、".join(nav["missing_price_dates"]))
-                if nav["missing_price_dates"] else ""),
     ]
 
+    # ---------- 怎么做（P17/T4）：买什么 / 买多少 / 什么价 / 下一步 ----------
+    # 这一段**常显**，是首屏的主角；其余各块的深度内容一律收进「查看详细」。
     adv = view.get("advisory") or []
-    body.append(section(
-        "动作建议", '<ul class="list">' + "".join(
+    if adv:
+        how = ('<ul class="list">' + "".join(
             f'<li>{rich(a["note"])}　<span class="mut">规则 {esc(a["rule"])}</span></li>'
-            for a in adv) + '</ul>' if adv
-        else '<p class="note">无建议（没有持仓或没有可用现价）</p>',
-        right="按纪律换算成股数"))
+            for a in adv) + '</ul>')
+    else:
+        how = ('<p class="note">无建议（没有持仓或没有可用现价）——'
+               '「无建议」本身是结论，不是缺数据。</p>')
+    body.append(section("怎么做", how, right="按纪律换算成股数",
+                        detail=more(_how_detail(view, nav, base=base),
+                                    label="查看详细：成本与口径")))
+
+    body.append(section("纪律", glance(_discipline_glance(view)),
+                        right="出格项标红，逐条给判据",
+                        detail=more(discipline_rail(view))))
+    body.append(section("持仓", glance(_position_glance(view)),
+                        note=view["price_policy"],
+                        detail=more(positions_table(view, base=base))))
+    body.append(section(
+        "净值曲线", f'<figure class="chart">'
+                  f'{nav_svg(nav["points"], net_invested=view["net_invested"])}'
+                  f'<figcaption>按日 mark-to-market，共 {nav["n_sessions"]} 个交易日'
+                  f'（{esc(nav["window"]["start"] if "window" in nav else nav["points"][0]["date"])}'
+                  f' ~ {esc(nav["points"][-1]["date"])}）</figcaption></figure>',
+        note=("缺现价 → 断点：" + "、".join(nav["missing_price_dates"]))
+        if nav["missing_price_dates"] else "",
+        detail=more(f'<p class="note">{rich(nav["policy"])}</p>',
+                    label="查看详细：净值口径")))
 
     risk_body = [_kelly_line(risk)]
+    risk_detail = []
     if risk is not None and risk.get("trend"):
         t = risk["trend"]
         st = t.get("state")
         cls = {"UP": "pass", "DOWN": "fail"}.get(str(st), "unknown")
-        risk_body.append(
+        risk_detail.append(
             f'<p>趋势状态：<span class="s-{cls}">{esc(st) if st else "未知"}</span>　'
             f'<span class="mut">MA20 {num(t.get("ma20"))} / MA60 {num(t.get("ma60"))}　'
             f'{esc(t.get("asof")) if t.get("asof") else "无日期"}</span></p>'
             f'<p class="note">{rich(t.get("note", ""))}</p>')
-    risk_body.append(f'<p class="note"><a href="{esc(base)}/risk">完整风险口径与约束逐条</a></p>')
-    body.append(section("风险摘要", "".join(risk_body)))
+    risk_detail.append(
+        f'<p class="note"><a href="{esc(base)}/risk">完整风险口径与约束逐条</a></p>')
+    body.append(section("风险摘要", "".join(risk_body),
+                        detail=more("".join(risk_detail), label="查看详细：趋势与约束")))
 
     fresh_body = [
         f'<p>bars_daily 最新 <b>{esc(fresh["bars_latest_date"])}</b>　'
@@ -692,9 +775,96 @@ def overview_page(summary: Mapping, *, base: str, built_at: str) -> str:
     fresh_body.append(f'<p class="note"><a href="{esc(base)}/data">数据明细与事件</a></p>')
     body.append(section("数据新鲜度", "".join(fresh_body)))
 
+    # ---------- 口径与限制（P17/T4）：把「我们算不出什么」写在页面上 ----------
+    cov = summary.get("coverage")
+    if cov is not None:
+        body.append(section(
+            "口径与限制", glance(_limits_glance(cov)),
+            right="算不出来的，明说",
+            detail=more(coverage_table(cov, base=base)
+                        + "<p class=\"note\">复权链限制详见 ADR-008："
+                          "ETF 的除权除息事件不在当前数据源里，"
+                          "本系统<b>不</b>用未复权价冒充复权价，宁可拒绝服务。</p>",
+                        label="查看详细：逐标的现价与来源")))
+
     body.append(section("最近验证统计", _accuracy_block(summary["accuracy"])))
     return layout(base=base, title="总览", body="".join(body), asof=summary["asof"],
                   built_at=built_at, current="/")
+
+
+def _discipline_glance(view: Mapping) -> list[str]:
+    """纪律首屏摘要：**只报「有几条出格」**，逐条判据交给「查看详细」。
+
+    判据键是 `view["discipline"]`，与 `discipline_rail` **同源**。
+    这里曾经取错键（`checks`）→ 取不到 → 落到「全部通过」分支，
+    而同一屏的纪律块里明明挂着 FAIL。**首屏说「没事」而正文里有事**，
+    是这类页面最坏的失效模式（比报错糟得多：报错至少有人去看）。
+    所以构造上分三段，最后一段专门兜「一条判据都没有」：
+    那时如实说「没有可判定的条目」，**不冒充「通过」**。
+
+    ## 返回**纯文本**，不要在这里做 HTML
+
+    `glance()` 会对每条再走一遍 `rich()`（转义 + 把 `**x**` 变粗）。这里若先
+    `rich()` 一次，就会**二次转义**：真页面上出现过 `&lt;b&gt;超&lt;/b&gt;`
+    这种双重编码的字面量 —— 单元测试没抓住（它只看字符串内容），
+    是打开真页面才看到的。标记交给 `glance()`，本函数只管语义分档。
+    """
+    checks = view.get("discipline") or []
+    fails = [c for c in checks if str(c.get("status")) == "FAIL"]
+    warns = [c for c in checks if str(c.get("status")) == "WARN"]
+    if fails:
+        return [f'{len(fails)} 条不通过：' + "；".join(
+            str(c.get("detail", "")) for c in fails[:2])]
+    if warns:
+        return [f'{len(warns)} 条偏离（未出格）：' + "；".join(
+            str(c.get("detail", "")) for c in warns[:2])]
+    if checks:
+        return [f'全部 {len(checks)} 条判据通过']
+    return ["没有可判定的纪律条目（无持仓或无可用现价）——这不是「通过」"]
+
+
+def _position_glance(view: Mapping) -> list[str]:
+    """持仓首屏摘要：有几只、市值多少、缺不缺价。**不做估值口径的二次加工**。"""
+    n = len(view["positions"])
+    out = [f'{n} 只标的，已定价市值 {money(view["market_value_priced"])}']
+    if view["missing_price_codes"]:
+        out.append(f'{"、".join(view["missing_price_codes"])} 无现价，'
+                   f'已排除出市值合计（不用成本价冒充）')
+    return out
+
+
+def _limits_glance(cov: Mapping) -> list[str]:
+    """限制摘要：**把「我们算不出什么」放在首屏**，而不是藏在折叠里。
+
+    一个只报好消息的页面会让人以为系统什么都能算。
+    """
+    out = [f'已登记 {len(cov["rows"])} 只标的']
+    if cov["unadjustable"]:
+        out.append(f'{"、".join(cov["unadjustable"])} 不可复权'
+                   f'（事件源不可见，ADR-008）—— 只用于估值展示')
+    if cov["missing"]:
+        out.append(f'{"、".join(cov["missing"])} 当前无现价')
+    return out
+
+
+def _how_detail(view: Mapping, nav: Mapping, *, base: str) -> str:
+    """「怎么做」的长文：成本口径逐项 + 下一步去哪。"""
+    costs = view.get("costs") or {}
+    rows = "".join(
+        f'<tr><td>{esc(k)}</td><td class="num">{esc(v)}</td></tr>'
+        for k, v in sorted(costs.items())) if costs else ""
+    cost_tbl = (f'<div class="scroll-x"><table class="tbl">'
+                f'<tr><th>成本项</th><th>取值</th></tr>{rows}</table></div>'
+                if rows else
+                '<p class="note">本次组合视图未带成本明细；'
+                '成本模型默认按<b>标的</b>口径取（股票/ETF 印花税不同，见 ADR-008）。</p>')
+    return (f'{cost_tbl}'
+            f'<p class="note">口径：成本默认含费（avg_cost_incl_fee）；'
+            f'不含费口径同时给出，差额即累计费用。'
+            f'具体标的的现价与来源日期见「口径与限制」。</p>'
+            f'<p class="note"><a href="{esc(base)}/trades">成交流水</a>　'
+            f'<a href="{esc(base)}/cash">资金流水</a>　'
+            f'<a href="{esc(base)}/risk">风险口径逐条</a></p>')
 
 
 def _accuracy_block(acc: Mapping) -> str:
