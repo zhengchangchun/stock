@@ -34,7 +34,7 @@ docs/
 - [`plans/2026-09-15-p12-实盘账本与组合视图.md`](plans/2026-09-15-p12-实盘账本与组合视图.md) —
   P12 设计稿
 - [`tasks/2026-09-15-p12-task53-60.md`](tasks/2026-09-15-p12-task53-60.md) — P12 任务拆分与验收清单
-
+- [`tasks/2026-09-15-p15-task66-70.md`](tasks/2026-09-15-p15-task66-70.md) — P15 持仓管理 Web 应用（路由/写入路径/测试/启动与 nginx 反代）\n
 ```bash
 # 录入（append-only；改错只能用 reverse 冲正）
 stocklab cash add --date 2026-09-14 --kind deposit --amount 20000 --idempotency-key principal-20260914
