@@ -1423,6 +1423,103 @@ def cmd_portfolio_show(args: argparse.Namespace) -> int:
     return 1 if alarm else 0
 
 
+# ---------- 风险与仓位（P14） ----------
+
+def _risk_conn(args):
+    """打开库（只读用途）。与 `_portfolio_conn` 同款守卫，但不需要账本表。"""
+    db = Path(args.db) if args.db else paths.DB_PATH
+    if not db.exists():
+        print(json.dumps({"error": "db not found; run `stocklab db init`"},
+                         ensure_ascii=False), file=sys.stderr)
+        return None, 2
+    return connect(db), None
+
+
+def _kelly_result(args, conn, code: str) -> dict:
+    """回放 `--rule` → 凯利结论（p/b 的唯一合法来源，见 `risk.kelly` docstring）。"""
+    from stocklab.risk.kelly import evaluate
+    from stocklab.risk.rules import replay
+
+    asof = args.asof or datetime.now(TZ).date().isoformat()
+    rp = replay(conn, code, rule=args.rule, asof=asof, horizon=args.horizon)
+    out = evaluate(rp.stats, frac=args.frac)
+    out["replay"] = {
+        "price_window": rp.price_window,
+        "cost_model": rp.cost_model,
+        "meta": rp.meta,
+        "trades_preview": [
+            {"entry": t.entry_date, "exit": t.exit_date, "qty": t.qty,
+             "net_return": t.net_return, "cost_bps": round(t.cost_bps, 2),
+             "still_open": t.still_open}
+            for t in rp.trades[-5:]],
+    }
+    return out
+
+
+def cmd_risk_kelly(args: argparse.Namespace) -> int:
+    """凯利仓位建议。**p/b 只来自 PIT 回放 + 扣成本 + 按日聚类 + 报样本量。**
+
+    预期（也是本项目的事实）：方向能力 ≈ 0 → 严格凯利输出 `NO_BET`。
+    `NO_BET` 是**结论**，不是错误；退出码 0。
+    """
+    from stocklab.risk.kelly import render_report
+    from stocklab.risk.rules import RULES
+
+    conn, code_ = _risk_conn(args)
+    if conn is None:
+        return code_
+    try:
+        out = _kelly_result(args, conn, args.code)
+    except ValueError as exc:
+        print(json.dumps({"error": str(exc), "rules": list(RULES)},
+                         ensure_ascii=False), file=sys.stderr)
+        return 2
+    finally:
+        conn.close()
+    _emit(args, out, render_report(out))
+    return 0
+
+
+def cmd_risk_size(args: argparse.Namespace) -> int:
+    """仓位裁剪：凯利 f → 具体股数 + 逐条纪律约束。"""
+    from stocklab.portfolio.view import build_portfolio
+    from stocklab.risk.sizing import render_sizing, size_position
+
+    conn, code_ = _risk_conn(args)
+    if conn is None:
+        return code_
+    now = args.now or datetime.now(TZ).isoformat(timespec="seconds")
+    asof = args.asof or now[:10]
+    try:
+        kelly = _kelly_result(args, conn, args.code)
+        view = build_portfolio(conn, asof)
+        held = next((p["qty"] for p in view["positions"]
+                     if p["code"] == args.code), 0)
+        pos = next((p for p in view["positions"] if p["code"] == args.code), None)
+        market = (pos or {}).get("price")
+        entry = args.entry if args.entry is not None else market
+        if entry is None:
+            raise ValueError(
+                f"{args.code} 没有可用现价，也没有 --entry —— "
+                f"没有价格就没有股数（不拿成本价冒充）")
+        out = size_position(code=args.code, f_final=kelly["f_final"],
+                            total_assets=view["total_assets"], cash=view["cash"],
+                            price=float(entry), qty_held=int(held),
+                            market_price=market)
+    except ValueError as exc:
+        print(json.dumps({"error": str(exc)}, ensure_ascii=False), file=sys.stderr)
+        return 2
+    finally:
+        conn.close()
+    out["kelly_verdict"] = kelly["verdict"]
+    out["kelly_verdict_label"] = kelly["verdict_label"]
+    out["kelly_verdict_reason"] = kelly["verdict_reason"]
+    out["kelly_rule"] = kelly["rule"]
+    out["asof"] = asof
+    _emit(args, out, render_sizing(out))
+    return 0
+
+
 # ---------- 看板 + 本地服务（P14） ----------
 
 def _dashboard_provider(args):
@@ -1791,6 +1888,36 @@ def build_parser() -> argparse.ArgumentParser:
     pf_show.add_argument("--now", help="覆盖当前时刻（测试用）")
     pf_show.add_argument("--json", action="store_true", help="输出稳定 JSON（P13 的接口）")
     pf_show.set_defaults(func=cmd_portfolio_show)
+
+    risk = sub.add_parser(
+        "risk", help="风险与仓位（P14）：凯利 / 仓位裁剪（p/b 只来自 PIT 回放）")
+    risk_sub = risk.add_subparsers(dest="risk_action")
+
+    def _add_risk_common(p, *, entry: bool = False, frac: bool = True):
+        p.add_argument("--code", required=True, help="标的代码，如 000333")
+        p.add_argument("--rule", default="trend-state",
+                       choices=["trend-state", "ma-cross", "buy-hold"],
+                       help="PIT 回放规则（p/b 的唯一合法来源）")
+        if frac:
+            p.add_argument("--frac", type=float, default=0.25,
+                           help="分数凯利 k（默认 0.25）")
+            p.add_argument("--horizon", type=int, default=5,
+                           help="持有视界（交易日，默认 5）")
+        if entry:
+            p.add_argument("--entry", type=float, default=None,
+                           help="拟成交价（默认取组合视图现价）")
+        p.add_argument("--asof", help="asof 日期 YYYY-MM-DD（默认今天）")
+        p.add_argument("--db", help="数据库路径（默认 data/stocklab.db）")
+        p.add_argument("--now", help="当前时刻（默认系统时间）")
+        p.add_argument("--json", action="store_true", help="输出机器可读结果")
+
+    rk = risk_sub.add_parser("kelly", help="凯利仓位建议（无 edge 就如实输出 NO_BET）")
+    _add_risk_common(rk)
+    rk.set_defaults(func=cmd_risk_kelly)
+
+    rs = risk_sub.add_parser("size", help="凯利 f → 具体股数 + 逐条纪律约束")
+    _add_risk_common(rs, entry=True)
+    rs.set_defaults(func=cmd_risk_size)
 
     dash = sub.add_parser("dashboard", help="单文件看板 + 本地只读服务（P14）")
     dash_sub = dash.add_subparsers(dest="dashboard_action")
