@@ -322,6 +322,12 @@ CREATE TABLE IF NOT EXISTS sim_portfolio (
 );
 
 -- A2：实盘只存成交流水，持仓与净值一律由流水推导
+-- ---------- 实盘账本（P12，append-only） ----------
+-- 成交。**刻意不加 UNIQUE(date,code,side,price,qty,fee)**：真实成交可能同价同量同费
+-- （同一天分两笔各买 100 股 @86.80、佣金都是 5.09 是完全正常的真单），
+-- 唯一约束会**静默吃掉真单**。重复录入防护改由 `ledger_idem` 幂等键 +
+-- 显式 `--allow-duplicate` 二次确认承担，见 ADR-006。
+-- 改错**只能冲正**（写一笔反向记录 + note），不许 UPDATE —— 触发器钉住。
 CREATE TABLE IF NOT EXISTS real_trades (
     trade_id   INTEGER PRIMARY KEY AUTOINCREMENT,
     date       TEXT NOT NULL,
@@ -331,6 +337,33 @@ CREATE TABLE IF NOT EXISTS real_trades (
     qty        INTEGER NOT NULL,
     fee        REAL NOT NULL DEFAULT 0,
     note       TEXT,
+    created_at TEXT NOT NULL
+);
+
+-- 本金与现金流（append-only）。`amount` **有符号**：正 = 流入组合，负 = 流出组合。
+-- 符号与 `kind` 必须一致（`deposit`/`dividend` > 0，`withdraw`/`fee`/`tax` < 0），
+-- 由写入口 `portfolio/ledger.py` 强制 —— 存绝对值再靠 kind 推方向，
+-- 迟早会在某处被加错符号，且错了看不出来。
+CREATE TABLE IF NOT EXISTS cash_flows (
+    flow_id    INTEGER PRIMARY KEY AUTOINCREMENT,
+    date       TEXT NOT NULL,
+    kind       TEXT NOT NULL CHECK (kind IN
+                 ('deposit','withdraw','dividend','fee','tax','other')),
+    amount     REAL NOT NULL,
+    note       TEXT,
+    created_at TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_cash_flows_date ON cash_flows (date, flow_id);
+
+-- 幂等键台账（append-only）：把「命令重试/补跑」与「真重复成交」分开。
+-- 键由调用方给（`--idempotency-key`），同一 key 第二次进来 = 幂等命中，不写第二行。
+-- 刻意**不**用业务元组当键：业务元组相同既可能是重试也可能是真单，无法区分；
+-- 只有调用方知道自己是不是在重试。见 ADR-006。
+CREATE TABLE IF NOT EXISTS ledger_idem (
+    idem_key   TEXT PRIMARY KEY,
+    scope      TEXT NOT NULL CHECK (scope IN ('trade','cash')),
+    row_id     INTEGER NOT NULL,
     created_at TEXT NOT NULL
 );
 
@@ -430,6 +463,34 @@ BEGIN SELECT RAISE(ABORT, 'decisions is append-only'); END;
 CREATE TRIGGER IF NOT EXISTS trg_decisions_no_delete
 BEFORE DELETE ON decisions
 BEGIN SELECT RAISE(ABORT, 'decisions is append-only'); END;
+
+-- 实盘账本三表：全保护（UPDATE + DELETE 皆禁）。
+-- 账本是「我真做过什么」的唯一记录，事后改写会让所有归因失效。
+-- 改错的唯一合法路径是**冲正**（追加一笔反向记录），它会作为新的一行出现、
+-- 带着 note 说明为什么 —— 历史因此仍然可读，而不是被抹掉。
+CREATE TRIGGER IF NOT EXISTS trg_real_trades_no_update
+BEFORE UPDATE ON real_trades
+BEGIN SELECT RAISE(ABORT, 'real_trades is append-only (改错请冲正)'); END;
+
+CREATE TRIGGER IF NOT EXISTS trg_real_trades_no_delete
+BEFORE DELETE ON real_trades
+BEGIN SELECT RAISE(ABORT, 'real_trades is append-only'); END;
+
+CREATE TRIGGER IF NOT EXISTS trg_cash_flows_no_update
+BEFORE UPDATE ON cash_flows
+BEGIN SELECT RAISE(ABORT, 'cash_flows is append-only (改错请冲正)'); END;
+
+CREATE TRIGGER IF NOT EXISTS trg_cash_flows_no_delete
+BEFORE DELETE ON cash_flows
+BEGIN SELECT RAISE(ABORT, 'cash_flows is append-only'); END;
+
+CREATE TRIGGER IF NOT EXISTS trg_ledger_idem_no_update
+BEFORE UPDATE ON ledger_idem
+BEGIN SELECT RAISE(ABORT, 'ledger_idem is append-only'); END;
+
+CREATE TRIGGER IF NOT EXISTS trg_ledger_idem_no_delete
+BEFORE DELETE ON ledger_idem
+BEGIN SELECT RAISE(ABORT, 'ledger_idem is append-only'); END;
 
 -- quote_snapshots：全保护（UPDATE + DELETE 皆禁）。盘中截面是**历史事实**，
 -- 源站事后修订某个 tick 不构成改写历史记录的理由 —— 修订会以 `conflict` 上报并留痕，

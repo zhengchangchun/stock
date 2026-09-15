@@ -13,6 +13,8 @@ EXPECTED_TABLES = {
     "raw_fetch_cache", "job_runs", "adj_factor_blackout",
     "experiment_decisions",
     "quote_snapshots",                 # P11：盘中快照（append-only）
+    "cash_flows",                      # P12：本金/现金流（append-only）
+    "ledger_idem",                     # P12：幂等键台账（append-only）
 }
 
 
