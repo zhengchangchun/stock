@@ -22,6 +22,9 @@ CODE = "000333"
 START = "2026-05-02"
 TODAY = "2026-09-01"
 NOW = f"{TODAY}T11:47:03+08:00"
+#: `_bars()` 覆盖区间（2026-05-02 起 124 天 → 止于 2026-09-02）**之外**的一天：
+#: 有快照、没有 bar 行 —— 用来构造「`ingest bars` 还没跑就补跑回填」。
+NO_BAR_DAY = "2026-09-03"
 
 
 def _bars(n=124):
@@ -49,6 +52,16 @@ def _run(capsys, argv):
     return rc, capsys.readouterr()
 
 
+def _insert_snapshot(conn, trade_date: str, ts: str, *, code: str = CODE) -> None:
+    """插一条快照（`backfill-close` 的唯一数据来源；amount/turnover 是当日累计量）。"""
+    conn.execute(
+        "INSERT INTO quote_snapshots (code, trade_date, ts, price, pre_close,"
+        " open, high, low, volume, amount, turnover, source, fetched_at)"
+        " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        (code, trade_date, ts, 12.0, 11.9, 11.9, 12.1, 11.8, 1000,
+         1_234_567.0, 0.42, "tencent", NOW))
+
+
 def test_tick_prints_json_and_verifies(capsys, db):
     rc, out = _run(capsys, ["session", "tick", "--db", str(db), "--now", NOW,
                             "--no-capture"])
@@ -63,19 +76,21 @@ def test_tick_prints_json_and_verifies(capsys, db):
 
 
 def test_tick_backfill_close_fills_the_day(capsys, db, tmp_path):
-    """补一条当日 bar + 一条当日快照，再手动补跑回填 —— 端到端写进 bars_daily。"""
+    """确保当日 bar（amount/turnover 为 NULL）+ 一条当日快照，手动补跑回填 → 写进 bars_daily。
+
+    ⚠️ 当日 bar 用 `ON CONFLICT ... DO UPDATE` 而不是裸 `INSERT`：建仓历史
+    `_bars(124)` 覆盖 2026-05-02~2026-09-02，`TODAY` 已在其中，seed 里已经有这一行，
+    裸 INSERT 会撞 `UNIQUE constraint failed: bars_daily.code, bars_daily.date`。
+    这里要的是「当日 bar 存在且 amount/turnover 为 NULL」这个**状态**，不是新插一行。
+    """
     conn = connect(db)
     conn.execute(
         "INSERT INTO bars_daily (code, date, open, high, low, close, volume,"
         " amount, turnover, adj_mode, is_suspended, source, fetched_at)"
-        " VALUES (?,?,?,?,?,?,?,NULL,NULL,'none',0,'test',?)",
+        " VALUES (?,?,?,?,?,?,?,NULL,NULL,'none',0,'test',?)"
+        " ON CONFLICT(code, date) DO UPDATE SET amount=NULL, turnover=NULL",
         (CODE, TODAY, 12.0, 12.0, 12.0, 12.0, 1000, NOW))
-    conn.execute(
-        "INSERT INTO quote_snapshots (code, trade_date, ts, price, pre_close,"
-        " open, high, low, volume, amount, turnover, source, fetched_at)"
-        " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
-        (CODE, TODAY, "20260901150003", 12.0, 11.9, 11.9, 12.1, 11.8, 1000,
-         1_234_567.0, 0.42, "tencent", NOW))
+    _insert_snapshot(conn, TODAY, "20260901150003")
     conn.commit()
     conn.close()
 
@@ -96,7 +111,17 @@ def test_tick_backfill_close_fills_the_day(capsys, db, tmp_path):
 
 
 def test_backfill_close_exits_nonzero_when_the_bar_is_missing(capsys, db):
-    rc, out = _run(capsys, ["session", "backfill-close", "--date", TODAY,
+    """有快照、但当日没有 bar 行 → 退出码 1 + 明细点名 + stderr 指向 `ingest bars`。
+
+    回填是**按快照逐标的**做的，所以「bar 缺失」只有在「该日有快照」时才可能被发现；
+    用 `NO_BAR_DAY`（`_bars()` 区间之外的一天）构造这个状态。
+    """
+    conn = connect(db)
+    _insert_snapshot(conn, NO_BAR_DAY, "20260903150003")
+    conn.commit()
+    conn.close()
+
+    rc, out = _run(capsys, ["session", "backfill-close", "--date", NO_BAR_DAY,
                             "--db", str(db)])
     assert rc == 1                                    # 「有事要你看」而不是静默 OK
     assert json.loads(out.out)["skipped_missing_bar"] == [CODE]
@@ -115,7 +140,8 @@ def test_review_daily_writes_report_and_labels_provenance(capsys, db, tmp_path):
     assert out_md.exists() and out_md.with_suffix(".json").exists()
     md = out_md.read_text(encoding="utf-8")
     assert "REPLAY（PIT 历史回放）" in md
-    assert "LIVE（实盘累计）：窗口内 0 行" in md
+    # 行首的 `**` 是渲染时的加粗标记（`review._window_line`），判的是同一句话
+    assert "**LIVE（实盘累计）**：窗口内 0 行" in md
     assert "不得" in md and "实盘表现" in md
 
 
