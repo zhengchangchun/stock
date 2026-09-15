@@ -81,16 +81,24 @@ class Lab:
             summary["nav"] = nav_series(c, self.asof, n_sessions=NAV_SESSIONS)
             return summary
 
-    def trades(self) -> dict:
+    def trades(self, *, code: str | None = None) -> dict:
+        """成交流水。`code` 是**显示筛选**，不改任何口径。
+
+        `all_rows` 一并带出：回执核对必须看全量（筛掉的可能是刚写的那笔）。
+        """
         with self.conn() as c:
             rows = [dict(r) for r in c.execute(
                 "SELECT * FROM real_trades ORDER BY date DESC, trade_id DESC")]
             # 回执要显示「写入后」的状态，所以顺带算出组合视图（同一次读库）
             view = build_portfolio(c, self.asof)
+        # 冲正标记永远按**全量**算：筛掉的那笔被冲正了，留在页上的这笔也该显示状态
         reversed_ids = _reversed_trade_ids(rows)
+        shown = [r for r in rows if r["code"] == code] if code else rows
         return {
             "asof": self.asof,
-            "rows": rows,
+            "rows": shown,
+            "all_rows": rows,
+            "filter": code,
             "reversed_ids": sorted(reversed_ids),
             "view": view,
         }

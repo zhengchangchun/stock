@@ -8,6 +8,7 @@
 """
 
 import html
+import json
 import http.client
 import re
 import sqlite3
@@ -187,12 +188,142 @@ def test_every_in_site_link_carries_the_base_path(server, base):
                 f"{page} 出现无前缀站内路径 {ref!r}"
 
 
+#: 允许出现的站外协议前缀（一个都不许有）
+EXTERNAL = ("http://", "https://", "//")
+
+
 def test_html_has_no_external_references(server, base):
-    """零依赖 + 离线可用：不许有 CDN / 外链字体 / 外部脚本。"""
+    """零依赖 + 离线可用：不许有 CDN / 外链字体 / 外部脚本。
+
+    P16 起改成**按 URL 判定**而不是按标签判定。原来的 `assert "<link" not in text`
+    是标签级的，本意对（不许外链）但判据错：自托管的
+    `<link rel="stylesheet" href="/lab/static/app.css">` 会被它误杀，
+    而 `<link href="//evil.example/x.css">` 这种协议相对外链它根本查不出来。
+    现在的判据对每个 `href`/`src` 都要求是 base-path 前缀的站内路径 ——
+    比原来**更严**，不是更松。
+    """
+    ref = re.compile(r'(?:href|src)="([^"]*)"')
     for page in READ_PAGES:
         _, text, _ = request(server, "GET", base + page)
-        assert "http://" not in text and "https://" not in text, page
-        assert "<script src" not in text and "<link" not in text, page
+        for bad in EXTERNAL:
+            assert bad not in text, f"{page} 出现外部引用前缀 {bad!r}"
+        for url in ref.findall(text):
+            if url.startswith("#"):
+                continue
+            assert url == base or url.startswith(base + "/"), \
+                f"{page} 出现非站内引用 {url!r}"
+
+
+def test_html_references_the_two_static_assets(server, base):
+    """全站**只有**两个外部资源，都是自己的静态路由。"""
+    for page in READ_PAGES:
+        _, text, _ = request(server, "GET", base + page)
+        assert f'href="{base}/static/app.css"' in text, page
+        assert f'src="{base}/static/app.js"' in text, page
+
+
+@pytest.mark.parametrize("asset,ctype", [
+    ("/static/app.css", "text/css"),
+    ("/static/app.js", "text/javascript"),
+])
+def test_static_assets_are_served_from_the_app_itself(server, base, asset, ctype):
+    status, text, hdrs = request(server, "GET", base + asset)
+    assert status == 200
+    assert hdrs["Content-Type"].startswith(ctype)
+    assert len(text) > 500
+    etag = hdrs["ETag"]
+    # 再要一次：带 If-None-Match 应当拿 304（省掉重复下载）
+    status2, body2, _ = request(server, "GET", base + asset,
+                                headers={"If-None-Match": etag})
+    assert status2 == 304 and body2 == ""
+
+
+def test_unknown_static_path_is_404(server, base):
+    """静态目录是白名单，不是文件服务器。"""
+    assert request(server, "GET", base + "/static/../app.py")[0] in (403, 404)
+    assert request(server, "GET", base + "/static/secrets.css")[0] == 404
+
+
+# ---------- 局部更新（fetch 片段） ----------
+
+FRAG = {"X-Lab-Fragment": "1"}
+
+
+def test_fragment_post_returns_json_blocks_and_writes(db, server, base, token):
+    """写成功后回 JSON：回执 + 流水表片段。**库照写**，只是不整页刷新。"""
+    status, text, hdrs = request(server, "POST", base + "/trades",
+                                 trade_form(token, form_id="frag-1"),
+                                 headers=FRAG)
+    assert status == 200, text[:400]
+    assert hdrs["Content-Type"].startswith("application/json")
+    data = json.loads(text)
+    assert data["ok"] is True
+    assert "已写入" in data["receipt_html"]
+    assert 'id="trades-pane"' not in text          # 片段不带整页外壳
+    assert "000333" in data["pane_html"]
+    assert data["url"].startswith(base + "/trades?receipt=trade:")
+    assert len(rows(db, "real_trades")) == 2       # 真的写进去了
+
+
+def test_fragment_post_is_idempotent_like_the_html_path(db, server, base, token):
+    """同一份表单发两次（双击）：第二回是幂等命中，**不写第二行**。"""
+    form = trade_form(token, form_id="frag-dup")
+    request(server, "POST", base + "/trades", form, headers=FRAG)
+    _, text, _ = request(server, "POST", base + "/trades", form, headers=FRAG)
+    data = json.loads(text)
+    assert data["ok"] is True and "幂等命中" in data["receipt_html"]
+    assert len(rows(db, "real_trades")) == 2
+
+
+def test_fragment_error_is_json_with_field_and_db_unchanged(db, server, base, token):
+    """校验失败 → 400 + JSON，且**带字段名**（页面才能标在那一格旁边）。"""
+    status, text, _ = request(server, "POST", base + "/trades",
+                              trade_form(token, form_id="frag-bad", price="0"),
+                              headers=FRAG)
+    assert status == 400
+    data = json.loads(text)
+    assert data["ok"] is False and data["field"] == "price"
+    assert "0" in data["error"]
+    assert len(rows(db, "real_trades")) == 1
+
+
+def test_field_level_error_is_marked_next_to_the_input(db, server, base, token):
+    """整页路径同样把错误标到字段旁（`field bad` + 格内文案）。"""
+    _, text, _ = request(server, "POST", base + "/trades",
+                         trade_form(token, form_id="bad-2", qty=""))
+    assert 'data-field="qty"' in text
+    assert 'class="field w-qty bad"' in text
+
+
+def test_no_duplicate_confirmation_still_falls_back_to_a_page(db, server, base, token):
+    """疑似重复**不**走片段：它需要一个整页让人勾选确认。"""
+    request(server, "POST", base + "/trades",
+            trade_form(token, form_id="real-1"), headers=FRAG)
+    status, text, _ = request(server, "POST", base + "/trades",
+                              trade_form(token, form_id="real-2"), headers=FRAG)
+    assert status == 409
+    assert "<!doctype html>" in text and "疑似重复" in text
+    assert len(rows(db, "real_trades")) == 2       # 没有写第三行
+
+
+# ---------- 显示筛选与富文本 ----------
+
+def test_trades_can_be_filtered_by_code(db, server, base):
+    _, text, _ = request(server, "GET", base + "/trades?code=000333")
+    assert "只看 000333" in text
+    assert "显示全部" in text
+
+
+def test_filtered_away_code_shows_an_empty_list(db, server, base):
+    _, text, _ = request(server, "GET", base + "/trades?code=600519")
+    assert "还没有任何成交" in text
+
+
+def test_double_asterisk_is_rendered_as_bold_not_shown_literally(db, server, base):
+    """账本 detail 里的 `**超**` 必须变成加粗 —— P16 之前是原样显示 `**超**` 的。"""
+    _, text, _ = request(server, "GET", base + "/")
+    assert "**" not in text, "页面里还在原样显示 Markdown 星号"
+    assert "<b>" in text
 
 
 # ---------- _token ----------

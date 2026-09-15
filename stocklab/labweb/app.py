@@ -40,9 +40,12 @@ from stocklab.dashboard.server import (LOOPBACK_HOSTS, NonLoopbackHost,
                                        assert_loopback)
 from stocklab.labweb import SERVICE, VERSION
 from stocklab.labweb.data import Lab, now_iso
-from stocklab.labweb.render import (cash_page, data_page, duplicate_page,
-                                    error_page, overview_page, risk_page,
-                                    trade_detail_page, trades_page)
+from stocklab.labweb.render import (CASH_FIELDS, CSS_PATH, JS_PATH,
+                                    TRADE_FIELDS, cash_page, cash_pane,
+                                    data_page, duplicate_page, error_page,
+                                    overview_page, receipt_block, risk_page,
+                                    trade_detail_page, trades_page,
+                                    trades_pane)
 from stocklab.labweb.tokens import TokenSigner, new_form_id, new_secret
 from stocklab.portfolio.ledger import (CASH_KINDS, CashFlowValidationError,
                                        DuplicateTradeError, LedgerError,
@@ -161,6 +164,90 @@ def _token_ok(ctx: Context, fields: dict) -> bool:
     return ctx.signer.verify(fields.get("_token"), today=ctx.lab.asof)
 
 
+# ---------- 静态资产（本应用自己的 CSS/JS） ----------
+
+#: 静态文件目录。**只有白名单里的两个文件**，不做目录遍历。
+STATIC_DIR = Path(__file__).with_name("static")
+STATIC_TYPES = {CSS_PATH: "text/css; charset=utf-8",
+                JS_PATH: "text/javascript; charset=utf-8"}
+
+
+def static_response(rel: str, if_none_match: str | None = None) -> Response | None:
+    """`/lab/static/app.css` 这类请求。不在白名单 → `None`（交给路由去 404）。
+
+    带 `ETag`：CSS/JS 每次导航都会重新校验，命中就是 304，
+    省掉的是「每次点导航都重下 20KB 样式表」——这正是「流畅」的一部分。
+    """
+    # `rel` 带前导斜杠（`/static/app.css`），白名单键不带 —— 归一后再查。
+    rel = rel.lstrip("/")
+    ctype = STATIC_TYPES.get(rel)
+    if ctype is None:
+        return None
+    path = STATIC_DIR / rel.rsplit("/", 1)[-1]
+    try:
+        raw = path.read_bytes()
+        mtime = int(path.stat().st_mtime)
+    except OSError:
+        return None
+    etag = f'"{len(raw):x}-{mtime:x}"'
+    if if_none_match and if_none_match.strip() == etag:
+        return Response(304, ctype, b"", (("ETag", etag),
+                                          ("Cache-Control", "no-cache")))
+    return Response(200, ctype, raw,
+                    (("ETag", etag), ("Cache-Control", "no-cache"),
+                     ("X-Content-Type-Options", "nosniff")))
+
+
+# ---------- 局部更新（fetch） ----------
+
+def _error_field(message: str, known: tuple[str, ...]) -> str:
+    """消息开头的字段名若在白名单里，就当成**字段级**错误标到那一格旁边。
+
+    认不出（例如「买入数量必须是 100 股整数倍」）返回空串 ——
+    标错格子比不标更糟。
+    """
+    head = (message or "").strip().split(" ", 1)[0]
+    return head if head in known else ""
+
+
+def _fragment(*, pane_html: str, receipt_html: str, url: str) -> Response:
+    return json_response({"ok": True, "pane_html": pane_html,
+                          "receipt_html": receipt_html, "url": url})
+
+
+def _frag_trade_error(ctx: Context, exc: Exception) -> Response:
+    msg = str(exc)
+    return json_response({"ok": False, "error": msg,
+                          "field": _error_field(msg, TRADE_FIELDS)}, status=400)
+
+
+def _frag_cash_error(ctx: Context, exc: Exception) -> Response:
+    msg = str(exc)
+    return json_response({"ok": False, "error": msg,
+                          "field": _error_field(msg, CASH_FIELDS)}, status=400)
+
+
+def _frag_trades(ctx: Context, trade_id: int, state: str) -> Response:
+    """写完之后：把**回执**和**流水表**一起回给页面（同一份取数，口径同一处）。"""
+    data = ctx.lab.trades()
+    base = ctx.base_path
+    return _fragment(
+        pane_html=trades_pane(data, base=base),
+        receipt_html=receipt_block({"id": trade_id, "state": state,
+                                    "what": "成交"}, data["view"]),
+        url=f"{base}/trades?receipt=trade:{trade_id}&state={state}")
+
+
+def _frag_cash(ctx: Context, flow_id: int, state: str) -> Response:
+    data = ctx.lab.cash()
+    base = ctx.base_path
+    return _fragment(
+        pane_html=cash_pane(data, base=base),
+        receipt_html=receipt_block({"id": flow_id, "state": state,
+                                    "what": "现金流"}, data["view"]),
+        url=f"{base}/cash?receipt=cash:{flow_id}&state={state}")
+
+
 def _forbidden(ctx: Context, path: str) -> Response:
     """403：**不写库**、不透露 token 的任何信息。"""
     return html_response(403, error_page(
@@ -173,30 +260,35 @@ def _forbidden(ctx: Context, path: str) -> Response:
 
 # ---------- 写路径 ----------
 
-def _post_trade(ctx: Context, fields: dict) -> Response:
+def _post_trade(ctx: Context, fields: dict, *, fragment: bool = False) -> Response:
     if not _token_ok(ctx, fields):
         return _forbidden(ctx, "/trades")
     base = ctx.base_path
     form_id = _f(fields, "_form_id")
-    values = {k: fields.get(k, "") for k in
-              ("date", "code", "side", "price", "qty", "fee", "note")}
+    values = {k: fields.get(k, "") for k in TRADE_FIELDS}
     confirm = _f(fields, "confirm_duplicate") == "1"
     try:
         kw = _trade_kwargs(fields)
     except TradeValidationError as exc:
+        if fragment:
+            return _frag_trade_error(ctx, exc)
         return html_response(400, trades_page(
             ctx.lab.trades(), base=base, built_at=now_iso(),
             token=ctx.signer.mint(ctx.lab.asof), form_id=new_form_id(),
-            error=str(exc), values=values))
+            error=str(exc), values=values,
+            err_field=_error_field(str(exc), TRADE_FIELDS)))
 
     with ctx.lab.conn() as conn:
         try:
             validate_trade(conn, now=now_iso(), **_key(kw))
         except TradeValidationError as exc:
+            if fragment:
+                return _frag_trade_error(ctx, exc)
             return html_response(400, trades_page(
                 ctx.lab.trades(), base=base, built_at=now_iso(),
                 token=ctx.signer.mint(ctx.lab.asof), form_id=new_form_id(),
-                error=str(exc), values=values))
+                error=str(exc), values=values,
+                err_field=_error_field(str(exc), TRADE_FIELDS)))
         # 重试（同一个 `_form_id` 已落过库）不弹「疑似重复」—— 那只是双击/刷新重发。
         # 不先问这一句的话，「疑似重复」预检查会先命中自己刚写下的那行，
         # 把一次无害的重试显示成「你手滑了」。
@@ -215,10 +307,15 @@ def _post_trade(ctx: Context, fields: dict) -> Response:
                 base=base, status=409, message=str(exc),
                 asof=ctx.lab.asof, built_at=now_iso()))
         except TradeValidationError as exc:
+            if fragment:
+                return _frag_trade_error(ctx, exc)
             return html_response(400, trades_page(
                 ctx.lab.trades(), base=base, built_at=now_iso(),
                 token=ctx.signer.mint(ctx.lab.asof), form_id=new_form_id(),
-                error=str(exc), values=values))
+                error=str(exc), values=values,
+                err_field=_error_field(str(exc), TRADE_FIELDS)))
+    if fragment:
+        return _frag_trades(ctx, res["trade_id"], res["state"])
     return redirect(f"{base}/trades?receipt=trade:{res['trade_id']}"
                     f"&state={res['state']}")
 
@@ -273,12 +370,12 @@ def _duplicate(ctx: Context, fields: dict, *, kind: str, existing_id: int,
         endpoint=endpoint, fields=clean, label="疑似重复"))
 
 
-def _post_cash(ctx: Context, fields: dict) -> Response:
+def _post_cash(ctx: Context, fields: dict, *, fragment: bool = False) -> Response:
     if not _token_ok(ctx, fields):
         return _forbidden(ctx, "/cash")
     base = ctx.base_path
     form_id = _f(fields, "_form_id")
-    values = {k: fields.get(k, "") for k in ("date", "kind", "amount", "note")}
+    values = {k: fields.get(k, "") for k in CASH_FIELDS}
     confirm = _f(fields, "confirm_duplicate") == "1"
     try:
         kw = _cash_kwargs(fields)
@@ -286,10 +383,13 @@ def _post_cash(ctx: Context, fields: dict) -> Response:
             raise CashFlowValidationError(
                 f"kind 必须是 {CASH_KINDS} 之一，收到 {kw['kind']!r}")
     except LedgerError as exc:
+        if fragment:
+            return _frag_cash_error(ctx, exc)
         return html_response(400, cash_page(
             ctx.lab.cash(), base=base, built_at=now_iso(),
             token=ctx.signer.mint(ctx.lab.asof), form_id=new_form_id(),
-            error=str(exc), values=values))
+            error=str(exc), values=values,
+            err_field=_error_field(str(exc), CASH_FIELDS)))
 
     with ctx.lab.conn() as conn:
         retry = bool(form_id) and find_idem(conn, form_id, "cash") is not None
@@ -302,10 +402,15 @@ def _post_cash(ctx: Context, fields: dict) -> Response:
             res = record_cash_flow(conn, now=now_iso(), idem_key=form_id or None,
                                    allow_duplicate=confirm, **kw)
         except LedgerError as exc:
+            if fragment:
+                return _frag_cash_error(ctx, exc)
             return html_response(400, cash_page(
                 ctx.lab.cash(), base=base, built_at=now_iso(),
                 token=ctx.signer.mint(ctx.lab.asof), form_id=new_form_id(),
-                error=str(exc), values=values))
+                error=str(exc), values=values,
+                err_field=_error_field(str(exc), CASH_FIELDS)))
+    if fragment:
+        return _frag_cash(ctx, res["flow_id"], res["state"])
     return redirect(f"{base}/cash?receipt=cash:{res['flow_id']}"
                     f"&state={res['state']}")
 
@@ -348,7 +453,9 @@ def _receipt_of(query: dict[str, list[str]], data: dict, kind: str,
     if got_kind != kind or not got_id.isdigit():
         return None
     target = int(got_id)
-    rows = data["rows"]
+    # 核对回执用**未过滤**的全量行：`?code=XXX&receipt=trade:9` 这种组合下，
+    # 刚写的那笔未必在当前筛选里，但它是真实存在的。
+    rows = data.get("all_rows") or data["rows"]
     if not any(r[id_key] == target for r in rows):
         return None
     state = (query.get("state") or [""])[0]
@@ -364,8 +471,14 @@ def _not_found(ctx: Context, path: str) -> Response:
         asof=ctx.lab.asof, built_at=now_iso()))
 
 
-def handle(method: str, target: str, *, body: bytes, ctx: Context) -> Response:
-    """路由（纯函数式：只经 `ctx.lab` 读库；写路径见 `_post_*`）。"""
+def handle(method: str, target: str, *, body: bytes, ctx: Context,
+           fragment: bool = False,
+           if_none_match: str | None = None) -> Response:
+    """路由（纯函数式：只经 `ctx.lab` 读库；写路径见 `_post_*`）。
+
+    `fragment=True`（请求头 `X-Lab-Fragment: 1`）时，写路径回 **JSON 片段**
+    而不是 303 —— 页面自己把回执与流水表换掉，不整页刷新。
+    """
     split = urlsplit(target)
     path = split.path
     query = parse_qs(split.query, keep_blank_values=True)
@@ -382,6 +495,9 @@ def handle(method: str, target: str, *, body: bytes, ctx: Context) -> Response:
         rel = "/"
 
     if method in ("GET", "HEAD"):
+        static = static_response(rel, if_none_match)
+        if static is not None:
+            return static
         return _get(ctx, rel, query, built_at)
 
     if method != "POST":
@@ -390,9 +506,9 @@ def handle(method: str, target: str, *, body: bytes, ctx: Context) -> Response:
 
     fields = _parse_form(body)
     if rel == "/trades":
-        return _post_trade(ctx, fields)
+        return _post_trade(ctx, fields, fragment=fragment)
     if rel == "/cash":
-        return _post_cash(ctx, fields)
+        return _post_cash(ctx, fields, fragment=fragment)
     m = _TRADE_REVERSE.match(rel)
     if m:
         return _post_reverse(ctx, fields, int(m.group(1)))
@@ -405,7 +521,8 @@ def _get(ctx: Context, rel: str, query: dict, built_at: str) -> Response:
         return html_response(200, overview_page(
             ctx.lab.overview(), base=base, built_at=built_at))
     if rel == "/trades":
-        data = ctx.lab.trades()
+        code = (query.get("code") or [""])[0].strip() or None
+        data = ctx.lab.trades(code=code)
         return html_response(200, trades_page(
             data, base=base, built_at=built_at,
             token=ctx.signer.mint(ctx.lab.asof), form_id=new_form_id(),
@@ -459,7 +576,9 @@ def make_handler() -> type[BaseHTTPRequestHandler]:
 
         def _go(self, method: str) -> None:
             resp = handle(method, self.path, body=self._read_body(),
-                          ctx=self.server.ctx)      # type: ignore[attr-defined]
+                          ctx=self.server.ctx,   # type: ignore[attr-defined]
+                          fragment=self.headers.get("X-Lab-Fragment") == "1",
+                          if_none_match=self.headers.get("If-None-Match"))
             self.send_response(resp.status)
             self.send_header("Content-Type", resp.content_type)
             self.send_header("Content-Length", str(len(resp.body)))

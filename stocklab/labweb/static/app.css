@@ -1,0 +1,460 @@
+/* ============================================================
+   stock-lab · 持仓与纪律台账
+   ------------------------------------------------------------
+   视觉隐喻：券商对账单。细线分栏、数字右对齐、来源脚注。
+   刻意不做：卡片墙 / 渐变 / 阴影 / 入场动画 / 眉标 / 表情图标。
+
+   约定
+   - 全站只有一个圆角 token（控件 4px），内容区块零圆角。
+   - 只有一条阴影 token，只给 dialog 用（它必须浮起来）。
+   - 饱和色只出现在纪律状态与盈亏上，别处一律 --ink / --ink2。
+   ============================================================ */
+
+:root {
+  /* 6 个基础值 */
+  --ground: #edf0f3;
+  --paper: #ffffff;
+  --ink: #12181f;
+  --ink2: #5a6672;
+  --rule: #d9dfe6;
+  --accent: #123e6b;
+
+  /* 4 个语义值（仅纪律与盈亏使用） */
+  --ok: #0f6b3b;
+  --warn: #8a5a00;
+  --fail: #a81c1c;
+  --unknown: #5a6672;
+
+  /* 由语义值派生的浅底（banner / 表格行），用于承载文字而非强调 */
+  --ok-bg: #eaf4ee;
+  --ok-line: #a9cfba;
+  --warn-bg: #fbf3e2;
+  --warn-line: #ddc48a;
+  --fail-bg: #fbeceb;
+  --fail-line: #e8b3b0;
+
+  --rail: 208px;
+  --sheet: 1100px;
+  --radius: 4px;
+}
+
+* { box-sizing: border-box; }
+
+html { -webkit-text-size-adjust: 100%; }
+
+body {
+  margin: 0;
+  background: var(--ground);
+  color: var(--ink);
+  font: 400 14px/1.5 system-ui, -apple-system, "PingFang SC", "Microsoft YaHei",
+        "Noto Sans SC", sans-serif;
+  /* 台账的全部分栏对齐都靠它 —— 数字等宽，中文不受影响 */
+  font-variant-numeric: tabular-nums;
+  font-feature-settings: "tnum" 1;
+}
+
+a { color: var(--accent); text-decoration: none; }
+a:hover { text-decoration: underline; }
+
+/* 可见键盘焦点：只在键盘触发时出现，鼠标点击不闪 */
+:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+
+/* ---------- 骨架：左轨 + 纸面 ---------- */
+
+.wrap { display: flex; min-height: 100vh; align-items: flex-start; }
+
+.rail {
+  flex: 0 0 var(--rail);
+  width: var(--rail);
+  position: sticky;
+  top: 0;
+  align-self: stretch;
+  padding: 18px 0 24px;
+  border-right: 1px solid var(--rule);
+}
+
+.rail__brand {
+  padding: 0 18px 14px;
+  border-bottom: 1px solid var(--rule);
+  margin-bottom: 10px;
+}
+.rail__name { font-size: 15px; font-weight: 700; letter-spacing: .01em; }
+.rail__sub {
+  display: block;
+  margin-top: 3px;
+  font-size: 11.5px;
+  color: var(--ink2);
+  line-height: 1.4;
+}
+
+.rail__nav { display: flex; flex-direction: column; }
+.rail__link {
+  display: block;
+  padding: 7px 18px 7px 16px;
+  font-size: 13.5px;
+  color: var(--ink);
+  border-left: 2px solid transparent;   /* 活动标记的占位，避免选中时抖动 */
+}
+.rail__link:hover { background: #e4e9ee; text-decoration: none; }
+.rail__link[aria-current="page"] {
+  border-left-color: var(--accent);
+  color: var(--accent);
+  font-weight: 600;
+  background: #e7edf4;
+}
+
+.sheet {
+  flex: 1 1 auto;
+  min-width: 0;              /* 没有它，宽表格会把 flex 撑破 */
+  max-width: var(--sheet);
+  padding: 0 22px 40px;
+}
+
+/* 窄屏：左轨变成横向条 */
+@media (max-width: 900px) {
+  .wrap { display: block; }
+  .rail {
+    position: static;
+    width: auto;
+    border-right: 0;
+    border-bottom: 1px solid var(--rule);
+    padding: 10px 0 0;
+    background: var(--paper);
+  }
+  .rail__brand { padding: 0 12px 8px; border-bottom: 0; margin-bottom: 0; }
+  .rail__nav {
+    flex-direction: row;
+    overflow-x: auto;
+    padding: 0 12px;
+    scrollbar-width: thin;
+  }
+  .rail__link {
+    white-space: nowrap;
+    padding: 9px 12px;
+    border-left: 0;
+    border-bottom: 2px solid transparent;
+  }
+  .rail__link[aria-current="page"] {
+    border-left-color: transparent;
+    border-bottom-color: var(--accent);
+    background: transparent;
+  }
+  .sheet { padding: 0 12px 32px; max-width: none; }
+}
+
+/* ---------- 通栏表头带（CANONICAL 数字） ---------- */
+
+.canon {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(158px, 1fr));
+  gap: 1px;
+  background: var(--rule);          /* gap 处透出细线 = 栏间竖线 */
+  border: 1px solid var(--rule);
+  margin: 16px 0 0;
+}
+.canon__cell { background: var(--paper); padding: 10px 12px 11px; min-width: 0; }
+.canon__k { font-size: 12.5px; color: var(--ink2); }
+.canon__v {
+  margin-top: 2px;
+  font-size: 28px;
+  line-height: 1.15;
+  font-weight: 700;
+  letter-spacing: -.01em;
+  white-space: nowrap;
+}
+.canon__v.is-sm { font-size: 19px; font-weight: 600; }
+.canon__n { margin-top: 3px; font-size: 11.5px; color: var(--ink2); line-height: 1.45; }
+/* 同一格里的第二口径：与主数字并列，但明显次一级 */
+.canon__alt { display: block; margin-top: 1px; font-size: 11.5px; color: var(--ink2); }
+
+/* ---------- 纪律条（首屏主角） ---------- */
+
+.disc {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(172px, 1fr));
+  gap: 1px;
+  background: var(--rule);
+  border: 1px solid var(--rule);
+  margin-top: 14px;
+}
+.disc__cell { background: var(--paper); padding: 9px 11px 11px; min-width: 0; }
+.disc__st { font-size: 11.5px; font-weight: 600; letter-spacing: .02em; }
+.disc__name { margin-top: 3px; font-size: 13.5px; font-weight: 600; }
+.disc__sub { font-size: 11.5px; color: var(--ink2); }
+.disc__v {
+  margin-top: 6px;
+  font-size: 17px;
+  font-weight: 600;
+  white-space: nowrap;
+}
+.disc__d { margin-top: 2px; font-size: 11.5px; color: var(--ink2); line-height: 1.45; }
+
+.disc__cell.s-pass .disc__st { color: var(--ok); }
+.disc__cell.s-warn .disc__st { color: var(--warn); }
+.disc__cell.s-unknown .disc__st { color: var(--unknown); font-style: italic; }
+
+/* FAIL 格：全页唯一的高对比块。醒目额度只花在「出格」上。 */
+.disc__cell.s-fail { background: var(--fail); }
+.disc__cell.s-fail .disc__st,
+.disc__cell.s-fail .disc__name,
+.disc__cell.s-fail .disc__sub,
+.disc__cell.s-fail .disc__v,
+.disc__cell.s-fail .disc__d { color: #fff; }
+.disc__cell.s-fail .disc__d { opacity: .92; }
+
+/* ---------- 区块与分节 ---------- */
+
+.sec { margin-top: 22px; }
+.sec__h {
+  display: flex;
+  align-items: baseline;
+  gap: 10px;
+  font-size: 16px;
+  font-weight: 600;
+  margin: 0 0 8px;
+  padding-bottom: 6px;
+  border-bottom: 1px solid var(--ink);
+}
+.sec__h .sec__n { font-size: 11.5px; font-weight: 400; color: var(--ink2); margin-left: auto; }
+
+.note { margin: 8px 0 0; font-size: 11.5px; color: var(--ink2); line-height: 1.55; }
+.note a { color: var(--accent); }
+
+/* ---------- 对账表格 ---------- */
+
+.scroll-x { overflow-x: auto; border: 1px solid var(--rule); background: var(--paper); }
+
+table.tbl { width: 100%; border-collapse: collapse; font-size: 13.5px; line-height: 1.35; }
+table.tbl th, table.tbl td {
+  padding: 6px 9px;
+  text-align: right;
+  white-space: nowrap;
+  border-bottom: 1px solid var(--rule);
+}
+table.tbl th:first-child, table.tbl td:first-child { text-align: left; }
+table.tbl thead th {
+  font-size: 12.5px;
+  font-weight: 600;
+  color: var(--ink2);
+  background: #f7f9fa;
+  border-bottom: 1px solid var(--ink2);
+}
+table.tbl tbody tr:last-child td { border-bottom: 0; }
+table.tbl tbody tr:hover { background: var(--ground); }
+table.tbl tbody tr.is-void td { color: var(--ink2); }
+table.tbl tbody tr.is-void td:first-child { text-decoration: line-through; }
+/* 合计行：对账单的收口 */
+table.tbl tr.total td {
+  border-top: 1px solid var(--ink);
+  border-bottom: 0;
+  font-weight: 600;
+  background: var(--paper);
+}
+table.tbl td.l { text-align: left; }
+table.tbl td .sub { font-size: 11.5px; color: var(--ink2); }
+table.tbl tr.empty td { text-align: left; color: var(--ink2); font-style: italic; }
+
+/* 详情页的键值表：键左、值右，是表不是卡 */
+table.kv { width: 100%; border-collapse: collapse; font-size: 13.5px; }
+table.kv th, table.kv td {
+  padding: 6px 0;
+  border-bottom: 1px solid var(--rule);
+  text-align: right;
+  vertical-align: top;
+}
+table.kv th { width: 108px; text-align: left; font-weight: 400; color: var(--ink2); }
+table.kv tr:last-child th, table.kv tr:last-child td { border-bottom: 0; }
+
+/* ---------- 语义色与标签 ---------- */
+
+.s-pass { color: var(--ok); }
+.s-warn { color: var(--warn); font-weight: 600; }
+.s-fail { color: var(--fail); font-weight: 600; }
+.s-unknown { color: var(--unknown); font-style: italic; }
+.pos { color: var(--ok); }
+.neg { color: var(--fail); }
+.mut { color: var(--ink2); }
+
+.tag {
+  display: inline-block;
+  padding: 0 5px;
+  border: 1px solid currentColor;
+  border-radius: 2px;
+  font-size: 11px;
+  line-height: 16px;
+  vertical-align: 1px;
+}
+
+/* ---------- 占比条（inline 元素，纯 CSS 手绘） ---------- */
+
+.bar { position: relative; display: inline-block; width: 54px; height: 8px;
+       background: var(--rule); vertical-align: middle; margin-right: 6px; }
+.bar i { position: absolute; inset: 0 auto 0 0; background: var(--accent); }
+.bar.cap i { background: var(--warn); }
+.bar.over i { background: var(--fail); }
+
+/* ---------- 表单 ---------- */
+
+.form { background: var(--paper); border: 1px solid var(--rule); padding: 13px 14px 15px; }
+.form__row { display: flex; flex-wrap: wrap; gap: 10px 12px; align-items: flex-start; }
+.field { display: flex; flex-direction: column; gap: 3px; min-width: 0; }
+.field > label { font-size: 12.5px; color: var(--ink2); }
+.field .hint { font-size: 11.5px; color: var(--ink2); }
+
+input[type="text"], input[type="date"], input[type="number"], input[name],
+select {
+  padding: 6px 8px;
+  border: 1px solid var(--rule);
+  border-radius: var(--radius);
+  background: var(--paper);
+  color: var(--ink);
+  font: inherit;
+  font-variant-numeric: tabular-nums;
+  min-width: 0;
+}
+input:hover, select:hover { border-color: var(--ink2); }
+input:focus, select:focus { border-color: var(--accent); outline: 2px solid var(--accent);
+                            outline-offset: -1px; }
+.w-date input, .w-date { width: 138px; }
+.w-code input { width: 92px; }
+.w-side select { width: 88px; }
+.w-price input { width: 96px; }
+.w-qty input { width: 92px; }
+.w-fee input { width: 84px; }
+.w-note input { width: 168px; }
+.w-amount input { width: 118px; }
+.w-kind select { width: 104px; }
+
+/* 字段级错误：贴在字段正下方，不用横幅代替 */
+.field .err { display: none; font-size: 11.5px; color: var(--fail); }
+.field.bad input, .field.bad select { border-color: var(--fail); background: var(--fail-bg); }
+.field.bad .err { display: block; }
+
+.btn {
+  padding: 7px 16px;
+  border: 1px solid var(--accent);
+  border-radius: var(--radius);
+  background: var(--accent);
+  color: #fff;
+  font: 600 13.5px/1.2 inherit;
+  cursor: pointer;
+}
+.btn:hover { background: #0d2f52; }
+.btn[disabled] { opacity: .62; cursor: progress; }
+.btn.ghost { background: var(--paper); color: var(--accent); }
+.btn.danger { background: var(--fail); border-color: var(--fail); }
+.btn.danger:hover { background: #8d1717; }
+
+/* ---------- 横幅与回执 ---------- */
+
+.banner {
+  border: 1px solid var(--rule);
+  border-left-width: 3px;
+  background: var(--paper);
+  padding: 9px 12px;
+  margin: 14px 0 0;
+  font-size: 13.5px;
+  line-height: 1.55;
+}
+.banner.ok { border-left-color: var(--ok); background: var(--ok-bg); border-color: var(--ok-line);
+             border-left-color: var(--ok); color: #0b4f2b; }
+.banner.warn { background: var(--warn-bg); border-color: var(--warn-line);
+               border-left-color: var(--warn); color: #6b4600; }
+.banner.bad { background: var(--fail-bg); border-color: var(--fail-line);
+              border-left-color: var(--fail); color: #7c1616; }
+.banner b { font-weight: 600; }
+.banner ul { margin: 5px 0 0; padding-left: 18px; }
+
+/* 表单顶部的内联报错（局部更新时插进去的那条） */
+.alert { margin: 0 0 10px; font-size: 13px; font-weight: 600; line-height: 1.5; }
+
+code {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: .92em;
+  background: var(--ground);
+  padding: 0 3px;
+  border-radius: 2px;
+}
+
+/* 唯一的动效：回执「刚落下来」的一次高亮回落。响应人的动作，不是入场动画。 */
+@keyframes receipt-land { from { background: #fff6d8; } to { } }
+.banner.landed { animation: receipt-land 240ms ease-out 1; }
+
+/* ---------- 曲线 ---------- */
+
+.chart { margin: 0; background: var(--paper); border: 1px solid var(--rule);
+         padding: 10px 12px 6px; }
+.chart svg { display: block; width: 100%; height: auto; }
+.chart figcaption { font-size: 11.5px; color: var(--ink2); padding: 4px 0 6px; }
+
+/* ---------- 确认框 ---------- */
+
+dialog.confirm {
+  border: 1px solid var(--ink2);
+  border-radius: var(--radius);
+  padding: 0;
+  max-width: 460px;
+  box-shadow: 0 6px 22px rgba(18, 24, 31, .22);
+  color: var(--ink);
+  font: inherit;
+}
+dialog.confirm::backdrop { background: rgba(18, 24, 31, .38); }
+.confirm__h { font-size: 15px; font-weight: 600; margin: 0; padding: 12px 16px 0; }
+.confirm__b { padding: 6px 16px 12px; font-size: 13.5px; line-height: 1.6; }
+.confirm__f { display: flex; gap: 8px; justify-content: flex-end;
+              padding: 10px 16px; border-top: 1px solid var(--rule); background: #f7f9fa; }
+
+/* ---------- 页脚与工具类 ---------- */
+
+.foot {
+  margin-top: 26px;
+  padding-top: 8px;
+  border-top: 1px solid var(--rule);
+  font-size: 11.5px;
+  color: var(--ink2);
+  line-height: 1.6;
+}
+.stack > * + * { margin-top: 6px; }
+.list { margin: 6px 0 0; padding-left: 18px; font-size: 13.5px; line-height: 1.6; }
+.list li + li { margin-top: 3px; }
+.inline { display: inline; }
+.nowrap { white-space: nowrap; }
+.sr {
+  position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px;
+  overflow: hidden; clip: rect(0 0 0 0); white-space: nowrap; border: 0;
+}
+
+/* ---------- 尊重用户的动效偏好 ---------- */
+
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after {
+    animation-duration: 1ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 1ms !important;
+    scroll-behavior: auto !important;
+  }
+  .banner.landed { animation: none; background: var(--ok-bg); }
+}
+
+/* ---------- 窄屏 ---------- */
+
+@media (max-width: 768px) {
+  .canon { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .canon__v { font-size: 22px; }
+  .disc { grid-template-columns: 1fr; }
+  .sec__h { font-size: 15px; }
+  .form__row { gap: 9px 10px; }
+  .w-note input { width: 100%; }
+  .field { flex: 1 1 44%; }
+  .field.w-note { flex: 1 1 100%; }
+}
+
+/* ---------- 打印：对账单本来就该能打 ---------- */
+
+@media print {
+  body { background: #fff; font-size: 11px; }
+  .rail, .form, .btn, dialog { display: none !important; }
+  .sheet { max-width: none; padding: 0; }
+  .sec { break-inside: avoid; }
+  a { color: inherit; text-decoration: none; }
+}
