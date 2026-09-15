@@ -360,11 +360,14 @@ CREATE INDEX IF NOT EXISTS idx_cash_flows_date ON cash_flows (date, flow_id);
 -- 键由调用方给（`--idempotency-key`），同一 key 第二次进来 = 幂等命中，不写第二行。
 -- 刻意**不**用业务元组当键：业务元组相同既可能是重试也可能是真单，无法区分；
 -- 只有调用方知道自己是不是在重试。见 ADR-006。
+-- 键 = **(idem_key, scope)**：同一个 key 字符串用在成交与用在现金流上是两回事，
+-- 各查各的表。scope 因此不是装饰列，它就在主键里。
 CREATE TABLE IF NOT EXISTS ledger_idem (
-    idem_key   TEXT PRIMARY KEY,
+    idem_key   TEXT NOT NULL,
     scope      TEXT NOT NULL CHECK (scope IN ('trade','cash')),
     row_id     INTEGER NOT NULL,
-    created_at TEXT NOT NULL
+    created_at TEXT NOT NULL,
+    PRIMARY KEY (idem_key, scope)
 );
 
 -- ---------- 治理 ----------
