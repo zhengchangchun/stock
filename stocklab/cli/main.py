@@ -1436,24 +1436,19 @@ def _risk_conn(args):
 
 
 def _kelly_result(args, conn, code: str) -> dict:
-    """回放 `--rule` → 凯利结论（p/b 的唯一合法来源，见 `risk.kelly` docstring）。"""
-    from stocklab.risk.kelly import evaluate
-    from stocklab.risk.rules import replay
+    """回放 `--rule` → 凯利结论（p/b 的唯一合法来源，见 `risk.kelly` docstring）。
+
+    实现在 `stocklab.risk.panel`（P15 从本函数搬出）—— **CLI 与 Web 页面调同一个
+    函数**，避免两处各拼一遍口径（那就是第二个真相来源）。
+    """
+    from stocklab.risk.panel import build_risk_block
 
     asof = args.asof or datetime.now(TZ).date().isoformat()
-    rp = replay(conn, code, rule=args.rule, asof=asof, horizon=args.horizon)
-    out = evaluate(rp.stats, frac=args.frac)
-    out["replay"] = {
-        "price_window": rp.price_window,
-        "cost_model": rp.cost_model,
-        "meta": rp.meta,
-        "trades_preview": [
-            {"entry": t.entry_date, "exit": t.exit_date, "qty": t.qty,
-             "net_return": t.net_return, "cost_bps": round(t.cost_bps, 2),
-             "still_open": t.still_open}
-            for t in rp.trades[-5:]],
-    }
-    return out
+    block = build_risk_block(conn, code, asof=asof, rule=args.rule,
+                             horizon=args.horizon, frac=args.frac)
+    if block["kelly"] is None:
+        raise ValueError("；".join(block["errors"]) or "回放不可用")
+    return block["kelly"]
 
 
 def cmd_risk_kelly(args: argparse.Namespace) -> int:
@@ -1530,6 +1525,7 @@ def _dashboard_provider(args):
     读库是只读的局部查询，代价远小于一次误读。
     """
     from stocklab.dashboard.summary import build_summary
+    from stocklab.risk.panel import build_risk_block
 
     db = Path(args.db) if args.db else paths.DB_PATH
     fixed_asof = getattr(args, "asof", None)
@@ -1538,7 +1534,17 @@ def _dashboard_provider(args):
         asof = fixed_asof or datetime.now(TZ).date().isoformat()
         conn = connect(db)
         try:
-            return build_summary(conn, asof)
+            # 风险面板挂在**当前持仓里权重最大的那只**上（P14 step4 遗留的并入）。
+            # 没有持仓 → risk=None；`build_summary` 的 docstring 说清了
+            # `None` 是「未接入」而不是「风险为零」，页面分开渲染这两种情况。
+            from stocklab.portfolio.view import build_portfolio
+            view = build_portfolio(conn, asof)
+            held = sorted((p for p in view["positions"] if p["qty"]),
+                          key=lambda p: (-(p["market_value"] or 0.0), p["code"]))
+            risk = (build_risk_block(conn, held[0]["code"], asof=asof,
+                                     price=held[0]["price"])
+                    if held else None)
+            return build_summary(conn, asof, risk_block=risk)
         finally:
             conn.close()
 

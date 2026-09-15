@@ -7,7 +7,7 @@
 | `portfolio` | `stocklab.portfolio.view.build_portfolio`（ADR-006 口径） |
 | `freshness` | `stocklab.session.review.freshness` + 全库最新快照 `ts` |
 | `accuracy`  | `stocklab.session.review.rolling_accuracy`（LIVE / REPLAY 分列） |
-| `risk`      | `stocklab.risk.report.build_risk_block`（P14 后半，由调用方注入） |
+| `risk`      | `stocklab.risk.panel.build_risk_block`（由调用方注入） |
 
 ## 确定性
 

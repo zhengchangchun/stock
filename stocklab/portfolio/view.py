@@ -245,6 +245,64 @@ def build_portfolio(conn: sqlite3.Connection, asof: str) -> dict:
     }
 
 
+def nav_series(conn: sqlite3.Connection, asof: str, *,
+               n_sessions: int = 120) -> dict:
+    """按日 mark-to-market 的净值序列（P15 页面曲线用）。
+
+    **口径与 `build_portfolio` 逐字相同**（同一份 `open_positions` /
+    `resolve_prices` / `_cash`）：每一天都当一次「那天收盘后我知道什么」，
+    取数一律 `date <= 那一天`。这里不引入任何新的估值口径 ——
+    曲线与卡片对不上时，人会先怀疑画图，然后怀疑整套数字。
+
+    **缺价的那一天 `total_assets = None`**，不是 0、也不是拿成本价顶上：
+    用成本价冒充会让浮亏恒为 0，曲线会在最该报警的那天看起来最平静。
+    调用方必须把 `None` 画成**断点**并显式标注。
+    """
+    days = [str(r["date"]) for r in conn.execute(
+        "SELECT date FROM trading_calendar WHERE is_open = 1 AND date <= ?"
+        " ORDER BY date DESC LIMIT ?", (asof, n_sessions))]
+    days.reverse()
+
+    points: list[dict] = []
+    missing: list[str] = []
+    for day in days:
+        trade_rows = [dict(r) for r in conn.execute(
+            "SELECT * FROM real_trades WHERE date <= ? ORDER BY date, trade_id",
+            (day,))]
+        flow_rows = [dict(r) for r in conn.execute(
+            "SELECT * FROM cash_flows WHERE date <= ? ORDER BY date, flow_id",
+            (day,))]
+        positions = open_positions(trade_rows)
+        cash = _cash(flow_rows, trade_rows)
+        if not trade_rows and not flow_rows:
+            # 账户还没诞生（既无本金也无成交）。给 0 会画出一条「0 元净值」的
+            # 平线，读起来像「亏光了」——曲线应当从账户起始日开始。
+            points.append({"date": day, "cash": None, "market_value": None,
+                           "total_assets": None, "status": "not_started"})
+            continue
+        prices = resolve_prices(conn, sorted(positions), day)
+        if any(prices.get(c) is None for c in positions):
+            missing.append(day)
+            points.append({"date": day, "cash": _money(cash), "market_value": None,
+                           "total_assets": None, "status": "missing_price"})
+            continue
+        mv = sum(prices[c].price * positions[c].qty for c in positions)
+        points.append({"date": day, "cash": _money(cash), "market_value": _money(mv),
+                       "total_assets": _money(cash + mv), "status": "ok"})
+
+    return {
+        "asof": asof,
+        "policy": ("按交易日逐日 mark-to-market：现金 + Σ(当日持仓 × 当日现价)；"
+                   "取数一律 date ≤ 该日。缺现价的那天 total_assets = null"
+                   "（画成断点），不用成本价冒充"),
+        "n_sessions": len(days),
+        "window": {"start": days[0] if days else None,
+                   "end": days[-1] if days else None},
+        "points": points,
+        "missing_price_dates": missing,
+    }
+
+
 def _cash(flow_rows, trade_rows) -> float:
     """现金 = Σ现金流（净投入 + 其他） + Σ成交净额（买入流出 / 卖出流入，均含费）。"""
     cash = sum(float(r["amount"]) for r in flow_rows)

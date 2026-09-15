@@ -18,8 +18,9 @@
 """
 
 from stocklab.risk.kelly import EdgeStats, evaluate, verdict_label
+from stocklab.risk.panel import build_risk_block
 from stocklab.risk.rules import RULES, RuleReplay, replay
 from stocklab.risk.sizing import size_position
 
-__all__ = ["RULES", "EdgeStats", "RuleReplay", "evaluate", "replay",
-           "size_position", "verdict_label"]
+__all__ = ["RULES", "EdgeStats", "RuleReplay", "build_risk_block", "evaluate",
+           "replay", "size_position", "verdict_label"]
