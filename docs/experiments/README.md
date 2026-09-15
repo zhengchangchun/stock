@@ -27,6 +27,6 @@
 | 2026-09-15 | [rw-mu0（把漂移 mu 置 0）](2026-09-15-rw-mu0.md) | `mu := 0` 提升样本外方向准确率、降低 Brier | **否证**（`falsified`）：validate 方向 **0.3310 vs 基线 0.3687**（Δ=-0.0376，CI 下界 ≤ 0，符号错）；Brier 改善落在噪声内。pre-registered gate 记 `LOSE` → **不打开 test** | ❌ 不采纳 |
 | 2026-09-15 | [index-mom-dir（用沪深300 当日方向定漂移符号）](2026-09-15-index-mom-dir.md) | 指数 `asof` 方向对次日个股方向有信息量 | **否证**（`falsified`）：validate 方向 **0.3372 vs 基线 0.3687**（Δ=-0.0315，CI 下界 ≤ 0，符号错）；Brier 改善落在噪声内。pre-registered gate 记 `LOSE` → **不打开 test** | ❌ 不采纳 |
 | 2026-09-15 | [P8 下半 · 口径修正与第二批变体准入](2026-09-15-p8b-口径修正与变体准入.md) | 把 `invalidated` 子群标注为「结果条件、不可交易」后，既有数字逐位不变，且读者不再把 66.9% 读成模型能力 | **未运行**（pre-registered）：由 Task 42 诊断驱动 —— 结论 (b)，诊断未给出任何值得预注册的 `mu_mode` 变体；本轮只登记准入六条与 F1/F2/F3 三条失效条件 | ⏸ 待跑 |
-| 2026-09-15 | [sigma-vol-z（量能 z 分位条件化 sigma）](2026-09-15-sigma-vol-z.md) | 量能 z（Φ 映射）条件化 sigma 改善样本外校准度 | **已预注册 · 未运行**（见该文 §0 多重比较声明） | ⏸ 待跑 |
-| 2026-09-15 | [sigma-rv-pct（自身 20 日 RV 分位条件化 sigma）](2026-09-15-sigma-rv-pct.md) | 自身 20 日 RV 分位条件化 sigma 改善样本外校准度 | **已预注册 · 未运行**（见该文 §0 多重比较声明） | ⏸ 待跑 |
-| 2026-09-15 | [sigma-index-rv-pct（指数（沪深300）RV 分位条件化 sigma）](2026-09-15-sigma-index-rv-pct.md) | 沪深300 RV 分位条件化 sigma 改善校准，增量小于自身 RV 变体 | **已预注册 · 未运行**（见该文 §0 多重比较声明） | ⏸ 待跑 |
+| 2026-09-15 | [sigma-vol-z（量能 z 分位条件化 sigma）](2026-09-15-sigma-vol-z.md) | 量能 z（Φ 映射）条件化 sigma 改善样本外校准度 | **否证**（`falsified`）：validate 方向 -0.0061（CI 跨 0）、Brier **+0.0060（显著变差）** → gate `LOSE`，不开 test | ❌ 不采纳 |
+| 2026-09-15 | [sigma-rv-pct（自身 20 日 RV 分位条件化 sigma）](2026-09-15-sigma-rv-pct.md) | 自身 20 日 RV 分位条件化 sigma 改善样本外校准度 | **否证**（`falsified`）：validate 方向 -0.0108（CI 跨 0）、Brier **+0.0150（显著变差，三个里最差）** → gate `LOSE`，不开 test | ❌ 不采纳 |
+| 2026-09-15 | [sigma-index-rv-pct（指数（沪深300）RV 分位条件化 sigma）](2026-09-15-sigma-index-rv-pct.md) | 沪深300 RV 分位条件化 sigma 改善校准，增量小于自身 RV 变体 | **否证**（`falsified`）：validate 方向 -0.0069（CI 跨 0）、Brier **+0.0116（显著变差，幅度确实小于自身 RV 变体）** → gate `LOSE`，不开 test | ❌ 不采纳 |
