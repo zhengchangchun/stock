@@ -20,8 +20,17 @@ from tests.test_predict_service import seed
 
 CODE = "000333"
 START = "2026-05-02"
-LIVE_NOW = "2026-08-31T15:05:00+08:00"      # 当天出预测 → LIVE
 REPLAY_NOW = "2026-09-15T07:04:51+08:00"    # 事后回放 → REPLAY
+
+
+def live_now(asof: str) -> str:
+    """`asof` **当天**收盘后出预测 → LIVE。
+
+    判据是 `created_at[:10] == asof_date`（见 `PROVENANCE_RULE`），
+    所以「实盘」的构造方式必须是**把入库时刻钉在 asof 当天**；
+    用别的日期（哪怕只差一天）入库就是补跑，按判据属于 REPLAY。
+    """
+    return f"{asof}T15:05:00+08:00"
 
 
 def _bars(n=124):
@@ -72,8 +81,8 @@ def test_classify_does_not_fall_into_the_utc_trap():
 # ---------- 分桶 ----------
 
 def test_rolling_splits_live_and_replay(conn):
-    t1 = _predict(conn, "2026-08-30", now=LIVE_NOW)
-    _verify(conn, t1, now=LIVE_NOW)
+    t1 = _predict(conn, "2026-08-30", now=live_now("2026-08-30"))
+    _verify(conn, t1, now=live_now("2026-08-30"))
     t2 = _predict(conn, "2026-08-31", now=REPLAY_NOW)
     _verify(conn, t2, now=REPLAY_NOW)
 
@@ -98,19 +107,41 @@ def test_all_replay_means_no_live_bucket_and_no_live_performance(conn):
     assert "LIVE(实盘累计) 0 行" in rep["disclosure"]["accuracy_provenance"]
 
     md = render_markdown(rep)
-    assert "LIVE（实盘累计）：窗口内 0 行" in md
+    # 行首的 `**` 是渲染时的加粗标记（`_window_line`），判的是同一句话
+    assert "**LIVE（实盘累计）**：窗口内 0 行" in md
     assert "REPLAY（PIT 历史回放）" in md
     assert "不得" in md and "实盘表现" in md
     assert PROVENANCE_RULE in md
 
 
 def test_accuracy_carries_ci_and_daily_clustering(conn):
-    for asof, now in (("2026-08-28", LIVE_NOW), ("2026-08-29", LIVE_NOW)):
-        _verify(conn, _predict(conn, asof, now=now), now=now)
+    """**有效样本量 = 交易日数**，且样本量小的时候区间必须诚实地宽。
+
+    两天**一命中一落空**：若两天结果相同，`stdev` 为 0 → 正态近似区间缩成
+    `[1.0, 1.0]`，把「2 个样本」说成「确定」—— 那正是本测试最后一条断言要挡的事。
+    """
+    p1 = _predict(conn, "2026-08-28", now=live_now("2026-08-28"))
+    p2 = _predict(conn, "2026-08-29", now=live_now("2026-08-29"))
+
+    # 让 2026-08-30（p2 的目标日）涨 +5%，远超 FLAT_BAND(0.5%) → 实际分类 up，
+    # 而模型预测 flat → 该日**不命中**。
+    # 预测只用 asof 之前的 bar（`build_predictions` 已完成），所以改 target 日的
+    # 行情不违反 PIT —— 它只影响「事后打分」这一步用的实际涨跌幅。
+    prev_close = conn.execute(
+        "SELECT close FROM bars_daily WHERE code=? AND date=?",
+        (CODE, "2026-08-29")).fetchone()["close"]
+    conn.execute("UPDATE bars_daily SET close=? WHERE code=? AND date=?",
+                 (prev_close * 1.05, CODE, "2026-08-30"))
+    conn.commit()
+
+    _verify(conn, p1, now=live_now("2026-08-28"))
+    _verify(conn, p2, now=live_now("2026-08-29"))
+
     roll = rolling_accuracy(conn, end_date="2026-09-01", n_sessions=30)
     live = roll["live"]
     assert live["effective_n_days"] == 2          # 两个交易日 = 2 个有效样本
     assert live["n_rows"] == 2
+    assert live["direction_accuracy_daily"] == 0.5    # 一命中一落空
     assert live["direction_ci95"] is not None
     assert "always_up" in live["baselines_daily"]
     # 区间必须宽到能看出来「还不知道」
@@ -133,7 +164,9 @@ def test_report_sections_and_gap_evidence(conn):
                 "gaps", "disclosure"):
         assert key in rep
     gaps = rep["gaps"]
-    assert gaps["bars_daily_rows"] == 30
+    # 建仓历史 = `_bars()` 的 124 根（2026-05-02 起连续 124 天），
+    # 不是某个更小的数：这个断言的含义是「报告如实数了 bars_daily 的行数」
+    assert gaps["bars_daily_rows"] == len(_bars()) == 124
     assert gaps["amount_non_null"] == 0 and gaps["amount_first_date"] is None
     assert gaps["turnover_non_null"] == 0
     assert "保持 NULL" in gaps["note"]
