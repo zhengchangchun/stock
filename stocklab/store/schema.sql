@@ -567,3 +567,95 @@ BEGIN SELECT RAISE(ABORT, 'experiment_decisions is append-only'); END;
 CREATE TRIGGER IF NOT EXISTS trg_experiment_decisions_no_delete
 BEFORE DELETE ON experiment_decisions
 BEGIN SELECT RAISE(ABORT, 'experiment_decisions is append-only'); END;
+
+-- ---------- 模拟盘（P19，append-only） ----------
+-- 三臂并行、每日一行净值，口径见 docs/plans/2026-09-15-p19-模拟盘骨架.md
+-- 与 ADR-010。**不是预测账本**：本组表与 predictions / model_version 无关，
+-- 生产模型的方向能力 ≈ 0（行级 38.14% / Brier 0.6581），模拟盘对照的是
+-- **纪律与分散本身**，因此这里没有、也不许有「模型信号」列。
+--
+-- 账户 ≠ 组合：一个 account_id 就是一条独立的机械臂。
+-- `arm-hold` 冻结、`arm-now` 镜像实盘账本、`arm-discipline-{05,10,15}` 各一档 ETF 目标。
+CREATE TABLE IF NOT EXISTS paper_accounts (
+    account_id     TEXT PRIMARY KEY,     -- 'arm-hold' | 'arm-now' | 'arm-discipline-05' …
+    arm            TEXT NOT NULL
+                   CHECK (arm IN ('hold', 'now', 'discipline')),
+    etf_target_pct REAL,                 -- 纪律臂的 ETF 目标占比 %；hold/now 为 NULL
+    start_date     TEXT NOT NULL,        -- 起跑日（收盘口径）YYYY-MM-DD
+    initial_cash   REAL NOT NULL,
+    initial_positions_json TEXT NOT NULL,-- [{"code","qty","cost_price"}]
+    initial_nav    REAL NOT NULL,
+    params_json    TEXT NOT NULL,        -- 冻结的口径参数（成本/整手/白名单…）
+    created_at     TEXT NOT NULL
+);
+
+-- 模拟成交。成本**分列**存：佣金 / 印花税 / 过户费 / 滑点。
+-- 存一个合计就查不出「ETF 免印花税」这条口径（ADR-008），口径错是静默错误。
+-- UNIQUE 是防重复下单的结构性第二道防线（第一道是 paper_nav_daily 的存在性判据，
+-- 顺序见 ADR-010：先查 nav 再决定要不要下单，否则会把自己的痕迹当成重复）。
+CREATE TABLE IF NOT EXISTS paper_trades (
+    trade_id      INTEGER PRIMARY KEY AUTOINCREMENT,
+    account_id    TEXT NOT NULL,
+    date          TEXT NOT NULL,         -- 决策日（PIT）
+    code          TEXT NOT NULL,
+    side          TEXT NOT NULL CHECK (side IN ('buy', 'sell')),
+    ref_price     REAL NOT NULL,         -- 当日 PIT 收盘（参考价）
+    fill_price    REAL NOT NULL,         -- 含滑点的实际成交价
+    qty           INTEGER NOT NULL CHECK (qty > 0),
+    commission    REAL NOT NULL,
+    stamp_tax     REAL NOT NULL,
+    transfer_fee  REAL NOT NULL,
+    slippage_cost REAL NOT NULL,
+    fee_total     REAL NOT NULL,
+    asset_class   TEXT NOT NULL,         -- 'stock' | 'etf'（成本口径按它取）
+    rule_citation TEXT NOT NULL,         -- 触发的规则条文（不许留空）
+    price_source  TEXT NOT NULL,         -- 价格出处：'snapshot' | 'bars'
+    price_asof    TEXT NOT NULL,         -- 价格实际所属日期（PIT 可审计）
+    created_at    TEXT NOT NULL,
+    UNIQUE (account_id, date, code, side, qty, rule_citation)
+);
+
+-- 每日净值（每账户每日一行）。drawdown 由本行之前的净值序列算出，
+-- 故必须**按日累积**才能读 —— 这也是它 append-only 的理由之一。
+-- net_deposits 单独一列：arm-now 镜像实盘账本，出入金会改变 NAV 但不是收益，
+-- 没有这一列就无法把「入金」与「赚了」分开（ADR-010）。
+CREATE TABLE IF NOT EXISTS paper_nav_daily (
+    account_id    TEXT NOT NULL,
+    date          TEXT NOT NULL,
+    cash          REAL NOT NULL,
+    positions_json TEXT NOT NULL,
+    market_value  REAL NOT NULL,
+    nav           REAL NOT NULL,
+    drawdown      REAL,                  -- 相对历史峰值；首行 = 0
+    cum_cost      REAL NOT NULL,
+    cum_return    REAL NOT NULL,         -- 相对**累计净入金**
+    net_deposits  REAL NOT NULL,         -- 累计净入金（本金 + 存入 − 取出）
+    index_300_level     REAL,            -- 沪深300 收盘点位（同一 asof）
+    index_300_asof      TEXT,
+    created_at    TEXT NOT NULL,
+    PRIMARY KEY (account_id, date)
+);
+
+CREATE TRIGGER IF NOT EXISTS trg_paper_accounts_no_update
+BEFORE UPDATE ON paper_accounts
+BEGIN SELECT RAISE(ABORT, 'paper_accounts is append-only'); END;
+
+CREATE TRIGGER IF NOT EXISTS trg_paper_accounts_no_delete
+BEFORE DELETE ON paper_accounts
+BEGIN SELECT RAISE(ABORT, 'paper_accounts is append-only'); END;
+
+CREATE TRIGGER IF NOT EXISTS trg_paper_trades_no_update
+BEFORE UPDATE ON paper_trades
+BEGIN SELECT RAISE(ABORT, 'paper_trades is append-only (改错请冲正)'); END;
+
+CREATE TRIGGER IF NOT EXISTS trg_paper_trades_no_delete
+BEFORE DELETE ON paper_trades
+BEGIN SELECT RAISE(ABORT, 'paper_trades is append-only'); END;
+
+CREATE TRIGGER IF NOT EXISTS trg_paper_nav_daily_no_update
+BEFORE UPDATE ON paper_nav_daily
+BEGIN SELECT RAISE(ABORT, 'paper_nav_daily is append-only'); END;
+
+CREATE TRIGGER IF NOT EXISTS trg_paper_nav_daily_no_delete
+BEFORE DELETE ON paper_nav_daily
+BEGIN SELECT RAISE(ABORT, 'paper_nav_daily is append-only'); END;
