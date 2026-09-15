@@ -21,6 +21,7 @@
 from __future__ import annotations
 
 import math
+import random
 import statistics
 from collections.abc import Mapping, Sequence
 from typing import Any
@@ -154,6 +155,69 @@ def paired_daily_delta(baseline: Sequence[Mapping], variant: Sequence[Mapping]
                 continue
             by_day.setdefault(rb["target_date"], []).append(b - a)
         out[metric] = daily_stats(by_day)
+    return out
+
+
+# ---------- 按日聚类的 bootstrap CI（P10-a 辅助判据） ----------
+
+#: bootstrap 的重采样次数与随机种子。**先验固定**（P10-a 台账 §1 预先写死）：
+#: 2000 次是分位 CI 的常用下限，种子固定使「同输入 → 同区间」可复现 ——
+#: 一个跑两次给出两个区间的判据不能被预注册。
+BOOTSTRAP_N = 2000
+BOOTSTRAP_SEED = 20260915
+
+
+def bootstrap_daily_ci(baseline: Sequence[Mapping], variant: Sequence[Mapping],
+                       metric: str, *, n_boot: int = BOOTSTRAP_N,
+                       seed: int = BOOTSTRAP_SEED) -> dict[str, Any]:
+    """按**交易日**重采样的配对 Δ 的 95% 分位 CI（P10-a 预注册的辅助判据）。
+
+    ## 为什么重采样单位是「日」而不是「行」
+
+    A 股同涨同跌：2 只标的同一天不是 2 个独立样本（总纲「按日聚类」）。
+    所以先按 `(日, 标的)` 配对算出每天的 Δ 均值，再对**日**做有放回重采样。
+    按行重采样会把当天全市场共同的涨跌当成独立证据，把区间**撑窄** ——
+    区间越窄越容易「显著」，那正好是我们要防的方向。
+
+    ## 与 `daily_stats().ci95` 的关系
+
+    后者是正态近似（`mean ± 1.96·se`），是 `gate()` 用的**判定**口径
+    （`METRIC_VERSION` 未变，既有报告仍可比）。本函数是**另一套估计量**，
+    P10-a 把它作为预注册的附加条件：两个区间**都要**满足才记 WIN（更保守）。
+    两者在同一份数据上接近是预期，差异大本身就是一条要写进台账的观察。
+
+    返回 `{n_days, mean, ci95, n_boot, seed, n_eff_days}`；`n_days < 2` → CI 为 `None`
+    （不编造一个宽度）。
+    """
+    if metric not in dict(PAIRED_METRICS):
+        raise ValueError(f"未知指标 {metric!r}；合法取值 {[m for m, _ in PAIRED_METRICS]}")
+    pairs, _counts = pair_rows(baseline, variant)
+    by_day: dict[str, list[float]] = {}
+    for rb, rv in pairs:
+        a, b = _side_value(rb, metric), _side_value(rv, metric)
+        if a is None or b is None:
+            continue
+        by_day.setdefault(rb["target_date"], []).append(b - a)
+    daily = [statistics.fmean(v) for _, v in sorted(by_day.items()) if v]
+    n = len(daily)
+    out: dict[str, Any] = {"n_days": n, "mean": None, "ci95": None,
+                           "n_boot": n_boot, "seed": seed,
+                           "method": "day_clustered_percentile_bootstrap"}
+    if n == 0:
+        return out
+    mean = statistics.fmean(daily)
+    out["mean"] = mean
+    if n < 2:
+        return out
+    rng = random.Random(seed)
+    boots = []
+    for _ in range(n_boot):
+        draw = [daily[rng.randrange(n)] for _ in range(n)]
+        boots.append(statistics.fmean(draw))
+    boots.sort()
+    lo = boots[max(0, int(0.025 * n_boot) - 1)]
+    hi = boots[min(n_boot - 1, int(0.975 * n_boot))]
+    out["ci95"] = [lo, hi]
     return out
 
 

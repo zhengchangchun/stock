@@ -17,6 +17,36 @@ import math
 import pytest
 
 from stocklab.data.models import Bar
+from stocklab.predict.model import DIST_MODES as _DIST_MODES
+
+
+def test_resid_quantile_variant_changes_exactly_one_field():
+    """P10-a 的形状轴：注册表里那条变体相对基线**恰好改 1 个字段**。"""
+    import dataclasses
+
+    from stocklab.experiments.variants import (VARIANTS, assert_single_variable,
+                                               get_variant)
+    from stocklab.predict.model import ForecastSpec
+
+    v = get_variant("residual-quantile-interval")            # 内部已 assert_single_variable
+    assert v.changed_axis == "dist_mode"
+    assert v.spec.changed_fields() == ("dist_mode",)
+    assert v.spec.dist_mode in _DIST_MODES
+    assert v.spec.mu_mode == "sample_mean" and v.spec.sigma_mode == "const", (
+        "形状轴**不许**同时动 mu 或 sigma —— 那是第二条/第三条变量"
+    )
+    assert v.spec == ForecastSpec(dist_mode="resid_emp")
+    assert VARIANTS["residual-quantile-interval"].prereg_doc.endswith(
+        "2026-09-15-residual-quantile-interval.md")
+
+
+def test_dist_mode_is_validated_at_construction():
+    from stocklab.predict.model import ForecastSpec
+
+    with pytest.raises(ValueError, match="未知 dist_mode"):
+        ForecastSpec(dist_mode="empirical")
+
+
 from stocklab.experiments.variants import (VARIANTS, MultiVariableVariant,
                                            UnknownVariant, Variant,
                                            assert_single_variable, get_variant,
@@ -144,7 +174,10 @@ def test_spec_has_no_knob_for_the_frozen_quantities():
     # 不能靠 `<=` 之类的宽松断言让新字段「顺手」混进来。
     # `sigma_mode` 是 P9-a 明示新增的第二条轴（条件化 sigma），
     # 取值 `SIGMA_MODES`；默认 `"const"` = 基线口径，见 docs/plans/2026-09-15-p9a-信息扩展.md。
-    assert names == {"mu_mode", "sigma_mode"}
+    # `dist_mode` 是 P10-a 明示新增的第三条轴（预测分布的形状来源），
+    # 取值 `DIST_MODES`；默认 `"gaussian"` = 基线口径，
+    # 见 docs/experiments/2026-09-15-residual-quantile-interval.md。
+    assert names == {"mu_mode", "sigma_mode", "dist_mode"}
 
 
 def test_index_direction_uses_the_frozen_flat_band():

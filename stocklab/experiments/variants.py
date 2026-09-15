@@ -146,6 +146,23 @@ VARIANTS: dict[str, Variant] = {
         ),
         prereg_doc="docs/experiments/2026-09-15-sigma-index-rv-pct.md",
     ),
+    # ---- P10-a：第三条轴（预测分布的**形状来源**）----
+    # 与上面三条刻意不同：那三条缩放 `sigma`（已被一致否证），这一条不动 `sigma`，
+    # 改的是「形状从哪里来」。每个变体相对基线仍然**恰好改 1 个字段**。
+    "residual-quantile-interval": Variant(
+        name="residual-quantile-interval",
+        changed_axis="dist_mode",
+        spec=ForecastSpec(dist_mode="resid_emp"),
+        hypothesis=(
+            "基线把次日收盘收益假设成 `Normal(mu, sigma)`，`range_80` 与三分类概率"
+            "全是解析分位 —— 这个**形状假设**（对称、尾部按 exp(−z²/2) 衰减）从未被"
+            "检验过。**假设**：把形状来源换成**训练窗内**标准化残差 "
+            "`(r_t − mu_hat_t)/sigma_hat_t` 的经验分位（分位只由 train 段拟合，"
+            "apply 到 validate），能改善样本外 **Brier（校准度）**，"
+            "且 `range_80` 覆盖率不劣化。"
+        ),
+        prereg_doc="docs/experiments/2026-09-15-residual-quantile-interval.md",
+    ),
 }
 
 

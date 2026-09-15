@@ -39,6 +39,7 @@ from dataclasses import dataclass
 from stocklab.data.models import Bar
 from stocklab.errors import DegenerateInput
 from stocklab.features.pit_regime import PitFeatures
+from stocklab.predict.residual import ResidualDistribution
 from stocklab.predict.version import MODEL_ID, MODEL_SPEC, MODEL_VERSION
 
 # `DegenerateInput` 自 P9-a 起搬到了 `stocklab.errors`（`features.pit_regime` 也要用它
@@ -101,6 +102,25 @@ SIGMA_MODES: tuple[str, ...] = ("const", "vol_z", "rv_pct", "index_rv_pct")
 SIGMA_SCALE_MIN = 0.5
 SIGMA_SCALE_MAX = 1.5
 
+#: `dist_mode` 的合法取值。**P10-a 新增的第三条轴**：预测分布的**形状来源**。
+#:
+#: 基线把次日收盘收益假设成 `Normal(mu, sigma)`，`range_80` 与三分类概率全是解析分位。
+#: 这个**形状假设**从未被检验过：
+#:
+#: - `gaussian`：基线 `pit-rw-v1.0.1` —— 解析分位，`residuals` 一行都不读；
+#: - `resid_emp`：形状取**训练窗内**标准化残差 `(r_t − mu_hat_t)/sigma_hat_t` 的
+#:   经验分布（`predict.residual.ResidualDistribution`，**只在 train 段拟合**）。
+#:   `direction` 的 CDF 与 `range_80` 的分位由**同一份**残差池给出 —— 它们是
+#:   同一个分布的两个泛函，不能各换一半（那不是一个分布，而且主指标会恒等于基线）。
+#:
+#: 与 `sigma_mode` 的**缩放**轴刻意区分：那条轴已被三个变体一致否证
+#: （`docs/experiments/2026-09-15-sigma-*.md`），本条轴不动
+#: `SIGMA_SCALE_MIN/MAX`、不换 `WINDOW`、`sigma` 仍是 60 日无条件样本标准差，
+#: 改的只是「形状从哪里来」。
+#:
+#: **不在本条轴定义域内**：`p_touch`（日内路径量的近似）保持解析式，逐行不动。
+DIST_MODES: tuple[str, ...] = ("gaussian", "resid_emp")
+
 #: 基线口径的 spec。**`compute_forecast(spec=None)` 与 `spec=BASELINE_SPEC` 必须逐字节等价**，
 #: 这条由 `tests/test_predict_model.py` 钉住。
 BASELINE_SPEC: "ForecastSpec"
@@ -127,20 +147,29 @@ class ForecastSpec:
     「单变量」这条纪律就没法机械校验了。所以它作为**数据**参数传进
     `compute_forecast`，与 `bars` 同级。
 
-    ## 字段只有 `mu_mode` / `sigma_mode` 两个
+    ## 字段只有 `mu_mode` / `sigma_mode` / `dist_mode` 三个
 
     标签带（`FLAT_BAND`）、窗口（`WINDOW` / `LEVEL_WINDOW`）、关键位口径**不在本类里**，
     因此「用某个变体把标签带改成 ±1%」在结构上不可能发生 ——
     口径冻结靠的是「没有那个旋钮」，不是靠自觉（见 `docs/plans/2026-09-15-p8-实验流水线.md` §1.5）。
 
-    `sigma_mode` 是 P9-a 新增的**第二条轴**（条件化波动率，取值见 `SIGMA_MODES`）。
-    它同样是**按调用显式传入**的 frozen 字段：没有环境变量、没有模块级开关，
-    「这次跑的是哪个口径」永远能从参数读出来。两个字段的默认值就是基线口径，
+    `sigma_mode` 是 P9-a 新增的**第二条轴**（条件化波动率，取值见 `SIGMA_MODES`）；
+    `dist_mode` 是 P10-a 新增的**第三条轴**（预测分布的形状来源，取值见 `DIST_MODES`）。
+    两者都是**按调用显式传入**的 frozen 字段：没有环境变量、没有模块级开关，
+    「这次跑的是哪个口径」永远能从参数读出来。三个字段的默认值就是基线口径，
     所以 `ForecastSpec()` 与 `spec=None` 仍然逐字节等价。
+
+    ## 为什么 `dist_mode` 不是两个字段（`range_mode` + 概率口径）
+
+    `range_80` 与 `direction` 是**同一个预测分布**的分位数与 CDF。拆成两个字段会允许
+    「经验分位 + 高斯 CDF」这种组合 —— 它不是一个分布，两个输出互相矛盾；
+    而且只换 `range_80` 会让 Brier 恒等于基线（Δ≡0），实验在结构上不可能赢。
+    所以形状**只能整体换**，一个字段一条轴。
     """
 
     mu_mode: str = "sample_mean"
     sigma_mode: str = "const"
+    dist_mode: str = "gaussian"
 
     def __post_init__(self) -> None:
         if self.mu_mode not in MU_MODES:
@@ -151,6 +180,11 @@ class ForecastSpec:
         if self.sigma_mode not in SIGMA_MODES:
             raise ValueError(
                 f"未知 sigma_mode={self.sigma_mode!r}；合法取值 {SIGMA_MODES}。"
+                "拒绝静默回退到基线口径（同上）"
+            )
+        if self.dist_mode not in DIST_MODES:
+            raise ValueError(
+                f"未知 dist_mode={self.dist_mode!r}；合法取值 {DIST_MODES}。"
                 "拒绝静默回退到基线口径（同上）"
             )
 
@@ -222,7 +256,8 @@ def degenerate_strategy_mix(*, excluded: Mapping[str, str] | None = None,
 def compute_forecast(*, code: str, asof: str, bars: Sequence[Bar], target_date: str,
                      strategy_mix: Mapping, spec: ForecastSpec | None = None,
                      index_dir: int | None = None,
-                     features: PitFeatures | None = None) -> dict:
+                     features: PitFeatures | None = None,
+                     residuals: ResidualDistribution | None = None) -> dict:
     """算出 `code` 在 `asof` 收盘后应给出的次日预测载荷。
 
     `bars` 必须是**复权**日 K 且**全部 `<= asof`**（调用方负责，见
@@ -240,6 +275,12 @@ def compute_forecast(*, code: str, asof: str, bars: Sequence[Bar], target_date: 
     需要哪个由 `PitFeatures.required_for(sigma_mode)` 决定；**需要的那个是 `None`
     即拒绝**（`DegenerateInput`）—— 不许静默回退成基线 `sigma`，
     那会让变体报告里混进基线口径的行而没人知道。
+
+    `residuals`（P10-a）同理：只有 `spec.dist_mode != "gaussian"` 时被读取，
+    是**数据**（形状的来源），由 `experiments.residuals` 在 **train 段** 拟合。
+    `spec.dist_mode != "gaussian"` 而 `residuals is None` → `DegenerateInput`，
+    **不许**静默回退成高斯分位。反过来，口径是 `gaussian` 时**即使传进来也不读** ——
+    「读什么」只由 spec 决定，不由调用方传了什么决定。
 
     返回 §8.1 契约字段 + 一个 `evidence` 块（`evidence` **不**进 `payload_hash`：
     它是解释，不是预测本身；把它算进去会让「同一天同一模型」因为多打印一个
@@ -317,14 +358,35 @@ def compute_forecast(*, code: str, asof: str, bars: Sequence[Bar], target_date: 
 
     close = usable[-1].close
     lo_b, hi_b = math.log(1 - FLAT_BAND), math.log(1 + FLAT_BAND)
-    nd = statistics.NormalDist(mu, sigma)
-    p_down = round(float(nd.cdf(lo_b)), 6)
-    p_up = round(1.0 - float(nd.cdf(hi_b)), 6)
+    # ---- 形状来源：`dist_mode` 是第三条轴（默认路径下逐字节不变）----
+    # `range_80` 与三分类概率是**同一个分布**的分位与 CDF，必须同源：
+    # 拆开换一半会得到两个互相矛盾的输出（见 `ForecastSpec` 的 docstring）。
+    if spec.dist_mode == "gaussian":
+        nd = statistics.NormalDist(mu, sigma)
+        p_down = round(float(nd.cdf(lo_b)), 6)
+        p_up = round(1.0 - float(nd.cdf(hi_b)), 6)
+        z80 = statistics.NormalDist().inv_cdf(0.50 + RANGE_COVERAGE / 2.0)
+        lo_shape, hi_shape = -z80, z80
+    elif spec.dist_mode == "resid_emp":
+        if residuals is None:
+            raise DegenerateInput(
+                f"{code} 在 {asof} 的 dist_mode='resid_emp' 需要训练窗残差分布，"
+                "但 residuals=None —— **拒绝静默回退到高斯分位**："
+                "那会让这一行看起来是变体口径，实际是基线"
+            )
+        r_lo = (lo_b - mu) / sigma
+        r_hi = (hi_b - mu) / sigma
+        p_down = round(residuals.cdf(r_lo), 6)
+        p_up = round(1.0 - residuals.cdf(r_hi), 6)
+        tail = (1.0 - RANGE_COVERAGE) / 2.0
+        # 非对称：左右分位各自取值 —— 这正是「形状」要与高斯比的东西
+        lo_shape, hi_shape = residuals.quantile(tail), residuals.quantile(1.0 - tail)
+    else:                                        # pragma: no cover - 构造期已挡
+        raise DegenerateInput(f"未知 dist_mode={spec.dist_mode!r}")
     p_flat = round(1.0 - p_up - p_down, 6)      # 减法 → 三者之和**恒等于** 1.0
 
-    z80 = statistics.NormalDist().inv_cdf(0.50 + RANGE_COVERAGE / 2.0)
-    range_80 = [round(close * math.exp(mu - z80 * sigma), 2),
-                round(close * math.exp(mu + z80 * sigma), 2)]
+    range_80 = [round(close * math.exp(mu + sigma * lo_shape), 2),
+                round(close * math.exp(mu + sigma * hi_shape), 2)]
 
     win = usable[-LEVEL_WINDOW:]
     support = round(min(b.low for b in win), 2)
@@ -392,6 +454,12 @@ def compute_forecast(*, code: str, asof: str, bars: Sequence[Bar], target_date: 
         evidence_inputs["sigma_mode"] = spec.sigma_mode
         evidence_inputs["sigma_quantile"] = sigma_quantile
         evidence_inputs["sigma_scale"] = sigma_scale
+    if spec.dist_mode != "gaussian":
+        # 只改形状的那条变体在这里留痕（基线走不到这一支，sha256 红线不受影响）。
+        # 残差池的**溯源**必须落进证据块：审计者要能回答「这个形状是拿多少样本、
+        # 哪一段、哪几个标的拟合的」，并且能拿这些分位自己复算每个数字。
+        evidence_inputs["dist_mode"] = spec.dist_mode
+        evidence_inputs["residuals"] = residuals.as_evidence()
 
     return {
         "code": code,

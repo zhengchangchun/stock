@@ -443,3 +443,55 @@ def test_sigma_variant_still_writes_nothing_to_production_tables(tmp_path):
              for t in _TABLES}
     conn.close()
     assert before == after
+
+
+# ---------- P10-a：第三条轴（预测分布的形状来源）在**运行路径**上的行为 ----------
+
+RESID_N = 800          # 算出来的：train 目标日 int((800-61+1)*0.6)=444 ×2 标的 > 250
+
+
+def _env_resid(tmp_path):
+    """够大的库（N=800），否则残差池跨不过 `RESIDUAL_MIN_SAMPLES` 门槛。"""
+    from tests.test_predict_service import bars as mk_bars, seed
+
+    days = _days(RESID_N)
+    rows = {c: mk_bars(code=c, n=RESID_N, base=10.0 + 0.5 * i)
+            for i, c in enumerate((CODE, CODE2))}
+    return seed(tmp_path / "resid.db", rows, cal_dates=days)
+
+
+def test_resid_quantile_variant_fits_on_train_and_reports_the_provenance(tmp_path):
+    """形状变体：拟合溯源落进报告，且 `test_evaluated` 仍受 gate 控制。"""
+    conn = _env_resid(tmp_path)
+    days = _days(RESID_N)
+    rep = run_experiment(conn, variant_name="residual-quantile-interval",
+                         codes=[CODE, CODE2], from_date=days[FIRST_TARGET],
+                         to_date=days[-1], min_days=MIN_DAYS, cache=PitCache())
+    assert rep["variant"]["spec"]["dist_mode"] == "resid_emp"
+    assert rep["variant"]["changed_fields"] == ["dist_mode"]
+    rf = rep["residual_fit"]
+    assert rf is not None and rf["fit_split"] == "train"
+    # 拟合窗口**恰好**是 train 段，一天不差
+    assert rf["distribution"]["last_day"] == rep["split_boundaries"]["train"]["last_date"]
+    assert rf["distribution"]["first_day"] == rep["split_boundaries"]["train"]["first_date"]
+    assert rf["distribution"]["n"] == rf["n_samples"] > 0
+    assert rf["distribution"]["q_10"] < rf["distribution"]["q_90"]
+    # 变体侧真的产出过带着残差口径的行
+    assert rep["counts"]["variant_rows"] > 0
+
+
+def test_gaussian_variants_carry_no_residual_fit_block(tmp_path):
+    """基线口径的变体**不拟合** —— 报告里 `residual_fit` 必须是 `None`，不是空块。"""
+    rep = _run(_env(tmp_path))
+    assert rep["residual_fit"] is None
+    assert rep["variant"]["spec"]["dist_mode"] == "gaussian"
+
+
+def test_resid_quantile_variant_writes_nothing_to_the_production_tables(tmp_path):
+    conn = _env_resid(tmp_path)
+    days = _days(RESID_N)
+    before = _counts(conn)
+    run_experiment(conn, variant_name="residual-quantile-interval",
+                   codes=[CODE, CODE2], from_date=days[FIRST_TARGET],
+                   to_date=days[-1], min_days=MIN_DAYS, cache=PitCache())
+    assert _counts(conn) == before

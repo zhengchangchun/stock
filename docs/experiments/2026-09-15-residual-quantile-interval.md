@@ -151,5 +151,5 @@ _（待跑）_
 
 ```bash
 .venv/bin/python -m stocklab.cli.main experiment run \
-  --variant resid-quantile --from 2013-04-16 --to 2026-09-14 --keep-test-sealed
+  --variant residual-quantile-interval --from 2013-04-16 --to 2026-09-14 --keep-test-sealed
 ```

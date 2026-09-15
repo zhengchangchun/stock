@@ -42,9 +42,11 @@ from stocklab.experiments.split import (SPLIT_NAMES, SplitConfig, boundaries,
 from stocklab.experiments.variants import (Variant, get_variant,
                                            load_index_direction,
                                            load_index_rv_percentile)
+from stocklab.experiments.residuals import fit_residual_distribution
 from stocklab.features.pit_regime import PitFeatures, rv_percentile, volume_z
 from stocklab.predict.model import (BASELINE_SPEC, DegenerateInput,
                                     compute_forecast, degenerate_strategy_mix)
+from stocklab.predict.residual import ResidualDistribution
 from stocklab.predict.service import (PitCache, UnusableWindow, load_pit_bars)
 from stocklab.predict.version import MODEL_VERSION
 from stocklab.verify.replay import session_dates
@@ -90,6 +92,7 @@ def _pit_features(hist: Sequence[Bar], asof: str, need: frozenset[str],
 def _replay(conn: sqlite3.Connection, days: Sequence[str], sessions: Sequence[str], *,
             variant: Variant, codes: Sequence[str], costs: CostModel,
             capital: float, cache: PitCache, strategy_mix: dict,
+            residuals: ResidualDistribution | None = None,
             progress=None) -> dict[str, Any]:
     """把 `days` 这些**目标日**各跑一遍：基线预测 + 变体预测 + 两侧打分。
 
@@ -99,6 +102,11 @@ def _replay(conn: sqlite3.Connection, days: Sequence[str], sessions: Sequence[st
     两侧共享同一次取数：行情、指数方向、PIT 特征都**只算一次**，
     基线侧拿到同样的 `features` 只是不读（`sigma_mode="const"`）——
     于是「变体与基线跑在同一根 bar、同一个状态上」是构造保证而非事后对齐。
+
+    `residuals`（P10-a）同理，而且是**更强**的一条：两侧拿到**同一个**
+    `ResidualDistribution`，基线侧只是不读（`dist_mode="gaussian"`）。
+    于是「变体读的是 train 段拟合的形状、基线读的是高斯」这件事由 **spec** 决定，
+    不由「调用方给谁传了残差」决定（有单测钉住「传了也不读」）。
     """
     index_of = {d: i for i, d in enumerate(sessions)}
     rows: dict[str, list[dict]] = {"baseline": [], "variant": []}
@@ -158,7 +166,8 @@ def _replay(conn: sqlite3.Connection, days: Sequence[str], sessions: Sequence[st
                 try:
                     p = compute_forecast(code=code, asof=asof, bars=hist,
                                          target_date=target, strategy_mix=strategy_mix,
-                                         spec=spec, index_dir=idir, features=feats)
+                                         spec=spec, index_dir=idir, features=feats,
+                                         residuals=residuals)
                 except DegenerateInput as exc:
                     skipped[side][f"{target}/{code}"] = f"DegenerateInput: {exc}"
                     continue
@@ -278,10 +287,22 @@ def run_experiment(conn: sqlite3.Connection, *, variant_name: str,
     seg = split_days(targets, cfg)
     strat_mix = degenerate_strategy_mix()
 
+    # ---- P10-a：形状变体需要「训练窗内标准化残差」的经验分布 ----
+    # **在跑之前**按 train 段拟合一次，apply 到 validate（以及将来可能打开的 test）。
+    # 拟合只喂 `seg["train"]`，所以「分位只由训练段决定」是**循环范围**保证的，
+    # 不是靠实现里记得裁。基线口径（`gaussian`）不拟合 —— 它一行都不读。
+    residual_fit = None
+    if variant.spec.dist_mode != "gaussian":
+        residual_fit = fit_residual_distribution(
+            conn, train_days=seg["train"], sessions=sessions, codes=codes,
+            cache=cache)
+    residual_dist = residual_fit.distribution if residual_fit is not None else None
+
     first = seg["train"] + seg["validate"]
     first_pass = _replay(conn, first, sessions, variant=variant, codes=codes,
                          costs=costs, capital=capital, cache=cache,
-                         strategy_mix=strat_mix, progress=progress)
+                         strategy_mix=strat_mix, residuals=residual_dist,
+                         progress=progress)
 
     splits: dict[str, dict] = {}
     for name in ("train", "validate"):
@@ -296,7 +317,8 @@ def run_experiment(conn: sqlite3.Connection, *, variant_name: str,
     if test_evaluated:
         second_pass = _replay(conn, seg["test"], sessions, variant=variant,
                               codes=codes, costs=costs, capital=capital,
-                              cache=cache, strategy_mix=strat_mix, progress=progress)
+                              cache=cache, strategy_mix=strat_mix,
+                              residuals=residual_dist, progress=progress)
         splits["test"] = _summarize_split("test", seg["test"], second_pass["rows"],
                                           variant=variant, min_days=min_days)
     test_gate = splits["test"]["gate"] if test_evaluated else None
@@ -317,7 +339,8 @@ def run_experiment(conn: sqlite3.Connection, *, variant_name: str,
             "name": variant.name,
             "changed_axis": variant.changed_axis,
             "spec": {"mu_mode": variant.spec.mu_mode,
-                     "sigma_mode": variant.spec.sigma_mode},
+                     "sigma_mode": variant.spec.sigma_mode,
+                     "dist_mode": variant.spec.dist_mode},
             "changed_fields": list(variant.spec.changed_fields()),
             "hypothesis": variant.hypothesis,
             "prereg_doc": variant.prereg_doc,
@@ -346,9 +369,12 @@ def run_experiment(conn: sqlite3.Connection, *, variant_name: str,
             "capital": capital,
             "min_days": min_days,
             "note": ("口径冻结靠的是「变体 spec 里根本没有这些旋钮」，"
-                     "不是靠自觉：`ForecastSpec` 只有 `mu_mode` / `sigma_mode` 两个字段，"
+                     "不是靠自觉：`ForecastSpec` 只有 `mu_mode` / `sigma_mode` / "
+                     "`dist_mode` 三个字段，"
                      "标签带、窗口、关键位口径、标的集合、区间一个都不在里面"),
         },
+        "residual_fit": (residual_fit.as_report_block()
+                         if residual_fit is not None else None),
         "skipped": skipped,
         "counts": {"baseline_rows": len(first_pass["rows"]["baseline"])
                    + (len(second_pass["rows"]["baseline"]) if second_pass else 0),
