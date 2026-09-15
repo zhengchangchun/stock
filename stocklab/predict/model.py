@@ -12,8 +12,10 @@
    每个数字都能被 `evidence.inputs` 里的 `mu` / `sigma` / `close` 复算出来
    （`test_probabilities_match_the_documented_formula` 就是手算一遍的对照）。
 2. **读全 NULL 的字段**。`features_daily` 的 `regime_label` / `main_net_5d` /
-   `pe_pct_3y` 当前全为 NULL。本模块**不收 features 参数**，所以
-   「NULL 被当成 0」在结构上不可能发生（不是靠自觉）。
+   `pe_pct_3y` 当前全为 NULL。本模块**不读 `features_daily`**；它只从 `bars` 与
+   显式传入的**当日事实**（`index_dir`、P9-a 的 `PitFeatures`）取数，所以
+   「NULL 被当成 0」在结构上不可能发生（不是靠自觉）—— `PitFeatures` 的字段是
+   `None` 时本模块**抛 `DegenerateInput`** 而不是当 0 用。
 3. **把 `size_pct` 说成可执行建议**。它没有成本、没有风险预算、不知道用户持仓，
    载荷里原样写明（`evidence.notes.size_pct`）。
 
@@ -35,7 +37,15 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 
 from stocklab.data.models import Bar
+from stocklab.errors import DegenerateInput
+from stocklab.features.pit_regime import PitFeatures
 from stocklab.predict.version import MODEL_ID, MODEL_SPEC, MODEL_VERSION
+
+# `DegenerateInput` 自 P9-a 起搬到了 `stocklab.errors`（`features.pit_regime` 也要用它
+# 硬拒绝退化输入，异常留在本模块会形成 import 环）。上面那行是**原样再导出**，
+# 既有的 `from stocklab.predict.model import DegenerateInput` 继续有效 ——
+# 有测试钉住它是**同一个对象**（两个长得像的类会让 `except` 静默失效）。
+# 刻意**不写 `__all__`**：本模块历史上没有它，加一个会悄悄改变 `import *` 的行为。
 
 #: 波动率/漂移的估计窗（交易日）。与 `trend_ma` 的 `slow=60` 同量级，
 #: 但不是同一个东西：这里是**统计估计窗**，那里是均线窗。
@@ -67,6 +77,30 @@ CONTRACT_FIELDS: tuple[str, ...] = (
 #:   （`index_dir` 作为**数据**传入，不是配置项 —— 见 `ForecastSpec` 的 docstring）。
 MU_MODES: tuple[str, ...] = ("sample_mean", "zero", "index_sign")
 
+#: `sigma_mode` 的合法取值。**P9-a 新增的第二条轴**：条件化波动率。
+#:
+#: 基线的 `sigma` 是最近 `WINDOW` 个对数收益的**无条件**样本标准差 —— 它把
+#: 「当前处于高波动还是低波动状态」平均掉了。下面三个取值各自用**一种 PIT 信息**
+#: 把 `sigma` 缩放成 `sigma_base × factor`，`factor = SIGMA_SCALE_MIN +
+#: (SIGMA_SCALE_MAX − SIGMA_SCALE_MIN) × q`，`q ∈ [0,1]` 是该信息给出的分位：
+#:
+#: - `const`：基线 `pit-rw-v1.0.1` —— 不缩放（`q` 不参与，`features` 一行都不读）；
+#: - `vol_z`：`q = Φ(量能 z)` —— 成交量相对自身近期均值的 z 分数（放量 ↔ 高波动）；
+#: - `rv_pct`：`q =` 20 日已实现波动率在**自身**过去 250 期 RV 中的分位；
+#: - `index_rv_pct`：同上，但序列换成 `sh000300` 的 PIT 指数 K 线（市场级状态）。
+#:   刻意**只取波动率、不取方向** —— 指数方向那条路已由 `index-mom-dir` 在
+#:   validate 段否证（`docs/experiments/2026-09-15-index-mom-dir.md`），不重复。
+#:
+#: 三者是**同一个字段的三个取值**：每个变体相对基线仍然**恰好改 1 个字段**，
+#: `assert_single_variable()` 的机械校验没有任何松动。
+SIGMA_MODES: tuple[str, ...] = ("const", "vol_z", "rv_pct", "index_rv_pct")
+
+#: `sigma` 缩放因子的上下界。**先验固定，不是搜出来的**：`P9-a` 不做任何参数搜索，
+#: 改这两个数就是第二个变量。±50% 是「同一个 `sigma` 估计量在不同波动状态下
+#: 合理的不确定带宽」，不是拟合值。
+SIGMA_SCALE_MIN = 0.5
+SIGMA_SCALE_MAX = 1.5
+
 #: 基线口径的 spec。**`compute_forecast(spec=None)` 与 `spec=BASELINE_SPEC` 必须逐字节等价**，
 #: 这条由 `tests/test_predict_model.py` 钉住。
 BASELINE_SPEC: "ForecastSpec"
@@ -93,14 +127,20 @@ class ForecastSpec:
     「单变量」这条纪律就没法机械校验了。所以它作为**数据**参数传进
     `compute_forecast`，与 `bars` 同级。
 
-    ## 字段只有 `mu_mode` 一个
+    ## 字段只有 `mu_mode` / `sigma_mode` 两个
 
     标签带（`FLAT_BAND`）、窗口（`WINDOW` / `LEVEL_WINDOW`）、关键位口径**不在本类里**，
     因此「用某个变体把标签带改成 ±1%」在结构上不可能发生 ——
     口径冻结靠的是「没有那个旋钮」，不是靠自觉（见 `docs/plans/2026-09-15-p8-实验流水线.md` §1.5）。
+
+    `sigma_mode` 是 P9-a 新增的**第二条轴**（条件化波动率，取值见 `SIGMA_MODES`）。
+    它同样是**按调用显式传入**的 frozen 字段：没有环境变量、没有模块级开关，
+    「这次跑的是哪个口径」永远能从参数读出来。两个字段的默认值就是基线口径，
+    所以 `ForecastSpec()` 与 `spec=None` 仍然逐字节等价。
     """
 
     mu_mode: str = "sample_mean"
+    sigma_mode: str = "const"
 
     def __post_init__(self) -> None:
         if self.mu_mode not in MU_MODES:
@@ -108,10 +148,21 @@ class ForecastSpec:
                 f"未知 mu_mode={self.mu_mode!r}；合法取值 {MU_MODES}。"
                 "拒绝静默回退到基线口径 —— 那会让一次实验跑出「看起来是变体、其实是基线」的数字"
             )
+        if self.sigma_mode not in SIGMA_MODES:
+            raise ValueError(
+                f"未知 sigma_mode={self.sigma_mode!r}；合法取值 {SIGMA_MODES}。"
+                "拒绝静默回退到基线口径（同上）"
+            )
 
     @property
     def is_baseline(self) -> bool:
-        return self.mu_mode == "sample_mean"
+        """**所有**字段都在基线上 —— 不是「`mu_mode` 是基线值」。
+
+        写成 `not self.changed_fields()` 而不是 `self.mu_mode == "sample_mean"`：
+        后者在新增第二条轴后会漏判（一个只改了 `sigma_mode` 的 spec 会被当成基线，
+        于是 `compute_forecast` 走基线证据分支、`evidence` 里少打印中间量）。
+        """
+        return not self.changed_fields()
 
     def changed_fields(self) -> tuple[str, ...]:
         """相对基线**被改掉的字段名**（供单变量校验）。"""
@@ -122,14 +173,6 @@ class ForecastSpec:
 BASELINE_SPEC = ForecastSpec()
 
 
-class DegenerateInput(ValueError):
-    """输入不足以给出分布 —— **拒绝**，绝不编一个默认预测。
-
-    触发情形（每一种都对应一条已知的数据/口径陷阱）：
-      - 当日无 K 线（停牌 / 采集缺口）→ 拿「最近一根」当今日 = 用昨天决定今天；
-      - 历史不足 `WINDOW + 1` 根 → 估计量不可计算；
-      - `sigma == 0`（价格恒定）→ 分布退化，`range_80` 宽度为 0 是个假区间。
-    """
 
 
 def canonical_json(obj) -> str:
@@ -178,7 +221,8 @@ def degenerate_strategy_mix(*, excluded: Mapping[str, str] | None = None,
 
 def compute_forecast(*, code: str, asof: str, bars: Sequence[Bar], target_date: str,
                      strategy_mix: Mapping, spec: ForecastSpec | None = None,
-                     index_dir: int | None = None) -> dict:
+                     index_dir: int | None = None,
+                     features: PitFeatures | None = None) -> dict:
     """算出 `code` 在 `asof` 收盘后应给出的次日预测载荷。
 
     `bars` 必须是**复权**日 K 且**全部 `<= asof`**（调用方负责，见
@@ -191,11 +235,18 @@ def compute_forecast(*, code: str, asof: str, bars: Sequence[Bar], target_date: 
     `sh000300` 在 `asof` 当日的方向（`+1` / `-1` / `0`）。**缺失即拒绝** ——
     不允许静默当成 0（那是把「不知道」写成「没有」，ERROR_DIARY 2026-09-14）。
 
+    `features`（P9-a）同理：只有 `spec.sigma_mode != "const"` 时被读取，是**数据**，
+    承载量能 z / 自身 RV 分位 / 指数 RV 分位三个 PIT 量（见 `features.pit_regime`）。
+    需要哪个由 `PitFeatures.required_for(sigma_mode)` 决定；**需要的那个是 `None`
+    即拒绝**（`DegenerateInput`）—— 不许静默回退成基线 `sigma`，
+    那会让变体报告里混进基线口径的行而没人知道。
+
     返回 §8.1 契约字段 + 一个 `evidence` 块（`evidence` **不**进 `payload_hash`：
     它是解释，不是预测本身；把它算进去会让「同一天同一模型」因为多打印一个
     中间量就变成另一个载荷）。
     """
-    mode = (spec or BASELINE_SPEC).mu_mode
+    spec = spec or BASELINE_SPEC
+    mode = spec.mu_mode
     usable = [b for b in bars if b.date <= asof]
     if not usable or usable[-1].date != asof:
         raise DegenerateInput(
@@ -233,12 +284,36 @@ def compute_forecast(*, code: str, asof: str, bars: Sequence[Bar], target_date: 
         mu = abs(mu_sample) * index_dir
     else:                                        # pragma: no cover - 构造期已挡
         raise DegenerateInput(f"未知 mu_mode={mode!r}")
-    sigma = statistics.stdev(rets)
-    if not (sigma > 0.0):
+    sigma_base = statistics.stdev(rets)
+    if not (sigma_base > 0.0):
         raise DegenerateInput(
-            f"{code} 在 {asof} 的 {WINDOW} 日对数收益标准差为 {sigma} —— "
+            f"{code} 在 {asof} 的 {WINDOW} 日对数收益标准差为 {sigma_base} —— "
             "分布退化，给不出有意义的区间与概率（不许编默认值）"
         )
+    # ---- 波动率：`sigma_mode` 是第二条轴（默认路径下 `sigma = sigma_base`，逐字节不变）----
+    sigma_quantile: float | None = None
+    sigma_scale = 1.0
+    if spec.sigma_mode != "const":
+        if features is None:
+            raise DegenerateInput(
+                f"{code} 在 {asof} 的 sigma_mode={spec.sigma_mode!r} 需要 PIT 特征，"
+                "但 features=None —— 拒绝静默回退到基线 sigma"
+            )
+        sigma_quantile = features.quantile_for(spec.sigma_mode)
+        if sigma_quantile is None:
+            missing = sorted(PitFeatures.required_for(spec.sigma_mode))
+            raise DegenerateInput(
+                f"{code} 在 {asof} 的 {missing}（sigma_mode={spec.sigma_mode!r} 所需）"
+                "算不出来 —— 历史不足或数据缺口。**拒绝静默当成 0/1 或回退到基线 sigma**："
+                "那会让这一行看起来是变体口径，实际是另一个东西"
+            )
+        if not (0.0 <= sigma_quantile <= 1.0):
+            raise DegenerateInput(
+                f"{code} 在 {asof} 的 sigma 分位={sigma_quantile!r} 不在 [0,1] —— "
+                "特征层坏了，拒绝猜"
+            )
+        sigma_scale = SIGMA_SCALE_MIN + (SIGMA_SCALE_MAX - SIGMA_SCALE_MIN) * sigma_quantile
+    sigma = sigma_base * sigma_scale
 
     close = usable[-1].close
     lo_b, hi_b = math.log(1 - FLAT_BAND), math.log(1 + FLAT_BAND)
@@ -301,12 +376,22 @@ def compute_forecast(*, code: str, asof: str, bars: Sequence[Bar], target_date: 
         "last_bar": usable[-1].date,
         "n_bars_used": len(usable),
     }
-    if mode != "sample_mean":
-        # **只在变体口径下**追加这三个键：基线的 evidence 必须逐字节不变
+    if not spec.is_baseline:
+        # **只在变体口径下**追加这些键：基线的 evidence 必须逐字节不变
         # （`reports/2026-09-15-predict-2026-09-14.json` 的 sha256 是回归红线）。
+        # 注意 `is_baseline` 是「**所有**字段都在基线上」—— 所以新增 `sigma_mode`
+        # 之后，一个只改 sigma 的 spec 也会走到这里（旧写法 `mode != "sample_mean"`
+        # 会漏判它，于是证据块里查不到变体改了什么）。
         evidence_inputs["mu_sample"] = mu_sample
         evidence_inputs["mu_mode"] = mode
         evidence_inputs["index_dir"] = index_dir
+    if spec.sigma_mode != "const":
+        # 只改 sigma 的那三个变体在这里留痕；`mu_mode` 那两条变体的 evidence
+        # 因此**逐字节不变**（既有报告 sha256 仍是红线）。
+        evidence_inputs["sigma_base"] = sigma_base
+        evidence_inputs["sigma_mode"] = spec.sigma_mode
+        evidence_inputs["sigma_quantile"] = sigma_quantile
+        evidence_inputs["sigma_scale"] = sigma_scale
 
     return {
         "code": code,

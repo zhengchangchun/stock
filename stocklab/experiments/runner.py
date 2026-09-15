@@ -34,14 +34,17 @@ from typing import Any, Sequence
 from stocklab.backtest.benchmark import INDEX_300_SYMBOL
 from stocklab.config.costs import CostModel
 from stocklab.data import adjust
+from stocklab.data.models import Bar
 from stocklab.experiments import metrics
 from stocklab.experiments.metrics import METRIC_VERSION, MIN_DAYS
 from stocklab.experiments.split import (SPLIT_NAMES, SplitConfig, boundaries,
                                         split_days)
 from stocklab.experiments.variants import (Variant, get_variant,
-                                           load_index_direction)
-from stocklab.predict.model import (DegenerateInput, compute_forecast,
-                                    degenerate_strategy_mix)
+                                           load_index_direction,
+                                           load_index_rv_percentile)
+from stocklab.features.pit_regime import PitFeatures, rv_percentile, volume_z
+from stocklab.predict.model import (BASELINE_SPEC, DegenerateInput,
+                                    compute_forecast, degenerate_strategy_mix)
 from stocklab.predict.service import (PitCache, UnusableWindow, load_pit_bars)
 from stocklab.predict.version import MODEL_VERSION
 from stocklab.verify.replay import session_dates
@@ -61,6 +64,29 @@ def _resolve_codes(conn: sqlite3.Connection, codes: Sequence[str] | None) -> lis
         "SELECT code FROM instruments WHERE active=1 AND type='stock' ORDER BY code")]
 
 
+def _pit_features(hist: Sequence[Bar], asof: str, need: frozenset[str],
+                  index_rv_pct: float | None) -> tuple[PitFeatures, str | None]:
+    """算变体需要的那几个 PIT 特征；**数据坏了就显式降级并计数**。
+
+    返回 `(features, err)`。`err` 非空 = 特征层**硬拒绝**了这天的输入
+    （`volume` 为 NULL、价格非正）—— 那不是「变体没用」，是数据缺口，
+    必须能被读出来（所以进 `skipped`），而不是静默算成 0。
+
+    「历史不足」不走这条路：那由各特征函数返回 `None`，再由
+    `compute_forecast` 抛 `DegenerateInput`（带字段名，比这里更精确）。
+    """
+    if not need:
+        return PitFeatures(), None                 # 基线/`const`：一个特征都不算
+    try:
+        return PitFeatures(
+            volume_z=volume_z(hist, asof) if "volume_z" in need else None,
+            rv_pct=rv_percentile(hist, asof) if "rv_pct" in need else None,
+            index_rv_pct=index_rv_pct if "index_rv_pct" in need else None,
+        ), None
+    except DegenerateInput as exc:
+        return PitFeatures(), f"DegenerateInput: {exc}"
+
+
 def _replay(conn: sqlite3.Connection, days: Sequence[str], sessions: Sequence[str], *,
             variant: Variant, codes: Sequence[str], costs: CostModel,
             capital: float, cache: PitCache, strategy_mix: dict,
@@ -69,6 +95,10 @@ def _replay(conn: sqlite3.Connection, days: Sequence[str], sessions: Sequence[st
 
     `sessions` 是完整的交易日轴，用来取每天的 `asof`（= 上一交易日）；
     区间起点那天没有「上一交易日」→ 跳过并记进 `skipped`。
+
+    两侧共享同一次取数：行情、指数方向、PIT 特征都**只算一次**，
+    基线侧拿到同样的 `features` 只是不读（`sigma_mode="const"`）——
+    于是「变体与基线跑在同一根 bar、同一个状态上」是构造保证而非事后对齐。
     """
     index_of = {d: i for i, d in enumerate(sessions)}
     rows: dict[str, list[dict]] = {"baseline": [], "variant": []}
@@ -76,6 +106,8 @@ def _replay(conn: sqlite3.Connection, days: Sequence[str], sessions: Sequence[st
     index_dirs: dict[str, int | None] = {}
     pred_seq = 0
     need_index = variant.spec.mu_mode == "index_sign"
+    # 这个变体需要哪些 PIT 特征（`const` → 空集，连算都不算）
+    need_feats = PitFeatures.required_for(variant.spec.sigma_mode)
 
     for n, target in enumerate(days, start=1):
         i = index_of[target]
@@ -88,6 +120,9 @@ def _replay(conn: sqlite3.Connection, days: Sequence[str], sessions: Sequence[st
         # 指数方向**每天只算一次**（同一天所有标的共用），且只用 <= asof 的数据
         idx_dir = load_index_direction(conn, asof, cache=cache) if need_index else None
         index_dirs[asof] = idx_dir
+        # 指数波动率状态同理：市场级，每天一次，只用 <= asof 的指数行
+        idx_rv = (load_index_rv_percentile(conn, asof, cache=cache)
+                  if "index_rv_pct" in need_feats else None)
 
         for code in codes:
             try:
@@ -109,13 +144,21 @@ def _replay(conn: sqlite3.Connection, days: Sequence[str], sessions: Sequence[st
             adjusted, raw, suspended, err = load_scoring_bars(
                 conn, code, target, cache=cache)
             index_pct = index_pct_for(conn, asof, target)
+            feats, feat_err = _pit_features(hist, asof, need_feats, idx_rv)
 
             sides = (("baseline", None, None), ("variant", variant.spec, idx_dir))
             for side, spec, idir in sides:
+                # 特征层**硬拒绝**了这天的输入（volume NULL / 价格非正）。
+                # 基线侧 `required_for("const")` 是空集 → 不受影响；
+                # 需要它的变体侧拒绝该行并**计数**，不许静默当成 0。
+                if feat_err is not None and PitFeatures.required_for(
+                        (spec or BASELINE_SPEC).sigma_mode):
+                    skipped[side][f"{target}/{code}"] = f"PitFeatureUnavailable: {feat_err}"
+                    continue
                 try:
                     p = compute_forecast(code=code, asof=asof, bars=hist,
                                          target_date=target, strategy_mix=strategy_mix,
-                                         spec=spec, index_dir=idir)
+                                         spec=spec, index_dir=idir, features=feats)
                 except DegenerateInput as exc:
                     skipped[side][f"{target}/{code}"] = f"DegenerateInput: {exc}"
                     continue
@@ -166,6 +209,7 @@ def run_experiment(conn: sqlite3.Connection, *, variant_name: str,
                    codes: Sequence[str] | None = None,
                    split_config: SplitConfig | None = None,
                    selection_split: str = "validate",
+                   evaluate_test_on_win: bool = True,
                    costs: CostModel | None = None, capital: float = CAPITAL,
                    cache: PitCache | None = None, min_days: int = MIN_DAYS,
                    progress=None) -> dict:
@@ -178,6 +222,12 @@ def run_experiment(conn: sqlite3.Connection, *, variant_name: str,
     3. **第一趟**只跑 train + validate；
     4. `gate(validate)`；只有 `WIN` 才**第二趟**去读 test；
     5. `decide(...)` 合成结论。
+
+    `evaluate_test_on_win=False`（CLI `--keep-test-sealed`）把第 4 步再收紧一档：
+    **即使 validate `WIN` 也不打开封存段**，结论记 `inconclusive` 并把「是否开 test」
+    留给下一轮。这是一个**只会更保守**的开关 —— 它只能阻止读 `test`，不能强制读
+    （默认值 `True` = 今天的行为，逐字节不变）。多变量比较那一轮的预注册常常需要它：
+    3 个变体共享同一段 validate 时，任何一个「第一眼 WIN」都不足以支撑晋级评审。
     """
     variant = get_variant(variant_name)
     if selection_split == "test":
@@ -210,8 +260,9 @@ def run_experiment(conn: sqlite3.Connection, *, variant_name: str,
                                         variant=variant, min_days=min_days)
 
     validate_gate = splits["validate"]["gate"]
-    # **只有 validate 赢了才打开 test** —— 「test 只读一次」的结构性实现
-    test_evaluated = validate_gate["status"] == "WIN"
+    # **只有 validate 赢了才打开 test** —— 「test 只读一次」的结构性实现。
+    # `evaluate_test_on_win=False` 时连这个条件也不满足（见函数 docstring）。
+    test_evaluated = (validate_gate["status"] == "WIN") and evaluate_test_on_win
     second_pass: dict[str, Any] | None = None
     if test_evaluated:
         second_pass = _replay(conn, seg["test"], sessions, variant=variant,
@@ -223,7 +274,8 @@ def run_experiment(conn: sqlite3.Connection, *, variant_name: str,
 
     verdict = metrics.decide(validate_gate=validate_gate, test_gate=test_gate,
                              selection_split=selection_split,
-                             test_evaluated=test_evaluated)
+                             test_evaluated=test_evaluated,
+                             test_sealed_by_policy=not evaluate_test_on_win)
 
     skipped = first_pass["skipped"]
     if second_pass is not None:
@@ -235,7 +287,8 @@ def run_experiment(conn: sqlite3.Connection, *, variant_name: str,
         "variant": {
             "name": variant.name,
             "changed_axis": variant.changed_axis,
-            "spec": {"mu_mode": variant.spec.mu_mode},
+            "spec": {"mu_mode": variant.spec.mu_mode,
+                     "sigma_mode": variant.spec.sigma_mode},
             "changed_fields": list(variant.spec.changed_fields()),
             "hypothesis": variant.hypothesis,
             "prereg_doc": variant.prereg_doc,
@@ -251,9 +304,13 @@ def run_experiment(conn: sqlite3.Connection, *, variant_name: str,
         "test_evaluated": test_evaluated,
         "test_not_evaluated_reason": (
             None if test_evaluated else
-            f"validate 段 gate={validate_gate['status']}（未达 WIN）→ 封存段不打开。"
-            "这正是纪律要求的：validate 输了就不许再看 test，"
-            "否则「用 test 挑变体」会以「我只是看一眼」的形式发生"
+            (f"validate 段 gate=WIN，但本轮预注册声明封存 test"
+             "（`--keep-test-sealed`）→ 封存段不打开，结论记 inconclusive，"
+             "「是否开 test」留给下一轮复现评审"
+             if not evaluate_test_on_win else
+             f"validate 段 gate={validate_gate['status']}（未达 WIN）→ 封存段不打开。"
+             "这正是纪律要求的：validate 输了就不许再看 test，"
+             "否则「用 test 挑变体」会以「我只是看一眼」的形式发生")
         ),
         "splits": splits,
         "verdict": verdict,
@@ -266,7 +323,8 @@ def run_experiment(conn: sqlite3.Connection, *, variant_name: str,
             "capital": capital,
             "min_days": min_days,
             "note": ("口径冻结靠的是「变体 spec 里根本没有这些旋钮」，"
-                     "不是靠自觉：`ForecastSpec` 只有 `mu_mode` 一个字段"),
+                     "不是靠自觉：`ForecastSpec` 只有 `mu_mode` / `sigma_mode` 两个字段，"
+                     "标签带、窗口、关键位口径、标的集合、区间一个都不在里面"),
         },
         "skipped": skipped,
         "counts": {"baseline_rows": len(first_pass["rows"]["baseline"])
@@ -345,7 +403,7 @@ def render_experiment_markdown(rep: dict) -> str:
     for name in SPLIT_NAMES:
         b = rep["split_boundaries"][name]
         evaluated = ("是" if name in rep["splits"] else
-                     "**否**（validate 未达 WIN，封存段不打开）")
+                     "**否**（封存段不打开，原因见本节下方 `test_not_evaluated_reason`）")
         L.append(f"| {name} | {b['first_date']} | {b['last_date']} | "
                  f"{b['n_days']} | {evaluated} |")
     L.append("")

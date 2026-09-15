@@ -26,6 +26,7 @@ from dataclasses import dataclass
 from typing import Sequence
 
 from stocklab.data.models import Bar
+from stocklab.features.pit_regime import rv_percentile
 from stocklab.predict.model import FLAT_BAND, ForecastSpec
 
 #: 指数基准的代码（与 `backtest.benchmark` 同一口径：指数走不复权点位）。
@@ -103,6 +104,48 @@ VARIANTS: dict[str, Variant] = {
         ),
         prereg_doc="docs/experiments/2026-09-15-index-mom-dir.md",
     ),
+    # ---- P9-a 第一轮：把三条**尚未用过**的 PIT 信息接进 sigma ----
+    # 三条都改 `sigma_mode`（同一个字段的三个取值），所以每个变体相对基线
+    # **恰好改 1 个字段**，单变量纪律没有任何松动；它们彼此是三次独立比较，
+    # 多重比较的处理写死在各自台账的「§0.3 多重比较声明」里。
+    "sigma-vol-z": Variant(
+        name="sigma-vol-z",
+        changed_axis="sigma_mode",
+        spec=ForecastSpec(sigma_mode="vol_z"),
+        hypothesis=(
+            "基线的 sigma 是最近 60 日对数收益的**无条件**标准差，它把「今天放量还是缩量」"
+            "这件事平均掉了。而成交量与波动率同向（mixture-of-distributions）是"
+            "最稳健的经验事实之一。**假设**：用 `q = Φ(量能 z)` 缩放 sigma"
+            "（`factor = 0.5 + 1.0×q`，先验固定、不拟合）能改善样本外**校准度**，"
+            "方向准确率不劣化。"
+        ),
+        prereg_doc="docs/experiments/2026-09-15-sigma-vol-z.md",
+    ),
+    "sigma-rv-pct": Variant(
+        name="sigma-rv-pct",
+        changed_axis="sigma_mode",
+        spec=ForecastSpec(sigma_mode="rv_pct"),
+        hypothesis=(
+            "波动率聚集意味着「20 日已实现波动率在**自身**过去 250 日 RV 中的分位」"
+            "携带了 60 日无条件标准差丢掉的状态信息。**假设**：用该分位缩放 sigma"
+            "（`factor = 0.5 + 1.0×q`）能改善样本外**校准度**（校准度是这条信息"
+            "最直接的落点），方向准确率不劣化。"
+        ),
+        prereg_doc="docs/experiments/2026-09-15-sigma-rv-pct.md",
+    ),
+    "sigma-index-rv-pct": Variant(
+        name="sigma-index-rv-pct",
+        changed_axis="sigma_mode",
+        spec=ForecastSpec(sigma_mode="index_rv_pct"),
+        hypothesis=(
+            "市场级（`sh000300`）的波动率状态是**不依赖个股自身历史**的第二条来源，"
+            "它可能包含个股 20 日 RV 尚未反映的共同波动。**假设**：用指数 RV 分位"
+            "缩放 sigma 也能改善样本外校准度，但其增量应当**小于** `sigma-rv-pct`"
+            "（个股自身的 RV 已经含了大部分市场成分）。注意这里只取**波动率**，"
+            "不取方向 —— 指数方向那条路已由 `index-mom-dir` 否证。"
+        ),
+        prereg_doc="docs/experiments/2026-09-15-sigma-index-rv-pct.md",
+    ),
 }
 
 
@@ -152,14 +195,16 @@ def index_direction(bars: Sequence[Bar], asof: str,
     return 0
 
 
-def load_index_direction(conn: sqlite3.Connection, asof: str, *,
-                         symbol: str = INDEX_300_SYMBOL,
-                         cache=None) -> int | None:
-    """从库里取 `sh000300` 在 `asof` 的方向（**只读**，不复权口径）。
+def load_index_bars(conn: sqlite3.Connection, *, symbol: str = INDEX_300_SYMBOL,
+                    cache=None) -> list[Bar]:
+    """取 `sh000300` 的**全量**不复权 K 线（**只读**）。
 
     指数没有分红送转，`adj_mode='none'` 就是它的真实点位（与
     `verify.service.index_pct_for`、`backtest.benchmark` 同一口径）。
-    缺数据返回 `None` —— 由调用方决定拒绝（**不许**在这里回退成 0）。
+    读取走 `PitCache.raw_bars`（同一场实验里所有 `asof` 共用一次读）。
+
+    刻意返回**全量**而不是裁剪后的：裁剪是各特征函数自己的第一件事，
+    「调用方已经裁好了」这种约定一旦有人忘，前视就静默发生了。
     """
     if cache is not None:
         bars, _suspended = cache.raw_bars(conn, symbol)
@@ -167,4 +212,26 @@ def load_index_direction(conn: sqlite3.Connection, asof: str, *,
         from stocklab.predict.service import _read_raw
 
         bars, _suspended = _read_raw(conn, symbol)
-    return index_direction(bars, asof)
+    return list(bars)
+
+
+def load_index_direction(conn: sqlite3.Connection, asof: str, *,
+                         symbol: str = INDEX_300_SYMBOL,
+                         cache=None) -> int | None:
+    """从库里取 `sh000300` 在 `asof` 的方向（**只读**）。
+
+    缺数据返回 `None` —— 由调用方决定拒绝（**不许**在这里回退成 0）。
+    """
+    return index_direction(load_index_bars(conn, symbol=symbol, cache=cache), asof)
+
+
+def load_index_rv_percentile(conn: sqlite3.Connection, asof: str, *,
+                             symbol: str = INDEX_300_SYMBOL,
+                             cache=None) -> float | None:
+    """`sh000300` 在 `asof` 的 20 日已实现波动率分位（PIT，只用 `<= asof` 的行）。
+
+    这是**市场级波动率状态**，与 `load_index_direction` 是两件事：
+    后者取**方向**（已被 `index-mom-dir` 否证），这里只取**波动率高低**。
+    历史不足返回 `None`（不是 0.5）—— 由调用方拒绝。
+    """
+    return rv_percentile(load_index_bars(conn, symbol=symbol, cache=cache), asof)

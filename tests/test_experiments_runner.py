@@ -350,3 +350,74 @@ def test_report_states_the_metric_version_and_the_frozen_quantities(tmp_path):
     assert rep["split_config"] == SplitConfig().as_dict()
     assert set(rep["split_boundaries"]) == {"train", "validate", "test"}
     assert rep["range"]["n_days"] == N - FIRST_TARGET
+
+
+# ---------- P9-a：第二条轴（条件化 sigma）在**运行路径**上的行为 ----------
+
+def test_sigma_variant_needs_its_pit_feature_and_is_not_silently_degraded(tmp_path):
+    """夹具的量能是常数 → z 的分母为 0 → `vol_z` 特征**算不出** → 变体侧整段拒绝。
+
+    这条路必须**硬拒绝并计数**。若实现选择「回退到基线 sigma」，变体侧会凭空多出
+    一批「看起来是变体口径、实际是基线」的行，而报告里看不出来 —— 这正是本包
+    最贵的一类错。基线侧不受影响（`const` 一个特征都不读）。
+    """
+    conn = _env(tmp_path)
+    rep = _run(conn, variant="sigma-vol-z")
+    conn.close()
+
+    assert rep["variant"]["changed_axis"] == "sigma_mode"
+    assert rep["variant"]["spec"]["sigma_mode"] == "vol_z"
+    assert rep["counts"]["variant_rows"] == 0          # 一行都没出来
+    assert rep["counts"]["baseline_rows"] > 0          # 基线照常
+    assert rep["splits"]["validate"]["paired"]["counts"]["keys_baseline_only"] > 0
+    reasons = set(rep["skipped"]["variant"].values())
+    assert reasons and all("算不出来" in r for r in reasons), reasons
+    assert rep["splits"]["validate"]["gate"]["status"] == "INSUFFICIENT"
+    assert rep["verdict"]["status"] == "inconclusive"
+    assert rep["test_evaluated"] is False
+
+
+def test_sigma_variant_with_usable_features_produces_paired_rows(tmp_path):
+    """够长的夹具（>= 270 根）才算得出 RV 分位 —— 这条走**成功路径**。
+
+    要证明的是「特征真的进了模型」而不是「变体跑通了」：变体侧出了数、
+    与基线配上了对，且基线行一个没少。
+    """
+    # 两条都要拉长：**库里**的 bar 数（`_env(n=400)`）决定特征算不算得出来，
+    # **回放区间**（`_days(400)`）决定这些日子跑不跑。只改一边的话，
+    # 要么特征永远算不出（区间停在 200 天，asof 处只有 < 270 根），
+    # 要么跑的是没有特征的日子 —— 两边都「绿」但什么也没测到。
+    conn = _env(tmp_path, n=400)
+    days = _days(400)
+    rep = _run(conn, variant="sigma-rv-pct",
+               from_date=days[FIRST_TARGET], to_date=days[-1])
+    conn.close()
+
+    assert rep["variant"]["changed_fields"] == ["sigma_mode"]
+    assert rep["counts"]["variant_rows"] > 0
+    assert rep["splits"]["validate"]["paired"]["counts"]["n_pairs"] > 0
+    assert rep["test_evaluated"] is False              # 夹具样本量 << 120，不可能 WIN
+
+    # 变体行**少于**基线行：回放区间的前 209 个目标日的 `asof` 只有 < 270 根 bar，
+    # 算不出 RV 分位。这些行必须**显式降低分母并计数**（进 `skipped`），
+    # 而不是「填个 0 / 0.5 蒙过去」—— 后者会让报告里的样本量凭空变大。
+    assert rep["counts"]["variant_rows"] < rep["counts"]["baseline_rows"]
+    reasons = list(rep["skipped"]["variant"].values())
+    assert len(reasons) == rep["counts"]["baseline_rows"] - rep["counts"]["variant_rows"]
+    assert all("算不出来" in r for r in reasons), set(reasons)
+    # 这 209 天的短缺会**越过切分边界**伸进 validate 的前几天，所以
+    # validate 段的配对计数里会看到 `keys_baseline_only > 0` —— 那正是
+    # 「变体在这几天没有可信输入」的可见记录，不是 bug。
+    assert rep["splits"]["validate"]["paired"]["counts"]["keys_baseline_only"] > 0
+
+
+def test_sigma_variant_still_writes_nothing_to_production_tables(tmp_path):
+    """变体不是模型版本：P9-a 的新轴也没有改变「一行都不写生产表」。"""
+    conn = _env(tmp_path)
+    before = {t: conn.execute(f"SELECT COUNT(*) FROM {t}").fetchone()[0]
+              for t in _TABLES}
+    _run(conn, variant="sigma-rv-pct")
+    after = {t: conn.execute(f"SELECT COUNT(*) FROM {t}").fetchone()[0]
+             for t in _TABLES}
+    conn.close()
+    assert before == after

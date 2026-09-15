@@ -263,3 +263,36 @@ def test_verdict_records_the_evidence_it_was_based_on():
     assert v["test_evaluated"] is True
     assert v["validate_gate"]["status"] == "WIN"
     assert v["test_gate"]["status"] == "WIN"
+
+
+# ---------- P9-a：`test` 按预注册封存（多变量比较轮次） ----------
+
+def test_validate_win_with_policy_sealed_test_is_inconclusive_not_promoted():
+    """validate `WIN` 但预注册声明封存 test → `inconclusive`，**不是** `promoted`。
+
+    这是 `test_validate_win_without_opening_test_is_a_programming_error` 的**有意例外**：
+    那里抛错是因为「忘了读」，这里不抛错是因为「声明了不读」。两种情形都绝不能
+    产出 `promoted` —— 没有封存段证据就不叫晋升。
+    """
+    v = decide(validate_gate=_win(), test_gate=None, selection_split="validate",
+               test_evaluated=False, test_sealed_by_policy=True)
+    assert v["status"] == "inconclusive"
+    assert "WIN" in v["reasons"][0]
+    assert "留给下一轮" in v["reasons"][0]
+
+
+def test_policy_sealed_contradicted_by_an_actual_test_gate_is_refused():
+    """声明封存却拿到了 test_gate —— 自相矛盾，拒绝合成一个说不清来源的结论。"""
+    with pytest.raises(ValueError, match="自相矛盾"):
+        decide(validate_gate=_win(), test_gate=_win(), selection_split="validate",
+               test_evaluated=True, test_sealed_by_policy=True)
+
+
+def test_policy_sealing_does_not_rescue_a_losing_validate():
+    """封存开关只会**更保守**：validate 输了它救不回来，也变不出 test 证据。"""
+    v = decide(validate_gate=_lose(), test_gate=None, selection_split="validate",
+               test_evaluated=False, test_sealed_by_policy=True)
+    assert v["status"] == "falsified"
+    v2 = decide(validate_gate=_flat(), test_gate=None, selection_split="validate",
+                test_evaluated=False, test_sealed_by_policy=True)
+    assert v2["status"] == "inconclusive"

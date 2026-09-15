@@ -140,7 +140,11 @@ def test_spec_has_no_knob_for_the_frozen_quantities():
         assert forbidden not in names, (
             f"{forbidden} 出现在 ForecastSpec 里 —— 变体就能改口径了，"
             "而「口径冻结」必须靠「没有那个旋钮」而不是靠自觉")
-    assert names == {"mu_mode"}
+    # 集合是**逐个点名**的：新增轴必须在这里显式加进去（= 一次被看见的决定），
+    # 不能靠 `<=` 之类的宽松断言让新字段「顺手」混进来。
+    # `sigma_mode` 是 P9-a 明示新增的第二条轴（条件化 sigma），
+    # 取值 `SIGMA_MODES`；默认 `"const"` = 基线口径，见 docs/plans/2026-09-15-p9a-信息扩展.md。
+    assert names == {"mu_mode", "sigma_mode"}
 
 
 def test_index_direction_uses_the_frozen_flat_band():

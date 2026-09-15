@@ -68,6 +68,18 @@ MUTATIONS = {
             "tests/test_experiments_runner.py::test_selection_split_test_is_refused_before_anything_is_run",
         ],
     },
+    5: {
+        "name": "PIT 特征偷看未来：`<= asof` 裁剪被拿掉",
+        "file": "stocklab/features/pit_regime.py",
+        "old": "    return [b for b in bars if b.date <= asof]\n",
+        "new": ("    return list(bars)   # MUTATION: 不裁 asof —— "
+                "量能/波动率分位偷看了未来\n"),
+        "tests": [
+            "tests/test_features_pit_regime.py::test_volume_z_reads_only_bars_up_to_asof",
+            "tests/test_features_pit_regime.py::test_rv_percentile_reads_only_bars_up_to_asof",
+            "tests/test_features_pit_regime.py::test_future_data_does_not_change_the_rv_series",
+        ],
+    },
     4: {
         "name": "污染分母：不可评分的行被算进配对计数",
         "file": "stocklab/experiments/metrics.py",

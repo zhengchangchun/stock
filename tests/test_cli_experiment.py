@@ -134,3 +134,36 @@ def test_cli_and_library_agree_on_the_report(tmp_path, capsys):
                          codes=[CODE])
     assert render_experiment_markdown(rep) == out.read_text()
     assert rep["range"]["n_days"] == N - FIRST_TARGET
+
+
+def test_keep_test_sealed_flag_is_accepted_and_forwarded(tmp_path, capsys):
+    """`--keep-test-sealed` 必须真的传到执行器（不是「解析了但没人用」）。
+
+    用 monkeypatch 把执行器包一层看实参：这是 CLI 与执行器之间**唯一**的接缝，
+    断言它比断言「命令跑通了」有意义得多。
+    """
+    from stocklab.experiments import runner as runner_mod
+
+    seen = {}
+    real = runner_mod.run_experiment
+
+    def spy(conn, **kw):
+        seen.update(kw)
+        return real(conn, **kw)
+
+    conn = _env(tmp_path)
+    conn.close()
+    days = _days()
+    runner_mod_orig = runner_mod.run_experiment
+    runner_mod.run_experiment = spy
+    try:
+        rc = main(["experiment", "run", "--variant", "rw-mu0",
+                   "--from", days[FIRST_TARGET], "--to", days[-1],
+                   "--db", str(tmp_path / "a.db"), "--code", CODE,
+                   "--keep-test-sealed"])
+    finally:
+        runner_mod.run_experiment = runner_mod_orig
+
+    assert rc == 0
+    assert seen["evaluate_test_on_win"] is False
+    assert _json_out(capsys)["test_evaluated"] is False

@@ -927,6 +927,7 @@ def cmd_experiment_run(args: argparse.Namespace) -> int:
                              from_date=args.from_date, to_date=args.to_date,
                              codes=args.code, split_config=cfg,
                              selection_split=args.selection_split,
+                             evaluate_test_on_win=not args.keep_test_sealed,
                              progress=_progress)
     except (UnknownVariant, MultiVariableVariant, TestSetLeak) as exc:
         print(f"❌ 实验被拒绝：{type(exc).__name__}: {exc}", file=sys.stderr)
@@ -1290,6 +1291,11 @@ def build_parser() -> argparse.ArgumentParser:
                          help="validate 段比例（默认 0.20）")
     exp_run.add_argument("--test-ratio", type=float, default=0.20,
                          help="test 段比例（默认 0.20）")
+    exp_run.add_argument(
+        "--keep-test-sealed", dest="keep_test_sealed", action="store_true",
+        help="即使 validate 达到 WIN 也不打开封存段 test（多变量比较轮次的"
+             "预注册要求）；结论记 inconclusive，是否开 test 留给下一轮。"
+             "这是一个只会更保守的开关：它不能强制读 test，只能阻止读")
     exp_run.add_argument("--code", action="append", help="只跑指定标的（可重复）")
     exp_run.add_argument("--report", help="报告输出路径（默认 reports/<today>-exp-<variant>.md）")
     exp_run.add_argument("--report-dir", dest="report_dir", help="报告目录")

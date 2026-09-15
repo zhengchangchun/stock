@@ -217,7 +217,8 @@ def gate(paired: Mapping, *, n_days: int | None = None,
 
 
 def decide(*, validate_gate: Mapping, test_gate: Mapping | None,
-           selection_split: str, test_evaluated: bool) -> dict:
+           selection_split: str, test_evaluated: bool,
+           test_sealed_by_policy: bool = False) -> dict:
     """把两个 split 的 gate 合成一个结论：`promoted` / `falsified` / `inconclusive`。
 
     **判定顺序就是纪律本身**，不能重排：
@@ -231,7 +232,21 @@ def decide(*, validate_gate: Mapping, test_gate: Mapping | None,
        test 也 `WIN` → `promoted`，否则 `falsified`（validate 的胜利没能复现 = 不许嘴硬）。
 
     最后一条覆盖一切：样本不足 → `inconclusive`（即使符号很好看）。
+
+    `test_sealed_by_policy=True`（P9-a 新增）是第 4 条的**收紧**：调用方已经声明
+    「本轮即使 validate `WIN` 也不读封存段」（多变量比较轮次的预注册要求）。
+    此时不会抛「赢了却没打开 test」的 `RuntimeError`（那是**配置错误**的信号，
+    这里是有意为之），而是记 `inconclusive` 并在理由里写明「validate 是 WIN，
+    但 test 按预注册封存 —— 是否打开留给下一轮」。**绝不**因此给出 `promoted`：
+    没有 test 证据就不叫晋升。
+
+    这个开关只会让结论**更保守**：它唯一的作用是阻止读 test，不能强制读。
     """
+    if test_sealed_by_policy and test_gate is not None:
+        raise ValueError(
+            "test_sealed_by_policy=True 却拿到了 test_gate —— 自相矛盾："
+            "声明的封存与实际的读取不一致，拒绝合成一个说不清来源的结论"
+        )
     if selection_split == "test":
         raise TestSetLeak(
             "selection_split='test' —— `test` 是封存段，只能被晋级评审读取一次，"
@@ -261,6 +276,13 @@ def decide(*, validate_gate: Mapping, test_gate: Mapping | None,
 
     # ---- validate WIN：晋级评审，test 必须已打开一次 ----
     if test_gate is None:
+        if test_sealed_by_policy:
+            return {**base, "status": STATUS_INCONCLUSIVE,
+                    "reasons": [
+                        "validate 段 **WIN**（方向与 Brier 都显著变好），"
+                        "但本轮预注册声明「test 封存、即使 WIN 也不打开」→ "
+                        "记为 inconclusive（**不是** promoted）："
+                        "没有封存段证据就不叫晋升，是否开 test 留给下一轮复现评审"]}
         raise RuntimeError(
             "validate 赢了却没打开 test —— 晋级评审必须一次性读取封存段，"
             "否则「promoted」这个结论没有被任何样本外证据支持"
