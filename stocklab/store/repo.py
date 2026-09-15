@@ -36,13 +36,23 @@ def now_iso() -> str:
 
 def upsert_instruments(conn: sqlite3.Connection, instruments: Sequence[Instrument],
                        *, now: str) -> int:
-    """登记标的。`added_at` 是首次入库时间，**不随再次 upsert 变化**。"""
-    rows = [(i.code, i.name, i.market, i.board, "stock", now) for i in instruments]
+    """登记标的。`added_at` 是首次入库时间，**不随再次 upsert 变化**。
+
+    `type` 写**标的自己的口径**（`Instrument.asset_type`）。P17 之前这里硬编码成
+    `"stock"` —— 于是 ETF 一旦入池就会被贴上股票标签，而下游正是按 `type` 决定
+    「用哪套成本/复权口径」的（见 ADR-008）。标签错 = 口径错，且完全静默。
+
+    `ON CONFLICT` 只覆盖 **name / market / board / type** 四列：既有标的的其余列
+    （`added_at`、`sector`、`listed_at`…）**逐列不变**，由
+    `test_upsert_extended_universe_leaves_existing_rows_column_identical` 钉住。
+    """
+    rows = [(i.code, i.name, i.market, i.board, i.asset_type, now)
+            for i in instruments]
     conn.executemany(
         "INSERT INTO instruments (code, name, market, board, type, added_at)"
         " VALUES (?,?,?,?,?,?)"
         " ON CONFLICT(code) DO UPDATE SET name=excluded.name,"
-        " market=excluded.market, board=excluded.board",
+        " market=excluded.market, board=excluded.board, type=excluded.type",
         rows,
     )
     conn.commit()

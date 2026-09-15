@@ -236,3 +236,50 @@ def test_insert_adj_factors_is_overwritable(conn):
     rows = dict(conn.execute("SELECT date, factor FROM adj_factors").fetchall())
     assert rows["2026-09-10"] == pytest.approx(1.0)
     assert rows["2026-09-11"] < 1.0
+
+
+# ---------- P17：标的池扩展不得动既有行 ----------
+
+def test_upsert_extended_universe_leaves_existing_rows_column_identical(conn):
+    """**append-only 的硬证据**：把 ETF 加进标的池后，000333/600690 的每一列都不许变。
+
+    逐列比较（含 `added_at`）—— 「只更新 name/market/board」这种说法要靠断言钉住，
+    不能靠读代码确认。
+    """
+    from stocklab.config.universe import DEFAULT_UNIVERSE
+
+    old = tuple(i for i in DEFAULT_UNIVERSE if i.code in ("000333", "600690"))
+    repo.upsert_instruments(conn, old, now="2026-09-01T00:00:00+08:00")
+    before = {r["code"]: dict(r) for r in conn.execute(
+        "SELECT * FROM instruments WHERE code IN ('000333','600690')")}
+    assert len(before) == 2
+
+    repo.upsert_instruments(conn, DEFAULT_UNIVERSE, now="2026-09-15T00:00:00+08:00")
+    after = {r["code"]: dict(r) for r in conn.execute(
+        "SELECT * FROM instruments WHERE code IN ('000333','600690')")}
+    assert before == after, "既有标的的行被改动了（append-only 纪律）"
+
+
+def test_upsert_writes_real_asset_type(conn):
+    """`type` 列必须写标的自己的口径 —— 曾经硬编码成 'stock'（P17 修正）。"""
+    from stocklab.config.universe import DEFAULT_UNIVERSE
+
+    repo.upsert_instruments(conn, DEFAULT_UNIVERSE, now=NOW)
+    got = {r["code"]: (r["type"], r["market"], r["board"]) for r in conn.execute(
+        "SELECT code, type, market, board FROM instruments")}
+    assert got["510300"] == ("etf", "sh", "main")
+    assert got["510880"] == ("etf", "sh", "main")
+    assert got["512890"] == ("etf", "sh", "main")
+    assert got["518880"] == ("etf", "sh", "main")
+    assert got["000333"] == ("stock", "sz", "main")
+    assert got["600690"] == ("stock", "sh", "main")
+
+
+def test_upsert_does_not_duplicate_or_delete_rows(conn):
+    """重复 upsert 不新增、不删除（仍幂等于 6 行）。"""
+    from stocklab.config.universe import DEFAULT_UNIVERSE
+
+    repo.upsert_instruments(conn, DEFAULT_UNIVERSE, now=NOW)
+    repo.upsert_instruments(conn, DEFAULT_UNIVERSE, now=NOW)
+    n = conn.execute("SELECT COUNT(*) FROM instruments").fetchone()[0]
+    assert n == len(DEFAULT_UNIVERSE) == 6

@@ -166,11 +166,18 @@ def test_fetch_failure_is_loud_and_writes_nothing(env):
 
 
 def test_partial_capture_is_reported_as_an_anomaly(env):
-    """源站少回一个标的 ≠「今天只该有这一个」。"""
+    """源站少回一个标的 ≠「今天只该有这一个」。
+
+    标的集合**显式取「种子池里的股票」**：本测试断言的是「缺失被报出来」，
+    不是「种子池有几只」。钉住 `DEFAULT_UNIVERSE` 的长度会让「往池子里加 ETF」
+    变成一条要改断言的红 —— 那是测试在替无关的变更收税（P17）。
+    """
     conn, _ = env
     from stocklab.config.universe import DEFAULT_UNIVERSE
 
-    s = run_tick(conn, now=NOW, fetch=_fetch(), universe=DEFAULT_UNIVERSE)
+    universe = tuple(i for i in DEFAULT_UNIVERSE if i.is_stock)
+    assert len(universe) == 2                      # 前提写死在这里，而不是隐含在断言里
+    s = run_tick(conn, now=NOW, fetch=_fetch(), universe=universe)
     assert s["collect"]["missing_codes"] == ["600690"]
     assert any(a["kind"] == "snapshot_missing_codes" for a in s["anomalies"])
 
