@@ -23,6 +23,27 @@ docs/
   `session tick`、15:30 `review daily`）、退出码含义、失败怎么办、如何补跑
   （含 `backfill-close` 用法与「历史 NULL 不碰」的语义）
 
+### 实盘账本与组合视图（P12）
+
+- [`architecture/portfolio-json.md`](architecture/portfolio-json.md) — **P13 页面的接口契约**：
+  `portfolio show --json` 的全部字段（顶层 17 / positions 19 / discipline 5 / advisory 5）、
+  退出码语义（0/1/2）、`WARN` 与 `UNDETERMINED` 为什么不触发报警
+- [`decisions/2026-09-15-ADR-006-实盘账本口径.md`](decisions/2026-09-15-ADR-006-实盘账本口径.md) —
+  **口径决策**：成本含费为默认（同时输出不含费）、现金是推导量、总资产只算有现价的持仓、
+  无保证金、改错只能冲正、**为什么不用唯一约束防重复录入**
+- [`plans/2026-09-15-p12-实盘账本与组合视图.md`](plans/2026-09-15-p12-实盘账本与组合视图.md) —
+  P12 设计稿
+- [`tasks/2026-09-15-p12-task53-60.md`](tasks/2026-09-15-p12-task53-60.md) — P12 任务拆分与验收清单
+
+```bash
+# 录入（append-only；改错只能用 reverse 冲正）
+stocklab cash add --date 2026-09-14 --kind deposit --amount 20000 --idempotency-key principal-20260914
+stocklab trade add --date 2026-09-14 --code 000333 --side buy --price 86.80 --qty 100 --fee 5.09
+stocklab trade reverse 1 --reason "录错券商"          # 冲正，不改原行
+stocklab portfolio show --asof 2026-09-15            # 表；退出码 1 = 要人来看
+stocklab portfolio show --asof 2026-09-15 --json     # P13 消费的稳定接口
+```
+
 ### 计划与任务（当前轮）
 
 - [`plans/2026-09-15-p11-调度链.md`](plans/2026-09-15-p11-调度链.md) — P11 设计稿：
