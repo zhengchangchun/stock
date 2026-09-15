@@ -204,6 +204,35 @@ def _summarize_split(name: str, days: Sequence[str], rows: dict, *,
     }
 
 
+def _sealed_reason(gate_status: str, evaluate_test_on_win: bool) -> str:
+    """test 段没被评估的**真实**原因。
+
+    两件事互相独立，报告里必须都能表达：
+
+      ① **实际 gate 状态** —— validate 可以是 `WIN` / `LOSE` / `FLAT` / `INSUFFICIENT`；
+      ② **封存声明** —— 预注册是否声明「即使 WIN 也不打开 test」（`--keep-test-sealed`）。
+
+    旧实现只看 ②：只要带了 `--keep-test-sealed`，不论 gate 是什么都写
+    「validate 段 gate=WIN」—— validate 明明是 `LOSE` 的报告因此**谎报变体赢了**
+    （ERROR_DIARY 2026-09-15 #16）。现在按 ① 取真实原因，再把 ② 作为附加事实补上。
+    """
+    sealed = not evaluate_test_on_win
+    if gate_status == "WIN":
+        # 走到这里必然 sealed：`test_evaluated = (gate==WIN) and evaluate_test_on_win`，
+        # 若 evaluate_test_on_win 为真则 test 已打开，不会来问原因。
+        return ("validate 段 gate=WIN，但本轮预注册声明封存 test"
+                "（`--keep-test-sealed`）→ 封存段不打开，结论记 inconclusive，"
+                "「是否开 test」留给下一轮复现评审")
+    reason = (f"validate 段 gate={gate_status}（未达 WIN）→ 封存段不打开。"
+              "这正是纪律要求的：validate 输了就不许再看 test，"
+              "否则「用 test 挑变体」会以「我只是看一眼」的形式发生")
+    if sealed:
+        reason += ("另外，本轮预注册也声明了「即使 WIN 也封存 test」"
+                   "（`--keep-test-sealed`）—— 但**这不是**本次封存的主因，"
+                   f"主因是 gate={gate_status}。")
+    return reason
+
+
 def run_experiment(conn: sqlite3.Connection, *, variant_name: str,
                    from_date: str, to_date: str,
                    codes: Sequence[str] | None = None,
@@ -303,14 +332,8 @@ def run_experiment(conn: sqlite3.Connection, *, variant_name: str,
         "selection_split": selection_split,
         "test_evaluated": test_evaluated,
         "test_not_evaluated_reason": (
-            None if test_evaluated else
-            (f"validate 段 gate=WIN，但本轮预注册声明封存 test"
-             "（`--keep-test-sealed`）→ 封存段不打开，结论记 inconclusive，"
-             "「是否开 test」留给下一轮复现评审"
-             if not evaluate_test_on_win else
-             f"validate 段 gate={validate_gate['status']}（未达 WIN）→ 封存段不打开。"
-             "这正是纪律要求的：validate 输了就不许再看 test，"
-             "否则「用 test 挑变体」会以「我只是看一眼」的形式发生")
+            None if test_evaluated
+            else _sealed_reason(validate_gate["status"], evaluate_test_on_win)
         ),
         "splits": splits,
         "verdict": verdict,

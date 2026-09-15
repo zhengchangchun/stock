@@ -207,6 +207,28 @@ def test_test_split_is_never_replayed_when_validate_is_not_a_win(tmp_path, monke
     assert rep["counts"]["baseline_rows"] == len(seg["train"]) + len(seg["validate"])
 
 
+def test_sealed_reason_reports_the_actual_gate_not_a_hardcoded_win(tmp_path, monkeypatch):
+    """`--keep-test-sealed` 时，原因串必须按**实际 gate**取值，不许一律写 WIN。
+
+    封存开关（`--keep-test-sealed`）与 gate 状态是**两个独立事实**：
+    validate 可以是 `LOSE`，同时预注册又声明「即使 WIN 也封存 test」。
+    报告是给审计者看的 —— 说「validate 段 gate=WIN，只是封存了 test」
+    会让人以为变体赢了。所以两条原因都要能同时表达。
+    """
+    conn = _env(tmp_path)
+    lose = {"status": "LOSE", "n_days": MIN_DAYS, "min_days": MIN_DAYS,
+            "reasons": [], "beat_direction": False, "beat_brier": False}
+    monkeypatch.setattr(metrics, "gate", lambda *a, **k: dict(lose))
+    rep = _run(conn, evaluate_test_on_win=False)
+
+    assert rep["test_evaluated"] is False
+    reason = rep["test_not_evaluated_reason"]
+    assert "gate=LOSE" in reason, f"原因串没写出实际 gate：{reason}"
+    assert "gate=WIN" not in reason, f"报告谎报 gate=WIN：{reason}"
+    # 封存声明也要如实表达，不能因为 gate 是 LOSE 就把它吞掉
+    assert "keep-test-sealed" in reason, f"封存声明丢了：{reason}"
+
+
 def test_test_split_is_replayed_exactly_once_when_validate_wins(tmp_path, monkeypatch):
     """validate 达到 WIN → 第二趟**只**跑 test，且只跑一次。
 
