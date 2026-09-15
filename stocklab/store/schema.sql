@@ -609,6 +609,8 @@ CREATE TABLE IF NOT EXISTS paper_trades (
     fee_total     REAL NOT NULL,
     asset_class   TEXT NOT NULL,         -- 'stock' | 'etf'（成本口径按它取）
     rule_citation TEXT NOT NULL,         -- 触发的规则条文（不许留空）
+    reason        TEXT NOT NULL,         -- 决策原文（人读；含「为什么是这个股数」）
+    binding_json  TEXT NOT NULL,         -- 生效的约束代号 JSON 数组（哪条把订单压小了）
     price_source  TEXT NOT NULL,         -- 价格出处：'snapshot' | 'bars'
     price_asof    TEXT NOT NULL,         -- 价格实际所属日期（PIT 可审计）
     created_at    TEXT NOT NULL,

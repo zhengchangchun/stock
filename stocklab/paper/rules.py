@@ -85,6 +85,9 @@ class Decision:
     cash_after: float | None = None
     weight_after_pct: float | None = None
     asset_class: str | None = None
+    #: 价格出处（由引擎从 `Price` 填；规则层不认识数据源）
+    price_source: str | None = None
+    price_asof: str | None = None
 
     @property
     def is_trade(self) -> bool:

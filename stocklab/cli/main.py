@@ -1675,6 +1675,118 @@ def cmd_lab_serve(args: argparse.Namespace) -> int:
     return 0
 
 
+# ---------- 模拟盘（P19） ----------
+
+def _paper_conn(args):
+    """打开库并确认 P19 的表已前滚；返回 `(conn, None)` 或 `(None, 退出码)`。"""
+    db = Path(args.db) if args.db else paths.DB_PATH
+    if not db.exists():
+        print(json.dumps({"error": "db not found; run `stocklab db init`"},
+                         ensure_ascii=False), file=sys.stderr)
+        return None, 2
+    conn = connect(db)
+    has = conn.execute(
+        "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name IN"
+        " ('paper_accounts','paper_trades','paper_nav_daily')").fetchone()[0]
+    if has < 3:
+        conn.close()
+        print(json.dumps({"error": "模拟盘表不存在；先跑 `stocklab db init` 前滚 schema"},
+                         ensure_ascii=False), file=sys.stderr)
+        return None, 2
+    return conn, None
+
+
+def _paper_fail(exc: Exception) -> int:
+    """模拟盘的可预期失败一律**退出码 2 + 原因上 stderr**（不写半截状态）。"""
+    print(json.dumps({"error": str(exc), "type": type(exc).__name__},
+                     ensure_ascii=False, sort_keys=True), file=sys.stderr)
+    return 2
+
+
+def cmd_paper_init(args: argparse.Namespace) -> int:
+    """建三条臂（纪律臂按 3 档 ETF 占比展开）。幂等：已存在不改写。"""
+    from stocklab.paper import engine
+
+    conn, code = _paper_conn(args)
+    if conn is None:
+        return code
+    try:
+        rep = engine.init_accounts(conn, now=args.now or datetime.now(TZ).isoformat(timespec="seconds"))
+    except engine.PaperError as exc:
+        return _paper_fail(exc)
+    finally_out = conn.close
+    try:
+        print(json.dumps(rep, ensure_ascii=False, sort_keys=True, indent=2))
+        print(json.dumps({"created": rep["created"], "accounts": rep["accounts"],
+                          "start_date": rep["start_date"],
+                          "initial_nav": rep["initial_nav"]},
+                         ensure_ascii=False, sort_keys=True), file=sys.stderr)
+    finally:
+        finally_out()
+    return 0
+
+
+def cmd_paper_step(args: argparse.Namespace) -> int:
+    """推进一天（幂等）。stdout = **稳定 JSON 状态载荷**，报告另落 `reports/paper/`。
+
+    stdout 只由「库里的行 + PIT 收盘价」决定 —— 所以同日重跑逐字节一致；
+    「这次有没有真的下单」这类过程信息走 stderr，不进 stdout（否则重跑就不一致了）。
+    """
+    from stocklab.paper import engine
+
+    conn, code = _paper_conn(args)
+    if conn is None:
+        return code
+    asof = args.asof
+    try:
+        payload = engine.step(conn, asof, now=args.now or datetime.now(TZ).isoformat(timespec="seconds"))
+        rep = engine.build_report(conn, asof)
+    except engine.PaperError as exc:
+        conn.close()
+        return _paper_fail(exc)
+    path = Path(args.out) if args.out else (paths.REPORT_DIR / "paper"
+                                            / f"{asof}-paper.md")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(engine.render_report(rep), encoding="utf-8")
+    # 与 predict/verify/review 同纪律：正文不含生成时刻 → 同输入逐字节一致
+    path.with_suffix(".json").write_text(
+        json.dumps(rep, ensure_ascii=False, sort_keys=True, indent=2) + "\n",
+        encoding="utf-8")
+    conn.close()
+    print(json.dumps(payload, ensure_ascii=False, sort_keys=True, indent=2))
+    trades = sum(len(a["decisions"]) for a in payload["accounts"])
+    print(json.dumps({"asof": asof, "report": str(path),
+                      "accounts": len(payload["accounts"]),
+                      "trades_on_asof": trades,
+                      "note": "本步为幂等操作：同日重跑不重复下单"},
+                     ensure_ascii=False, sort_keys=True), file=sys.stderr)
+    return 0
+
+
+def cmd_paper_show(args: argparse.Namespace) -> int:
+    """查模拟盘现状（离线只读，不写任何表、不落报告）。"""
+    from stocklab.paper import engine
+
+    conn, code = _paper_conn(args)
+    if conn is None:
+        return code
+    asof = args.asof or _today()
+    try:
+        payload = engine.state_payload(conn, asof)
+    except engine.PaperError as exc:
+        conn.close()
+        return _paper_fail(exc)
+    conn.close()
+    print(json.dumps(payload, ensure_ascii=False, sort_keys=True, indent=2))
+    print(json.dumps({"asof": asof,
+                      "accounts": [{"account_id": a["account_id"], "nav": a["nav"],
+                                    "cum_return": a["cum_return"],
+                                    "max_or_last_drawdown": a["drawdown"]}
+                                   for a in payload["accounts"]]},
+                     ensure_ascii=False, sort_keys=True), file=sys.stderr)
+    return 0
+
+
 # ---------- parser ----------
 
 def build_parser() -> argparse.ArgumentParser:
@@ -2014,6 +2126,30 @@ def build_parser() -> argparse.ArgumentParser:
     lab_serve.add_argument("--db", help="数据库路径（默认 data/stocklab.db）")
     lab_serve.add_argument("--asof", help="固定 asof 日期（默认每次请求取今天）")
     lab_serve.set_defaults(func=cmd_lab_serve)
+
+    paper = sub.add_parser(
+        "paper", help="模拟盘（P19）：三臂并行、每日记净值，append-only")
+    paper_sub = paper.add_subparsers(dest="paper_action", required=True)
+
+    pp_init = paper_sub.add_parser(
+        "init", help="建三条臂（arm-hold / arm-now / 3 档 arm-discipline）；幂等")
+    pp_init.add_argument("--db")
+    pp_init.add_argument("--now", help="覆盖当前时刻（测试/补录用）")
+    pp_init.set_defaults(func=cmd_paper_init)
+
+    pp_step = paper_sub.add_parser(
+        "step", help="按 --asof 收盘推进一天（幂等：同日重跑不重复下单）")
+    pp_step.add_argument("--asof", required=True, help="决策日 YYYY-MM-DD（PIT 收盘）")
+    pp_step.add_argument("--out", help="报告路径（默认 reports/paper/<asof>-paper.md）")
+    pp_step.add_argument("--db")
+    pp_step.add_argument("--now", help="覆盖当前时刻（测试/补录用）")
+    pp_step.set_defaults(func=cmd_paper_step)
+
+    pp_show = paper_sub.add_parser("show", help="查模拟盘现状（离线只读）")
+    pp_show.add_argument("--asof", help="asof 日期 YYYY-MM-DD（默认今天）")
+    pp_show.add_argument("--db")
+    pp_show.add_argument("--now", help="覆盖当前时刻（测试用）")
+    pp_show.set_defaults(func=cmd_paper_show)
 
     doctor = sub.add_parser("doctor", help="数据健康度报告（离线）")
     doctor.set_defaults(func=lambda _a: cmd_doctor())

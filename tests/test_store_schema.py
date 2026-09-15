@@ -15,6 +15,9 @@ EXPECTED_TABLES = {
     "quote_snapshots",                 # P11：盘中快照（append-only）
     "cash_flows",                      # P12：本金/现金流（append-only）
     "ledger_idem",                     # P12：幂等键台账（append-only）
+    "paper_accounts",                  # P19：模拟盘三臂（append-only）
+    "paper_trades",                    # P19：模拟成交（append-only）
+    "paper_nav_daily",                 # P19：每日净值（append-only）
 }
 
 
