@@ -24,15 +24,29 @@ from __future__ import annotations
 DISCIPLINE = {
     "single_position_max_pct": 40.0,
     "cash_band_pct": (45.0, 60.0),
-    "stop_loss_close": 85.00,
-    "stop_loss_weekly": 83.25,
-    "no_add_above": 87.00,
     "cash_per_trade_max_pct": 5.0,
     "trim_light_pct": 10.0,
     "trim_on_break_pct": 20.0,
 }
 
+#: **按标的**的纪律线。止损线是从**入场价**推出来的，不是全市场常数。
+#
+# 用户的三条线（85.00 / 83.25 / 87.00）都是围绕 000333 的 86.80 建仓价定的。
+# 把它们当全局常数套到别的标的上会产出**看起来像结论的垃圾**：
+# 一只 20 元的股票会被判「跌破 85.00 止损线 65 元」，而这条判定毫无意义。
+# 没有配置纪律线的标的，对应检查一律 `UNDETERMINED`（不猜），
+# 而不是拿别人的线去量它。
+PER_CODE_LINES = {
+    "000333": {"stop_loss_close": 85.00, "stop_loss_weekly": 83.25,
+               "no_add_above": 87.00},
+}
+
 UNDETERMINED_REASON = "数据不足（无可用现价），未判定"
+
+
+def lines_for(code: str) -> dict | None:
+    """该标的的纪律线；没配过返回 `None`。"""
+    return PER_CODE_LINES.get(code)
 
 
 def _out(check: str, status: str, detail: str, numbers: dict,
@@ -87,31 +101,53 @@ def check_cash_band(cash_pct: float | None) -> dict:
 
 # ---------- 止损 ----------
 
-def check_stop_loss_close(code: str, close: float | None) -> dict:
-    """收盘价口径止损线 85.00：**跌破**才动，正好 85.00 不算破。"""
-    line = DISCIPLINE["stop_loss_close"]
+def check_stop_loss_close(code: str, close: float | None, *,
+                          source: str | None = None,
+                          price_asof: str | None = None) -> dict:
+    """收盘价口径止损线：**跌破**才动，正好落在线上不算破。
+
+    `close` 必须是**日收盘价**（`bars_daily`），不是盘中快照价 ——
+    拿盘中价去判「收盘有没有破位」，盘中每一分钟都会给出不同的答案。
+    收盘价取不到、或该标的没配过纪律线 → `UNDETERMINED`。
+    """
+    lines = lines_for(code)
+    if lines is None:
+        return _out("stop_loss_close_85", "UNDETERMINED",
+                    f"{code} 未配置纪律线（止损线由**入场价**推出，不是全局常数）；"
+                    "不拿别的标的的线去量它",
+                    {"line": None, "close": close}, subject=code)
+    line = lines["stop_loss_close"]
     if close is None:
         return _out("stop_loss_close_85", "UNDETERMINED",
-                    f"{code}：{UNDETERMINED_REASON}", {"line": line}, subject=code)
+                    f"{code}：{UNDETERMINED_REASON}（收盘价需 bars_daily，当前取不到）",
+                    {"line": line, "close": None}, subject=code)
     distance = round(close - line, 4)
+    where = f"（{source}，{price_asof}）" if source else ""
     if close >= line:
         status = "PASS"
-        detail = f"{code} 收盘 {close:.2f}，在止损线 {line:.2f} 上方 {distance:.2f}"
+        detail = f"{code} 收盘{where} {close:.2f}，在止损线 {line:.2f} 上方 {distance:.2f}"
     else:
         status = "FAIL"
-        detail = f"{code} 收盘 {close:.2f}，**跌破**止损线 {line:.2f}（{distance:.2f}）"
+        detail = f"{code} 收盘{where} {close:.2f}，**跌破**止损线 {line:.2f}（{distance:.2f}）"
     return _out("stop_loss_close_85", status, detail,
-                {"line": line, "close": close, "distance": distance}, subject=code)
+                {"line": line, "close": close, "distance": distance,
+                 "close_source": source, "close_asof": price_asof}, subject=code)
 
 
 def check_stop_loss_weekly(code: str, weekly_close: float | None, *,
                            source: str | None = None,
                            price_asof: str | None = None) -> dict:
-    """周线口径止损线 83.25。`weekly_close` 由调用方从 bars_daily 算出并标明出处。
+    """周线口径止损线。`weekly_close` 由调用方从 bars_daily 算出并标明出处。
 
-    取不到就 `UNDETERMINED` —— 周线猜不出来，也不该装作用成本价算得出来。
+    取不到、或该标的没配过纪律线 → `UNDETERMINED` —— 周线猜不出来，
+    也不该装作用成本价算得出来。
     """
-    line = DISCIPLINE["stop_loss_weekly"]
+    lines = lines_for(code)
+    if lines is None:
+        return _out("stop_loss_weekly_83_25", "UNDETERMINED",
+                    f"{code} 未配置纪律线（周线止损线由**入场价**推出，不是全局常数）",
+                    {"line": None, "weekly_close": weekly_close}, subject=code)
+    line = lines["stop_loss_weekly"]
     if weekly_close is None:
         return _out("stop_loss_weekly_83_25", "UNDETERMINED",
                     f"{code}：{UNDETERMINED_REASON}"
@@ -134,12 +170,17 @@ def check_stop_loss_weekly(code: str, weekly_close: float | None, *,
 # ---------- 不追高 ----------
 
 def check_no_add_above(code: str, price: float | None) -> dict:
-    """现价 ≥ 87.00 → 禁止补仓（WARN）。
+    """现价 ≥ 禁补仓线 → WARN。
 
     WARN 而不是 FAIL：这是**禁止一个动作**，不是「当前持仓违规」。
-    已经持有的仓位不会因为price高而变成错误。
+    已经持有的仓位不会因为价格高而变成错误。
     """
-    threshold = DISCIPLINE["no_add_above"]
+    lines = lines_for(code)
+    if lines is None:
+        return _out("no_add_above_87", "UNDETERMINED",
+                    f"{code} 未配置禁补仓线（该线由**入场价**推出，不是全局常数）",
+                    {"threshold": None, "price": price}, subject=code)
+    threshold = lines["no_add_above"]
     if price is None:
         return _out("no_add_above_87", "UNDETERMINED",
                     f"{code}：{UNDETERMINED_REASON}", {"threshold": threshold},
@@ -147,7 +188,7 @@ def check_no_add_above(code: str, price: float | None) -> dict:
     if price >= threshold:
         status = "WARN"
         detail = (f"{code} 现价 {price:.2f} ≥ {threshold:.2f} —— **禁止补仓**"
-                  f"（高出现价门槛 {price - threshold:.2f}）")
+                  f"（高出禁补仓线 {price - threshold:.2f}）")
     else:
         status = "PASS"
         detail = f"{code} 现价 {price:.2f} < {threshold:.2f}，未触发禁补仓线"
@@ -175,7 +216,8 @@ def check_cash_per_trade(total_assets: float | None) -> dict:
 # ---------- 汇总 ----------
 
 def run_checks(*, positions, cash_pct, close, weekly_close, price,
-               total_assets, weekly_source=None, weekly_asof=None) -> list[dict]:
+               total_assets, close_source=None, close_asof=None,
+               weekly_source=None, weekly_asof=None) -> list[dict]:
     """跑全部六条。`positions` 是 `[(code, weight_pct_or_None), ...]`。
 
     ⚠️ `close` / `weekly_close` / `price` 是**单标的**的简化入参，
@@ -186,7 +228,8 @@ def run_checks(*, positions, cash_pct, close, weekly_close, price,
         checks.append(check_position_weight(code, weight))
     checks.append(check_cash_band(cash_pct))
     code = positions[0][0] if positions else "-"
-    checks.append(check_stop_loss_close(code, close))
+    checks.append(check_stop_loss_close(code, close, source=close_source,
+                                        price_asof=close_asof))
     checks.append(check_stop_loss_weekly(code, weekly_close,
                                          source=weekly_source,
                                          price_asof=weekly_asof))

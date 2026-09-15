@@ -1291,6 +1291,138 @@ def cmd_review_daily(args: argparse.Namespace) -> int:
     return 0
 
 
+# ---------- 实盘账本 + 组合视图（P12） ----------
+
+def _portfolio_conn(args):
+    """打开库并确认 P12 的表已前滚；返回 `(conn, None)` 或 `(None, 退出码)`。"""
+    db = Path(args.db) if args.db else paths.DB_PATH
+    if not db.exists():
+        print(json.dumps({"error": "db not found; run `stocklab db init`"},
+                         ensure_ascii=False), file=sys.stderr)
+        return None, 2
+    conn = connect(db)
+    has = conn.execute(
+        "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name IN"
+        " ('real_trades','cash_flows','ledger_idem')").fetchone()[0]
+    if has < 3:
+        conn.close()
+        print(json.dumps({"error": "账本表不存在；先跑 `stocklab db init` 前滚 schema"},
+                         ensure_ascii=False), file=sys.stderr)
+        return None, 2
+    return conn, None
+
+
+def _emit(args, payload: dict, human: str) -> None:
+    """`--json` 出机器可读、否则出人看的（两者同源）。"""
+    if getattr(args, "json", False):
+        print(json.dumps(payload, ensure_ascii=False, sort_keys=True, indent=2))
+    else:
+        print(human)
+
+
+def cmd_trade_add(args: argparse.Namespace) -> int:
+    """录入一笔实盘成交（append-only；改错只能 `trade reverse`）。"""
+    from stocklab.portfolio.ledger import LedgerError, record_trade
+
+    conn, code = _portfolio_conn(args)
+    if conn is None:
+        return code
+    now = args.now or datetime.now(TZ).isoformat(timespec="seconds")
+    try:
+        out = record_trade(conn, date=args.date, code=args.code, side=args.side,
+                           price=args.price, qty=args.qty, fee=args.fee,
+                           note=args.note, now=now,
+                           idem_key=args.idempotency_key,
+                           allow_duplicate=args.allow_duplicate)
+    except LedgerError as exc:
+        print(json.dumps({"error": str(exc), "kind": type(exc).__name__},
+                         ensure_ascii=False), file=sys.stderr)
+        return 2
+    finally:
+        conn.close()
+    verb = "幂等命中（未重复写入）" if out["state"] == "identical" else "已录入"
+    _emit(args, out,
+          f"✅ {verb} trade_id={out['trade_id']}  "
+          f"{out['date']} {out['side']} {out['code']} {out['qty']}股"
+          f" @{args.price} 费{args.fee}")
+    return 0
+
+
+def cmd_trade_reverse(args: argparse.Namespace) -> int:
+    """冲正一笔成交：追加反向记录 + note，**不改原行**。"""
+    from stocklab.portfolio.ledger import LedgerError, reverse_trade
+
+    conn, code = _portfolio_conn(args)
+    if conn is None:
+        return code
+    now = args.now or datetime.now(TZ).isoformat(timespec="seconds")
+    try:
+        out = reverse_trade(conn, args.trade_id, reason=args.reason, now=now,
+                            idem_key=args.idempotency_key)
+    except LedgerError as exc:
+        print(json.dumps({"error": str(exc), "kind": type(exc).__name__},
+                         ensure_ascii=False), file=sys.stderr)
+        return 2
+    finally:
+        conn.close()
+    _emit(args, out, f"✅ 已冲正 #{args.trade_id} → 新记录 trade_id={out['trade_id']}"
+                     f"（原行未改动）")
+    return 0
+
+
+def cmd_cash_add(args: argparse.Namespace) -> int:
+    """录入本金 / 现金流。`amount` **有符号**：正=流入，负=流出，须与 kind 一致。"""
+    from stocklab.portfolio.ledger import LedgerError, record_cash_flow
+
+    conn, code = _portfolio_conn(args)
+    if conn is None:
+        return code
+    now = args.now or datetime.now(TZ).isoformat(timespec="seconds")
+    try:
+        out = record_cash_flow(conn, date=args.date, kind=args.kind,
+                               amount=args.amount, note=args.note, now=now,
+                               idem_key=args.idempotency_key,
+                               allow_duplicate=args.allow_duplicate)
+    except LedgerError as exc:
+        print(json.dumps({"error": str(exc), "kind": type(exc).__name__},
+                         ensure_ascii=False), file=sys.stderr)
+        return 2
+    finally:
+        conn.close()
+    verb = "幂等命中（未重复写入）" if out["state"] == "identical" else "已录入"
+    _emit(args, out, f"✅ {verb} flow_id={out['flow_id']}  "
+                     f"{out['date']} {out['kind']} {out['amount']:+,.2f}")
+    return 0
+
+
+def cmd_portfolio_show(args: argparse.Namespace) -> int:
+    """组合视图（离线只读）。
+
+    退出码：`0` 一切正常 / `1` **要人来看**（有标的缺现价，或有纪律条目 FAIL）
+    / `2` 用法或库的问题。
+
+    `1` 不是"命令失败"——视图照样打印完整。它让调度器能机械地发现
+    「单票超 40%」或「某只票算不出市值」，而不必去解析人看的文本。
+    """
+    from stocklab.portfolio.view import build_portfolio, has_alarm, render_table
+
+    conn, code = _portfolio_conn(args)
+    if conn is None:
+        return code
+    now = args.now or datetime.now(TZ).isoformat(timespec="seconds")
+    asof = args.asof or now[:10]
+    try:
+        view = build_portfolio(conn, asof)
+    finally:
+        conn.close()
+    _emit(args, view, render_table(view))
+    alarm = has_alarm(view)
+    if alarm:
+        for w in view["warnings"]:
+            print(f"⚠️  {w}", file=sys.stderr)
+    return 1 if alarm else 0
+
+
 # ---------- parser ----------
 
 def build_parser() -> argparse.ArgumentParser:
@@ -1507,6 +1639,61 @@ def build_parser() -> argparse.ArgumentParser:
                            help="滚动准确率窗口（交易日，默认 30）")
     rev_daily.add_argument("--out", help="markdown 输出路径（.json 同名同目录）")
     rev_daily.set_defaults(func=cmd_review_daily)
+
+    # ---------- 实盘账本 + 组合视图（P12） ----------
+    trade = sub.add_parser("trade", help="实盘成交录入（append-only；改错只能冲正）")
+    trade_sub = trade.add_subparsers(dest="trade_cmd", required=True)
+
+    tr_add = trade_sub.add_parser("add", help="录入一笔成交")
+    tr_add.add_argument("--date", required=True, help="成交日 YYYY-MM-DD（须在日历内且不晚于最近已收盘交易日）")
+    tr_add.add_argument("--code", required=True, help="标的代码（须已在 instruments）")
+    tr_add.add_argument("--side", required=True, choices=["buy", "sell"])
+    tr_add.add_argument("--price", required=True, type=float, help="成交价（元）")
+    tr_add.add_argument("--qty", required=True, type=int, help="股数（买入须 100 整数倍）")
+    tr_add.add_argument("--fee", type=float, default=0.0, help="费用（元，≥0）")
+    tr_add.add_argument("--note")
+    tr_add.add_argument("--idempotency-key", help="幂等键：同键第二次进来不重复写入")
+    tr_add.add_argument("--allow-duplicate", action="store_true",
+                        help="确认「与已有记录完全相同」的是另一笔真单（不加唯一约束的原因）")
+    tr_add.add_argument("--db")
+    tr_add.add_argument("--now", help="覆盖当前时刻（测试/补录用）")
+    tr_add.add_argument("--json", action="store_true")
+    tr_add.set_defaults(func=cmd_trade_add)
+
+    tr_rev = trade_sub.add_parser("reverse", help="冲正一笔成交（追加反向记录，不改原行）")
+    tr_rev.add_argument("trade_id", type=int)
+    tr_rev.add_argument("--reason", required=True, help="冲正原因（写进 note，必填）")
+    tr_rev.add_argument("--idempotency-key")
+    tr_rev.add_argument("--db")
+    tr_rev.add_argument("--now")
+    tr_rev.add_argument("--json", action="store_true")
+    tr_rev.set_defaults(func=cmd_trade_reverse)
+
+    cash = sub.add_parser("cash", help="本金 / 现金流录入（append-only）")
+    cash_sub = cash.add_subparsers(dest="cash_cmd", required=True)
+    ca_add = cash_sub.add_parser("add", help="录入一笔现金流（amount 有符号：正=流入）")
+    ca_add.add_argument("--date", required=True)
+    ca_add.add_argument("--kind", required=True,
+                        choices=["deposit", "withdraw", "dividend", "fee", "tax", "other"])
+    ca_add.add_argument("--amount", required=True, type=float,
+                        help="有符号金额：deposit/dividend > 0，withdraw/fee/tax < 0")
+    ca_add.add_argument("--note")
+    ca_add.add_argument("--idempotency-key")
+    ca_add.add_argument("--allow-duplicate", action="store_true")
+    ca_add.add_argument("--db")
+    ca_add.add_argument("--now")
+    ca_add.add_argument("--json", action="store_true")
+    ca_add.set_defaults(func=cmd_cash_add)
+
+    pf = sub.add_parser("portfolio", help="组合视图（离线只读）")
+    pf_sub = pf.add_subparsers(dest="portfolio_cmd", required=True)
+    pf_show = pf_sub.add_parser(
+        "show", help="组合视图；退出码 1 = 要人来看（缺现价或纪律 FAIL）")
+    pf_show.add_argument("--asof", help="估值日 YYYY-MM-DD（默认今天）")
+    pf_show.add_argument("--db")
+    pf_show.add_argument("--now", help="覆盖当前时刻（测试用）")
+    pf_show.add_argument("--json", action="store_true", help="输出稳定 JSON（P13 的接口）")
+    pf_show.set_defaults(func=cmd_portfolio_show)
 
     doctor = sub.add_parser("doctor", help="数据健康度报告（离线）")
     doctor.set_defaults(func=lambda _a: cmd_doctor())

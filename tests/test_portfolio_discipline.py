@@ -4,6 +4,7 @@ import pytest
 
 from stocklab.portfolio.discipline import (
     DISCIPLINE,
+    PER_CODE_LINES,
     check_cash_band,
     check_cash_per_trade,
     check_no_add_above,
@@ -17,10 +18,11 @@ from stocklab.portfolio.discipline import (
 def test_limits_match_the_users_stated_rules():
     assert DISCIPLINE["single_position_max_pct"] == 40.0
     assert DISCIPLINE["cash_band_pct"] == (45.0, 60.0)
-    assert DISCIPLINE["stop_loss_close"] == 85.00
-    assert DISCIPLINE["stop_loss_weekly"] == 83.25
-    assert DISCIPLINE["no_add_above"] == 87.00
     assert DISCIPLINE["cash_per_trade_max_pct"] == 5.0
+    # 止损/禁补仓线是**按标的**的（由入场价推出），不是全局常数
+    assert PER_CODE_LINES["000333"] == {"stop_loss_close": 85.00,
+                                        "stop_loss_weekly": 83.25,
+                                        "no_add_above": 87.00}
     assert DISCIPLINE["trim_light_pct"] == 10.0
     assert DISCIPLINE["trim_on_break_pct"] == 20.0
 
@@ -207,3 +209,27 @@ def test_every_check_has_status_detail_and_numbers():
         assert c["status"] in ("PASS", "WARN", "FAIL", "UNDETERMINED"), c
         assert isinstance(c["detail"], str) and c["detail"], c
         assert isinstance(c["numbers"], dict), c
+
+
+# ---------- 纪律线是**按标的**的，不是全局常数 ----------
+
+def test_unconfigured_code_gets_undetermined_not_someone_elses_line():
+    """一只没配纪律线的票，不许拿 000333 的 85.00 去量它。
+
+    实测过这个坑：给一只 20 元的票套 85.00 止损线，会判出
+    「跌破止损线 65.00 元」这种看着像结论、其实毫无意义的 FAIL。
+    """
+    out = check_stop_loss_close("600690", 20.00)
+    assert out["status"] == "UNDETERMINED"
+    assert "未配置纪律线" in out["detail"]
+    assert out["numbers"]["line"] is None
+
+
+def test_unconfigured_code_weekly_and_no_add_are_undetermined():
+    assert check_stop_loss_weekly("600690", 20.00)["status"] == "UNDETERMINED"
+    assert check_no_add_above("600690", 20.00)["status"] == "UNDETERMINED"
+
+
+def test_configured_code_still_uses_its_own_line():
+    assert check_stop_loss_close("000333", 84.99)["status"] == "FAIL"
+    assert check_stop_loss_close("000333", 85.00)["status"] == "PASS"
