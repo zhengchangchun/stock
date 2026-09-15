@@ -209,7 +209,15 @@ def _baselines(scorable: Sequence[Mapping]) -> dict[str, Any]:
         "accuracy_daily": _daily({
             r["target_date"]: [1.0 if ic == a else 0.0]
             for r, a, ic in index_rows}),
-        "note": "index_300 当日方向作为「预测」；缺指数数据的交易日不参与",
+        "note": (
+            "index_300 同期（asof→target，与个股被预测窗口**同一段**）涨跌方向。"
+            "**同窗口、含未来信息、不可交易**，仅作参照，"
+            "**不作为可比的预测对手**；缺指数数据的交易日不参与"
+        ),
+        "pit_comparable": (
+            "PIT 口径的可比对手是 `index-mom-dir`（只用 <=asof 的指数方向）"
+            "与 `always_up` / `always_down`；`index_300` 不在此列"
+        ),
     }
     return out
 
@@ -281,6 +289,12 @@ def render_markdown(summary: Mapping) -> str:
         L.append(f"| **{mv}** | {_pct(g['direction']['accuracy_row'])} | "
                  f"{_daily_cell(g['direction']['accuracy_daily'])} |")
         L.append("")
+        if "index_300" in g["baselines"]:
+            b = g["baselines"]["index_300"]
+            L.append(f"> ⚠️ `index_300`：{b['note']}")
+            L.append(">")
+            L.append(f"> {b['pit_comparable']}")
+            L.append("")
         L.append("### 区间 / 关键位 / 动作")
         L.append("")
         L.append("| 项 | 值 |")

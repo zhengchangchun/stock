@@ -152,6 +152,33 @@ def test_index_baseline_excludes_rows_without_index_data():
     assert b["index_300"]["accuracy_row"] == pytest.approx(1.0)
 
 
+def test_index_baseline_is_labelled_contemporaneous_and_untradable():
+    """钉住口径诚实性标注：`index_300` 是**同窗口、含未来信息、不可交易**的参照，
+    不是可比的预测对手。这段文字被删/被改回去，等于把同期共动当成领先信号。"""
+    rows = [_row("2026-01-05", index=0.01, actual_class="up")]
+    g = summarize(rows, from_date="2026-01-05", to_date="2026-01-05")
+    b = g["model_versions"]["pit-rw-v1.0.1"]["baselines"]["index_300"]
+
+    note = b["note"]
+    assert "同窗口" in note
+    assert "含未来信息" in note
+    assert "不可交易" in note
+    assert "不作为可比的预测对手" in note
+    # 口径描述必须说清是「同期（asof→target）」，不能只说「当日」
+    assert "同期" in note
+    assert "asof" in note and "target" in note
+
+    pit = b["pit_comparable"]
+    assert "index-mom-dir" in pit          # PIT 口径的可比对手
+    assert "always_up" in pit and "always_down" in pit
+    assert "不在此列" in pit               # index_300 被显式排除在可比对手之外
+
+    md = render_markdown(g)
+    assert "含未来信息" in md and "不可交易" in md
+    assert "不作为可比的预测对手" in md
+    assert "index-mom-dir" in md
+
+
 def test_markdown_is_deterministic_and_declares_provenance():
     rows = [_row("2026-01-05"), _unscorable("2026-01-06")]
     g = summarize(rows, from_date="2026-01-05", to_date="2026-01-06")
