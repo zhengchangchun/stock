@@ -166,13 +166,17 @@ def _rail(base: str, current: str, asof: str) -> str:
             f'</div><div class="rail__nav">{links}</div></nav>')
 
 
+def alarms_banner(alarms: Sequence[str]) -> str:
+    if not alarms:
+        return ""
+    items = "".join(f"<li>{rich(a)}</li>" for a in alarms)
+    return (f'<div class="banner bad"><b>{len(alarms)} 条需要注意</b>'
+            f'<ul>{items}</ul></div>')
+
+
 def layout(*, base: str, title: str, body: str, asof: str, built_at: str,
            current: str = "", alarms: Sequence[str] = ()) -> str:
-    warn = ""
-    if alarms:
-        items = "".join(f"<li>{rich(a)}</li>" for a in alarms)
-        warn = (f'<div class="banner bad"><b>{len(alarms)} 条纪律出格</b>'
-                f'<ul>{items}</ul></div>')
+    warn = alarms_banner(alarms)
     return (
         '<!doctype html>\n<html lang="zh-CN"><head><meta charset="utf-8">'
         '<meta name="viewport" content="width=device-width,initial-scale=1">'
@@ -641,6 +645,9 @@ def overview_page(summary: Mapping, *, base: str, built_at: str) -> str:
 
     body = [
         canon,
+        # 告警条排在 CANONICAL 数字**之后**：首屏第一个视觉落点是大数字，
+        # 第二个就是纪律条里那块红的。告警条抢在数字前面会把数字挤出首屏。
+        alarms_banner(summary["alarms"]),
         section("纪律", discipline_rail(view), right="出格项标红，逐条给判据"),
         section("持仓", positions_table(view, base=base), note=view["price_policy"]),
         section("净值曲线", f'<figure class="chart">'
@@ -687,7 +694,7 @@ def overview_page(summary: Mapping, *, base: str, built_at: str) -> str:
 
     body.append(section("最近验证统计", _accuracy_block(summary["accuracy"])))
     return layout(base=base, title="总览", body="".join(body), asof=summary["asof"],
-                  built_at=built_at, current="/", alarms=summary["alarms"])
+                  built_at=built_at, current="/")
 
 
 def _accuracy_block(acc: Mapping) -> str:
@@ -734,7 +741,6 @@ def trades_page(data: Mapping, *, base: str, built_at: str, token: str,
          if filt else ""),
         section("录入成交", _trade_form(
             base, token=token, form_id=form_id, values=values,
-            note="买入 100 股整数倍，卖出不得超过当时持仓；日期不得晚于最近已收盘交易日。",
             err_field=err_field, err=error), right="写入后立刻回读"),
         section(f'成交流水（{len(data["rows"])} 笔）',
                 f'<div id="trades-pane">{trades_pane(data, base=base)}</div>',

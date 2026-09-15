@@ -35,6 +35,8 @@ docs/
   P12 设计稿
 - [`tasks/2026-09-15-p12-task53-60.md`](tasks/2026-09-15-p12-task53-60.md) — P12 任务拆分与验收清单
 - [`tasks/2026-09-15-p15-task66-70.md`](tasks/2026-09-15-p15-task66-70.md) — P15 持仓管理 Web 应用（路由/写入路径/测试/启动与 nginx 反代）\n
+- [`plans/2026-09-15-p16-UI设计.md`](plans/2026-09-15-p16-UI设计.md) — P16 前端 UI 设计计划（对账单色板 / 字体角色 / 布局线框 / AI 默认脸逐条自检）
+- [`tasks/2026-09-15-p16-ui.md`](tasks/2026-09-15-p16-ui.md) — P16 任务记录（静态资产本地化 / 局部更新 / 已知缺陷）
 ```bash
 # 录入（append-only；改错只能用 reverse 冲正）
 stocklab cash add --date 2026-09-14 --kind deposit --amount 20000 --idempotency-key principal-20260914
