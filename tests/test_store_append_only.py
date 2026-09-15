@@ -7,13 +7,14 @@ from stocklab.store.migrate import init_db
 
 NOW = "2026-09-14T19:00:00+08:00"
 
-# ADR-001 §5：这 5 张表 append-only
+# ADR-001 §5：这 5 张表 append-only；`experiment_decisions` 是 P8 Task 43 新增的同族表
 APPEND_ONLY_TABLES = (
     "features_daily",
     "predictions",
     "verifications",
     "sim_trades",
     "decisions",
+    "experiment_decisions",
 )
 
 
@@ -86,6 +87,7 @@ def test_all_append_only_triggers_exist(conn):
         "trg_predictions_no_update", "trg_predictions_no_delete",
         "trg_sim_trades_no_update", "trg_sim_trades_no_delete",
         "trg_decisions_no_update", "trg_decisions_no_delete",
+        "trg_experiment_decisions_no_update", "trg_experiment_decisions_no_delete",
         # verifications 不做全表 UPDATE 保护，改用「身份列不可变」触发器（ADR-002）
         "trg_verifications_no_update_identity", "trg_verifications_no_delete",
     }

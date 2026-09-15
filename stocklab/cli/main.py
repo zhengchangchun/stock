@@ -18,6 +18,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import sqlite3
 import sys
 from datetime import date, datetime, timedelta
 from pathlib import Path
@@ -939,6 +940,26 @@ def cmd_experiment_run(args: argparse.Namespace) -> int:
     written = (write_report_at(rep, Path(args.report)) if args.report
                else write_report(rep, report_dir, _today()))
 
+    # ---- 决策落库（Task 43）：**只落决策、不落预测** ----
+    # 报告写完后才知道自己的 sha256，所以这一步排在 write_report 之后。
+    # 幂等键含该 sha256：重跑同一场实验 → `identical`，不刷重复行。
+    from stocklab.experiments.decisions import (decisions_from_report,
+                                                record_decisions)
+    try:
+        conn = connect(db)
+        try:
+            recorded = record_decisions(
+                conn, decisions_from_report(rep,
+                                            report_sha256=written["sha256_json"]))
+        finally:
+            conn.close()
+    except sqlite3.OperationalError as exc:
+        if "no such table" not in str(exc):
+            raise
+        print(f"❌ 决策落库失败：{exc} —— 库没前滚，先跑 "
+              "`stocklab db init`（幂等，会先自动备份）", file=sys.stderr)
+        return 2
+
     print(json.dumps({
         "report": written["markdown"], "summary_json": written["json"],
         "sha256_md": written["sha256_md"], "sha256_json": written["sha256_json"],
@@ -953,6 +974,7 @@ def cmd_experiment_run(args: argparse.Namespace) -> int:
         "verdict": rep["verdict"]["status"],
         "verdict_reasons": rep["verdict"]["reasons"],
         "counts": rep["counts"],
+        "decisions_recorded": recorded,
     }, ensure_ascii=False, indent=2))
     if not rep["test_evaluated"]:
         print(f"🔒 test 段未打开：{rep['test_not_evaluated_reason']}", file=sys.stderr)

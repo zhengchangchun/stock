@@ -412,3 +412,44 @@ BEGIN SELECT RAISE(ABORT, 'verifications identity columns are append-only'); END
 CREATE TRIGGER IF NOT EXISTS trg_verifications_no_delete
 BEFORE DELETE ON verifications
 BEGIN SELECT RAISE(ABORT, 'verifications is append-only (delete)'); END;
+
+-- ---------- 实验决策台账（P8 Task 43，append-only） ----------
+-- 「哪个变体在哪一段是 WIN/LOSE」从此可 SQL 查。
+--
+-- **只落决策，不落预测**：变体预测仍然一行都不写 `predictions` / `verifications`
+-- （P8 §1.1 的架构决策不变）。本表记的是「这次评估判了什么」，不是「模型算了什么」。
+--
+-- 一行的粒度 = (变体, 分段, 指标)。`metric` ∈ {direction, brier}：
+-- 两者的 `delta` / `ci_low` / `ci_high` 各自独立，而 `gate_status` 是**分段级**的
+-- （`metrics.gate` 同时看两个指标才给 `WIN`/`LOSE`/`FLAT`/`INSUFFICIENT`），
+-- 所以同段的两行共享一个 `gate_status`。`decision` 是**整场实验**的结论
+-- （`promoted` / `falsified` / `inconclusive`），同一次运行的所有行相同。
+--
+-- 幂等键 = (variant_id, split, metric, metric_version, report_sha256)。
+-- 报告 sha256 覆盖了全部闸门数字，所以「同一份报告重跑」= 同一行 → 幂等跳过；
+-- 换了区间/配置 → 新 sha256 → **追加新行**（历史结论不被改写）。
+CREATE TABLE IF NOT EXISTS experiment_decisions (
+    decision_id     INTEGER PRIMARY KEY AUTOINCREMENT,
+    variant_id      TEXT NOT NULL,
+    split           TEXT NOT NULL CHECK (split IN ('train', 'validate', 'test')),
+    metric          TEXT NOT NULL CHECK (metric IN ('direction', 'brier')),
+    metric_version  TEXT NOT NULL,
+    delta           REAL,
+    ci_low          REAL,
+    ci_high         REAL,
+    gate_status     TEXT NOT NULL
+                    CHECK (gate_status IN ('WIN', 'LOSE', 'FLAT', 'INSUFFICIENT')),
+    decision        TEXT NOT NULL
+                    CHECK (decision IN ('promoted', 'falsified', 'inconclusive')),
+    report_sha256   TEXT NOT NULL,
+    created_at      TEXT NOT NULL,
+    UNIQUE (variant_id, split, metric, metric_version, report_sha256)
+);
+
+CREATE TRIGGER IF NOT EXISTS trg_experiment_decisions_no_update
+BEFORE UPDATE ON experiment_decisions
+BEGIN SELECT RAISE(ABORT, 'experiment_decisions is append-only'); END;
+
+CREATE TRIGGER IF NOT EXISTS trg_experiment_decisions_no_delete
+BEFORE DELETE ON experiment_decisions
+BEGIN SELECT RAISE(ABORT, 'experiment_decisions is append-only'); END;
