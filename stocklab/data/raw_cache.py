@@ -6,6 +6,10 @@
   - 读取时**总是校验 SHA256**，不匹配抛 `CacheCorrupt`；损坏时绝不退化成重新联网，
     否则复现问题会被掩盖成偶发问题。
   - 文件名由 `_safe()` 清洗 + 哈希后缀保证：既不含路径分隔符，又不会互相覆盖。
+  - **当日盘中快照不算命中**（ADR-009）：`params_key` 只带锚点 `end`、不含 `start`，
+    「首写保留」会把一份缺当日收盘（或含未完成盘中价）的 body 永久冻结。
+    判据：`fetched_at` 的本地日 == 锚点日，且时刻早于收盘（复用 `session.close`）。
+    读侧视为未命中并在 `conflicts` 留痕；写侧**不落正式缓存**；历史锚点行为不变。
 
 写入这些缓存的是手工运行的一次性脚本（`scripts/`），项目内无 cron/守护进程（ADR-001 D-05）。
 """
@@ -15,9 +19,11 @@ from __future__ import annotations
 import hashlib
 import json
 import re
+from datetime import date, datetime
 from pathlib import Path
 
 from stocklab.data.errors import CacheCorrupt
+from stocklab.session import close as close_mod
 
 _SAFE = re.compile(r"[^A-Za-z0-9._-]+")
 
@@ -34,6 +40,53 @@ def _safe(name: str) -> str:
     """
     cleaned = _SAFE.sub("_", name)[:80]
     return f"{cleaned}.{sha256_bytes(name.encode('utf-8'))[:12]}"
+
+
+def _anchor_date(params_key: str) -> date | None:
+    """取 `params_key` 第 3 段作为请求锚点日（`kline:{code}:{end}:{page}:{adj}`、
+    `actions:{code}:{end}:{page}`）。不是 ISO 日期 → None（时效规则不适用）。"""
+    parts = params_key.split(":")
+    if len(parts) < 3:
+        return None
+    try:
+        return date.fromisoformat(parts[2])
+    except ValueError:
+        return None
+
+
+def _fetched_local_dt(fetched_at: str) -> datetime | None:
+    """`fetched_at` 是带 +08:00 的本地时刻（`http.now_iso()`）。解析不了 → None。"""
+    try:
+        return datetime.fromisoformat(fetched_at)
+    except (TypeError, ValueError):
+        return None
+
+
+def is_intraday_snapshot(params_key: str, fetched_at: str) -> bool:
+    """这份响应是不是「锚点日当天、收盘前」抓到的**未完成**快照。
+
+    口径与 `session.tick._closed_at` 一致：`(时, 分) >= (CLOSE_HOUR, CLOSE_MINUTE)`
+    才算已收盘。解析不出锚点日 / 抓取时刻时返回 False —— **判不了就不猜**，维持旧行为。
+    """
+    anchor = _anchor_date(params_key)
+    dt = _fetched_local_dt(fetched_at)
+    if anchor is None or dt is None or dt.date() != anchor:
+        return False
+    return (dt.hour, dt.minute) < (close_mod.CLOSE_HOUR, close_mod.CLOSE_MINUTE)
+
+
+def _record_intraday_conflict(meta_path: Path, meta: dict, fetched_at: str) -> None:
+    """把「这份当日快照被读侧忽略」写进 `conflicts`（铁律③：不许静默）。
+
+    幂等：同一个 `fetched_at` 只记一次 —— 读是高频动作，不能把 conflicts 撑爆。
+    """
+    conflicts = meta.setdefault("conflicts", [])
+    entry = {"reason": "intraday_snapshot", "fetched_at": fetched_at}
+    if entry in conflicts:
+        return
+    conflicts.append(entry)
+    meta_path.write_text(json.dumps(meta, ensure_ascii=False, indent=2),
+                         encoding="utf-8")
 
 
 def _read_verified(body_path: Path, meta_path: Path, what: str) -> tuple[bytes, dict]:
@@ -68,11 +121,31 @@ class RawCache:
     # ---------- 读写 ----------
 
     def has(self, source: str, params_key: str) -> bool:
-        return self.body_path(source, params_key).exists()
+        """`load` 会不会命中 —— **不是**「文件在不在」。
+
+        （ADR-009 之后两者不再等价：盘中快照的正文还在盘上，但读侧忽略它。）
+        完整性不在这里判：元数据读不了就返回 True，让 `load()` 去抛 `CacheCorrupt`。
+        """
+        if not self.body_path(source, params_key).exists():
+            return False
+        try:
+            meta = json.loads(
+                self.meta_path(source, params_key).read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return True
+        return not is_intraday_snapshot(params_key, meta.get("fetched_at") or "")
 
     def store(self, source: str, params_key: str, url: str, body: bytes, *,
               encoding: str, fetched_at: str) -> str:
-        """返回**已存版本**的 SHA256（重复写入时返回首次版本的）。"""
+        """返回**已存版本**的 SHA256（重复写入时返回首次版本的）。
+
+        当日收盘前抓到的响应**不入正式缓存**：它缺当日收盘（或含未完成的盘中价），
+        一旦因「首写保留」被冻结，收盘链就再也拿不到当日 K 线（ADR-009）。
+        返回 body 自己的哈希，调用方语义不变（本就不消费返回值）。
+        """
+        if is_intraday_snapshot(params_key, fetched_at):
+            return sha256_bytes(body)
+
         p = self.body_path(source, params_key)
         meta_path = self.meta_path(source, params_key)
         if p.exists():
@@ -102,11 +175,20 @@ class RawCache:
         return meta["sha256"]
 
     def load(self, source: str, params_key: str) -> bytes | None:
-        """未命中返回 None；命中但损坏抛 `CacheCorrupt`。"""
+        """未命中返回 None；命中但损坏抛 `CacheCorrupt`。
+
+        **先校验完整性，再判时效** —— 损坏的条目照旧抛错，不许被时效规则吞掉。
+        """
         p = self.body_path(source, params_key)
         if not p.exists():
             return None
-        body, _ = _read_verified(p, self.meta_path(source, params_key), "缓存")
+        meta_path = self.meta_path(source, params_key)
+        body, meta = _read_verified(p, meta_path, "缓存")
+        fetched_at = meta.get("fetched_at") or ""
+        if is_intraday_snapshot(params_key, fetched_at):
+            # 视为未命中 → 调用方重新联网；但绝不静默：conflicts 里留痕
+            _record_intraday_conflict(meta_path, meta, fetched_at)
+            return None
         return body
 
 

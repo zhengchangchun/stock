@@ -226,3 +226,169 @@ def test_http_corrupt_cache_raises_instead_of_refetching(tmp_path):
     with pytest.raises(CacheCorrupt):
         _client(tmp_path, _ExplodingSession()).get_text(url, source="tencent",
                                                          cache_key=KEY)
+
+
+# ---------- 当日时效（ADR-009）：盘中抓到的 body 不得冻结当日数据 ----------
+#
+# 事故：key 只带锚点 `end`、不含 `start`，同一 key 首写永久保留。
+# 15 日 00:21 抓到的 body 最新一根是 14 日收盘 → 15:30 收盘链命中它，
+# **当日 K 线当日不落库**；若抓取发生在盘中，还会把未完成的盘中价当收盘价。
+
+INTRADAY_KEY = "kline:sz000333:2026-09-15:2000:"     # 第 3 段 = 锚点日 end
+HIST_KEY = "kline:sz000333:2020-01-02:2000:"          # 历史锚点
+INTRADAY_AT = "2026-09-15T09:35:00+08:00"             # 盘中
+LEGACY_AT = "2026-09-15T00:21:33+08:00"               # 事故现场那份（收盘前）
+CLOSED_AT = "2026-09-15T15:40:00+08:00"               # 收盘后
+
+
+def _plant_legacy_entry(cache, key, body, fetched_at):
+    """绕过写侧闸门，直接在盘上伪造一份修复前留下的条目（模拟事故现场）。"""
+    p = cache.body_path("tencent", key)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_bytes(body)
+    cache.meta_path("tencent", key).write_text(json.dumps({
+        "source": "tencent", "params_key": key, "url": URL, "encoding": "utf-8",
+        "fetched_at": fetched_at, "sha256": sha256_bytes(body), "conflicts": [],
+    }, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def test_legacy_intraday_snapshot_is_not_a_hit(tmp_path):
+    """反证测试：修复前落下的「同日收盘前」条目，读侧必须视为**未命中**。
+
+    不许静默 —— 必须在 meta 的 conflicts 里留下 intraday_snapshot 痕迹，
+    否则「当日数据没到」会再次表现为一个查不出原因的哑巴故障。
+    """
+    c = RawCache(tmp_path)
+    body = b'{"data":{"sz000333":{"day":[["2026-09-14","86.8"]]}}}'
+    _plant_legacy_entry(c, INTRADAY_KEY, body, LEGACY_AT)
+
+    assert c.load("tencent", INTRADAY_KEY) is None
+    assert c.has("tencent", INTRADAY_KEY) is False, "has() 是「load 会不会命中」，不是「文件在不在」"
+
+    meta = json.loads(c.meta_path("tencent", INTRADAY_KEY).read_text(encoding="utf-8"))
+    assert meta["conflicts"], "盘中快照被忽略必须留痕，不许静默"
+    assert meta["conflicts"][-1]["reason"] == "intraday_snapshot"
+    assert meta["conflicts"][-1]["fetched_at"] == LEGACY_AT
+    assert meta["sha256"] == sha256_bytes(body), "读侧的时效判定不得改动原有正文与校验值"
+
+
+def test_intraday_conflict_trace_is_not_duplicated(tmp_path):
+    """重复读同一条毒性条目不应把 conflicts 撑成无限长（读是高频动作）。"""
+    c = RawCache(tmp_path)
+    _plant_legacy_entry(c, INTRADAY_KEY, b"stale", INTRADAY_AT)
+    for _ in range(3):
+        assert c.load("tencent", INTRADAY_KEY) is None
+    meta = json.loads(c.meta_path("tencent", INTRADAY_KEY).read_text(encoding="utf-8"))
+    assert len(meta["conflicts"]) == 1
+
+
+def test_intraday_write_does_not_enter_formal_cache(tmp_path):
+    """写侧：盘中响应不落正式缓存 —— 否则「首写保留」会把它永久冻结。"""
+    c = RawCache(tmp_path)
+    h = c.store("tencent", INTRADAY_KEY, URL, b"intraday-body", encoding="utf-8",
+                fetched_at=INTRADAY_AT)
+    assert h == sha256_bytes(b"intraday-body")
+    assert not c.body_path("tencent", INTRADAY_KEY).exists()
+    assert not c.meta_path("tencent", INTRADAY_KEY).exists()
+    assert c.load("tencent", INTRADAY_KEY) is None
+
+
+def test_intraday_write_then_post_close_write_then_hit(tmp_path):
+    """事故主路径：盘中抓过 → 收盘后再抓，必须拿到**含当日收盘**的那份。"""
+    c = RawCache(tmp_path)
+    c.store("tencent", INTRADAY_KEY, URL, b"intraday-body", encoding="utf-8",
+            fetched_at=INTRADAY_AT)
+    c.store("tencent", INTRADAY_KEY, URL, b"closed-body", encoding="utf-8",
+            fetched_at=CLOSED_AT)
+    assert c.load("tencent", INTRADAY_KEY) == b"closed-body"
+
+
+def test_post_close_same_day_write_is_a_hit(tmp_path):
+    """② 固定时钟 15:40 写入 → 同日再读必须命中（不重复联网）。"""
+    c = RawCache(tmp_path)
+    c.store("tencent", INTRADAY_KEY, URL, b"closed-body", encoding="utf-8",
+            fetched_at=CLOSED_AT)
+    assert c.load("tencent", INTRADAY_KEY) == b"closed-body"
+    assert c.has("tencent", INTRADAY_KEY) is True
+
+
+def test_close_time_boundary_is_exclusive(tmp_path):
+    """收盘时刻本身（15:00）算已收盘；(时,分) 口径与 session.tick._closed_at 一致。"""
+    c = RawCache(tmp_path)
+    c.store("tencent", INTRADAY_KEY, URL, b"at-1500", encoding="utf-8",
+            fetched_at="2026-09-15T15:00:00+08:00")
+    assert c.load("tencent", INTRADAY_KEY) == b"at-1500"
+
+    c2 = RawCache(tmp_path / "b")
+    c2.store("tencent", INTRADAY_KEY, URL, b"at-1459", encoding="utf-8",
+             fetched_at="2026-09-15T14:59:00+08:00")
+    assert c2.load("tencent", INTRADAY_KEY) is None
+
+
+def test_historical_anchor_is_unaffected_by_today_fetch(tmp_path):
+    """③ 历史锚点（end=2020-01-02、今天抓）必须照常命中、首写保留、SHA 校验不放松。"""
+    c = RawCache(tmp_path)
+    c.store("tencent", HIST_KEY, URL, b"history-body", encoding="utf-8",
+            fetched_at=INTRADAY_AT)
+    assert c.load("tencent", HIST_KEY) == b"history-body"
+    assert c.store("tencent", HIST_KEY, URL, b"rewritten", encoding="utf-8",
+                   fetched_at=CLOSED_AT) == sha256_bytes(b"history-body")
+    assert c.load("tencent", HIST_KEY) == b"history-body"
+
+
+def test_non_date_anchor_key_keeps_old_semantics(tmp_path):
+    """第 3 段不是日期（如 `sz000333:320:qfq`）→ 时效规则不适用，照旧命中。"""
+    c = RawCache(tmp_path)
+    c.store("tencent", "sz000333:320:qfq", URL, b"x", encoding="utf-8",
+            fetched_at=INTRADAY_AT)
+    assert c.load("tencent", "sz000333:320:qfq") == b"x"
+
+
+def test_unparsable_fetched_at_keeps_old_semantics(tmp_path):
+    """元数据里的 fetched_at 不可解析 → 判不了时效，按旧行为命中（不猜）。"""
+    c = RawCache(tmp_path)
+    _plant_legacy_entry(c, INTRADAY_KEY, b"x", "t1")
+    assert c.load("tencent", INTRADAY_KEY) == b"x"
+
+
+def test_intraday_snapshot_still_verifies_sha(tmp_path):
+    """时效判定排在完整性校验之后：毒性条目被改写过，照样抛 CacheCorrupt。"""
+    c = RawCache(tmp_path)
+    _plant_legacy_entry(c, INTRADAY_KEY, b"stale", INTRADAY_AT)
+    c.body_path("tencent", INTRADAY_KEY).write_bytes(b"tampered")
+    with pytest.raises(CacheCorrupt):
+        c.load("tencent", INTRADAY_KEY)
+
+
+def test_http_refetches_instead_of_replaying_legacy_intraday_snapshot(tmp_path):
+    """① 端到端：09:35 那份被冻结的 body → 15:30 读取必须**重新联网**拿当日收盘。
+
+    事故正是发生在这条路径上：15:30 的 `ingest bars` 命中了 00:21 的 body，
+    于是「当日 K 线当日不落库」。`_OnceSession` 只喂一次：命中缓存就发不出请求。
+    """
+    url = "https://web.ifzq.gtimg.cn/appstock/app/fqkline/get"
+    _plant_legacy_entry(RawCache(tmp_path), INTRADAY_KEY, b"stale-intraday", LEGACY_AT)
+
+    fresh = '{"day":[["2026-09-15","87.23"]]}'
+    client = _client(tmp_path, _OnceSession(fresh.encode("utf-8")))
+    text = client.get_text(url, source="tencent", cache_key=INTRADAY_KEY)
+    assert "2026-09-15" in text, "必须真的联网拿到含当日收盘的 body"
+
+
+def test_legacy_poison_is_never_replayed_even_after_a_fresh_fetch(tmp_path):
+    """既有毒条目**不会被自动修复**（显式限制，见 ADR-009）：写侧依旧「首写保留」。
+
+    代价：该 key 每轮多一次联网，直到人工删除那份文件。收益：读侧永远拿不到它，
+    且它的 sha/fetched_at 被记进 conflicts —— 事故证据保留，故障不再复发。
+    """
+    c = RawCache(tmp_path)
+    _plant_legacy_entry(c, INTRADAY_KEY, b"stale-intraday", LEGACY_AT)
+
+    assert c.store("tencent", INTRADAY_KEY, URL, b"closed-body", encoding="utf-8",
+                   fetched_at=CLOSED_AT) == sha256_bytes(b"stale-intraday")
+
+    assert c.load("tencent", INTRADAY_KEY) is None, "旧毒条目不得因新写入而变成命中"
+    meta = json.loads(c.meta_path("tencent", INTRADAY_KEY).read_text(encoding="utf-8"))
+    reasons = [x.get("reason") for x in meta["conflicts"]]
+    assert "intraday_snapshot" in reasons
+    assert {"sha256": sha256_bytes(b"closed-body"), "fetched_at": CLOSED_AT} in meta["conflicts"]
