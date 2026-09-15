@@ -4,6 +4,8 @@
     .venv/bin/python -m stocklab.cli.main db init [--db PATH]
     .venv/bin/python -m stocklab.cli.main doctor
     .venv/bin/python -m stocklab.cli.main ingest bars [--days N] [--code C]...
+    .venv/bin/python -m stocklab.cli.main session tick
+    .venv/bin/python -m stocklab.cli.main review daily
     .venv/bin/python -m stocklab.cli.main fixture record --name NAME
 
 退出码：0 成功 / 2 用法错误或库不存在 / 1 运行失败。
@@ -56,26 +58,21 @@ def _cmd_db_init(args: argparse.Namespace) -> int:
 # ---------- doctor ----------
 
 def cmd_doctor(db_path: Path | None = None) -> int:
-    """输出数据健康度 JSON（供人读，也供 nanobot 侧调度判读）。"""
+    """输出数据健康度 JSON（供人读，也供 nanobot 侧调度判读）。
+
+    取数逻辑在 `stocklab.session.review.doctor_report`（复盘报告要复用同一份，
+    抽出函数以免两处各写一遍、日后数字对不上）。
+    """
+    from stocklab.session.review import doctor_report
+
     db = Path(db_path) if db_path else paths.DB_PATH
     if not db.exists():
         print(json.dumps({"error": "db not found; run `stocklab db init`"},
                          ensure_ascii=False))
         return 2
-    out: dict = {}
     conn = connect(db)
     try:
-        for table in ("instruments", "bars_daily", "features_daily", "predictions",
-                      "verifications", "data_quality", "system_events", "job_runs"):
-            out[table] = conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
-        row = conn.execute("SELECT MAX(date) AS d FROM bars_daily").fetchone()
-        out["latest_bar_date"] = row["d"] if row else None
-        out["open_issues"] = conn.execute(
-            "SELECT COUNT(*) FROM data_quality WHERE resolved=0").fetchone()[0]
-        last_job = conn.execute(
-            "SELECT job_name, status, detail, finished_at FROM job_runs"
-            " ORDER BY run_id DESC LIMIT 1").fetchone()
-        out["last_job"] = dict(last_job) if last_job else None
+        out = doctor_report(conn)
     finally:
         conn.close()
     print(json.dumps(out, ensure_ascii=False, indent=2))
@@ -1118,6 +1115,182 @@ def _cmd_fixture_record(args: argparse.Namespace) -> int:
     return 0
 
 
+# ---------- session tick（盘中采集 + 收盘回填 + 到期验证） ----------
+
+def _tick_universe(conn):
+    """tick 的标的集合：库里的 active 股票，库为空时退回 `DEFAULT_UNIVERSE`。
+
+    数据库是**真源**（`instruments` 可增删），`DEFAULT_UNIVERSE` 只是首次建库的种子。
+    库为空说明还没 `db init` / `ingest`，此时退回种子并在摘要里能看出来。
+    """
+    try:
+        loaded = _load_universe(conn)
+    except sqlite3.Error:
+        return tuple(DEFAULT_UNIVERSE)
+    return loaded or tuple(DEFAULT_UNIVERSE)
+
+
+def cmd_session_tick(args: argparse.Namespace) -> int:
+    """一次调用完成「采集 → 收盘回填 → 验证到期预测」并输出机器可读 JSON 摘要。
+
+    给 cron 用：**stdout 只有一段 JSON**（异常另写 stderr），退出码 0/1/2。
+    幂等：同 `ts` 的快照不重复写、已验证的预测不重复记分 —— 所以「每 2 小时跑一次」
+    不会因为重试或补跑而多出任何一行。
+
+    **本命令不入 raw_cache**：快照的全部价值在「此刻」，命中缓存 = 拿旧截面冒充新截面。
+    """
+    from stocklab.data.fetch import fetch_quotes, policy_from_settings
+    from stocklab.data.http import HttpClient
+    from stocklab.session.quotes import SNAPSHOT_SOURCE
+    from stocklab.session.tick import run_tick
+
+    db = Path(args.db) if args.db else paths.DB_PATH
+    if not db.exists():
+        print(json.dumps({"error": "db not found; run `stocklab db init`"},
+                         ensure_ascii=False), file=sys.stderr)
+        return 2
+    now = args.now or datetime.now(TZ).isoformat(timespec="seconds")
+    settings = load_settings()
+    client = HttpClient(policy_from_settings(settings), cache=None)
+
+    conn = connect(db)
+    try:
+        if not _has_session_tables(conn):
+            print(json.dumps({"error": "quote_snapshots 不存在；先跑 "
+                                       "`stocklab db init` 前滚 schema"},
+                             ensure_ascii=False), file=sys.stderr)
+            return 2
+        universe = tuple(i for i in _tick_universe(conn)
+                         if not args.code or i.code in args.code)
+        summary = run_tick(
+            conn, now=now, universe=universe, window=args.window,
+            capture=not args.no_capture, source=SNAPSHOT_SOURCE,
+            fetch=lambda codes: fetch_quotes(client, codes=codes),
+        )
+    finally:
+        conn.close()
+
+    blob = json.dumps(summary, ensure_ascii=False, sort_keys=True, indent=2) + "\n"
+    if args.out:
+        out = Path(args.out)
+        out.parent.mkdir(parents=True, exist_ok=True)
+        out.write_text(blob, encoding="utf-8")
+    print(blob, end="")
+    for a in summary["anomalies"]:
+        print(f"⚠️  {a['kind']}: {a.get('detail') or a.get('codes') or ''}",
+              file=sys.stderr)
+    return int(summary["exit_code"])
+
+
+def _has_session_tables(conn) -> bool:
+    """schema 是否已前滚到 P11（`quote_snapshots` 存在）。"""
+    return conn.execute(
+        "SELECT COUNT(*) FROM sqlite_master WHERE type='table'"
+        " AND name='quote_snapshots'").fetchone()[0] > 0
+
+
+def cmd_session_backfill_close(args: argparse.Namespace) -> int:
+    """手动补跑收盘回填（幂等；只补当日、只补 NULL）。
+
+    这条命令存在的理由是**补跑**：收盘那次 tick 若因接口不通没跑成，
+    第二天还能拿已落库的快照把 `amount`/`turnover` 补上。它不抓任何数据。
+    """
+    from stocklab.session import close as close_mod
+
+    db = Path(args.db) if args.db else paths.DB_PATH
+    if not db.exists():
+        print(json.dumps({"error": "db not found; run `stocklab db init`"},
+                         ensure_ascii=False), file=sys.stderr)
+        return 2
+    now = args.now or datetime.now(TZ).isoformat(timespec="seconds")
+    conn = connect(db)
+    try:
+        if not _has_session_tables(conn):
+            print(json.dumps({"error": "quote_snapshots 不存在；先跑 "
+                                       "`stocklab db init` 前滚 schema"},
+                             ensure_ascii=False), file=sys.stderr)
+            return 2
+        out = close_mod.backfill_close_amounts(conn, args.date, now=now)
+    finally:
+        conn.close()
+    print(json.dumps(out, ensure_ascii=False, sort_keys=True, indent=2))
+    for code in out["skipped_missing_bar"]:
+        print(f"⚠️  {code} {args.date} 无 bars_daily 当日行 —— 先跑 "
+              f"`ingest bars` 再补跑回填", file=sys.stderr)
+    return 1 if out["skipped_missing_bar"] else 0
+
+
+# ---------- review daily（15:30 整体数据复盘） ----------
+
+def cmd_review_daily(args: argparse.Namespace) -> int:
+    """生成 `reports/YYYY-MM-DD-review.md` + `.json`（离线只读；不写任何数据表）。
+
+    ⚠️ 报告里的准确率**默认是 PIT 历史回放口径**（当前 38.14% / Brier 0.6581）。
+    口径由 `provenance` 判据按**实测行数**分列（LIVE / REPLAY），**不是**按
+    「有没有实盘开关」—— 见 `session/review.py` 与 ERROR_DIARY #16。
+    """
+    from stocklab.session.review import build_review, render_markdown
+
+    db = Path(args.db) if args.db else paths.DB_PATH
+    if not db.exists():
+        print(json.dumps({"error": "db not found; run `stocklab db init`"},
+                         ensure_ascii=False), file=sys.stderr)
+        return 2
+    date = args.date or _today()
+    conn = connect(db)
+    try:
+        if not _has_session_tables(conn):
+            print(json.dumps({"error": "quote_snapshots 不存在；先跑 "
+                                       "`stocklab db init` 前滚 schema"},
+                             ensure_ascii=False), file=sys.stderr)
+            return 2
+        rep = build_review(conn, date, n_sessions=args.window)
+    finally:
+        conn.close()
+
+    md = render_markdown(rep)
+    path = Path(args.out) if args.out else (paths.REPORT_DIR / f"{date}-review.md")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(md, encoding="utf-8")
+    json_path = path.with_suffix(".json")
+    # 与 predict/verify 报告同纪律：正文**不含生成时刻**，同输入两次运行逐字节一致。
+    json_path.write_text(
+        json.dumps(rep, ensure_ascii=False, sort_keys=True, indent=2) + "\n",
+        encoding="utf-8")
+
+    roll = rep["rolling"]
+    live, replay = roll.get("live"), roll.get("replay")
+    print(json.dumps({
+        "report": str(path), "json": str(json_path),
+        "date": date,
+        "bars_latest_date": rep["freshness"]["bars_latest_date"],
+        "snapshots": rep["freshness"]["snapshots"],
+        "target_predictions": rep["day"]["predictions"],
+        "target_verifications": {
+            "n": rep["day"]["verifications"]["n"],
+            "scorable": rep["day"]["verifications"]["scorable"],
+            "unscorable": rep["day"]["verifications"]["unscorable"]},
+        "rolling_window": roll["window"],
+        "provenance": {
+            "rule": roll["provenance"]["rule"],
+            "live_rows": roll["provenance"]["live"]["n_rows"],
+            "replay_rows": roll["provenance"]["replay"]["n_rows"]},
+        "live": live,
+        "replay": ({"n_rows": replay["n_rows"],
+                    "direction_accuracy_daily": replay["direction_accuracy_daily"],
+                    "direction_ci95": replay["direction_ci95"],
+                    "brier_daily": replay["brier_daily"],
+                    "effective_n_days": replay["effective_n_days"],
+                    "sample_gate": replay["sample_gate"]} if replay else None),
+        "experiment_decisions_rows": rep["experiments"]["rows"],
+        "gaps": {k: rep["gaps"][k] for k in
+                 ("bars_daily_rows", "amount_non_null", "amount_first_date",
+                  "turnover_non_null", "turnover_first_date")},
+        "disclosure": rep["disclosure"],
+    }, ensure_ascii=False, sort_keys=True, indent=2))
+    return 0
+
+
 # ---------- parser ----------
 
 def build_parser() -> argparse.ArgumentParser:
@@ -1301,6 +1474,39 @@ def build_parser() -> argparse.ArgumentParser:
     exp_run.add_argument("--report-dir", dest="report_dir", help="报告目录")
     exp_run.add_argument("--db", help="数据库路径（默认 data/stocklab.db）")
     exp_run.set_defaults(func=cmd_experiment_run)
+
+    sess = sub.add_parser("session", help="调度链（P11）：盘中采集 + 收盘回填")
+    sess_sub = sess.add_subparsers(dest="session_action")
+    sess_tick = sess_sub.add_parser(
+        "tick", help="采集快照 + 收盘回填 + 验证到期预测，输出 JSON 摘要（供 cron）")
+    sess_tick.add_argument("--db", help="数据库路径（默认 data/stocklab.db）")
+    sess_tick.add_argument("--now", help="覆盖当前时刻（ISO8601；仅供测试/补跑）")
+    sess_tick.add_argument("--code", action="append", default=None,
+                           help="只处理指定代码，可重复；默认库内全部 active 标的")
+    sess_tick.add_argument("--window", type=int, default=10,
+                           help="最多回看多少个到期日（默认 10）")
+    sess_tick.add_argument("--no-capture", action="store_true",
+                           help="跳过联网采集，只做回填 + 验证（离线可跑）")
+    sess_tick.add_argument("--out", help="把 JSON 摘要另存到这个路径")
+    sess_tick.set_defaults(func=cmd_session_tick)
+
+    sess_bf = sess_sub.add_parser(
+        "backfill-close", help="手动补跑某交易日的 amount/turnover 回填（离线、幂等）")
+    sess_bf.add_argument("--date", required=True, help="交易日 YYYY-MM-DD")
+    sess_bf.add_argument("--db", help="数据库路径（默认 data/stocklab.db）")
+    sess_bf.add_argument("--now", help="覆盖当前时刻（ISO8601；仅供测试）")
+    sess_bf.set_defaults(func=cmd_session_backfill_close)
+
+    review = sub.add_parser("review", help="复盘报告（P11；离线只读）")
+    review_sub = review.add_subparsers(dest="review_action")
+    rev_daily = review_sub.add_parser(
+        "daily", help="生成 reports/<date>-review.md + .json（15:30 复盘）")
+    rev_daily.add_argument("--date", help="复盘日期 YYYY-MM-DD（默认今天）")
+    rev_daily.add_argument("--db", help="数据库路径（默认 data/stocklab.db）")
+    rev_daily.add_argument("--window", type=int, default=30,
+                           help="滚动准确率窗口（交易日，默认 30）")
+    rev_daily.add_argument("--out", help="markdown 输出路径（.json 同名同目录）")
+    rev_daily.set_defaults(func=cmd_review_daily)
 
     doctor = sub.add_parser("doctor", help="数据健康度报告（离线）")
     doctor.set_defaults(func=lambda _a: cmd_doctor())

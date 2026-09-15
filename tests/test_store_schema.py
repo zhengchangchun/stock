@@ -12,6 +12,7 @@ EXPECTED_TABLES = {
     "real_trades", "decisions", "data_quality", "system_events",
     "raw_fetch_cache", "job_runs", "adj_factor_blackout",
     "experiment_decisions",
+    "quote_snapshots",                 # P11：盘中快照（append-only）
 }
 
 

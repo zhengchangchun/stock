@@ -15,6 +15,7 @@ APPEND_ONLY_TABLES = (
     "sim_trades",
     "decisions",
     "experiment_decisions",
+    "quote_snapshots",                 # P11：盘中截面是历史事实，不许改写
 )
 
 

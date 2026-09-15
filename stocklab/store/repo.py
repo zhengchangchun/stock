@@ -60,6 +60,13 @@ def insert_bars(conn: sqlite3.Connection, bars: Sequence[Bar], *, now: str) -> i
 
     计划接口原文写「`adj_mode` 不同视为不同记录」，与 schema 的 PK 互斥
     （同一天放不下两条口径）→ 按「哪个意图更强」取舍：铁律①优先，改为拒绝。
+
+    `amount` / `turnover` 的覆盖用 `COALESCE(excluded.x, bars_daily.x)`：
+    **源站没给这个字段 ≠ 源站说这个字段应当为空**。腾讯的 `fqkline` 响应里根本没有
+    成交额/换手率（`excluded.amount` 恒为 NULL），而 P11 的收盘回填会从盘中快照把当日
+    `amount`/`turnover` 补进这张表 —— 若这里照旧写 `amount=excluded.amount`，
+    第二天重跑一次 `ingest bars`（窗口含昨天）就会把昨天刚补上的值**抹回 NULL**，
+    「从今天起积累」根本积累不起来。反过来，源站**给了**值时仍然照常覆盖（修订语义不变）。
     """
     bad = [b.code for b in bars if b.adj_mode != "none"]
     if bad:
@@ -76,8 +83,10 @@ def insert_bars(conn: sqlite3.Connection, bars: Sequence[Bar], *, now: str) -> i
         " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)"
         " ON CONFLICT(code, date) DO UPDATE SET"
         " open=excluded.open, high=excluded.high, low=excluded.low,"
-        " close=excluded.close, volume=excluded.volume, amount=excluded.amount,"
-        " turnover=excluded.turnover, adj_mode=excluded.adj_mode,"
+        " close=excluded.close, volume=excluded.volume,"
+        " amount=COALESCE(excluded.amount, bars_daily.amount),"
+        " turnover=COALESCE(excluded.turnover, bars_daily.turnover),"
+        " adj_mode=excluded.adj_mode,"
         " is_suspended=excluded.is_suspended, source=excluded.source,"
         " fetched_at=excluded.fetched_at",
         rows,

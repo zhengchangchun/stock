@@ -144,6 +144,38 @@ CREATE TABLE IF NOT EXISTS market_state (
     PRIMARY KEY (date, index_code)
 );
 
+-- ---------- 盘中快照（P11，append-only） ----------
+-- 一行 = 源站在**某一时刻**对某标的下发的截面。身份键取 (code, trade_date, ts)：
+-- `ts` 是**源站自己报的时刻**，也就是「这份截面描述的是哪一刻」——不是我们抓取的时刻
+-- （`fetched_at` 只是呈现，不进键，见 ADR-005）。
+--
+-- 由此得到一条免费的强性质：**非交易日重复抓取天然幂等**。非交易日源站返回的仍是
+-- 上一交易日的最后一条 tick，键与之前那条相同 → `identical`，一行都不增。
+-- 于是「今天是不是交易日」猜错也不会造出假行。
+--
+-- `amount` / `turnover` 是**当日累计**量（源站口径），收盘后的最后一条即全天值 ——
+-- 收盘回填（`session/close.py`）正是取这一条写进 `bars_daily`。
+CREATE TABLE IF NOT EXISTS quote_snapshots (
+    snapshot_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    code        TEXT NOT NULL,
+    trade_date  TEXT NOT NULL,          -- 源站时间戳所属交易日 YYYY-MM-DD
+    ts          TEXT NOT NULL,          -- 源站时间戳 YYYYMMDDHHMMSS（身份的一部分）
+    price       REAL NOT NULL,
+    pre_close   REAL,
+    open        REAL,
+    high        REAL,
+    low         REAL,
+    volume      INTEGER NOT NULL,       -- 股（当日累计）
+    amount      REAL,                   -- 元（当日累计）
+    turnover    REAL,                   -- %（当日累计）
+    source      TEXT NOT NULL,
+    fetched_at  TEXT NOT NULL,          -- 我们抓到的时刻；**不进身份键**
+    UNIQUE (code, trade_date, ts)
+);
+
+CREATE INDEX IF NOT EXISTS idx_quote_snapshots_date
+    ON quote_snapshots (trade_date, code, ts);
+
 -- ---------- 特征快照（append-only） ----------
 -- A1：自增主键 + (code,date,version) 唯一，使「重算追加」与 append-only 共存
 CREATE TABLE IF NOT EXISTS features_daily (
@@ -398,6 +430,17 @@ BEGIN SELECT RAISE(ABORT, 'decisions is append-only'); END;
 CREATE TRIGGER IF NOT EXISTS trg_decisions_no_delete
 BEFORE DELETE ON decisions
 BEGIN SELECT RAISE(ABORT, 'decisions is append-only'); END;
+
+-- quote_snapshots：全保护（UPDATE + DELETE 皆禁）。盘中截面是**历史事实**，
+-- 源站事后修订某个 tick 不构成改写历史记录的理由 —— 修订会以 `conflict` 上报并留痕，
+-- 交给人决定，而不是让代码静默覆盖（ERROR_DIARY「取不到就回退」的同型错误）。
+CREATE TRIGGER IF NOT EXISTS trg_quote_snapshots_no_update
+BEFORE UPDATE ON quote_snapshots
+BEGIN SELECT RAISE(ABORT, 'quote_snapshots is append-only'); END;
+
+CREATE TRIGGER IF NOT EXISTS trg_quote_snapshots_no_delete
+BEFORE DELETE ON quote_snapshots
+BEGIN SELECT RAISE(ABORT, 'quote_snapshots is append-only'); END;
 
 -- verifications：刻意例外（ADR-002）。
 -- 允许 UPDATE 结果列与 attribution_manual（人工回填），但身份列不可变；DELETE 全禁。

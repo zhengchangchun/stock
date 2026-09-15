@@ -22,7 +22,7 @@ from datetime import date, timedelta
 from stocklab.config.settings import Settings
 from stocklab.data.errors import FetchError
 from stocklab.data.http import RetryPolicy
-from stocklab.data.models import Bar, CorpAction
+from stocklab.data.models import Bar, CorpAction, Quote
 from stocklab.data.sources import tencent
 
 #: 不复权单次上限（ADR-003 实测）
@@ -131,6 +131,41 @@ def fetch_index_daily(client, *, symbol: str, start: str, end: str,
     bars = fetch_daily_bars(client, code=symbol, start=start, end=end, adj="",
                             page=page, max_pages=max_pages)
     return [replace(b, code=symbol) for b in bars]
+
+
+#: 腾讯快照接口的请求头。实测不带 `Referer` 也会返回，但带上更稳（源站策略会变），
+#: 且固定请求头让「回放」与「实时」走同一条路径（可复现性铁律②）。
+QUOTE_HEADERS = {"User-Agent": "Mozilla/5.0", "Referer": "https://gu.qq.com/"}
+
+
+def fetch_quotes(client, *, codes) -> list[Quote]:
+    """抓取**实时快照**（腾讯 `qt.gtimg.cn`，GBK）。`codes` 用源站形式（`sz000333`）。
+
+    **刻意不写 raw_cache**（`cache_key=""` → 既不读也不写）：缓存命中会直接返回
+    上一次的响应体，而快照的全部价值就在「此刻」。命中缓存 = 拿旧截面冒充新截面，
+    正是本项目最怕的一类错（数字合法、时刻错）。日K 用缓存是对的（历史不变），
+    快照用缓存是错的 —— 差别在数据本身是否随时间变化。
+
+    返回值可能**少于**请求的代码（源站对停牌/退市/写错的代码不回行）。
+    调用方必须显式报出缺了哪些（`session/quotes.py`），不许把「少了两个标的」
+    当成「今天只该有两个标的」。
+
+    **全空即报错**：一条都没解析出来说明响应格式变了或接口降级了 ——
+    这时返回 `[]` 会让上层把「接口坏了」读成「今天没有行情」，故直接抛 `FetchError`。
+    """
+    wanted = [c for c in codes if c]
+    if not wanted:
+        raise ValueError("fetch_quotes 需要至少一个源站代码（如 sz000333）")
+    text = client.get_text(tencent.quote_url(wanted), encoding="gbk",
+                           headers=QUOTE_HEADERS, source="tencent",
+                           cache_key="")          # 空键 = 绕过缓存（刻意的，见上）
+    quotes = tencent.parse_quote(text)
+    if not quotes:
+        raise FetchError(
+            f"腾讯快照接口未返回任何可解析的行（请求 {len(wanted)} 个代码："
+            f"{','.join(wanted)}）—— 格式变更或接口降级，拒绝静默当成「无行情」"
+        )
+    return quotes
 
 
 def _loads(text: str) -> dict:
