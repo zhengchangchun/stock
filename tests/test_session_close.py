@@ -6,6 +6,8 @@
 
 from __future__ import annotations
 
+import json
+
 import pytest
 
 from stocklab.data.models import Bar
@@ -175,6 +177,96 @@ def test_repository_reinsert_does_not_wipe_a_filled_value(conn):
     close_mod.backfill_close_amounts(conn, TODAY, now=NOW)
     repo.insert_bars(conn, [_bar(TODAY)], now=NOW)      # 源站日K 里没有 amount 字段
     assert _amount_of(conn, TODAY) == (925_191_406.0, 0.15)
+
+
+# ---------- P22：快照必须取自收盘后，盘中快照不许当全天值 ----------
+
+def test_stale_intraday_snapshot_is_not_used(conn):
+    """`amount` 是**当日累计**量：若当天只有盘中快照（无 15:00 后），回填必须跳过。
+
+    实测背景（2026-09-16）：15:05 的收盘 tick 排队未执行，当日快照只有 09:35 与 14:30，
+    旧实现会静默拿 14:30 那条填 amount/turnover → 成交额系统性低估且**无任何告警**。
+    """
+    repo.insert_bars(conn, [_bar(TODAY)], now=NOW)
+    _snap(conn, ts="20260915093500", amount=100.0, turnover=0.01)
+    _snap(conn, ts="20260915143000", amount=999.0, turnover=0.09)
+    out = close_mod.backfill_close_amounts(conn, TODAY, now=NOW)
+    assert out["updated"] == 0
+    assert out["skipped_stale_snapshot"] == [CODE]
+    assert out["reason"] == "stale_snapshot"
+    assert _amount_of(conn, TODAY) == (None, None)      # 一行没写
+
+
+def test_stale_snapshot_leaves_a_warn_event(conn):
+    """跳过必须**看得见**：`system_events` 留一条 warn，含 code/trade_date/ts/job。"""
+    repo.insert_bars(conn, [_bar(TODAY)], now=NOW)
+    _snap(conn, ts="20260915093500", amount=100.0, turnover=0.01)
+    _snap(conn, ts="20260915143000", amount=999.0, turnover=0.09)
+    close_mod.backfill_close_amounts(conn, TODAY, now=NOW)
+    row = conn.execute("SELECT level, message, context_json FROM system_events"
+                       " WHERE module='session'").fetchone()
+    assert row is not None, "stale 跳过必须留痕，不能静默"
+    assert row["level"] == "warn"
+    assert "143000" in row["message"]
+    ctx = json.loads(row["context_json"])
+    assert ctx["code"] == CODE
+    assert ctx["trade_date"] == TODAY
+    assert ctx["ts"] == "20260915143000"                # 用**实际那条**最新快照的 ts
+    assert ctx["job"] == "session_backfill_close"
+
+
+def test_snapshot_at_exactly_the_close_minute_is_accepted(conn):
+    """边界：15:00:00 整算收盘后（判据是 `>= 15:00:00`，不是 `> 15:00:00`）。"""
+    repo.insert_bars(conn, [_bar(TODAY)], now=NOW)
+    _snap(conn, ts="20260915150000", amount=999.0, turnover=0.09)
+    out = close_mod.backfill_close_amounts(conn, TODAY, now=NOW)
+    assert out["skipped_stale_snapshot"] == []
+    assert out["updated"] == 1
+    assert _amount_of(conn, TODAY) == (999.0, 0.09)
+
+
+def test_fresh_snapshot_after_close_is_filled(conn):
+    """15:05 的收盘快照 → 正常回填（这条是上一组的正向对照）。"""
+    repo.insert_bars(conn, [_bar(TODAY)], now=NOW)
+    _snap(conn, ts="20260915150500", amount=925_191_406.0, turnover=0.15)
+    out = close_mod.backfill_close_amounts(conn, TODAY, now=NOW)
+    assert out["updated"] == 1
+    assert out["skipped_stale_snapshot"] == []
+    assert "reason" not in out                            # 做成了事就不该带 reason
+    assert _amount_of(conn, TODAY) == (925_191_406.0, 0.15)
+
+
+def test_stale_code_is_skipped_while_fresh_code_keeps_its_own_ts(conn):
+    """逐标的判：同一交易日两个标的的快照时刻可以不同，互不牵连。"""
+    repo.insert_bars(conn, [_bar(TODAY), _bar(TODAY, code="600690")], now=NOW)
+    _snap(conn, ts="20260915143000", amount=100.0, turnover=0.01)
+    _snap(conn, ts="20260915150500", code="600690", amount=200.0, turnover=0.02)
+    out = close_mod.backfill_close_amounts(conn, TODAY, now=NOW)
+    assert out["skipped_stale_snapshot"] == [CODE]
+    assert out["updated"] == 1
+    assert "reason" not in out                            # 有标的正经补上了，不是「什么都没做」
+    assert _amount_of(conn, TODAY) == (None, None)
+    assert _amount_of(conn, TODAY, "600690") == (200.0, 0.02)
+
+
+def test_unparseable_ts_is_treated_as_not_closed(conn):
+    """`ts` 解不出时刻时**不许当成已收盘**（fail-closed）—— 拿不准就不写。"""
+    repo.insert_bars(conn, [_bar(TODAY)], now=NOW)
+    _snap(conn, ts="20260915", amount=999.0, turnover=0.09)
+    out = close_mod.backfill_close_amounts(conn, TODAY, now=NOW)
+    assert out["skipped_stale_snapshot"] == [CODE]
+    assert _amount_of(conn, TODAY) == (None, None)
+
+
+def test_stale_skip_is_idempotent(conn):
+    """跳过也是幂等的：连跑两次结果一致，不因第一次的 warn 而改变行为。"""
+    repo.insert_bars(conn, [_bar(TODAY)], now=NOW)
+    _snap(conn, ts="20260915143000", amount=999.0, turnover=0.09)
+    first = close_mod.backfill_close_amounts(conn, TODAY, now=NOW)
+    second = close_mod.backfill_close_amounts(conn, TODAY, now=NOW)
+    assert first["skipped_stale_snapshot"] == second["skipped_stale_snapshot"] == [CODE]
+    assert second["updated"] == 0
+    assert _amount_of(conn, TODAY) == (None, None)
 
 
 def test_no_rolling_cleanup_anywhere_in_the_module():
