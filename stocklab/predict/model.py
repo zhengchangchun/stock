@@ -76,7 +76,12 @@ CONTRACT_FIELDS: tuple[str, ...] = (
 #: - `zero`：漂移项取 0（其余一律不变）；
 #: - `index_sign`：`mu = |mu_sample| × s`，`s` 由**指数在 `asof` 当日**的方向给出
 #:   （`index_dir` 作为**数据**传入，不是配置项 —— 见 `ForecastSpec` 的 docstring）。
-MU_MODES: tuple[str, ...] = ("sample_mean", "zero", "index_sign")
+#: - `mf_sign`（P34 / P29 V1）：`mu = |mu_sample| × s`，`s` = `money_flow_daily.main_net`
+#:   在 `asof` 当日的符号（`main_net=0 → 0`；缺行/NULL → 拒绝）。数据参数 `mf_sign`。
+#: - `val_pe_pct`（P34 / P29 V2）：`mu = |mu_sample| × s`，`s` = `PE_TTM` 在 `asof`
+#:   之前（含）最近 756 行分位 `q` 的映射（`q≤0.30→+1`、`q≥0.70→-1`、其余 `0`）。
+#:   数据参数 `val_sign`。
+MU_MODES: tuple[str, ...] = ("sample_mean", "zero", "index_sign", "mf_sign", "val_pe_pct")
 
 #: `sigma_mode` 的合法取值。**P9-a 新增的第二条轴**：条件化波动率。
 #:
@@ -256,6 +261,8 @@ def degenerate_strategy_mix(*, excluded: Mapping[str, str] | None = None,
 def compute_forecast(*, code: str, asof: str, bars: Sequence[Bar], target_date: str,
                      strategy_mix: Mapping, spec: ForecastSpec | None = None,
                      index_dir: int | None = None,
+                     mf_sign: int | None = None,
+                     val_sign: int | None = None,
                      features: PitFeatures | None = None,
                      residuals: ResidualDistribution | None = None) -> dict:
     """算出 `code` 在 `asof` 收盘后应给出的次日预测载荷。
@@ -269,6 +276,10 @@ def compute_forecast(*, code: str, asof: str, bars: Sequence[Bar], target_date: 
     `index_dir` 只在 `spec.mu_mode == "index_sign"` 时被读取，是**数据**不是配置：
     `sh000300` 在 `asof` 当日的方向（`+1` / `-1` / `0`）。**缺失即拒绝** ——
     不允许静默当成 0（那是把「不知道」写成「没有」，ERROR_DIARY 2026-09-14）。
+
+    `mf_sign` / `val_sign` 同理（P34 / P29）：只在 `mu_mode == "mf_sign"` /
+    `"val_pe_pct"` 时被读取，是**按 (code, asof)** 的当日事实（资金流主力净额符号 /
+    估值 PE 分位符号），不是配置。**缺失或非法即拒绝** —— 不许静默退化成 mu=0 或基线。
 
     `features`（P9-a）同理：只有 `spec.sigma_mode != "const"` 时被读取，是**数据**，
     承载量能 z / 自身 RV 分位 / 指数 RV 分位三个 PIT 量（见 `features.pit_regime`）。
@@ -323,6 +334,30 @@ def compute_forecast(*, code: str, asof: str, bars: Sequence[Bar], target_date: 
         # 只换**方向的来源**（指数前一日方向），漂移的**幅度**仍是基线那个 |mu_sample|。
         # 直接指数收益当漂移会连尺度一起改掉，那就不是一个变量了（见 P8 计划 §1.3）。
         mu = abs(mu_sample) * index_dir
+    elif mode == "mf_sign":
+        if mf_sign is None:
+            raise DegenerateInput(
+                f"{code} 在 {asof} 缺当日主力净额符号（mf_sign=None）—— "
+                "`mf_sign` 变体**拒绝静默退化成 mu=0 或基线**：那是把「不知道」写成「没有」，"
+                "会让报告里的样本量悄悄变少而没人知道"
+            )
+        if mf_sign not in (-1, 0, 1):
+            raise DegenerateInput(
+                f"mf_sign={mf_sign!r} 非法（只接受 -1 / 0 / +1）—— 拒绝猜"
+            )
+        # 只换**方向的来源**（当日主力净额符号），幅度仍是基线那个 |mu_sample|。
+        mu = abs(mu_sample) * mf_sign
+    elif mode == "val_pe_pct":
+        if val_sign is None:
+            raise DegenerateInput(
+                f"{code} 在 {asof} 缺当日估值分位符号（val_sign=None）—— "
+                "`val_pe_pct` 变体**拒绝静默退化成 mu=0 或基线**：那是把「不知道」写成「没有」"
+            )
+        if val_sign not in (-1, 0, 1):
+            raise DegenerateInput(
+                f"val_sign={val_sign!r} 非法（只接受 -1 / 0 / +1）—— 拒绝猜"
+            )
+        mu = abs(mu_sample) * val_sign
     else:                                        # pragma: no cover - 构造期已挡
         raise DegenerateInput(f"未知 mu_mode={mode!r}")
     sigma_base = statistics.stdev(rets)
@@ -447,6 +482,12 @@ def compute_forecast(*, code: str, asof: str, bars: Sequence[Bar], target_date: 
         evidence_inputs["mu_sample"] = mu_sample
         evidence_inputs["mu_mode"] = mode
         evidence_inputs["index_dir"] = index_dir
+        # 两个新数据参数**只在各自口径下**留痕：无条件追加会改既有变体的 evidence，
+        # 违背「新变体只在实验通道、既有报告逐字节不变」的红线。
+        if mode == "mf_sign":
+            evidence_inputs["mf_sign"] = mf_sign
+        elif mode == "val_pe_pct":
+            evidence_inputs["val_sign"] = val_sign
     if spec.sigma_mode != "const":
         # 只改 sigma 的那三个变体在这里留痕；`mu_mode` 那两条变体的 evidence
         # 因此**逐字节不变**（既有报告 sha256 仍是红线）。

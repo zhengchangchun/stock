@@ -236,7 +236,8 @@ def test_load_val_pe_pct_sign_boundaries_at_030_070(tmp_path):
     """含等分位的边界：`# ≤ 当前` 的整数阈值 226 / 530 钉死 0.30 / 0.70。"""
 
     def sign_for(k):
-        vals = list(range(1, 756)) + [k]          # 前 755 行 1..755，末行 = k
+        # 前 755 行取 {1..756} 去掉 k，末行 = k → 756 个互异值、当前值 rank 恰为 k
+        vals = [v for v in range(1, 757) if v != k] + [k]
         conn = _val_db(tmp_path, [float(v) for v in vals], name=f"val{k}.db")
         try:
             return load_val_pe_pct_sign(conn, CODE, _to_date(D0 + 755))

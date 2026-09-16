@@ -208,6 +208,8 @@ class PitCache:
         self._calendar: Calendar | None = None
         self._axis: set[str] | None = None
         self._holidays: HolidayTable | None = None
+        self._money_flow: dict[str, dict[str, float | None]] = {}
+        self._valuation: dict[str, list[tuple[str, float | None]]] = {}
 
     def chain(self, conn: sqlite3.Connection, code: str) -> tuple:
         if code not in self._chains:
@@ -241,6 +243,18 @@ class PitCache:
             self._holidays = load_holiday_table(conn)
         return self._holidays
 
+    def money_flow(self, conn: sqlite3.Connection, code: str) -> dict[str, float | None]:
+        """`code` 的 `main_net` 全序列 `{date: main_net}`（读一次；NULL 原样保留）。"""
+        if code not in self._money_flow:
+            self._money_flow[code] = _read_money_flow(conn, code)
+        return self._money_flow[code]
+
+    def valuation(self, conn: sqlite3.Connection, code: str) -> list[tuple[str, float | None]]:
+        """`code` 的 `pe_ttm` 全序列 `[(date, pe_ttm), ...]`（按 date 升序，读一次）。"""
+        if code not in self._valuation:
+            self._valuation[code] = _read_valuation(conn, code)
+        return self._valuation[code]
+
 
 def _read_raw(conn: sqlite3.Connection, code: str) -> tuple[list[Bar], set[str]]:
     """全量不复权 K 线 + 停牌日集合（`PitCache.raw_bars` 的底层读取）。"""
@@ -253,6 +267,26 @@ def _read_raw(conn: sqlite3.Connection, code: str) -> tuple[list[Bar], set[str]]
                 amount=r["amount"], turnover=r["turnover"], source=r["source"],
                 adj_mode=r["adj_mode"]) for r in rows]
     return bars, {r["date"] for r in rows if r["is_suspended"]}
+
+
+def _read_money_flow(conn: sqlite3.Connection, code: str) -> dict[str, float | None]:
+    """`code` 的 `money_flow_daily.main_net` 全序列（**只读**；`date → main_net`）。
+
+    返回**全量**（含未来行）：裁剪是 `load_mf_sign` 自己的第一件事 ——
+    「调用方已经裁好了」这种约定一旦有人忘，前视就静默发生了（与 `_read_raw` 同款理由）。
+    """
+    rows = conn.execute(
+        "SELECT date, main_net FROM money_flow_daily WHERE code=? ORDER BY date",
+        (code,)).fetchall()
+    return {r["date"]: r["main_net"] for r in rows}
+
+
+def _read_valuation(conn: sqlite3.Connection, code: str) -> list[tuple[str, float | None]]:
+    """`code` 的 `valuation_daily.pe_ttm` 全序列（**只读**；`[(date, pe_ttm), ...]` 升序）。"""
+    rows = conn.execute(
+        "SELECT date, pe_ttm FROM valuation_daily WHERE code=? ORDER BY date",
+        (code,)).fetchall()
+    return [(r["date"], r["pe_ttm"]) for r in rows]
 
 
 def load_pit_bars(conn: sqlite3.Connection, code: str, asof: str, *,

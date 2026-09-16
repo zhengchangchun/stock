@@ -41,7 +41,9 @@ from stocklab.experiments.split import (SPLIT_NAMES, SplitConfig, boundaries,
                                         split_days)
 from stocklab.experiments.variants import (Variant, get_variant,
                                            load_index_direction,
-                                           load_index_rv_percentile)
+                                           load_index_rv_percentile,
+                                           load_mf_sign,
+                                           load_val_pe_pct_sign)
 from stocklab.experiments.residuals import fit_residual_distribution
 from stocklab.features.pit_regime import PitFeatures, rv_percentile, volume_z
 from stocklab.predict.model import (BASELINE_SPEC, DegenerateInput,
@@ -114,6 +116,9 @@ def _replay(conn: sqlite3.Connection, days: Sequence[str], sessions: Sequence[st
     index_dirs: dict[str, int | None] = {}
     pred_seq = 0
     need_index = variant.spec.mu_mode == "index_sign"
+    # P34 / P29：资金流/估值符号是**按 (code, asof)** 的当日事实，与按天的指数方向不同
+    need_mf = variant.spec.mu_mode == "mf_sign"
+    need_val = variant.spec.mu_mode == "val_pe_pct"
     # 这个变体需要哪些 PIT 特征（`const` → 空集，连算都不算）
     need_feats = PitFeatures.required_for(variant.spec.sigma_mode)
 
@@ -153,9 +158,15 @@ def _replay(conn: sqlite3.Connection, days: Sequence[str], sessions: Sequence[st
                 conn, code, target, cache=cache)
             index_pct = index_pct_for(conn, asof, target)
             feats, feat_err = _pit_features(hist, asof, need_feats, idx_rv)
+            # 资金流/估值符号是**按 (code, asof)** 的当日事实：每股每行各取一次
+            mf_s = (load_mf_sign(conn, code, asof, cache=cache)
+                    if need_mf else None)
+            val_s = (load_val_pe_pct_sign(conn, code, asof, cache=cache)
+                     if need_val else None)
 
-            sides = (("baseline", None, None), ("variant", variant.spec, idx_dir))
-            for side, spec, idir in sides:
+            sides = (("baseline", None, None, None, None),
+                     ("variant", variant.spec, idx_dir, mf_s, val_s))
+            for side, spec, idir, mf_sign, val_sign in sides:
                 # 特征层**硬拒绝**了这天的输入（volume NULL / 价格非正）。
                 # 基线侧 `required_for("const")` 是空集 → 不受影响；
                 # 需要它的变体侧拒绝该行并**计数**，不许静默当成 0。
@@ -166,7 +177,8 @@ def _replay(conn: sqlite3.Connection, days: Sequence[str], sessions: Sequence[st
                 try:
                     p = compute_forecast(code=code, asof=asof, bars=hist,
                                          target_date=target, strategy_mix=strategy_mix,
-                                         spec=spec, index_dir=idir, features=feats,
+                                         spec=spec, index_dir=idir, mf_sign=mf_sign,
+                                         val_sign=val_sign, features=feats,
                                          residuals=residuals)
                 except DegenerateInput as exc:
                     skipped[side][f"{target}/{code}"] = f"DegenerateInput: {exc}"
@@ -380,6 +392,23 @@ def run_experiment(conn: sqlite3.Connection, *, variant_name: str,
                    + (len(second_pass["rows"]["baseline"]) if second_pass else 0),
                    "variant_rows": len(first_pass["rows"]["variant"])
                    + (len(second_pass["rows"]["variant"]) if second_pass else 0)},
+        # P34 / P29：预注册 PIT 约束要求报告**显式**给出「实际用变体的天数 vs 报告天数」。
+        # 资金流/估值是按 (code, asof) 的，所以「天数」这里 = (日, 标的) 对；
+        # 基线侧不因变体缺数据而缺行，故 `baseline_rows - variant_rows` 就是
+        # 「报告口径里实际用了变体的对子」之外、被硬拒绝计入 skipped 的对子数。
+        "coverage": {
+            "variant_days_used": len(first_pass["rows"]["variant"])
+                + (len(second_pass["rows"]["variant"]) if second_pass else 0),
+            "variant_days_skipped": len(first_pass["rows"]["baseline"])
+                + (len(second_pass["rows"]["baseline"]) if second_pass else 0)
+                - (len(first_pass["rows"]["variant"])
+                   + (len(second_pass["rows"]["variant"]) if second_pass else 0)),
+            "reported_days": len(targets),
+            "reported_pairs": len(targets) * len(codes),
+            "note": ("「天」在此 = (日, 标的) 对：资金流/估值是每股每行一个符号。"
+                     "`variant_days_skipped` = 基线出了数而变体被硬拒绝的对子数，"
+                     "明细见 `skipped.variant`，**绝不静默回落到基线**"),
+        },
         "notes": {
             "not_persisted": (
                 "本报告的每一行都是**内存里的**评估结果 —— 一行都没有写进 "
@@ -460,6 +489,11 @@ def render_experiment_markdown(rep: dict) -> str:
     L.append(f"- `test_evaluated` = **`{rep['test_evaluated']}`**")
     if rep["test_not_evaluated_reason"]:
         L.append(f"- 原因：{rep['test_not_evaluated_reason']}")
+    L.append("")
+    cov = rep["coverage"]
+    L.append(f"- **变体覆盖**：实际使用 **{cov['variant_days_used']}** 个 (日, 标的)，"
+             f"硬拒绝跳过 **{cov['variant_days_skipped']}** 个，"
+             f"报告口径 {cov['reported_days']} 天 / {cov['reported_pairs']} 个 (日, 标的)")
     L.append("")
     L.append("## 2. 逐段结果（P7 报告口径，基线 / 变体同栏）")
     L.append("")

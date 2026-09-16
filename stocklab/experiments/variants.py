@@ -104,6 +104,31 @@ VARIANTS: dict[str, Variant] = {
         ),
         prereg_doc="docs/experiments/2026-09-15-index-mom-dir.md",
     ),
+    # ---- P34 / P29：资金流 / 估值作为「次日方向先验」----
+    # 与 `index-mom-dir` 同构：都只换 `mu_mode` 里的**符号来源**，幅度仍是 |mu_sample|。
+    # 差别在**数据**：资金流/估值是**按 (code, asof)** 的当日事实，不是按天的指数方向。
+    "mf-dir-prior": Variant(
+        name="mf-dir-prior",
+        changed_axis="mu_mode",
+        spec=ForecastSpec(mu_mode="mf_sign"),
+        hypothesis=(
+            "`asof` 当日主力净额（`money_flow_daily.main_net`）的符号对次日个股方向"
+            "的信息量高于个股自身 60 日对数收益均值（噪声主导）。**假设**：令 "
+            "`mu = |mu_sample| · sign(main_net)` 应使样本外方向准确率上升、Brier 下降。"
+        ),
+        prereg_doc="docs/experiments/2026-09-17-valuation-moneyflow-oos.md",
+    ),
+    "val-pe-pct-mu": Variant(
+        name="val-pe-pct-mu",
+        changed_axis="mu_mode",
+        spec=ForecastSpec(mu_mode="val_pe_pct"),
+        hypothesis=(
+            "`PE_TTM` 在过去 756 个交易日中的分位 `q` 具备均值回归含义（低分位 → 正漂移）："
+            "`q ≤ 0.30 → +1`、`q ≥ 0.70 → −1`、其余 `0`。**假设**：令 "
+            "`mu = |mu_sample| · s(q)` 应使样本外方向准确率上升、Brier 下降。"
+        ),
+        prereg_doc="docs/experiments/2026-09-17-valuation-moneyflow-oos.md",
+    ),
     # ---- P9-a 第一轮：把三条**尚未用过**的 PIT 信息接进 sigma ----
     # 三条都改 `sigma_mode`（同一个字段的三个取值），所以每个变体相对基线
     # **恰好改 1 个字段**，单变量纪律没有任何松动；它们彼此是三次独立比较，
@@ -252,3 +277,89 @@ def load_index_rv_percentile(conn: sqlite3.Connection, asof: str, *,
     历史不足返回 `None`（不是 0.5）—— 由调用方拒绝。
     """
     return rv_percentile(load_index_bars(conn, symbol=symbol, cache=cache), asof)
+
+
+# ---------- PIT 资金流 / 估值符号（P34 / P29）----------
+#
+# 与 `load_index_direction` 不同：指数方向是**按天**共享的（全市场同一个 `asof` 一个值），
+# 资金流/估值是**按 (code, asof)** 的 —— 每股每行一个符号。所以这两个 loader 的签名
+# 带 `code`，由 runner **逐 code** 调用（见 `experiments.runner._replay`）。
+
+
+def _money_flow_series(conn: sqlite3.Connection, code: str, *,
+                       cache=None) -> dict[str, float | None]:
+    """`code` 的 `main_net` 全序列（只读）。走 `PitCache` 时同一场实验只读一次。"""
+    if cache is not None:
+        return cache.money_flow(conn, code)
+    from stocklab.predict.service import _read_money_flow
+
+    return _read_money_flow(conn, code)
+
+
+def _valuation_series(conn: sqlite3.Connection, code: str, *,
+                      cache=None) -> list[tuple[str, float | None]]:
+    """`code` 的 `pe_ttm` 全序列 `[(date, pe_ttm), ...]`（按 date 升序，只读）。"""
+    if cache is not None:
+        return cache.valuation(conn, code)
+    from stocklab.predict.service import _read_valuation
+
+    return _read_valuation(conn, code)
+
+
+def load_mf_sign(conn: sqlite3.Connection, code: str, asof: str, *,
+                 cache=None) -> int | None:
+    """`money_flow_daily.main_net` 在 `(code, asof)` 当日的符号：`+1` / `-1` / `0`。
+
+    **PIT 硬约束**（预注册 §1）：只允许用 `date <= asof` 的行，且**必须精确命中 asof**
+    当天 —— 缺行 / `main_net` 为 NULL → 返回 `None`，**绝不**「取最近一根」冒充。
+    返回 `None` 由调用方决定拒绝（`compute_forecast` 抛 `DegenerateInput`），
+    不许在这里回退成 0。
+    """
+    series = _money_flow_series(conn, code, cache=cache)
+    if asof not in series:                 # 精确命中：dict 键查找，天然不碰未来行
+        return None
+    v = series[asof]
+    if v is None:                          # NULL main_net：采集到了但没值，也是缺口
+        return None
+    if v > 0:
+        return 1
+    if v < 0:
+        return -1
+    return 0
+
+
+def load_val_pe_pct_sign(conn: sqlite3.Connection, code: str, asof: str, *,
+                         cache=None, window: int = 756,
+                         lo: float = 0.30, hi: float = 0.70) -> int | None:
+    """`PE_TTM` 在 `(code, asof)` 的**近 `window` 行分位**符号：`+1` / `-1` / `0`。
+
+    **PIT 硬约束**（预注册 §1/§2）：窗口 = `asof` 之前（含）最近 `window` 行，不含未来行；
+    **必须精确命中 asof** 当天（缺行 → `None`）、`pe_ttm` NULL → `None`、历史不足
+    `window` 行 → `None`（分位必须用固定窗口，否则跨天不可比 —— 与 `rv_percentile`
+    的 `len < lookback → None` 同款）。
+
+    分位用「含等」约定（复用 `rv_percentile` / `features.indicators.percentile_rank`）：
+    `q = (# 窗口内 ≤ 当前) / len(窗口)`，取值 `(0, 1]`。`q ≤ lo → +1`、`q ≥ hi → -1`、
+    其余 `0`。`lo`/`hi`/`window` 默认值即预注册写死的 0.30 / 0.70 / 756，形参存在只为
+    让「口径漂移」可被测到。
+    """
+    rows = _valuation_series(conn, code, cache=cache)
+    # 只留 <= asof 的行；若末行不是 asof 本身 → 缺行，绝不取最近一根
+    hist = [r for r in rows if r[0] <= asof]
+    if not hist or hist[-1][0] != asof:
+        return None
+    if len(hist) < window:                 # 历史不足一个完整窗口 → 分位无意义
+        return None
+    tail = hist[-window:]
+    cur = tail[-1][1]
+    if cur is None:
+        return None
+    vals = [v for _d, v in tail if v is not None]
+    if not vals:                           # pragma: no cover - cur 非空已保证 vals 非空
+        return None
+    q = sum(1 for v in vals if v <= cur) / len(vals)
+    if q <= lo:
+        return 1
+    if q >= hi:
+        return -1
+    return 0
