@@ -1,9 +1,12 @@
 {
   "url": "https://www.sse.com.cn/disclosure/announcement/general/c/c_20260611_10821419.shtml",
-  "recorded_at": "2026-09-17T00:51:21+08:00",
+  "recorded_at": "2026-09-17T01:27:10+08:00",
   "encoding": "utf-8",
   "published_at": "2026-06-11",
+  "title": "关于2026年端午节休市安排的公告",
+  "doc_kind": "holiday",
+  "covered_year": 2026,
   "note": "上交所休市安排公告",
   "sha256": "fbcc0ba031d3d720aecf744557c882e562d18b47056f5854d2dcfdf6712d04b5",
-  "name": "sse_holiday_2026_dragonboat"
+  "name": "sse_holiday_c_20260611_10821419"
 }

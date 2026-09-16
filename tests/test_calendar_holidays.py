@@ -35,12 +35,18 @@ from stocklab.store.migrate import init_db
 NOW = "2026-09-17T19:00:00+08:00"
 CODE = "000333"
 
-#: fixture 名 → (doc_kind, covered_year)
-FIXTURES = {
-    "sse_holiday_2026_annual": ("annual", 2026),
-    "sse_holiday_2026_dragonboat": ("holiday", 2026),
-    "sse_holiday_2025_annual": ("annual", 2025),
-}
+#: 列表页 fixture 名（其余公告 fixture 名由它**现推**）。
+LIST_FIXTURE = "sse_holiday_list"
+
+#: 三篇被逐条断言的公告（id = 列表页 URL 尾段）。其余 12 篇由回放测试整批覆盖。
+AID_2026_ANNUAL = "c_20251222_10802507"
+AID_2026_DRAGONBOAT = "c_20260611_10821419"
+AID_2025_ANNUAL = "c_20241223_10767108"
+
+
+def fixture_name(aid: str) -> str:
+    """公告 id → fixture 名（与 `scripts/record_p30_fixtures.py` 同一约定）。"""
+    return f"sse_holiday_{aid}"
 
 
 def fixture_text(name: str) -> tuple[str, dict]:
@@ -49,12 +55,33 @@ def fixture_text(name: str) -> tuple[str, dict]:
     return raw.decode("utf-8"), meta
 
 
-def parsed(name: str) -> list[H.MarketHoliday]:
-    text, meta = fixture_text(name)
-    kind, year = FIXTURES[name]
+def article_meta(aid: str) -> dict:
+    """该公告的 `doc_kind` / `covered_year` —— 取自**生产解析器**，不另立一份映射。
+
+    手写映射 = 一个会飘的第二真源：列表页多一篇公告、或标题改了措辞，
+    测试侧不会跟着变，于是「测试绿」与「抓取对」脱钩。
+    """
+    text, _ = fixture_text(LIST_FIXTURE)
+    for a in sse.parse_article_list(text):
+        if a["url"].rsplit("/", 1)[-1].removesuffix(".shtml") == aid:
+            return a
+    raise AssertionError(f"列表页里没有公告 {aid} —— fixture 与列表页不同步")
+
+
+def article_ids() -> list[str]:
+    """列表页里的**全部**公告 id（顺序 = 列表页顺序）。"""
+    text, _ = fixture_text(LIST_FIXTURE)
+    return [a["url"].rsplit("/", 1)[-1].removesuffix(".shtml")
+            for a in sse.parse_article_list(text)]
+
+
+def parsed(aid: str) -> list[H.MarketHoliday]:
+    text, meta = fixture_text(fixture_name(aid))
+    art = article_meta(aid)
     return H.parse_holiday_notice(sse.article_text(text), source_url=meta["url"],
                                   published_at=meta["published_at"],
-                                  doc_kind=kind, covered_year=year)
+                                  doc_kind=art["doc_kind"],
+                                  covered_year=art["covered_year"])
 
 
 def weekdays(rows) -> list[str]:
@@ -92,7 +119,7 @@ def test_next_weekday_never_returns_a_weekend():
 
 def test_2026_annual_notice_gives_exact_weekday_closure_set():
     """2026 全年公告 → 工作日休市日**精确**集合（周末不列，另有 weekend 子句）。"""
-    assert weekdays(parsed("sse_holiday_2026_annual")) == [
+    assert weekdays(parsed(AID_2026_ANNUAL)) == [
         "2026-01-01", "2026-01-02",                                  # 元旦
         "2026-02-16", "2026-02-17", "2026-02-18", "2026-02-19",
         "2026-02-20", "2026-02-23",                                  # 春节
@@ -110,7 +137,7 @@ def test_single_day_holiday_is_not_dropped():
 
     该公告里其它节都在，所以「整体非空」判不出来；只有逐条目完整性判据能抓。
     """
-    got = weekdays(parsed("sse_holiday_2025_annual"))
+    got = weekdays(parsed(AID_2025_ANNUAL))
     assert "2025-01-01" in got                    # 元旦（单日）
     assert "2025-01-28" in got                    # 春节（区间）
     assert len(got) == 18
@@ -118,13 +145,13 @@ def test_single_day_holiday_is_not_dropped():
 
 def test_holiday_only_notice_covers_only_its_own_dates():
     """单节公告只列那一个节（端午 6/19–6/21），doc_kind 必须是 holiday。"""
-    rows = parsed("sse_holiday_2026_dragonboat")
+    rows = parsed(AID_2026_DRAGONBOAT)
     assert [r.date for r in rows] == ["2026-06-19", "2026-06-20", "2026-06-21"]
     assert {r.doc_kind for r in rows} == {"holiday"}
 
 
 def test_published_at_comes_from_the_article_not_the_fetch_time():
-    _, meta = fixture_text("sse_holiday_2026_annual")
+    _, meta = fixture_text(fixture_name(AID_2026_ANNUAL))
     assert meta["published_at"] == "2025-12-22"   # 上证公告〔2025〕45号
 
 
@@ -132,7 +159,7 @@ def test_published_at_comes_from_the_article_not_the_fetch_time():
 
 def test_wrong_year_is_rejected_by_the_weekday_selfcheck():
     """把 2026 的公告按 2027 年解析 → 星期对不上 → 必须抛错（不许写入错日期）。"""
-    text, meta = fixture_text("sse_holiday_2026_annual")
+    text, meta = fixture_text(fixture_name(AID_2026_ANNUAL))
     with pytest.raises(H.HolidayParseError, match="星期自校验失败"):
         H.parse_holiday_notice(sse.article_text(text), source_url=meta["url"],
                                published_at=meta["published_at"],
@@ -171,7 +198,7 @@ def _db(tmp_path, name="h.db"):
 
 
 def test_save_is_idempotent_and_append_only(tmp_path):
-    rows = parsed("sse_holiday_2026_annual")
+    rows = parsed(AID_2026_ANNUAL)
     conn = _db(tmp_path)
     try:
         first = H.save_holidays(conn, rows, now=NOW)
@@ -196,11 +223,11 @@ def test_holiday_table_coverage_requires_an_annual_notice(tmp_path):
     """覆盖判据：只有年度通知才说「整年都知道」。"""
     conn = _db(tmp_path)
     try:
-        H.save_holidays(conn, parsed("sse_holiday_2026_dragonboat"), now=NOW)
+        H.save_holidays(conn, parsed(AID_2026_DRAGONBOAT), now=NOW)
         t = H.load_holiday_table(conn)
         assert t.is_closed("2026-06-19")
         assert not t.covers("2026-06-22")      # 只有单节公告 → 不许说知道
-        H.save_holidays(conn, parsed("sse_holiday_2026_annual"), now=NOW)
+        H.save_holidays(conn, parsed(AID_2026_ANNUAL), now=NOW)
         t = H.load_holiday_table(conn)
         assert t.covers("2026-06-22") and not t.covers("2027-01-04")
         assert t.bounds() == ("2026-01-01", "2026-10-10")
@@ -278,7 +305,7 @@ def _history(end: date, n: int = MIN_BARS) -> list[str]:
     兄弟测试则**空转通过**（它测的 `target_date` 是顶层字段，不需要任何预测行）。
     「断言绿了」不等于「断言被测到了」。
     """
-    closed = {r.date for r in parsed("sse_holiday_2026_annual")}
+    closed = {r.date for r in parsed(AID_2026_ANNUAL)}
     out: list[str] = []
     d = end
     while len(out) < n:
@@ -292,7 +319,7 @@ def test_predict_payload_skips_announced_holidays_end_to_end(tmp_path):
     """asof = 长假前最后一个交易日 → target_date 跳过休市日，source 如实反映来源。"""
     conn = _seed(tmp_path / "a.db", _history(ASOF))
     try:
-        H.save_holidays(conn, parsed("sse_holiday_2026_annual"), now=NOW)
+        H.save_holidays(conn, parsed(AID_2026_ANNUAL), now=NOW)
         rep = S.build_predictions(conn, ASOF.isoformat(), [CODE])
         # 2026-09-25（中秋）与 09-26/27（周末）休市 → 下一个交易日是 09-28
         assert rep["target_date"] == "2026-09-28"
@@ -336,17 +363,38 @@ class ReplayClient:
 
 
 def _replay_client() -> ReplayClient:
+    """列表页里**每一篇**公告都必须有对应 fixture —— 一篇不缺才能回放整批。
+
+    `fetch_holiday_notices` 是整批 fail-closed 的：漏录一篇，回放测试就挂在
+    `ReplayClient` 的「未录制的 URL」上（上一轮就是这样红的）。
+    因此这里**断言篇数相等**，把「fixture 缺篇」变成一条读得懂的失败，
+    而不是让 `ReplayClient` 在深处抛 `AssertionError`。
+    """
     pages = {}
-    for name in FIXTURES:
-        text, meta = fixture_text(name)
+    for aid in article_ids():
+        text, meta = fixture_text(fixture_name(aid))
         pages[meta["url"]] = text
-    list_text, list_meta = fixture_text("sse_holiday_list")
+    list_text, list_meta = fixture_text(LIST_FIXTURE)
     pages[list_meta["url"]] = list_text
+    ids = article_ids()
+    assert len(pages) == len(ids) + 1, (
+        f"fixture 与列表页不同步：列表页 {len(ids)} 篇 + 1 列表页，"
+        f"回放表只有 {len(pages)} 项 —— 跑 scripts/record_p30_fixtures.py 补录")
     return ReplayClient(pages)
 
 
 def test_fetch_holiday_notices_parses_every_article_offline():
-    rows = fetch_holiday_notices(_replay_client())
+    """回放**全部 15 篇**真实公告 —— 「每一篇」是关键字。
+
+    只断言「解析出的日期包含某某」是会飘的：漏抓几篇照样能包含那几个日期。
+    所以先钉住**抓取篇数**（列表页 N 篇 + 列表页本身 = N+1 次取数）。
+    """
+    client = _replay_client()
+    rows = fetch_holiday_notices(client)
+    ids = article_ids()
+    assert len(client.urls) == len(ids) + 1, (
+        f"列表页有 {len(ids)} 篇公告，实际只取了 {len(client.urls)} 个 URL —— 有漏抓")
+    assert set(client.urls[1:]) == {a for a in client.pages if a != sse.LIST_URL}
     dates = {r.date for r in rows}
     assert {"2026-01-01", "2026-09-25", "2026-10-01", "2025-01-01"} <= dates
     assert {r.doc_kind for r in rows} == {"annual", "holiday"}
@@ -367,13 +415,13 @@ def test_fetch_fails_closed_when_an_article_cannot_be_parsed():
 def test_fetch_fails_closed_when_the_list_page_has_no_articles():
     from stocklab.data.errors import FetchError
 
-    _, meta = fixture_text("sse_holiday_list")
+    _, meta = fixture_text(LIST_FIXTURE)
     with pytest.raises(FetchError, match="一条公告都没解析出来"):
         fetch_holiday_notices(ReplayClient({meta["url"]: "<html></html>"}))
 
 
 def test_article_list_keeps_only_holiday_notices():
-    text, _ = fixture_text("sse_holiday_list")
+    text, _ = fixture_text(LIST_FIXTURE)
     arts = sse.parse_article_list(text)
     assert len(arts) == 15
     assert all("休市安排" in a["title"] for a in arts)

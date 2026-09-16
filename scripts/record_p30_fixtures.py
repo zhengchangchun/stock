@@ -5,11 +5,17 @@
     .venv/bin/python scripts/record_p30_fixtures.py
 
 产物（提交进仓库，供离线测试回放）:
-    tests/fixtures/sse_holiday_list.html                        列表页原始 HTML
-    tests/fixtures/sse_holiday_2026_annual.html                 2026 年度通知
-    tests/fixtures/sse_holiday_2026_dragonboat.html             2026 端午节单节公告
-    tests/fixtures/sse_holiday_2025_annual.html                 2025 年度通知
-    *.json                                                      溯源元数据 + sha256
+    tests/fixtures/sse_holiday_list.{bin,json}              列表页原始 HTML
+    tests/fixtures/sse_holiday_c_YYYYMMDD_NNNNNNN.{bin,json} 列表页里**每一篇**公告
+
+## 为什么是「列表页里每一篇」，不是一个手挑的短名单
+
+上一轮只录了 3 篇手挑的公告，于是回放测试挂在 `ReplayClient` 的
+「未录制的 URL」上 —— 而 `fetch_holiday_notices` 是**整批 fail-closed** 的，
+漏一篇就整批失败。**手挑名单 = 一个会飘的映射**：列表页多一篇公告，
+回放测试就从「验证抓取」退化成「验证我上次挑的那 3 篇」。
+本脚本改成**从列表页现推**：抓到什么就录什么，测试侧同样按 id 现推，
+两边共用同一个 `sse.parse_article_list`（单一真源）。
 
 注意：这是**手工运行**的录制工具，不是定时任务（项目禁止 cron/守护进程）。
 走 `HttpClient`（R13 白名单 + 限流 + raw_cache），与生产同一条通道 ——
@@ -29,15 +35,12 @@ from stocklab.data.http import HttpClient, RetryPolicy, now_iso  # noqa: E402
 from stocklab.data.raw_cache import record_fixture  # noqa: E402
 from stocklab.data.sources import sse  # noqa: E402
 
-#: (fixture 名, 文章 URL)。列表页单独录，名字固定。
-ARTICLES = [
-    ("sse_holiday_2026_annual",
-     "https://www.sse.com.cn/disclosure/announcement/general/c/c_20251222_10802507.shtml"),
-    ("sse_holiday_2026_dragonboat",
-     "https://www.sse.com.cn/disclosure/announcement/general/c/c_20260611_10821419.shtml"),
-    ("sse_holiday_2025_annual",
-     "https://www.sse.com.cn/disclosure/announcement/general/c/c_20241223_10767108.shtml"),
-]
+LIST_FIXTURE = "sse_holiday_list"
+
+
+def fixture_name(aid: str) -> str:
+    """公告 id（`c_YYYYMMDD_NNNNNNN`）→ fixture 名。测试侧同款。"""
+    return f"sse_holiday_{aid}"
 
 
 def main() -> int:
@@ -45,21 +48,33 @@ def main() -> int:
     client = HttpClient(RetryPolicy(min_interval=settings.http_min_interval,
                                     timeout=settings.http_timeout))
     stamp = now_iso()
+    headers = {"User-Agent": "Mozilla/5.0"}
 
-    page = client.get_text(sse.LIST_URL, source="sse", headers={"User-Agent": "Mozilla/5.0"})
-    p = record_fixture(FIXTURE_DIR, "sse_holiday_list", page.encode("utf-8"),
-                       {"url": sse.LIST_URL, "recorded_at": stamp, "encoding": "utf-8",
-                        "note": "上交所休市安排栏目列表页（服务端渲染）"})
-    print(f"✅ {p}  ({len(page.encode('utf-8'))} 字节)")
+    page = client.get_text(sse.LIST_URL, source="sse", headers=headers)
+    record_fixture(FIXTURE_DIR, LIST_FIXTURE, page.encode("utf-8"),
+                   {"url": sse.LIST_URL, "recorded_at": stamp, "encoding": "utf-8",
+                    "note": "上交所休市安排栏目列表页（服务端渲染）"})
+    print(f"✅ {LIST_FIXTURE}  ({len(page.encode('utf-8'))} 字节)")
 
-    for name, url in ARTICLES:
-        body = client.get_text(url, source="sse", headers={"User-Agent": "Mozilla/5.0"})
+    # 现推文章清单：解析器与生产**同一个**，不手工维护短名单。
+    articles = sse.parse_article_list(page)
+    if not articles:
+        print("❌ 列表页一条公告都没解析出来 —— 拒绝录空（源站换排版必须表现为失败）")
+        return 1
+
+    for art in articles:
+        aid = art["url"].rsplit("/", 1)[-1].removesuffix(".shtml")
+        body = client.get_text(art["url"], source="sse", headers=headers)
         raw = body.encode("utf-8")
-        p = record_fixture(FIXTURE_DIR, name, raw,
-                           {"url": url, "recorded_at": stamp, "encoding": "utf-8",
-                            "published_at": sse.published_at_from_article(body),
-                            "note": "上交所休市安排公告"})
-        print(f"✅ {p}  ({len(raw)} 字节)")
+        name = fixture_name(aid)
+        record_fixture(FIXTURE_DIR, name, raw,
+                       {"url": art["url"], "recorded_at": stamp, "encoding": "utf-8",
+                        "published_at": sse.published_at_from_article(body),
+                        "title": art["title"], "doc_kind": art["doc_kind"],
+                        "covered_year": art["covered_year"],
+                        "note": "上交所休市安排公告"})
+        print(f"✅ {name}  ({len(raw)} 字节)  {art['title']}")
+    print(f"\n共 {len(articles)} 篇公告 + 1 个列表页")
     return 0
 
 
