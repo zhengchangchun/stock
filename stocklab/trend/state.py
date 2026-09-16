@@ -73,17 +73,21 @@ def sma(closes: Sequence[float], i: int, window: int) -> float | None:
     return sum(closes[i - window + 1:i + 1]) / window
 
 
-def trend_state(closes: Sequence[float], i: int) -> str | None:
-    """`i` 日的趋势状态；不足 `MA_LONG` 根 → `None`。
+def trend_state(closes: Sequence[float], i: int, *, ma_short: int = MA_SHORT,
+                ma_long: int = MA_LONG) -> str | None:
+    """`i` 日的趋势状态；不足 `ma_long` 根 → `None`。
 
-    **PIT**：只读 `closes[:i+1]`（`sma` 的两窗口都止于 `i`）。
+    **PIT**：只读 `closes[:i+1]`（`sma` 的两个窗口都止于 `i`）。
+
+    窗口可传参**只有一个用途**：预注册 §2 的稳健性附表（`MA(10,30)` / `MA(5,20)`）。
+    正式判定一律走默认值 —— 默认值就是预注册写死的 `MA20/MA60`。
     """
-    if i < MA_LONG - 1 or i >= len(closes):
+    if i < ma_long - 1 or i >= len(closes):
         return None
     c = closes[i]
-    ma_s = sma(closes, i, MA_SHORT)
-    ma_l = sma(closes, i, MA_LONG)
-    assert ma_s is not None and ma_l is not None     # i >= MA_LONG-1 保证
+    ma_s = sma(closes, i, ma_short)
+    ma_l = sma(closes, i, ma_long)
+    assert ma_s is not None and ma_l is not None     # i >= ma_long-1 保证
     if c > ma_s and ma_s > ma_l:
         return STATE_UP
     if c < ma_s and ma_s < ma_l:
@@ -91,14 +95,15 @@ def trend_state(closes: Sequence[float], i: int) -> str | None:
     return STATE_FLAT
 
 
-def state_series(closes: Sequence[float]) -> list[str | None]:
-    """整条序列的状态标签（前 `MA_LONG-1` 个为 `None`）。
+def state_series(closes: Sequence[float], *, ma_short: int = MA_SHORT,
+                 ma_long: int = MA_LONG) -> list[str | None]:
+    """整条序列的状态标签（前 `ma_long-1` 个为 `None`）。
 
     用前缀和做到 O(1)/点：3000 根 × 3 标的在 CLI 里是热路径。
     """
     n = len(closes)
     out: list[str | None] = [None] * n
-    if n < MA_LONG:
+    if n < ma_long:
         return out
     prefix = [0.0] * (n + 1)
     for k, c in enumerate(closes):
@@ -107,10 +112,10 @@ def state_series(closes: Sequence[float]) -> list[str | None]:
     def mean(i: int, w: int) -> float:
         return (prefix[i + 1] - prefix[i + 1 - w]) / w
 
-    for i in range(MA_LONG - 1, n):
+    for i in range(ma_long - 1, n):
         c = closes[i]
-        ma_s = mean(i, MA_SHORT)
-        ma_l = mean(i, MA_LONG)
+        ma_s = mean(i, ma_short)
+        ma_l = mean(i, ma_long)
         if c > ma_s and ma_s > ma_l:
             out[i] = STATE_UP
         elif c < ma_s and ma_s < ma_l:
