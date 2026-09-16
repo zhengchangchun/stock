@@ -58,7 +58,7 @@ PER_STEP_CASH_PCT: float = 5.0
 # ---------- 规则条文（写进 paper_trades.rule_citation，可追溯） ----------
 
 RULE_CITATIONS: dict[str, str] = {
-    "stop_loss": "止损：000333 收盘价 < 85.00 → 整清（收盘价口径，"
+    "stop_loss": "止损：000333 收盘价 < 82.14 → 整清（收盘价口径，"
                  "`discipline.PER_CODE_LINES['000333'].stop_loss_close`）",
     "single_max": "单票 ≤40%：超出即减到 ≤40%（整手向下取整；不足 1 手则不动）",
     "etf_first_build": "分散建仓（首次建仓/未达目标）：白名单 510300/510880，"

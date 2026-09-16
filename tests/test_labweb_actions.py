@@ -58,7 +58,7 @@ def _row(lab, code):
 # ---------- 三种价格情形：走真库、真 daily_close ----------
 
 @pytest.mark.parametrize("close,expected", [
-    (84.90, "stop"),
+    (82.13, "stop"),
     (86.00, "hold"),
     (87.50, "no_add"),
 ])
@@ -73,7 +73,7 @@ def test_actions_state_from_daily_close(tmp_path, close, expected):
 def test_actions_uses_close_not_intraday_snapshot(tmp_path):
     """现价（盘中快照）怎么变都不改结论 —— 结论只看 bars_daily 收盘。"""
     path = _db(tmp_path, positions=[("000333", "美的集团", 86.80, 100)],
-               closes={"000333": 84.90})
+               closes={"000333": 82.13})
     conn = connect(path)
     try:
         for k in ("000333",):
@@ -86,8 +86,8 @@ def test_actions_uses_close_not_intraday_snapshot(tmp_path):
     finally:
         conn.close()
     row = _row(Lab(path, asof=ASOF), "000333")
-    assert row["state"] == "stop"          # 收盘 84.90 破线
-    assert row["money"]["close"] == pytest.approx(84.90, abs=0.01)
+    assert row["state"] == "stop"          # 收盘 82.13 破线
+    assert row["money"]["close"] == pytest.approx(82.13, abs=0.01)
 
 
 def test_close_asof_is_reported(tmp_path):
@@ -109,11 +109,11 @@ def test_each_position_gets_its_own_close(tmp_path):
     path = _db(
         tmp_path,
         positions=[("000333", "美的集团", 86.80, 100), ("600519", "贵州茅台", 86.80, 100)],
-        closes={"000333": 84.90, "600519": 86.00})
+        closes={"000333": 82.13, "600519": 86.00})
     lab = Lab(path, asof=ASOF)
     a, b = _row(lab, "000333"), _row(lab, "600519")
 
-    assert a["money"]["close"] == pytest.approx(84.90, abs=0.01)
+    assert a["money"]["close"] == pytest.approx(82.13, abs=0.01)
     assert b["money"]["close"] == pytest.approx(86.00, abs=0.01)
     # 600519 没配纪律线 → 判不了（不拿 000333 的线去量它）
     assert b["state"] == "unknown"

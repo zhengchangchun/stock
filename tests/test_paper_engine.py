@@ -186,9 +186,9 @@ def test_etf_buy_has_zero_stamp_tax_in_db(db):
 
 
 def test_stock_sell_pays_stamp_tax(db):
-    """跌破 85.00 → 整清 000333，卖出**要**收印花税（口径的另一侧）。"""
+    """跌破 82.14 → 整清 000333，卖出**要**收印花税（口径的另一侧）。"""
     c = _conn(db)
-    c.execute("UPDATE bars_daily SET close=84.00 WHERE code='000333' AND date='2026-09-15'")
+    c.execute("UPDATE bars_daily SET close=82.00 WHERE code='000333' AND date='2026-09-15'")
     c.commit()
     c.close()
     _run_init(db)

@@ -79,13 +79,14 @@
 |---|---|---|
 | `single_position_max_40pct` | 单票市值/总资产 ≤ 40% | 超 → FAIL |
 | `cash_band_45_60pct` | 现金/总资产 ∈ [45%, 60%] | 带外 → WARN |
-| `stop_loss_close_85` | 日**收盘** ≥ 85.00 | 破 → FAIL |
+| `stop_loss_close_85` | 日**收盘** ≥ 82.14 | 破 → FAIL |
 | `stop_loss_weekly_83_25` | 周线（本周 ≤asof 最后收盘）≥ 83.25 | 破 → FAIL |
 | `no_add_above_87` | 现价 < 87.00 | ≥ 87 → WARN |
 | `cash_per_trade_max_5pct` | 单次动用现金 ≤ 总资产 5% | 给额度，恒 PASS |
 
-后三条的价格线是**按标的**配置的（`PER_CODE_LINES`）。未配线的标的判 `UNDETERMINED`
-—— 85.00 是围绕 000333 的 86.80 入场价定的，不是全市场常数。
+价格线是**按标的**配置的（`PER_CODE_LINES`）。未配线的标的判 `UNDETERMINED`
+—— 不是全市场常数。`stop_loss_close` 是 `MA60 − 1×ATR14` 的规则值（ADR-012）；
+`stop_loss_weekly`（83.25）与 `no_add_above`（87.00）仍是 000333 入场价推的硬约定。
 
 ## `advisory[]`（5 个字段）
 

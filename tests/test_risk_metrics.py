@@ -31,7 +31,7 @@ def _bars(closes, spread=0.0):
             for i, c in enumerate(closes)]
 
 
-LINES = {"stop_loss_close": 85.00, "stop_loss_weekly": 83.25, "no_add_above": 87.00}
+LINES = {"stop_loss_close": 82.14, "stop_loss_weekly": 83.25, "no_add_above": 87.00}
 
 
 # ---------- RV ----------

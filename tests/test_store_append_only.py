@@ -53,7 +53,7 @@ def _seed_prediction(conn, *, model_version="v0.1.0"):
         " strategy_mix_json, model_version, created_at)"
         " VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
         ("000333", "2026-09-14", "2026-09-15", 0.4, 0.3, 0.3, "hold", 50,
-         "跌破 85.00", "{}", model_version, NOW),
+         "跌破 82.14", "{}", model_version, NOW),
     )
 
 

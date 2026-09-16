@@ -19,8 +19,9 @@ def test_limits_match_the_users_stated_rules():
     assert DISCIPLINE["single_position_max_pct"] == 40.0
     assert DISCIPLINE["cash_band_pct"] == (45.0, 60.0)
     assert DISCIPLINE["cash_per_trade_max_pct"] == 5.0
-    # 止损/禁补仓线是**按标的**的（由入场价推出），不是全局常数
-    assert PER_CODE_LINES["000333"] == {"stop_loss_close": 85.00,
+    # 止损/禁补仓线是**按标的**的，不是全局常数；
+    # 收盘止损线是规则值（ADR-012），周线/禁补仓仍是入场价推的硬约定
+    assert PER_CODE_LINES["000333"] == {"stop_loss_close": 82.14,
                                         "stop_loss_weekly": 83.25,
                                         "no_add_above": 87.00}
     assert DISCIPLINE["trim_light_pct"] == 10.0
@@ -82,24 +83,24 @@ def test_cash_band_above_reports_the_gap():
     assert out["numbers"]["gap_pct"] == pytest.approx(20.0)
 
 
-# ---------- 止损：收盘 85.00 ----------
+# ---------- 止损：收盘 82.14 ----------
 
 def test_close_at_stop_line_is_pass():
-    """止损线是「跌破才动」—— 正好 85.00 还没跌破。"""
-    assert check_stop_loss_close("000333", 85.00)["status"] == "PASS"
+    """止损线是「跌破才动」—— 正好 82.14 还没跌破。"""
+    assert check_stop_loss_close("000333", 82.14)["status"] == "PASS"
 
 
 def test_close_below_stop_line_is_fail():
-    out = check_stop_loss_close("000333", 84.99)
+    out = check_stop_loss_close("000333", 82.13)
     assert out["status"] == "FAIL"
-    assert out["numbers"]["line"] == 85.00
+    assert out["numbers"]["line"] == 82.14
     assert out["numbers"]["distance"] == pytest.approx(-0.01)
 
 
 def test_close_above_stop_line_is_pass_with_distance():
     out = check_stop_loss_close("000333", 86.80)
     assert out["status"] == "PASS"
-    assert out["numbers"]["distance"] == pytest.approx(1.80)
+    assert out["numbers"]["distance"] == pytest.approx(4.66)
 
 
 def test_close_stop_line_undetermined_without_price():
@@ -214,10 +215,10 @@ def test_every_check_has_status_detail_and_numbers():
 # ---------- 纪律线是**按标的**的，不是全局常数 ----------
 
 def test_unconfigured_code_gets_undetermined_not_someone_elses_line():
-    """一只没配纪律线的票，不许拿 000333 的 85.00 去量它。
+    """一只没配纪律线的票，不许拿 000333 的 82.14 去量它。
 
-    实测过这个坑：给一只 20 元的票套 85.00 止损线，会判出
-    「跌破止损线 65.00 元」这种看着像结论、其实毫无意义的 FAIL。
+    实测过这个坑：给一只 20 元的票套 82.14 止损线，会判出
+    「跌破止损线 62.14 元」这种看着像结论、其实毫无意义的 FAIL。
     """
     out = check_stop_loss_close("600690", 20.00)
     assert out["status"] == "UNDETERMINED"
@@ -231,5 +232,5 @@ def test_unconfigured_code_weekly_and_no_add_are_undetermined():
 
 
 def test_configured_code_still_uses_its_own_line():
-    assert check_stop_loss_close("000333", 84.99)["status"] == "FAIL"
-    assert check_stop_loss_close("000333", 85.00)["status"] == "PASS"
+    assert check_stop_loss_close("000333", 82.13)["status"] == "FAIL"
+    assert check_stop_loss_close("000333", 82.14)["status"] == "PASS"

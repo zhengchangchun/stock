@@ -70,14 +70,14 @@ def test_stale_price_is_allowed_and_reported_by_caller():
 # ---------- 止损（收盘价口径） ----------
 
 def test_stop_loss_triggers_below_line_and_sells_everything():
-    d = plan_stop_loss(code="000333", close=84.99, qty=100)
+    d = plan_stop_loss(code="000333", close=82.13, qty=100)
     assert d.action == "sell" and d.qty == 100
-    assert "85.00" in d.rule_citation
+    assert "82.14" in d.rule_citation
 
 
 def test_stop_loss_exactly_on_line_does_not_trigger():
     """**跌破**才动，正好在线上不算破（与 `discipline.check_stop_loss_close` 同口径）。"""
-    d = plan_stop_loss(code="000333", close=85.00, qty=100)
+    d = plan_stop_loss(code="000333", close=82.14, qty=100)
     assert d.action == "hold"
     assert "未触发" in d.reason
 
@@ -195,7 +195,7 @@ def test_etf_buy_has_no_stamp_tax_but_stock_sell_does():
     etf = plan_etf_buy(code="510880", price=3.382, cash=11314.91,
                        total_assets=20037.91, leg_gap_value=1001.90, costs=ETF)
     assert etf.fees["stamp_tax"] == 0.0
-    stk = plan_stop_loss(code="000333", close=84.00, qty=100, costs=STOCK)
+    stk = plan_stop_loss(code="000333", close=82.00, qty=100, costs=STOCK)
     assert stk.fees["stamp_tax"] > 0.0
 
 
