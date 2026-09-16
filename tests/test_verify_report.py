@@ -199,3 +199,152 @@ def test_action_excess_is_reported_with_daily_clustering():
     assert a["excess_mean"] == pytest.approx((0.01 - 0.01) / 2)
     assert a["excess_win_rate"] == pytest.approx(0.5)
     assert a["excess_daily"]["n_days"] == 2
+
+
+# ---------- 5. `invalidated` 子群的口径诚实性标注（P24） ----------
+
+def _golden_rows() -> list[dict]:
+    """固定 fixture：两日、两标的、含不可评分与 UNDETERMINED 各一条。
+
+    它同时是 T2 数字投影的**唯一输入**，所以必须是确定性的（不含时钟、不含随机）。
+    """
+    return [
+        _row("2026-01-05", code="000333", hit=1, hit_range=1, hit_levels=1,
+             level=1.0, brier=0.2, sim=0.012, bh=0.004, index=0.006,
+             actual_class="up", invalidated=0),
+        _row("2026-01-05", code="600690", hit=0, hit_range=1, hit_levels=0,
+             level=0.0, brier=0.8, sim=-0.006, bh=0.004, index=0.006,
+             actual_class="up", invalidated=1),
+        _row("2026-01-06", code="000333", hit=1, hit_range=0, hit_levels=1,
+             level=1.0, brier=0.3, sim=0.002, bh=-0.003, index=0.001,
+             actual_class="flat", invalidated=1,
+             undetermined=("invalidate_if",)),
+        _row("2026-01-07"),          # 第三条有效日，让 CI 不至退化
+        _unscorable("2026-01-08"),
+    ]
+
+
+def _numbers_only(obj):
+    """递归摘掉全部**文字叶子**，只留数字 / 布尔 / None / 结构。
+
+    用途：机械证明「新增纯文字字段不改动既有数字」—— 若投影变了，说明某个数字动了。
+    文字叶子按定义被丢弃，因此新增文字字段**不进**投影（这正是我们要的性质）。
+    """
+    if isinstance(obj, dict):
+        return {k: _numbers_only(v) for k, v in obj.items()
+                if not isinstance(v, str)}
+    if isinstance(obj, list):
+        return [_numbers_only(v) for v in obj]
+    return obj
+
+
+#: 改前（Task 41 之后的实现）在 `_golden_rows()` 上的数字投影。
+#: 由 `tests/test_verify_report.py::_numbers_only(summarize(_golden_rows(), ...))`
+#: 在**改动 `report.py` 之前**跑出来，见 P24 计划 §4 T2。
+_GOLDEN_NUMBERS: dict = {
+    "min_days": 120,
+    "notes": {},
+    "model_versions": {"pit-rw-v1.0.1": {
+        "action": {"bh_ret_sum": 0.01,
+                   "excess_daily": {"ci95": [-0.0009199999999999994,
+                                             0.006920000000000001],
+                                    "mean": 0.0030000000000000005, "n_days": 3,
+                                    "sd": 0.0034641016151377548, "se": 0.002},
+                   "excess_mean": 0.002, "excess_win_rate": 0.75,
+                   "index_ret_sum": 0.017,
+                   "sim_ret_sum": 0.018000000000000002},
+        "baselines": {
+            "always_down": {"accuracy_daily": {"ci95": [0.0, 0.0], "mean": 0.0,
+                                               "n_days": 3, "sd": 0.0, "se": 0.0},
+                            "accuracy_row": 0.0},
+            "always_flat": {"accuracy_daily": {"ci95": [-0.32,
+                                                         0.9866666666666666],
+                                               "mean": 0.3333333333333333,
+                                               "n_days": 3,
+                                               "sd": 0.5773502691896257,
+                                               "se": 0.3333333333333333},
+                            "accuracy_row": 0.25},
+            "always_up": {"accuracy_daily": {"ci95": [0.013333333333333308,
+                                                      1.3199999999999998],
+                                             "mean": 0.6666666666666666,
+                                             "n_days": 3,
+                                             "sd": 0.5773502691896257,
+                                             "se": 0.3333333333333333},
+                          "accuracy_row": 0.75},
+            "index_300": {"accuracy_daily": {"ci95": [0.013333333333333308,
+                                                      1.3199999999999998],
+                                             "mean": 0.6666666666666666,
+                                             "n_days": 3,
+                                             "sd": 0.5773502691896257,
+                                             "se": 0.3333333333333333},
+                          "accuracy_row": 0.75, "n_rows": 4}},
+        "direction": {"accuracy_daily": {"ci95": [0.5066666666666667,
+                                                  1.1600000000000001],
+                                         "mean": 0.8333333333333334, "n_days": 3,
+                                         "sd": 0.28867513459481287,
+                                         "se": 0.16666666666666666},
+                      "accuracy_row": 0.75,
+                      "brier_daily": {"ci95": [0.23600000000000002,
+                                               0.4973333333333334],
+                                      "mean": 0.3666666666666667, "n_days": 3,
+                                      "sd": 0.11547005383792516,
+                                      "se": 0.06666666666666668},
+                      "brier_row": 0.4},
+        "effective_n": 3,
+        "invalidated": {"n_known": 3, "n_undetermined": 1,
+                        "rate": 0.3333333333333333},
+        "levels": {"hit_all_row": 0.75, "level_realized_row": 0.75},
+        "n_predictions": 5, "n_rows": 4, "n_scorable": 4, "n_unscorable": 1,
+        "range": {"coverage_daily": {"ci95": [0.013333333333333308,
+                                              1.3199999999999998],
+                                     "mean": 0.6666666666666666, "n_days": 3,
+                                     "sd": 0.5773502691896257,
+                                     "se": 0.3333333333333333},
+                  "coverage_row": 0.75, "nominal": 0.8},
+        "rows_by_day_avg": 1.3333333333333333,
+        "sample_gate": {"effective_n": 3, "min_days": 120,
+                        "sufficient": False},
+        "unscorable_reasons": {"NO_BAR_TARGET": 1}}},
+}
+
+
+def test_invalidated_labels_do_not_change_any_number():
+    """机械证明：`invalidated` 的两条纯文字标注**不参与任何计算**。
+
+    判据 = 数字投影（摘掉全部文字叶子后的整份 summary）与改前金标准**逐位相等**，
+    且 `invalidated` 块里新增的键全部是 `str` 值。整条链的最终证明是 F1 全量回放
+    逐字段 diff（P24 验收 (a)）；本测试是它的离线替身，防止本地改坏而不自知。
+    """
+    g = summarize(_golden_rows(), from_date="2026-01-05", to_date="2026-01-08")
+    assert _numbers_only(g) == _GOLDEN_NUMBERS
+
+    inv = g["model_versions"]["pit-rw-v1.0.1"]["invalidated"]
+    assert set(inv) == {"n_known", "rate", "n_undetermined", "note",
+                        "pit_comparable"}
+    for key in ("note", "pit_comparable"):
+        assert isinstance(inv[key], str) and inv[key].strip()
+
+
+def test_invalidated_subgroup_is_labelled_outcome_conditioned_and_untradable():
+    """钉住口径：`invalidated` 子群的分组键是**次日收盘**，是「结果条件、不可交易」，
+    **不得作为模型能力证据**。这段文字被删，等于把「事后纯度」当成「样本外能力」
+    （ERROR_DIARY #15；诊断 `docs/diagnostics/2026-09-15-invalidated-subgroup.md`）。
+    """
+    g = summarize(_golden_rows(), from_date="2026-01-05", to_date="2026-01-08")
+    inv = g["model_versions"]["pit-rw-v1.0.1"]["invalidated"]
+
+    note = inv["note"]
+    assert "次日收盘" in note          # 分组键 = 次日收盘（不是预测时点可知的量）
+    assert "结果条件" in note          # 三要素 ①
+    assert "不可交易" in note          # 三要素 ②
+    assert "不得作为模型能力证据" in note   # 三要素 ③
+
+    pit = inv["pit_comparable"]
+    assert "变体假设" in pit           # 禁止作为变体假设来源（预注册 §5.1-2）
+    assert "不分" in pit or "无" in pit
+
+    md = render_markdown(g)
+    for token in ("次日收盘", "结果条件", "不可交易", "不得作为模型能力证据"):
+        assert token in md
+    # 断言「内容」而非「非空」：不得把这条标注写成褒义/中性的能力描述
+    assert "模型能力" in md

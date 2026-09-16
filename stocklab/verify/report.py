@@ -174,6 +174,22 @@ def _summarize_group(rows: Sequence[Mapping], min_days: int) -> dict:
             "n_known": len(invalidated_known),
             "rate": _mean([float(r["invalidated"]) for r in invalidated_known]),
             "n_undetermined": len(scorable) - len(invalidated_known),
+            # ↓ 以下两个字段是**纯文字**（P24，照 Task 41 的 `_baselines.note` 形态）：
+            #   不参与任何计算，也不改变上面三个数字。作用是把这组数字的**口径**写在
+            #   它旁边，避免读者把「事后子群的纯度」当成「模型的方向能力」。
+            "note": (
+                "`invalidate_if` 子群的**分组键 = 次日收盘**（次日收盘价是否越过 asof 当日"
+                "算出的支撑/阻力边界）。它是**结果条件、不可交易** —— 该子群只能在收盘后"
+                "才被划分出来，预测时点不存在可执行的选行规则；"
+                "本节的命中率**不得作为模型能力证据**"
+            ),
+            "pit_comparable": (
+                "该子群**没有** PIT 口径的可比对照：诊断"
+                "（`docs/diagnostics/2026-09-15-invalidated-subgroup.md`）用「预测时点可观测"
+                "的边界最窄 10%」选行复现该子群，模型准确率与全体无差别，反向对照"
+                "（最宽 20%）方向也不相反 → 机制不存在。故**不得作为变体假设的来源**；"
+                "要看方向能力，请读上面的按日聚类准确率与 `always_up` / `always_down`"
+            ),
         },
         "baselines": _baselines(scorable),
         "sample_gate": _gate(len(by_day), min_days),
@@ -319,6 +335,13 @@ def render_markdown(summary: Mapping) -> str:
         L.append(f"| `invalidate_if` 命中率（n={g['invalidated']['n_known']}，"
                  f"另有 {g['invalidated']['n_undetermined']} 条不可判定） | "
                  f"{_pct(g['invalidated']['rate'])} |")
+        L.append("")
+        # 口径**紧挨着数字**输出（照 Task 41 的 index_300 caveat 形态）：
+        # 这段话不改变上面任何一个数字，只声明它们该怎么读。
+        inv = g["invalidated"]
+        L.append(f"> ⚠️ `invalidate_if` 子群：{inv['note']}")
+        L.append(">")
+        L.append(f"> {inv['pit_comparable']}")
         L.append("")
     L.append("## 口径声明（读数字前必看）")
     L.append("")
