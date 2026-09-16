@@ -11,6 +11,7 @@ docs/
 ├── tasks/                 # 任务拆分与跟踪
 ├── plans/                 # 设计与实现计划（superpowers 产物）
 ├── decisions/             # 设计决策记录（ADR）
+├── diagnostics/           # 实测证据 / 复核报告（只记实测数字）
 └── errors/                # 错误日记
     └── ERROR_DIARY.md     # 错误与教训记录
 ```
@@ -52,6 +53,13 @@ stocklab trade reverse 1 --reason "录错券商"          # 冲正，不改原�
 stocklab portfolio show --asof 2026-09-15            # 表；退出码 1 = 要人来看
 stocklab portfolio show --asof 2026-09-15 --json     # P13 消费的稳定接口
 ```
+
+### 实测证据（diagnostics）
+
+- [`diagnostics/2026-09-17-p28-实测证据.md`](diagnostics/2026-09-17-p28-实测证据.md) — **P28 估值/资金流采集**
+  的 c/d/e/f 四类实测证据：真实行数与字段样例、幂等重跑 `rows=0`、**turnover 单位交叉验证**
+  （结论：同口径确证 / 量纲差 100 确证 / **精确倍数未确证**，比值 97.15–101.08）、
+  ETF 两源实测（估值全空 + 4 条显式覆盖记录；**资金流有数据，原假设被否证**）
 
 ### 计划与任务（当前轮）
 

@@ -94,9 +94,16 @@ class ValuationDaily:
 class MoneyFlowDaily:
     """一行资金流（新浪 MoneyFlow.ssl_qsfx_zjlrqs）。
 
-    单位：`close`/`ratio_amount` = 元，`change_ratio`/`turnover` = %，
-    `main_net`/`xl_net` = 元（净额，可负）。
-    ⚠️ `turnover` 是**新浪口径**：百分数值 ×100，与 `bars_daily.turnover`（%）差 100 倍。
+    单位：`close` = 元，`change_ratio` = **小数**（非 %），`turnover` = **百分数值 ×100**，
+    `main_net`/`xl_net`/`ratio_amount` = 元（净额，可负；单位**未独立确证**，按源原值存）。
+
+    ⚠️ `turnover` 与 `bars_daily.turnover`（%）的关系（P28b 实测，见
+    `docs/diagnostics/2026-09-17-p28-实测证据.md` §e）：
+      - **同口径确证**：两源都是「流通股换手率」，单位 %。独立反推（用腾讯
+        `float_mv`/`total_mv`/`amount` 自算）两源同时吻合流通股分母、同时不符总股本分母。
+      - **量纲差 100 确证**：新浪存的是百分数值 ×100。
+      - **精确倍数未确证**：实测比值 97.15–101.08（n=6，仅 3 个交易日两侧有值），
+        不是精确 100；残余 1–3% 未归因。**消费方不得按「/100 即可对齐」处理。**
     """
 
     code: str

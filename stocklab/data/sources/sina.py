@@ -6,11 +6,13 @@
   netamount（主力净额，元）、ratioamount、r0_net（超大单净额，元）、
   r0_ratio、r0x_ratio、cate_ra、cate_na。
 
-单位注意：
-  - `turnover` 是**百分数值 ×100**（新浪口径）：同一交易日 `bars_daily.turnover`（%）
-    实测是它的 1/100（P28 计划 §2.1 交叉验证结论）。本适配器**不做换算**、原样存，
-    换算/对拍是消费方的责任，且必须在文档里写清口径差异。
-  - `netamount` / `r0_net` / `ratio_amount` = 元（原值，可负）。
+单位注意（P28b 实测，见 `docs/diagnostics/2026-09-17-p28-实测证据.md` §e）：
+  - `turnover` = **百分数值 ×100**（新浪口径）。与 `bars_daily.turnover`（%）**同口径**
+    （都是流通股换手率，已独立反推确证），但换算倍数**实测 97.15–101.08，不是精确 100**
+    （n=6，仅 3 个交易日两侧同时有值；残余 1–3% 未归因）。
+    本适配器**不做换算**、原样存；换算/对拍是消费方的责任，且**不得假设「/100 就对齐」**。
+  - `changeratio` = **小数**（非 %，如 -0.0255646 = -2.5565%）。
+  - `netamount` / `r0_net` / `ratioamount` = 元（原值，可负）；**单位未独立确证**（无第二证据源）。
 """
 
 from __future__ import annotations
