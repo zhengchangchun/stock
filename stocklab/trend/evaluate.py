@@ -151,8 +151,19 @@ def load_closes(conn: sqlite3.Connection, code: str, *,
     rows = [(r["date"], float(r["close"])) for r in conn.execute(sql, args)]
     if rows:
         return rows
+    # 空结果有两种完全不同的原因，**不许合并**（ERROR_DIARY：「为空时是
+    # 『没有』还是『没填』？」）：区间外有数据 → 区间选错了；
+    # 一行不复权都没有 → 口径不满足。分别给出各自的错。
+    n_none = conn.execute(
+        "SELECT COUNT(*) c FROM bars_daily WHERE code=? AND adj_mode='none'",
+        (code,)).fetchone()["c"]
     total = conn.execute("SELECT COUNT(*) c FROM bars_daily WHERE code=?",
                          (code,)).fetchone()["c"]
+    if n_none:
+        raise ValueError(
+            f"{code} 在 [{from_date}, {to_date}] 内没有日线 —— 该区间的交易日轴为空"
+            f"（库里共有 {n_none} 行不复权日线，是区间选错了，不是标的没数据）"
+        )
     if total:
         raise AdjustModeError(
             f"{code} 有 {total} 行日线，但没有一行是 adj_mode='none'（不复权）—— "

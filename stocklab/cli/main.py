@@ -979,6 +979,82 @@ def cmd_experiment_run(args: argparse.Namespace) -> int:
     return 1 if rep["verdict"]["status"] == "falsified" else 0
 
 
+def cmd_trend_evaluate(args: argparse.Namespace) -> int:
+    """跑预注册 `trend-state-hit-rate` 的正式版验证（**离线**；**不写任何生产表**）。
+
+    三件必须显式说出来的事：
+
+      - **口径照抄预注册**：状态定义 / `N=5` / 标的 / 判据全部写在
+        `stocklab/trend/evaluate.py` 的常量里，本层一个口径都不新增；
+      - **test 段封存**：validate 未达标**根本不读** test（不是「读了不报」）；
+        达标才打开一次复核；
+      - **不落库**：只 `SELECT` `bars_daily` / `raw_fetch_cache`，产物只有 `reports/`。
+
+    退出码：0 完成（`WIN` / `inconclusive`）/ 2 用法、数据库或数据问题 /
+    1 结论为 `falsified`（**不是错误**，但让 CI/脚本能区分「跑通了且否证」与「跑通了且达标」）。
+    """
+    from stocklab.experiments.split import SplitConfig, SplitConfigError
+    from stocklab.trend.evaluate import (AdjustModeError, PreregViolation,
+                                         UnmappedRows, run_evaluation, write_report)
+
+    db = Path(args.db) if args.db else paths.DB_PATH
+    if not db.exists():
+        print(json.dumps({"error": "db not found; run `stocklab db init`"},
+                         ensure_ascii=False), file=sys.stderr)
+        return 2
+    try:
+        cfg = SplitConfig(train=args.train_ratio, validate=args.validate_ratio,
+                          test=args.test_ratio)
+    except SplitConfigError as exc:
+        print(f"❌ 切分配置不合法：{exc}", file=sys.stderr)
+        return 2
+
+    conn = connect(db)
+    try:
+        rep = run_evaluation(conn, from_date=args.from_date, to_date=args.to_date,
+                             split_config=cfg, min_days=args.min_days,
+                             keep_test_sealed=args.keep_test_sealed)
+    except (PreregViolation, AdjustModeError, UnmappedRows) as exc:
+        print(f"❌ 实验被拒绝：{type(exc).__name__}: {exc}", file=sys.stderr)
+        return 2
+    except ValueError as exc:
+        print(f"❌ {exc}", file=sys.stderr)
+        return 2
+    finally:
+        conn.close()
+
+    report_dir = Path(args.report_dir) if args.report_dir else paths.REPORT_DIR
+    out = (Path(args.report) if args.report
+           else report_dir / f"{_today()}-trend-state-hit-rate.md")
+    written = write_report(rep, out)
+
+    verdict = rep["verdict"]
+    print(json.dumps({
+        "report": written["markdown"], "summary_json": written["json"],
+        "sha256_md": written["sha256_md"], "sha256_json": written["sha256_json"],
+        "trend_metric_version": rep["trend_metric_version"],
+        "framework_metric_version": rep["framework_metric_version"],
+        "prereg_doc": rep["prereg_doc"],
+        "universe": rep["universe"],
+        "range": rep["range"],
+        "horizon": rep["horizon"], "ma": rep["ma"],
+        "split_boundaries": rep["split_boundaries"],
+        "selection_split": rep["selection_split"],
+        "test_evaluated": rep["test_evaluated"],
+        "test_not_evaluated_reason": rep["test_not_evaluated_reason"],
+        "validate_n_days": rep["splits"]["validate"]["n_days"],
+        "criteria": verdict["criteria"],
+        "verdict": verdict["status"],
+        "verdict_reasons": verdict["reasons"],
+        "bootstrap": rep["bootstrap"],
+        "data_snapshot": rep["data_snapshot"],
+        "counts": rep["counts"],
+    }, ensure_ascii=False, indent=2))
+    if not rep["test_evaluated"]:
+        print(f"🔒 test 段未打开：{rep['test_not_evaluated_reason']}", file=sys.stderr)
+    return 1 if verdict["status"] == "falsified" else 0
+
+
 def _progress(target: str, done: int, total: int) -> None:
     if done % 250 == 0 or done == total:
         print(f"  … 回放 {done}/{total} 天（最近 {target}）", file=sys.stderr)
@@ -2182,6 +2258,33 @@ def build_parser() -> argparse.ArgumentParser:
     feat_build.add_argument("--code", action="append", default=None,
                             help="只构建指定代码，可重复；默认全部 active 标的")
     feat_build.set_defaults(func=_cmd_features_build)
+
+    from stocklab.trend.evaluate import MIN_DAYS as TREND_MIN_DAYS
+
+    tr = sub.add_parser(
+        "trend", help="趋势状态标签（双均线三态）的正式版验证 —— 离线、只读、不写生产表")
+    tr_sub = tr.add_subparsers(dest="trend_cmd", required=True)
+    tr_eval = tr_sub.add_parser(
+        "evaluate",
+        help="跑预注册 `trend-state-hit-rate`：M1 命中率 / M2 延续率 + 按日聚类 + "
+             "F1/F2/F3 判定；test 段达标才打开")
+    tr_eval.add_argument("--from", dest="from_date",
+                         help="起点（按**实现日** t+N 计；默认全轴）")
+    tr_eval.add_argument("--to", dest="to_date", help="终点（按实现日 t+N 计；默认全轴）")
+    tr_eval.add_argument("--min-days", dest="min_days", type=int,
+                         default=TREND_MIN_DAYS,
+                         help=f"有效交易日门槛（预注册 F3；默认 {TREND_MIN_DAYS}）")
+    tr_eval.add_argument("--train-ratio", type=float, default=0.60)
+    tr_eval.add_argument("--validate-ratio", type=float, default=0.20)
+    tr_eval.add_argument("--test-ratio", type=float, default=0.20)
+    tr_eval.add_argument(
+        "--keep-test-sealed", dest="keep_test_sealed", action="store_true",
+        help="即使 validate 达标也不打开封存段 test（只会更保守：结论记 inconclusive）")
+    tr_eval.add_argument(
+        "--report", help="报告输出路径（默认 reports/<today>-trend-state-hit-rate.md）")
+    tr_eval.add_argument("--report-dir", dest="report_dir", help="报告目录")
+    tr_eval.add_argument("--db", help="数据库路径（默认 data/stocklab.db）")
+    tr_eval.set_defaults(func=cmd_trend_evaluate)
 
     fixture = sub.add_parser("fixture", help="fixture 管理（离线）")
     fx_sub = fixture.add_subparsers(dest="fixture_action")
