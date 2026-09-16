@@ -25,6 +25,36 @@ CREATE TABLE IF NOT EXISTS trading_calendar (
     created_at  TEXT NOT NULL
 );
 
+-- ---------- 已公告的休市安排（P30）----------
+-- **语义与 trading_calendar 严格区分**：trading_calendar = 「某个日期是不是**已采集到的**
+-- 交易日」（回看，只用已发生的指数日线日期集合构建）；本表 = 「交易所**已公告**的开/休市」
+-- （前瞻，来自年度休市安排通知与单节公告）。两者混用会让 `Calendar.load` 把未来日期当成
+-- 「已采集交易日」，直接污染回测轴与 predict 的 session_check，故**另起一张表**。
+--
+-- PIT 判断（ADR-013）：休市安排是交易所**提前公告的公开日历信息**，不是价格/成交数据；
+-- 在 asof 时点它已经公开可得，因此允许用于决定 `target_date`。风险边界见 ADR-013。
+--
+-- 主键 (date, source_url) 而非 date：同一日期可能被「年度通知」与「单节公告」各写一条
+-- （内容相同，无害）；**改期/临时休市**则是新公告=新行，读取侧取 `published_at` 最新者。
+-- 于是全程只有 INSERT —— 不触发 append-only 触发器，也不会出现「INSERT OR IGNORE 把
+-- 已改期的旧值静默留住」这种错误。
+--
+-- `covered_year` 是**覆盖判据**：只有年度通知（doc_kind='annual'）才代表「该年**全部**日期的
+-- 开/休市都已公告」。单节公告只覆盖那一个节，不许拿它声称整年都知道。
+CREATE TABLE IF NOT EXISTS market_holidays (
+    date         TEXT NOT NULL,          -- YYYY-MM-DD
+    is_open      INTEGER NOT NULL CHECK (is_open IN (0, 1)),
+    source       TEXT NOT NULL,          -- 发布机构：'sse'
+    doc_kind     TEXT NOT NULL CHECK (doc_kind IN ('annual', 'holiday')),
+    covered_year INTEGER NOT NULL,       -- 这份公告所覆盖的年份（本行日期所在的年）
+    source_url   TEXT NOT NULL,
+    published_at TEXT NOT NULL,          -- 公告发布日（源站给出，非抓取时间）
+    created_at   TEXT NOT NULL,
+    PRIMARY KEY (date, source_url)
+);
+
+CREATE INDEX IF NOT EXISTS idx_market_holidays_date ON market_holidays (date);
+
 -- ---------- 行情 ----------
 CREATE TABLE IF NOT EXISTS bars_daily (
     code        TEXT NOT NULL,
@@ -699,3 +729,12 @@ BEGIN SELECT RAISE(ABORT, 'money_flow_daily is append-only'); END;
 CREATE TRIGGER IF NOT EXISTS trg_money_flow_daily_no_delete
 BEFORE DELETE ON money_flow_daily
 BEGIN SELECT RAISE(ABORT, 'money_flow_daily is append-only'); END;
+
+-- P30：已公告休市安排 append-only（改期/临时休市 = 追加新公告行，不改旧行）。
+CREATE TRIGGER IF NOT EXISTS trg_market_holidays_no_update
+BEFORE UPDATE ON market_holidays
+BEGIN SELECT RAISE(ABORT, 'market_holidays is append-only'); END;
+
+CREATE TRIGGER IF NOT EXISTS trg_market_holidays_no_delete
+BEFORE DELETE ON market_holidays
+BEGIN SELECT RAISE(ABORT, 'market_holidays is append-only'); END;

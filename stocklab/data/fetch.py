@@ -24,7 +24,7 @@ from stocklab.config.settings import Settings
 from stocklab.data.errors import FetchError
 from stocklab.data.http import RetryPolicy
 from stocklab.data.models import Bar, CorpAction, MoneyFlowDaily, Quote, ValuationDaily
-from stocklab.data.sources import eastmoney, sina, tencent
+from stocklab.data.sources import eastmoney, sina, sse, tencent
 
 #: 不复权单次上限（ADR-003 实测）
 MAX_COUNT = tencent.MAX_COUNT
@@ -347,3 +347,41 @@ def fetch_money_flow_daily(
     out = [(r, s, k) for r, s, k in out if start <= r.date <= end]
     out.sort(key=lambda t: t[0].date)
     return out
+
+
+# ---------- P30：上交所休市安排（联网；只解析，落库由调用方决定） ----------
+
+def fetch_holiday_notices(
+    client,
+    *,
+    list_url: str = sse.LIST_URL,
+    max_articles: int = 30,
+) -> list:
+    """抓「休市安排」栏目 → 逐篇解析 → 返回 `MarketHoliday` 列表（按日期升序）。
+
+    **fail-closed**：任一篇公告「标题说休市、正文解析不出」→ 抛 `FetchError`，
+    **整批不返回**。理由：半批数据会让调用方以为「那几个节不开市、别的都开市」，
+    而真相是「有一篇没读懂」。宁可这轮不入库（旧表原样保留），也不写半截。
+    """
+    from stocklab.calendar.holidays import parse_holiday_notice
+
+    text = client.get_text(list_url, source="sse", cache_key="holiday:list")
+    articles = sse.parse_article_list(text)
+    if not articles:
+        raise FetchError(
+            f"休市安排列表页里一条公告都没解析出来（{list_url}）—— "
+            "拒绝静默返回空：源站换排版必须表现为失败")
+
+    out = []
+    for art in articles[:max_articles]:
+        aid = art["url"].rsplit("/", 1)[-1].removesuffix(".shtml")
+        body = client.get_text(art["url"], source="sse", cache_key=f"holiday:{aid}")
+        try:
+            published = sse.published_at_from_article(body)
+            out.extend(parse_holiday_notice(
+                sse.article_text(body), source_url=art["url"], published_at=published,
+                doc_kind=art["doc_kind"], covered_year=art["covered_year"]))
+        except Exception as exc:                      # 逐篇失败 → 整批失败（见 docstring）
+            raise FetchError(
+                f"休市公告解析失败：{art['title']}（{art['url']}）：{exc}") from exc
+    return sorted(out, key=lambda h: (h.date, h.source_url))

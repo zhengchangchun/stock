@@ -1370,6 +1370,89 @@ def _cmd_features_build(args: argparse.Namespace) -> int:
     return cmd_features_build(args.date, args.code)
 
 
+# ---------- calendar holidays（P30：已公告休市安排） ----------
+
+def cmd_calendar_holidays_fetch(*, db=None, max_articles: int = 30,
+                                client=None) -> int:
+    """采集交易所休市安排公告并落 `market_holidays`（**联网**）。
+
+    `client` 可注入（测试用回放 client；默认按配置建 `HttpClient`）。
+    **fail-closed**：`fetch_holiday_notices` 解析不出就抛错 → 本命令返回 1，
+    **一条都不落库**（旧表原样保留）。
+    """
+    from stocklab.calendar.holidays import load_holiday_table, save_holidays
+    from stocklab.data.fetch import fetch_holiday_notices, policy_from_settings
+    from stocklab.data.http import HttpClient
+    from stocklab.data.raw_cache import RawCache
+
+    paths.ensure_dirs()
+    db_path = Path(db) if db else paths.DB_PATH
+    now = datetime.now(TZ).isoformat(timespec="seconds")
+    if client is None:
+        settings = load_settings()
+        cache = RawCache(paths.RAW_CACHE_DIR) if settings.cache_enabled else None
+        client = HttpClient(policy_from_settings(settings), cache=cache)
+
+    conn = connect(db_path)
+    try:
+        try:
+            rows = fetch_holiday_notices(client, max_articles=max_articles)
+        except Exception as exc:                       # fail-closed：一条都不落库
+            repo.log_event(conn, "ingest", "error",
+                           f"休市安排抓取/解析失败：{exc}", now=now)
+            print(json.dumps({"error": f"{type(exc).__name__}: {exc}",
+                              "inserted": 0}, ensure_ascii=False))
+            return 1
+        inserted = save_holidays(conn, rows, now=now)
+        table = load_holiday_table(conn)
+        b = table.bounds()
+        out = {
+            "parsed_rows": len(rows),
+            "inserted": inserted,
+            "closed_dates": len(table.closed),
+            "annual_years": sorted(table.annual_years),
+            "first": b[0] if b else None,
+            "last": b[1] if b else None,
+        }
+    finally:
+        conn.close()
+    print(json.dumps(out, ensure_ascii=False))
+    return 0
+
+
+def cmd_calendar_holidays_show(*, db=None, limit: int = 40) -> int:
+    """查已公告休市表（**离线只读**）。"""
+    from stocklab.calendar.holidays import load_holiday_table
+
+    db_path = Path(db) if db else paths.DB_PATH
+    conn = connect(db_path)
+    try:
+        table = load_holiday_table(conn)
+        closed = sorted(table.closed)
+        recent = [r for r in table.rows if r.date in set(closed[-limit:])]
+        out = {
+            "rows": len(table.rows),
+            "closed_dates": len(table.closed),
+            "annual_years": sorted(table.annual_years),
+            "bounds": table.bounds(),
+            "closed": [{"date": r.date, "doc_kind": r.doc_kind,
+                        "covered_year": r.covered_year, "published_at": r.published_at,
+                        "source_url": r.source_url} for r in recent],
+        }
+    finally:
+        conn.close()
+    print(json.dumps(out, ensure_ascii=False, indent=2))
+    return 0
+
+
+def _cmd_calendar_holidays_fetch(args: argparse.Namespace) -> int:
+    return cmd_calendar_holidays_fetch(db=args.db, max_articles=args.max_articles)
+
+
+def _cmd_calendar_holidays_show(args: argparse.Namespace) -> int:
+    return cmd_calendar_holidays_show(db=args.db, limit=args.limit)
+
+
 def _cmd_fixture_record(args: argparse.Namespace) -> int:
     """把 raw_cache 里的一份响应登记为可回放 fixture（离线脚本，不联网）。"""
     from stocklab.data.raw_cache import record_fixture
@@ -2580,6 +2663,23 @@ def build_parser() -> argparse.ArgumentParser:
     tr_eval.add_argument("--report-dir", dest="report_dir", help="报告目录")
     tr_eval.add_argument("--db", help="数据库路径（默认 data/stocklab.db）")
     tr_eval.set_defaults(func=cmd_trend_evaluate)
+
+    cal = sub.add_parser(
+        "calendar", help="交易日历（P30）：已公告休市安排（只新增，不动既有子命令）")
+    cal_sub = cal.add_subparsers(dest="calendar_cmd", required=True)
+    cal_hol = cal_sub.add_parser("holidays", help="已公告的休市安排")
+    cal_hol_sub = cal_hol.add_subparsers(dest="holidays_cmd", required=True)
+    cal_hol_fetch = cal_hol_sub.add_parser(
+        "fetch", help="采上交所休市安排公告并落 market_holidays（联网；fail-closed）")
+    cal_hol_fetch.add_argument("--db", help="数据库路径（默认 data/stocklab.db）")
+    cal_hol_fetch.add_argument("--max-articles", dest="max_articles", type=int,
+                               default=30, help="最多抓几篇公告（默认 30）")
+    cal_hol_fetch.set_defaults(func=_cmd_calendar_holidays_fetch)
+    cal_hol_show = cal_hol_sub.add_parser("show", help="查已公告休市表（离线只读）")
+    cal_hol_show.add_argument("--db", help="数据库路径（默认 data/stocklab.db）")
+    cal_hol_show.add_argument("--limit", type=int, default=40,
+                              help="列出最后 N 个休市日（默认 40）")
+    cal_hol_show.set_defaults(func=_cmd_calendar_holidays_show)
 
     fixture = sub.add_parser("fixture", help="fixture 管理（离线）")
     fx_sub = fixture.add_subparsers(dest="fixture_action")

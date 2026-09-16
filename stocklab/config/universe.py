@@ -12,6 +12,7 @@ ALLOWED_HOSTS: frozenset[str] = frozenset(
         "push2his.eastmoney.com",
         "datacenter-web.eastmoney.com",       # P28：估值（RPT_VALUEANALYSIS_DET）
         "vip.stock.finance.sina.com.cn",      # P28：资金流（MoneyFlow）
+        "www.sse.com.cn",                     # P30：休市安排公告（年度通知 + 单节公告）
     }
 )
 

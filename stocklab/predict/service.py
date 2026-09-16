@@ -28,6 +28,7 @@ from __future__ import annotations
 import sqlite3
 from typing import Sequence
 
+from stocklab.calendar.holidays import HolidayTable, load_holiday_table, weekday_of
 from stocklab.calendar.trading_calendar import Calendar
 from stocklab.data import adjust
 from stocklab.data.models import Bar
@@ -100,21 +101,47 @@ def assert_session(conn: sqlite3.Connection, calendar: Calendar, asof: str, *,
         )
 
 
-def resolve_target_date(calendar: Calendar, asof: str) -> tuple[str, str]:
+def resolve_target_date(calendar: Calendar, asof: str, *,
+                        holidays: "HolidayTable | None" = None) -> tuple[str, str]:
     """下一个交易日 = 日历中**严格大于** `asof` 的第一个日期。
 
-    返回 `(date, source)`，`source ∈ {"trading_calendar", "weekday_fallback"}`。
+    返回 `(date, source)`，`source ∈ {"trading_calendar", "holiday_table",
+    "weekday_fallback"}`。
 
     **为什么不与行情轴取交集**：未来的交易日必然还没有 K 线，取交集恒为空。
     故 `target_date` 只用日历 —— 而日历**今天就是耗尽态**
-    （`trading_calendar` 最晚 = `2026-09-14`），此时退化为「下一个工作日（周一~周五）」，
-    `source` 记为 `weekday_fallback`。这个退化会原样进载荷与报告：
-    它是本任务**最弱的字段**，不许被当成真实交易日历。
+    （`trading_calendar` 最晚 = `2026-09-16`），此时按**三级**处理：
+
+    1. 日历里有 > asof 的日期 → `trading_calendar`（**最强**，实测交易日）；
+    2. 日历耗尽 + 休市表**覆盖**该年（有年度休市安排通知）→ 沿已公告的休市日往后推到
+       第一个开市日，`source="holiday_table"`（**用了真实休市公告**，前瞻已知信息，
+       PIT 判断见 ADR-013）；
+    3. 日历耗尽 + 休市表**覆盖不到**（尚未公告的年份，如 2027 元旦）→ 退回
+       `weekday_fallback`：**纯工作日外推**，会算错节假日，是本函数**最弱**的一档。
+
+    第 2/3 档的区别必须留在 `source` 里 —— 载荷与报告会原样带上它，
+    下游据此知道「这个 target_date 是查了公告的」还是「是猜的」。
     """
     later = [d for d in calendar.all_dates if d > asof]
     if later:
         return later[0], "trading_calendar"
-    y, m, d = (int(x) for x in asof.split("-"))
+
+    cand = _next_weekday(asof)
+    if holidays is not None:
+        d = cand
+        # 覆盖范围内：已公告休市就继续往后推（春节最长连休 7 个工作日，循环必在上限内收敛）
+        while holidays.covers(d) and holidays.is_closed(d):
+            d = _next_weekday(d)
+        if holidays.covers(d):
+            return d, "holiday_table"
+        # 覆盖不到 → 原样退回工作日外推（语义与 P30 之前**逐字一致**）
+        return d, "weekday_fallback"
+    return cand, "weekday_fallback"
+
+
+def _next_weekday(after: str) -> str:
+    """`after` 之后的下一个周一~周五（纯日历外推，不知道任何节假日）。"""
+    y, m, d = (int(x) for x in after.split("-"))
     o = y * 372 + m * 31 + d
     while True:
         o += 1
@@ -122,19 +149,39 @@ def resolve_target_date(calendar: Calendar, asof: str) -> tuple[str, str]:
         mm, dd = divmod(rem, 31)
         if mm < 1 or mm > 12 or dd < 1 or dd > 31:
             continue
-        if _weekday(yy, mm, dd) < 5:
-            break
-    return f"{yy:04d}-{mm:02d}-{dd:02d}", "weekday_fallback"
-
-
-def _weekday(y: int, m: int, d: int) -> int:
-    """0=周一 … 6=周日（Sakamoto 公式，不引第三方库）。"""
-    t = (0, 3, 2, 5, 0, 3, 5, 1, 4, 6, 2, 4)
-    yy = y - (1 if m < 3 else 0)
-    return (yy + yy // 4 - yy // 100 + yy // 400 + t[m - 1] + d) % 7
+        if weekday_of(yy, mm, dd) < 5:
+            return f"{yy:04d}-{mm:02d}-{dd:02d}"
 
 
 # ---------- PIT 取数 ----------
+
+def _target_date_note(source: str, holidays: HolidayTable) -> str:
+    """`notes.target_date` 的文案（**按事实取值，不按开关取值** —— ERROR_DIARY #16）。
+
+    `trading_calendar` 那一支的字符串**逐字节保持不变**：回归红线
+    (`docs/baselines/redlines.json`) 盯的就是两个 predict 载荷的 sha256，
+    而它们都用 `trading_calendar`。改这个分支的文案 = 动红线，必须单独归因。
+    """
+    if source == "trading_calendar":
+        return "target_date 取自 trading_calendar，非外推"
+    if source == "holiday_table":
+        b = holidays.bounds()
+        return (
+            f"target_date 由**已公告的休市安排**推出（source=holiday_table）："
+            f"trading_calendar 已耗尽，改用 market_holidays（已公告休市 {b[0]}~{b[1]}，"
+            "覆盖年份取有**年度通知**者）沿休市日往后推到第一个开市日。"
+            "休市安排是交易所提前公告的公开日历信息，PIT 判断见 ADR-013"
+        )
+    tail = ""
+    if holidays.rows:
+        tail = ("（休市表里有公告，但**覆盖不到**该日期所在的年份 —— "
+                "尚未公告的年份不许假装知道）")
+    return (
+        "target_date 取自 trading_calendar 的下一交易日；"
+        "日历耗尽时为「下一个工作日」外推（source=weekday_fallback）—— "
+        "**那是工作日外推，不是交易日历**，它是最弱的一个字段" + tail
+    )
+
 
 class PitCache:
     """批量回放期的**只读记忆化**（默认为 `None`，单日 `predict` 不用它）。
@@ -160,6 +207,7 @@ class PitCache:
         self._raw: dict[str, tuple] = {}
         self._calendar: Calendar | None = None
         self._axis: set[str] | None = None
+        self._holidays: HolidayTable | None = None
 
     def chain(self, conn: sqlite3.Connection, code: str) -> tuple:
         if code not in self._chains:
@@ -186,6 +234,12 @@ class PitCache:
         if self._axis is None:
             self._axis = market_axis(conn)
         return self._axis
+
+    def holidays(self, conn: sqlite3.Connection) -> HolidayTable:
+        """已公告休市表（只读派生量；`market_holidays` 是 append-only，回放期不变）。"""
+        if self._holidays is None:
+            self._holidays = load_holiday_table(conn)
+        return self._holidays
 
 
 def _read_raw(conn: sqlite3.Connection, code: str) -> tuple[list[Bar], set[str]]:
@@ -300,7 +354,8 @@ def build_predictions(conn: sqlite3.Connection, asof: str,
     codes = list(codes)
     calendar = cache.calendar(conn) if cache is not None else Calendar.load(conn)
     assert_session(conn, calendar, asof, cache=cache)
-    target_date, td_source = resolve_target_date(calendar, asof)
+    holidays = cache.holidays(conn) if cache is not None else load_holiday_table(conn)
+    target_date, td_source = resolve_target_date(calendar, asof, holidays=holidays)
 
     history: dict[str, list[Bar]] = {}
     skipped: dict[str, str] = {}
@@ -359,13 +414,7 @@ def build_predictions(conn: sqlite3.Connection, asof: str,
         "strategy_weights": weights,
         "skipped": skipped,
         "notes": {
-            "target_date": (
-                "target_date 取自 trading_calendar 的下一交易日；"
-                "日历耗尽时为「下一个工作日」外推（source=weekday_fallback）—— "
-                "**那是工作日外推，不是交易日历**，它是最弱的一个字段"
-                if td_source == "weekday_fallback" else
-                "target_date 取自 trading_calendar，非外推"
-            ),
+            "target_date": _target_date_note(td_source, holidays),
             "integration": (
                 "当前集成是**退化**的："
                 + (f"仅 {sorted(weights)} 参与" if weights else
