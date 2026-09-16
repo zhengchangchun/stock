@@ -76,6 +76,20 @@ validate 652 天（2021-04-29→2024-01-03）／test 654 天（2024-01-04→2026
    差异来自 600690 1993–2013 的 4572 行落在交易日轴之外、以及 N=5 尾部截断）→ DOWN 命中率 54.62% vs 48.44%
    差得很远。**该自检未逐位吻合，不能据此声称「读的是同一套口径」**，需在报告里显式说明差异来源。
 
+> **以上 3 处已于 2026-09-16 20:2x 修复（P23，提交 `06fb9af` / `a2a6f01` / `23401fa`，$3 预算内跑完）**：
+> ① `counts.test_rows` 由「指标字典键数」改为真实行数 `len(splits["test"])` = **1962**（与同层 `train_rows 5485` /
+> `validate_rows 1956` / `rows_used 9403` 量纲一致）；② md §3 判据 (a) 的理由**改由 CI 实测值生成**（现为
+> 「UP 侧 CI 下界 -0.0681 ≤ 0；DOWN 侧 -0.0081 ≤ 0 → 并未均 > 0」），不再照抄判据原文；③ §6 补上两套行集
+> 的来源、差值（剔前 13975 − 9403 = 4572 行落在交易日轴外）与「不得互引」声明。另修**第 4 处**（超出原清单，
+> 经确认保留）：§9 复现命令写出**实际生效的** `--to`，否则默认窗口取「当下全轴」，库里多一根 bar 就复现出另一套数字。
+> 教训记入 `docs/errors/ERROR_DIARY.md` #33（同根：指标/口径的「名字」被当成了「定义」）。
+>
+> **nanobot 自跑验证（2026-09-16 20:4x，不采信口头结论）**：`.venv/bin/python -m pytest` → **1506 passed**（基线
+> 1497，+9 来自本轮新增测试）/ `bash scripts/verify.sh` → **✅ 验证通过: all**（工作区干净）/ 逐字节复现
+> `.venv/bin/python -m stocklab.cli.main trend evaluate --to 2026-09-15 --report /tmp/p23-repro`（61s，exit=0）
+> → 产出的 md 与库内报告 **sha256 相同**（`c3b5bea6…9f68`）、json 逐键相同。**结论未变**：status `WIN` /
+> 判据 a=False / b=True / `counts` = {rows_total 13975, rows_used 9403, test_rows 1962, train_rows 5485, validate_rows 1956}。
+
 ## 6. 过程事实（成本与中断）
 
 - claude 任务 P20：**预算触顶中断**（`terminal_reason=budget_exhausted`，$6.13 / 上限 $6，71 turns，25 分钟）。
