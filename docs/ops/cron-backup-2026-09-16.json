@@ -1,0 +1,237 @@
+[
+ {
+  "id": "cd003088",
+  "name": "stock-lab-巡检(2h)",
+  "enabled": true,
+  "schedule": {
+   "kind": "cron",
+   "atMs": null,
+   "everyMs": null,
+   "expr": "45 9-21/2 * * 1-5",
+   "tz": "Asia/Shanghai"
+  },
+  "payload": {
+   "kind": "agent_turn",
+   "message": "【stock-lab 巡检】先读 skill `stock-lab-patrol`（runbook + 功能缺口队列 + 调度全景），按它执行。要点：\nA 只读核查（cd /root/.nanobot/workspace/projects/stock-lab；git log --oneline -5 / git status / reports 与 docs/experiments 最新）；B `pgrep -af \"claude -p\"`，有任务在跑则只汇报进度、绝不起新任务（同时只允许 1 个）；C 刚跑完的任务必须我自己实跑 `.venv/bin/python -m pytest` + `bash scripts/verify.sh`，只认我自己的输出；D 起任务照抄姿势（`IS_SANDBOX=1 nohup claude -p \"$(cat /tmp/stocklab-p*.txt)\" --permission-mode bypassPermissions --output-format json --max-budget-usd 6`，禁 acceptEdits）。\n优先级：① 数据链 tick/复盘是否在跑（断了最高优先，立刻修）；② 缺口队列（P12 实盘账本/组合视图 → 标的池+ETF → 看板 → 数据维度 → 模拟盘对比）；③ 队列空且无任务在跑 → **当轮直接制定并起下一轮优化任务**（用户已授权自行排期，不许空转、不许只复述计划）。\n实验红线：样本外才算数 / 按日聚类 / <120 交易日不算数 / 扣成本 / 对照 index_300 / 禁止全样本调参；实验落 docs/experiments/ 并更新 README 索引（失败/否证也留）。汇报 ≤6 行，含准确率数字与阻塞点。",
+   "deliver": false,
+   "channel": null,
+   "to": null,
+   "channelMeta": {},
+   "sessionKey": "websocket:4330212c-7da8-4dcf-8f18-028126f1d803",
+   "originChannel": "websocket",
+   "originChatId": "4330212c-7da8-4dcf-8f18-028126f1d803",
+   "originMetadata": {
+    "remote": [
+     "127.0.0.1",
+     45866
+    ],
+    "webui": true,
+    "webui_turn_id": "0d0e7adf-3a4a-4351-949a-cdecce38de66",
+    "workspace_scope": {
+     "project_path": "/root/.nanobot/workspace",
+     "access_mode": "full"
+    },
+    "_wants_stream": true
+   }
+  },
+  "state": {
+   "nextRunAtMs": 1789530300000,
+   "lastRunAtMs": 1789523100006,
+   "lastStatus": "ok",
+   "lastError": null,
+   "runHistory": [
+    {
+     "runAtMs": 1789451100003,
+     "status": "ok",
+     "durationMs": 129768,
+     "error": null
+    },
+    {
+     "runAtMs": 1789458300002,
+     "status": "ok",
+     "durationMs": 1032948,
+     "error": null
+    },
+    {
+     "runAtMs": 1789465500006,
+     "status": "ok",
+     "durationMs": 391317,
+     "error": null
+    },
+    {
+     "runAtMs": 1789472700005,
+     "status": "ok",
+     "durationMs": 281526,
+     "error": null
+    },
+    {
+     "runAtMs": 1789479900002,
+     "status": "ok",
+     "durationMs": 199682,
+     "error": null
+    },
+    {
+     "runAtMs": 1789523100006,
+     "status": "ok",
+     "durationMs": 242906,
+     "error": null
+    }
+   ]
+  },
+  "createdAtMs": 1789444012992,
+  "updatedAtMs": 1789523342912,
+  "deleteAfterRun": false
+ },
+ {
+  "id": "f7ca6482",
+  "name": "stock-lab-tick-盘中",
+  "enabled": true,
+  "schedule": {
+   "kind": "cron",
+   "atMs": null,
+   "everyMs": null,
+   "expr": "35 9,11,13 * * 1-5",
+   "tz": "Asia/Shanghai"
+  },
+  "payload": {
+   "kind": "agent_turn",
+   "message": "【stock-lab 盘中 tick】执行（不要起 claude 任务）：\ncd /root/.nanobot/workspace/projects/stock-lab && .venv/bin/python -m stocklab.cli.main session tick; echo \"exit=$?\"\n\n汇报：exit=0 且 anomalies=0 → **只回一行**（快照新增 N 行 / 验证新增 M 行 / 今日未到期预测不碰）；exit≠0 或 anomalies>0 → 贴原始错误 + `system_events` 最新一条，并明写「数据链异常」+ 是否需人工介入。禁止复述代码。",
+   "deliver": false,
+   "channel": null,
+   "to": null,
+   "channelMeta": {},
+   "sessionKey": "websocket:4330212c-7da8-4dcf-8f18-028126f1d803",
+   "originChannel": "websocket",
+   "originChatId": "4330212c-7da8-4dcf-8f18-028126f1d803",
+   "originMetadata": {
+    "remote": [
+     "127.0.0.1",
+     45866
+    ],
+    "webui": true,
+    "webui_turn_id": "1b4f16df-22ac-4f8d-a30c-3dc3144d99e3",
+    "workspace_scope": {
+     "project_path": "/root/.nanobot/workspace",
+     "access_mode": "full"
+    },
+    "_wants_stream": true
+   }
+  },
+  "state": {
+   "nextRunAtMs": 1789529700000,
+   "lastRunAtMs": 1789522500001,
+   "lastStatus": "ok",
+   "lastError": null,
+   "runHistory": [
+    {
+     "runAtMs": 1789522500001,
+     "status": "ok",
+     "durationMs": 7190,
+     "error": null
+    }
+   ]
+  },
+  "createdAtMs": 1789452784752,
+  "updatedAtMs": 1789522507191,
+  "deleteAfterRun": false
+ },
+ {
+  "id": "42afa64d",
+  "name": "stock-lab-tick-收盘",
+  "enabled": true,
+  "schedule": {
+   "kind": "cron",
+   "atMs": null,
+   "everyMs": null,
+   "expr": "5 15 * * 1-5",
+   "tz": "Asia/Shanghai"
+  },
+  "payload": {
+   "kind": "agent_turn",
+   "message": "【stock-lab 收盘快照 tick】执行（不要起 claude 任务）：\ncd /root/.nanobot/workspace/projects/stock-lab && .venv/bin/python -m stocklab.cli.main session tick; echo \"exit=$?\"\n\n汇报：exit=0 且 anomalies=0 → **只回一行**（收盘快照新增 N 行 / 验证新增 M 行）；exit≠0 或 anomalies>0 → 贴原始错误 + `system_events` 最新一条，并明写「数据链异常」。禁止复述代码。",
+   "deliver": false,
+   "channel": null,
+   "to": null,
+   "channelMeta": {},
+   "sessionKey": "websocket:4330212c-7da8-4dcf-8f18-028126f1d803",
+   "originChannel": "websocket",
+   "originChatId": "4330212c-7da8-4dcf-8f18-028126f1d803",
+   "originMetadata": {
+    "remote": [
+     "127.0.0.1",
+     45866
+    ],
+    "webui": true,
+    "webui_turn_id": "1b4f16df-22ac-4f8d-a30c-3dc3144d99e3",
+    "workspace_scope": {
+     "project_path": "/root/.nanobot/workspace",
+     "access_mode": "full"
+    },
+    "_wants_stream": true
+   }
+  },
+  "state": {
+   "nextRunAtMs": 1789542300000,
+   "lastRunAtMs": 1789455900005,
+   "lastStatus": "ok",
+   "lastError": null,
+   "runHistory": [
+    {
+     "runAtMs": 1789455900005,
+     "status": "ok",
+     "durationMs": 8550,
+     "error": null
+    }
+   ]
+  },
+  "createdAtMs": 1789452784760,
+  "updatedAtMs": 1789455908555,
+  "deleteAfterRun": false
+ },
+ {
+  "id": "5820fe94",
+  "name": "stock-lab-收盘链(daily)",
+  "enabled": true,
+  "schedule": {
+   "kind": "cron",
+   "atMs": null,
+   "everyMs": null,
+   "expr": "30 15 * * 1-5",
+   "tz": "Asia/Shanghai"
+  },
+  "payload": {
+   "kind": "agent_turn",
+   "message": "【stock-lab 收盘链】按序执行，每步看退出码（不要起 claude 任务，数据链断了才在汇报里点名）：\ncd /root/.nanobot/workspace/projects/stock-lab\nLATEST=\"$(.venv/bin/python -c \"import sqlite3;print(sqlite3.connect('data/stocklab.db').execute('select max(date) from bars_daily').fetchone()[0])\")\"\n1) .venv/bin/python -m stocklab.cli.main ingest bars --days 12000 2>&1 | tail -3\n2) .venv/bin/python -m stocklab.cli.main session backfill-close 2>&1 | tail -5\n3) .venv/bin/python -m stocklab.cli.main predict run --asof \"$LATEST\" 2>&1 | tail -8\n4) .venv/bin/python -m stocklab.cli.main review daily 2>&1 | tail -20\n5) .venv/bin/python -m stocklab.cli.main paper step --asof \"$LATEST\" 2>&1 | tail -6   # 模拟盘（ADR-010）；退出 2 多为当日 bars 未入库（ADR-009 缓存冻结），排查后补跑，幂等\n6) .venv/bin/python -m stocklab.cli.main doctor 2>&1 | tail -8\n\n汇报（≤6 行）：最新交易日 / 当日入库根数与快照行数 / 明日预测（各标的涨/平/跌概率 + 80% 区间）/ review 报告文件名 + LIVE 与 REPLAY 两组数字（LIVE=0 就写 0，**禁止**拿 REPLAY 的 38% 当实盘表现）/ amount 非 NULL 行数 / 模拟盘三臂净值（<120 交易日标注样本不足，只并列不挑推荐）/ 异常与阻塞。全部正常就压到 3 行。",
+   "deliver": false,
+   "channel": null,
+   "to": null,
+   "channelMeta": {},
+   "sessionKey": "websocket:4330212c-7da8-4dcf-8f18-028126f1d803",
+   "originChannel": "websocket",
+   "originChatId": "4330212c-7da8-4dcf-8f18-028126f1d803",
+   "originMetadata": {
+    "remote": [
+     "127.0.0.1",
+     52940
+    ],
+    "webui": true,
+    "webui_turn_id": "c5d23acd-4dc2-4ab8-b8b3-8367ad5719b0",
+    "workspace_scope": {
+     "project_path": "/root/.nanobot/workspace",
+     "access_mode": "full"
+    },
+    "_wants_stream": true
+   }
+  },
+  "state": {
+   "nextRunAtMs": 1789543800000,
+   "lastRunAtMs": null,
+   "lastStatus": null,
+   "lastError": null,
+   "runHistory": []
+  },
+  "createdAtMs": 1789525190403,
+  "updatedAtMs": 1789525190403,
+  "deleteAfterRun": false
+ }
+]
