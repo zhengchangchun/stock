@@ -11,6 +11,7 @@
 | 交易日 09:35 / 11:35 / 13:35 | `session tick` | 抓快照 → 落库（幂等）→ 验证**已到期**的预测 → 滚动准确率 |
 | 交易日 15:05 | `session tick` | 同上，且此时 `cutoff` = 今天 → 回填当日 `amount`/`turnover` + 验证 `target_date == 今天` 的预测 |
 | 交易日 15:30 | `review daily` | 生成 `reports/YYYY-MM-DD-review.md` + `.json`（只读，不写任何数据表） |
+| 交易日 15:30（`review daily` **之后**） | `paper step --asof <最新交易日>` | 推进模拟盘一天：三臂记净值 → `reports/paper/<asof>-paper.md` + `.json`（幂等，见 §1.1） |
 | 每 2 小时（nanobot 开发巡检） | **不在本项目内** | nanobot 自己的开发流程巡检（总纲 §「每 2 小时开发巡检」），与本项目代码无关 |
 
 **为什么盘中每 2 小时一次**：A 股同涨同跌，日内多次采集拿到的是**同一交易日的多个截面**，
@@ -38,6 +39,33 @@ cutoff = max{ d ∈ 日历交易日 : d < today，或 d == today 且本地时刻
 日历为空（未 `ingest index`）→ 摘要里报 `calendar.error` 并**不猜**：采集照做
 （快照的身份键含源站 `ts`，猜错也不会造假行），但依赖日历的 `cutoff` / 回填准入
 会显式降级为「跳过」并写进摘要。
+
+## 1.1 模拟盘（P19）：`paper step` 进 15:30 链
+
+```bash
+cd /root/.nanobot/workspace/projects/stock-lab
+.venv/bin/python -m stocklab.cli.main paper step --asof <最新交易日>
+# 报告：reports/paper/<asof>-paper.md（+ .json）；退出码 0=完成（含幂等命中）/ 2=用法或库的问题
+```
+
+**前置条件（缺一不可）**
+
+1. **当日 bars 已入库**：`step` 只用 `bars_daily`（`adj_mode='none'`）里 `date <= asof`
+   的收盘价 → 必须排在 **`ingest bars` 之后**。取不到价会**退出 2 且一行净值都不写**
+   （不落半截状态）。⚠️ 见 ADR-009：15:30 抓日K 可能命中当天盘中冻结的缓存 → 当日 bar 缺失
+   → 本步失败，需按该 ADR 的排查命令处理后再补跑。
+2. `--asof` 取**最新交易日**（不是自然日；非交易日跑会把净值记到不存在的交易日上）。
+3. 建臂只跑一次：`paper init`（幂等）；全新库先 `stocklab db init` 前滚 schema。
+
+**补跑安全**：`step` 幂等（同日重跑不重复下单、stdout 与报告逐字节一致），
+落库前先补 `ingest bars` 即可。只读查看用 `paper show`
+（不带 `--asof` 时：今天没净值会**回落**到最新净值日，并在 `asof_source` /
+`disclosure` 里写明 —— ADR-010 D7）。
+
+口径与已知限制见 **ADR-010**（禁方向择时 / 三臂并列 / 成本 / PIT / append-only /
+整手约束下的 `[FAIL]`）。
+
+---
 
 ## 2. 退出码
 
