@@ -24,14 +24,40 @@ def test_unknown_host_rejected():
 
 
 def test_whitelist_is_exact():
+    """白名单是**精确相等**断言：多一个、少一个都算红灯。
+
+    语义刻意保持「集合相等」而非子集/包含 —— 白名单是出网闸门，
+    放松成子集就等于「悄悄多开一个域名没人发现」，正是本测试要防的。
+    """
     assert ALLOWED_HOSTS == frozenset(
         {
             "qt.gtimg.cn",
             "web.ifzq.gtimg.cn",
             "push2.eastmoney.com",
             "push2his.eastmoney.com",
+            # P28 新增：估值源 = 东财 datacenter（RPT_VALUEANALYSIS_DET）
+            "datacenter-web.eastmoney.com",
+            # P28 新增：资金流源 = 新浪 MoneyFlow（vip.stock.finance.sina.com.cn）
+            "vip.stock.finance.sina.com.cn",
         }
     )
+
+
+def test_p28_hosts_do_not_open_subdomain_wildcard():
+    """P28 新增的两个 host 不得顺带打开「同域任意子域」的口子。
+
+    `assert_host_allowed` 用的是**精确匹配**（`host not in ALLOWED_HOSTS`），
+    没有后缀/通配逻辑；这里把该性质钉成回归测试：同域的其它子域仍须被拒。
+    """
+    for url in (
+        "https://other.eastmoney.com/api/data/v1/get",
+        "https://datacenter.eastmoney.com/api/data/v1/get",
+        "https://vip.stock.finance.sina.com.cn.evil.com/x",
+        "https://stock.finance.sina.com.cn/quotes_service/api/json_v2.php",
+        "https://finance.sina.com.cn/x",
+    ):
+        with pytest.raises(HostNotAllowed):
+            assert_host_allowed(url)
 
 
 # ---------- P17：标的池纳入 ETF ----------
