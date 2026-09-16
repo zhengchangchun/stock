@@ -186,6 +186,9 @@ def doctor_report(conn: sqlite3.Connection) -> dict:
         "SELECT job_name, status, detail, finished_at FROM job_runs"
         " ORDER BY run_id DESC LIMIT 1").fetchone()
     out["last_job"] = dict(last_job) if last_job else None
+    # P33：schema 迁移 marker 在位与否（**只报告，不迁移**——doctor 是只读入口）。
+    from stocklab.store.migrate import schema_status
+    out["schema"] = schema_status(conn)
     return out
 
 

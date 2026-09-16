@@ -63,6 +63,12 @@ def _table_columns(conn, table: str) -> set[str]:
     return {r[1] for r in conn.execute(f"PRAGMA table_info({table})")}
 
 
+def _table_exists(conn, table: str) -> bool:
+    return conn.execute(
+        "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name=?",
+        (table,)).fetchone()[0] > 0
+
+
 def migrate_p28_valuation_moneyflow(conn) -> list[str]:
     """把空的旧-shape 估值/资金流表前滚到新 shape，返回被重建的表名列表。
 
@@ -115,6 +121,58 @@ def migrate_p32_predictions_origin(conn) -> list[str]:
     return ["predictions.origin"]
 
 
+#: 已知迁移 marker 清单：doctor 逐个报告在位与否（只读，不迁移）。
+#: (name, table, column)。新增迁移时必须在这里登记，否则 doctor 看不出来。
+_KNOWN_MARKERS: list[tuple[str, str, str]] = [
+    ("p28_resp_sha256_valuation", "valuation_daily", "resp_sha256"),
+    ("p28_resp_sha256_moneyflow", "money_flow_daily", "resp_sha256"),
+    ("p32_predictions_origin", "predictions", "origin"),
+]
+
+
+def _pending_column_migrations(conn) -> list[str]:
+    """只读探测：哪些「改既有表结构」的前滚还没做（不含建新表）。
+
+    只统计**表已存在但缺 marker 列**的情况 —— 表不存在时 `executescript` 会按
+    schema.sql 的新 shape 直接建出（无需迁移、无需备份），不算 pending。
+    """
+    pending: list[str] = []
+    for table, marker in _MIGRATE_P28_MARKER.items():
+        if _table_exists(conn, table) and marker not in _table_columns(conn, table):
+            pending.append(f"p28:{table}")
+    if (_table_exists(conn, "predictions")
+            and _MIGRATE_P32_MARKER not in _table_columns(conn, "predictions")):
+        pending.append("p32:predictions.origin")
+    return pending
+
+
+def schema_status(conn) -> dict:
+    """只读报告各已知迁移 marker 在位与否，供 doctor 显式告警（**不迁移**）。
+
+    doctor 是只读入口：发现缺失只报告、让调用方决定（跑任一写库入口或 `db init`
+    都会前滚），绝不擅自改库。
+    """
+    markers = {}
+    for name, table, column in _KNOWN_MARKERS:
+        present = (_table_exists(conn, table)
+                   and column in _table_columns(conn, table))
+        markers[name] = {"table": table, "column": column, "present": present}
+    return {
+        "markers": markers,
+        "ok": all(m["present"] for m in markers.values()),
+        "note": "doctor 只报告、不迁移；缺失请跑任一写库入口或 `db init` 前滚。",
+    }
+
+
+def _apply_schema(conn, sql: str) -> list[str]:
+    """executescript 建表 + P28/P32 前滚，返回实际结构变更列表。"""
+    conn.executescript(sql)
+    changes: list[str] = []
+    changes += migrate_p28_valuation_moneyflow(conn)
+    changes += migrate_p32_predictions_origin(conn)
+    return changes
+
+
 def _now_tag() -> str:
     return datetime.now(TZ).strftime("%Y%m%dT%H%M%SZ")
 
@@ -151,13 +209,39 @@ def init_db(db_path: Path, *, backup_dir: Path | None = None,
     sql = (schema_path or SCHEMA_SQL).read_text(encoding="utf-8")
     conn = connect(db_path)
     try:
-        conn.executescript(sql)
         # P28：空表重定义（老库的 valuation/money_flow 是旧 shape，见模块 docstring）。
         # 必须在 executescript 之后跑：触发器已在上面重建，这里只动表结构。
-        migrate_p28_valuation_moneyflow(conn)
         # P32：给 predictions 增 origin 列（只加列、不回填历史行）。
-        migrate_p32_predictions_origin(conn)
+        _apply_schema(conn, sql)
         conn.commit()
     finally:
         conn.close()
     return backup
+
+
+def ensure_schema(db_path: Path | str) -> list[str]:
+    """幂等前滚 schema —— 写库入口的统一守护（P33）。
+
+    与 `init_db` 的分工：`init_db` 每次显式调用都先备份（`db init` 的语义是
+    「我要动库，留退路」）；`ensure_schema` 是**每次写之前**自动调用的守护，
+    必须廉价且幂等 —— 只在「确有结构变更」时备份一次（备份的是变更前那份），
+    没有变更则零写、零备份（否则每次 `predict run` 都产一份备份文件）。
+
+    真失败要炸、不许静默：老 shape 表有数据（`migrate_p28` 抛 `RuntimeError`）、
+    `ALTER TABLE` 失败、IO 错误，一律向上抛 —— 宁可让写入口停下来报错，
+    也不要在坏 schema 上写进口径错误的数据。
+
+    返回本次实际结构变更列表（列级迁移的变更；`executescript` 建新表不计入）。
+    """
+    db_path = Path(db_path)
+    db_path.parent.mkdir(parents=True, exist_ok=True)
+    sql = SCHEMA_SQL.read_text(encoding="utf-8")
+    conn = connect(db_path)
+    try:
+        if _pending_column_migrations(conn):
+            backup_db(db_path, db_path.parent / "backups", "premigrate")
+        changes = _apply_schema(conn, sql)
+        conn.commit()
+        return changes
+    finally:
+        conn.close()

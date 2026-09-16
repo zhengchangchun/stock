@@ -32,7 +32,7 @@ from stocklab.config.universe import DEFAULT_UNIVERSE
 from stocklab.data.fetch import EARLIEST as EARLIEST_ACTION_START
 from stocklab.store import repo
 from stocklab.store.db import connect
-from stocklab.store.migrate import init_db
+from stocklab.store.migrate import ensure_schema, init_db
 
 TZ = ZoneInfo("Asia/Shanghai")
 
@@ -108,6 +108,7 @@ def cmd_ingest_bars(args: argparse.Namespace) -> int:
         inst = next(i for i in universe if i.code == code)
         return fetch_daily_bars(client, code=inst.tencent_code, start=start, end=end)
 
+    ensure_schema(paths.DB_PATH)   # 写库入口前滚（P33）：链路上任一步都不许在旧 schema 上写
     conn = connect(paths.DB_PATH)
     try:
         repo.upsert_instruments(conn, universe, now=now)
@@ -151,6 +152,7 @@ def cmd_ingest_actions(args: argparse.Namespace) -> int:
     out: dict = {"end": end, "start": args.start, "codes": {}}
     failed: list[str] = []
 
+    ensure_schema(paths.DB_PATH)   # 写库入口前滚（P33）
     conn = connect(paths.DB_PATH)
     try:
         repo.upsert_instruments(conn, universe, now=now)
@@ -219,6 +221,7 @@ def cmd_ingest_index(args: argparse.Namespace) -> int:
     cache = RawCache(paths.RAW_CACHE_DIR) if settings.cache_enabled else None
     client = HttpClient(policy_from_settings(settings), cache=cache)
 
+    ensure_schema(paths.DB_PATH)   # 写库入口前滚（P33）
     conn = connect(paths.DB_PATH)
     try:
         bars = fetch_index_daily(client, symbol=args.symbol, start=start, end=end)
@@ -271,7 +274,7 @@ def _cmd_ingest_series(args: argparse.Namespace, *, kind: str) -> int:
     universe = tuple(i for i in DEFAULT_UNIVERSE
                      if not args.code or i.code in args.code)
 
-    init_db(paths.DB_PATH)          # 前滚 schema（P28 空表重定义；幂等）
+    ensure_schema(paths.DB_PATH)    # 前滚 schema（P33：写库入口统一走 ensure_schema）
 
     cache = RawCache(paths.RAW_CACHE_DIR) if settings.cache_enabled else None
     client = HttpClient(policy_from_settings(settings), cache=cache)
@@ -790,6 +793,7 @@ def cmd_predict_run(args: argparse.Namespace) -> int:
     report_dir.mkdir(parents=True, exist_ok=True)
     now = datetime.now(TZ).isoformat(timespec="seconds")
 
+    ensure_schema(db)   # 写库入口前滚（P33）
     conn = connect(db)
     try:
         try:
@@ -872,6 +876,7 @@ def cmd_verify_run(args: argparse.Namespace) -> int:
     report_dir.mkdir(parents=True, exist_ok=True)
     now = datetime.now(TZ).isoformat(timespec="seconds")
 
+    ensure_schema(db)   # 写库入口前滚（P33）
     conn = connect(db)
     try:
         try:
@@ -931,6 +936,7 @@ def cmd_verify_backfill(args: argparse.Namespace) -> int:
     report_dir = Path(args.report_dir) if args.report_dir else paths.REPORT_DIR
     report_dir.mkdir(parents=True, exist_ok=True)
 
+    ensure_schema(db)   # 写库入口前滚（P33）
     conn = connect(db)
     try:
         rep = backfill(conn, args.from_date, args.to_date, codes=args.code,
@@ -1012,6 +1018,7 @@ def cmd_verify_pending(args: argparse.Namespace) -> int:
     now = args.now or datetime.now(TZ).isoformat(timespec="seconds")
     only = set(args.code or [])
 
+    ensure_schema(db)   # 写库入口前滚（P33）
     conn = connect(db)
     try:
         pend = pending_predictions(conn, now)
@@ -1294,7 +1301,7 @@ def cmd_features_build(date: str, codes: list[str] | None) -> int:
                          ensure_ascii=False))
         return 2
     paths.ensure_dirs()
-    init_db(db)
+    ensure_schema(db)
     now = datetime.now(TZ).isoformat(timespec="seconds")
     written = identical = 0
     skipped: list[str] = []
@@ -1509,6 +1516,7 @@ def cmd_session_tick(args: argparse.Namespace) -> int:
     settings = load_settings()
     client = HttpClient(policy_from_settings(settings), cache=None)
 
+    ensure_schema(db)   # 写库入口前滚（P33）
     conn = connect(db)
     try:
         if not _has_session_tables(conn):
@@ -1559,6 +1567,7 @@ def cmd_session_backfill_close(args: argparse.Namespace) -> int:
                          ensure_ascii=False), file=sys.stderr)
         return 2
     now = args.now or datetime.now(TZ).isoformat(timespec="seconds")
+    ensure_schema(db)   # 写库入口前滚（P33）
     conn = connect(db)
     try:
         if not _has_session_tables(conn):
@@ -1593,6 +1602,7 @@ def cmd_review_daily(args: argparse.Namespace) -> int:
                          ensure_ascii=False), file=sys.stderr)
         return 2
     date = args.date or _today()
+    ensure_schema(db)   # 写库入口前滚（P33）
     conn = connect(db)
     try:
         if not _has_session_tables(conn):
@@ -2006,6 +2016,7 @@ def cmd_lab_serve(args: argparse.Namespace) -> int:
         print(json.dumps({"error": "db not found; run `stocklab db init`"},
                          ensure_ascii=False), file=sys.stderr)
         return 2
+    ensure_schema(db)   # lab 应用写入口前滚（P33）
     ctx = labweb.Context(lab=labweb.Lab(db, asof=args.asof),
                          signer=labweb.TokenSigner(labweb.new_secret()),
                          base_path=base_path)
@@ -2044,6 +2055,7 @@ def _paper_conn(args):
         print(json.dumps({"error": "db not found; run `stocklab db init`"},
                          ensure_ascii=False), file=sys.stderr)
         return None, 2
+    ensure_schema(db)   # 写库入口前滚（P33）
     conn = connect(db)
     has = conn.execute(
         "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name IN"
