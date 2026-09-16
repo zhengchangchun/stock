@@ -25,8 +25,9 @@ from pathlib import Path
 from zoneinfo import ZoneInfo
 
 from stocklab.dashboard.summary import build_summary
+from stocklab.portfolio.decision import position_decision
 from stocklab.portfolio.prices import resolve_prices
-from stocklab.portfolio.view import build_portfolio, nav_series
+from stocklab.portfolio.view import build_portfolio, daily_close, nav_series
 from stocklab.risk.panel import build_risk_block, risk_subject
 from stocklab.session.review import freshness
 from stocklab.store.db import connect
@@ -76,12 +77,43 @@ class Lab:
     # ---------- 各页面 ----------
 
     def overview(self) -> dict:
-        """总览：`build_summary` 的全部分 + 净值曲线 + 标的覆盖。"""
+        """总览：`build_summary` 的全部分 + 净值曲线 + 标的覆盖 + 「能不能动」。"""
         with self.conn() as c:
             summary = build_summary(c, self.asof)
             summary["nav"] = nav_series(c, self.asof, n_sessions=NAV_SESSIONS)
+            summary["actions"] = self._actions(c, summary["portfolio"])
         summary["coverage"] = self.coverage()
         return summary
+
+    def _actions(self, conn, view: dict) -> dict:
+        """「能不能动」结论区（P1b）：逐只持仓一条结论。
+
+        本方法**不产生新口径**：收盘价、成本、权重、总资产全部来自
+        `view`（`build_portfolio`），它只补一样 view 没有的东西 ——
+        **每只票自己的日收盘价和它的日期**（`daily_close`，与
+        `build_portfolio` 判止损用的是同一个函数、同一口径）。
+
+        ⚠️ `build_portfolio` 的 `discipline` 段只对**第一只**标的判止损
+        （`run_checks` 的单标的简化入参），所以这里的收盘价要按标的分别取 ——
+        否则第二只票会拿到第一只票的止损结论。
+        """
+        rows = []
+        for p in view.get("positions") or []:
+            close, close_asof = daily_close(conn, p["code"], self.asof)
+            rows.append(position_decision(
+                p["code"], close=close, close_asof=close_asof,
+                qty=int(p["qty"]), cost_basis=p.get("cost_basis_incl_fee"),
+                avg_cost=p.get("avg_cost_incl_fee"), price=p.get("price"),
+                price_asof=p.get("price_asof"), price_source=p.get("price_source"),
+                total_assets=view.get("total_assets"), cash=view.get("cash"),
+                name=p.get("name")))
+        return {
+            "asof": self.asof,
+            "rows": rows,
+            "n_unknown": sum(1 for r in rows if r["state"] == "unknown"),
+            "policy": ("结论只看日收盘价（bars_daily），不看盘中报价；"
+                       "只摆选项，不替人做买卖决定"),
+        }
 
     def trades(self, *, code: str | None = None) -> dict:
         """成交流水。`code` 是**显示筛选**，不改任何口径。
