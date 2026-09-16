@@ -37,7 +37,7 @@ from stocklab.risk.kelly import (
     BOOTSTRAP_SEED,
     daily_clustered_winrate_ci,
 )
-from stocklab.session.review import PROVENANCE_RULE, load_rows
+from stocklab.session.review import PROVENANCE_RULE, classify, load_rows
 from stocklab.verify.report import MIN_DAYS, summarize
 
 #: 四段的固定顺序。**顺序本身是设计**：回放 → 实时 → 模拟盘 → 实盘
@@ -156,7 +156,8 @@ def boot_ci_by_day(rows: Sequence[Mapping]) -> list[float] | None:
 # ---------- 段 1/2：回放段、实时段 ----------
 
 def _accuracy_segment(seg: str, rows: Sequence[Mapping], *, from_date: str,
-                      to_date: str, min_days: int) -> dict[str, Any]:
+                      to_date: str, min_days: int,
+                      predictions_written: int) -> dict[str, Any]:
     """回放段 / 实时段共用的一份构造（两段的**唯一**差别就是喂进来的行）。"""
     metrics = summarize(rows, from_date=from_date, to_date=to_date,
                         min_days=min_days)
@@ -182,6 +183,11 @@ def _accuracy_segment(seg: str, rows: Sequence[Mapping], *, from_date: str,
         "n_rows": len(rows),
         "n_scorable": len(scorable),
         "n_days": len(days),
+        # 「写了多少条预测」与「其中多少条已被验证打分」**分列**：
+        # 前者是模型的产出量，后者才是准确率的分母来源。混成一个数会让
+        # 「实时预测已产出但尚未打分」被读成「样本量 0 = 什么都没发生」。
+        "predictions_written": predictions_written,
+        "predictions_verified": len(rows),
         "model_versions": sorted(metrics["model_versions"]),
         "metrics": metrics,
         "gate": _gate(len(days), min_days),
@@ -338,6 +344,20 @@ def _window(conn: sqlite3.Connection, from_date: str | None,
     return str(lo), str(hi)
 
 
+def _written_by_origin(conn: sqlite3.Connection) -> dict[str, int]:
+    """**已写入**的预测按来源计数（与「已被验证打分」是两件事）。
+
+    没有这一对读数，实时段 `n_days = 0` 会被读成「根本没有实时预测」——
+    而真实情况是「实时预测写了，但它的目标日还没到/还没打分」。判据一律走
+    `classify()`（不在 SQL 里重写一遍规则）。
+    """
+    rows = conn.execute(
+        "SELECT asof_date, created_at FROM predictions").fetchall()
+    live = sum(1 for r in rows
+               if classify(r["asof_date"], r["created_at"]) == "live")
+    return {"live": live, "replay": len(rows) - live}
+
+
 def build_chain_accuracy(conn: sqlite3.Connection, *, from_date: str | None = None,
                          to_date: str | None = None,
                          min_days: int = _MIN) -> dict[str, Any]:
@@ -347,12 +367,15 @@ def build_chain_accuracy(conn: sqlite3.Connection, *, from_date: str | None = No
     by_origin: dict[str, list[dict]] = {"replay": [], "live": []}
     for r in rows:
         by_origin[r["provenance"]].append(r)
+    written = _written_by_origin(conn)
 
     segments = [
         _accuracy_segment("replay", by_origin["replay"], from_date=lo,
-                          to_date=hi, min_days=min_days),
+                          to_date=hi, min_days=min_days,
+                          predictions_written=written["replay"]),
         _accuracy_segment("live", by_origin["live"], from_date=lo,
-                          to_date=hi, min_days=min_days),
+                          to_date=hi, min_days=min_days,
+                          predictions_written=written["live"]),
         _paper_segment(conn, from_date=from_date, to_date=to_date,
                        min_days=min_days),
         _real_segment(conn, from_date=from_date, to_date=to_date,
@@ -436,6 +459,12 @@ def _render_segment(s: Mapping[str, Any]) -> list[str]:
     w = s.get("window") or {}
     if w.get("from") or w.get("to"):
         L.append(f"- **区间**：{w.get('from') or '—'} → {w.get('to') or '—'}")
+    if s.get("predictions_written") is not None:
+        pending = s["predictions_written"] - s["predictions_verified"]
+        tail = ("" if pending == 0 else
+                f"（差 {pending} 条 = 目标日还没到 / 还没打分，**不是**「没有预测」）")
+        L.append(f"- **该来源已写入的预测**：{s['predictions_written']} 条；"
+                 f"其中**已被验证打分**：{s['predictions_verified']} 条{tail}")
     L.append(f"- **样本量**：有效交易日数 **n_days = {s['n_days']}**，"
              f"行数 {s['n_rows']}（行数只作参考，**不得**当样本量）")
     L.append(f"- **门槛**：{s['gate']['min_days']} 交易日"

@@ -155,6 +155,9 @@ def test_four_segments_are_listed_separately(db):
     assert rep["provenance_counts"] == {"live": 1, "replay": 1}
     assert _seg(rep, "live")["n_rows"] == 1
     assert _seg(rep, "replay")["n_rows"] == 1
+    # 「写了多少条预测」与「其中多少条已被打分」**分列**：写了 1 条、打分 1 条
+    assert _seg(rep, "live")["predictions_written"] == 1
+    assert _seg(rep, "live")["predictions_verified"] == 1
     # 两个准确率段的「准确率」是各自算的，不许互相填充
     assert _seg(rep, "live")["metrics"]["model_versions"]
     assert _seg(rep, "replay")["metrics"]["model_versions"]
