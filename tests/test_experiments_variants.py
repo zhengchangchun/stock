@@ -152,8 +152,31 @@ def test_unknown_mu_mode_is_refused_at_construction():
         ForecastSpec(mu_mode="whatever")
 
 
-def test_mu_modes_are_exactly_the_documented_three():
-    assert MU_MODES == ("sample_mean", "zero", "index_sign")
+def test_mf_dir_prior_variant_changes_exactly_one_field():
+    """V1 `mf-dir-prior`：只改 `mu_mode`，取 `mf_sign`；预注册路径钉死。"""
+    v = get_variant("mf-dir-prior")                       # 内部已 assert_single_variable
+    assert v.changed_axis == "mu_mode"
+    assert v.spec.changed_fields() == ("mu_mode",)
+    assert v.spec.mu_mode == "mf_sign"
+    assert v.spec.sigma_mode == "const" and v.spec.dist_mode == "gaussian"
+    assert v.spec == ForecastSpec(mu_mode="mf_sign")
+    assert v.prereg_doc.endswith("2026-09-17-valuation-moneyflow-oos.md")
+
+
+def test_val_pe_pct_variant_changes_exactly_one_field():
+    """V2 `val-pe-pct-mu`：只改 `mu_mode`，取 `val_pe_pct`。"""
+    v = get_variant("val-pe-pct-mu")
+    assert v.changed_axis == "mu_mode"
+    assert v.spec.changed_fields() == ("mu_mode",)
+    assert v.spec.mu_mode == "val_pe_pct"
+    assert v.spec.sigma_mode == "const" and v.spec.dist_mode == "gaussian"
+    assert v.spec == ForecastSpec(mu_mode="val_pe_pct")
+    assert v.prereg_doc.endswith("2026-09-17-valuation-moneyflow-oos.md")
+
+
+def test_mu_modes_are_exactly_the_documented_five():
+    # P34 / P29 新增 `mf_sign`（V1 资金流符号）与 `val_pe_pct`（V2 估值分位符号）。
+    assert MU_MODES == ("sample_mean", "zero", "index_sign", "mf_sign", "val_pe_pct")
 
 
 # ---------- 2. 口径冻结：没有那些旋钮 ----------

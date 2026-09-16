@@ -37,7 +37,7 @@ from stocklab.predict.service import PitCache, build_predictions
 from stocklab.predict.version import MODEL_VERSION
 from stocklab.verify.replay import backfill
 from stocklab.verify.score import CAPITAL
-from tests.test_predict_service import _to_date, _to_ord, bars, seed
+from tests.test_predict_service import NOW, _to_date, _to_ord, bars, seed
 
 CODE = "000333"
 CODE2 = "600690"
@@ -334,7 +334,54 @@ def test_unscorable_rows_are_recorded_but_do_not_enter_the_denominator(tmp_path)
     assert split["summary"]["model_versions"][MODEL_VERSION]["n_rows"] > n_days
 
 
-# ---------- 5. 幂等与呈现 ----------
+# ---------- 5. P34 / P29：资金流 / 估值方向先验在运行路径上的行为 ----------
+
+def _add_money_flow(conn, *, code=CODE, missing=()):
+    """给 `code` 全交易日写入资金流（`main_net` 恒正）；`missing` 里的日期**不写**行。"""
+    from stocklab.data.models import MoneyFlowDaily
+    from stocklab.store import repo
+
+    data = [(MoneyFlowDaily(code=code, date=d, main_net=1e6), "sha", None)
+            for d in _days() if d not in missing]
+    repo.insert_money_flow(conn, data, now=NOW)
+
+
+def test_mf_sign_variant_skips_when_money_flow_missing(tmp_path):
+    """资金流在 `asof` 缺行 → 变体侧硬拒绝并记录，**不许**退化成基线。
+
+    基线侧照常出数 → 该日配对只剩基线（`keys_baseline_only` +1）。
+    这正是预注册 PIT 约束要防的那类自欺：报告显示变体跑了 N 天，实际 M < N。
+    """
+    gap, target = _validate_day()
+    conn = _env(tmp_path)
+    _add_money_flow(conn, missing=(gap,))
+    rep = _run(conn, variant="mf-dir-prior")
+
+    variant_misses = {k: v for k, v in rep["skipped"]["variant"].items()
+                      if k.startswith(target)}
+    assert variant_misses, "资金流缺口没被记录 —— 变体大概静默退化成了基线"
+    assert "mf_sign=None" in list(variant_misses.values())[0]
+    assert not [k for k in rep["skipped"]["baseline"] if k.startswith(target)]
+    paired = rep["splits"]["validate"]["paired"]
+    assert paired["counts"]["keys_baseline_only"] >= 1
+    assert paired["counts"]["keys_variant_only"] == 0
+    # 变体覆盖：实际使用 < 报告口径，缺口被显式计数
+    cov = rep["coverage"]
+    assert cov["variant_days_used"] == rep["counts"]["variant_rows"]
+    assert cov["variant_days_skipped"] >= 1
+
+
+def test_mf_sign_variant_without_any_money_flow_is_all_skipped(tmp_path):
+    conn = _env(tmp_path)
+    rep = _run(conn, variant="mf-dir-prior")
+    assert rep["counts"]["variant_rows"] == 0
+    assert rep["counts"]["baseline_rows"] > 0
+    assert rep["splits"]["validate"]["gate"]["status"] == "INSUFFICIENT"
+    assert rep["verdict"]["status"] == "inconclusive"
+    assert rep["coverage"]["variant_days_skipped"] == rep["counts"]["baseline_rows"]
+
+
+# ---------- 6. 幂等与呈现 ----------
 
 def test_same_parameters_produce_a_byte_identical_report(tmp_path):
     """同参数两次 → 报告 `sha256` 相同（否则「准确率」可以被重跑改掉）。"""
