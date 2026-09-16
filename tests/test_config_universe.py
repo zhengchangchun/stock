@@ -39,6 +39,9 @@ def test_whitelist_is_exact():
             "datacenter-web.eastmoney.com",
             # P28 新增：资金流源 = 新浪 MoneyFlow（vip.stock.finance.sina.com.cn）
             "vip.stock.finance.sina.com.cn",
+            # P30 新增：休市安排公告源 = 上交所（www.sse.com.cn）——
+            # **有意**扩白名单，不是偷偷加：本断言仍是精确相等，改它必须留下痕迹。
+            "www.sse.com.cn",
         }
     )
 

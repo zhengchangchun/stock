@@ -18,6 +18,7 @@ EXPECTED_TABLES = {
     "paper_accounts",                  # P19：模拟盘三臂（append-only）
     "paper_trades",                    # P19：模拟成交（append-only）
     "paper_nav_daily",                 # P19：每日净值（append-only）
+    "market_holidays",                 # P30：已公告休市（append-only，前瞻；非 trading_calendar）
 }
 
 
