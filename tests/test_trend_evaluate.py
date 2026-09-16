@@ -321,6 +321,117 @@ def _table_counts(conn):
             for n in names}
 
 
+# ---------- 7b. 报告口径缺陷（P21）：计数语义与理由文字 ----------
+
+
+def test_counts_test_rows_is_a_row_count_like_its_siblings(tmp_path, monkeypatch):
+    """P21-D1：`counts.test_rows` 必须是 test 段的**样本行数**（与 `train_rows`/
+    `validate_rows`/`rows_used` 同语义），**不是** test 段指标字典的键数。
+
+    缺陷现场：写的是 `len(splits["test"])` → 报 7（M1/M2… 的键数），
+    而 md §4 写的是 1962 行 —— 同一个量两个数。
+    """
+    conn = _trend_env(tmp_path, n=N_BARS)
+    _force_judge(monkeypatch, requires_test=True)
+    rep = run_evaluation(conn, min_days=5)
+    c = rep["counts"]
+    assert rep["test_evaluated"] is True
+    assert c["test_rows"] == rep["splits"]["test"]["n_rows"]
+    assert c["test_rows"] != len(rep["splits"]["test"])   # 不是「键数」
+    assert c["test_rows"] != 7
+    # 四个 *_rows 同一把尺子：加起来必须回到全样本
+    assert (c["test_rows"] + c["train_rows"] + c["validate_rows"]) <= c["rows_used"]
+
+
+def test_counts_test_rows_is_zero_when_the_test_segment_is_sealed(tmp_path, monkeypatch):
+    """封存段**没算过** → 行数写 0，不许写成「段里有多少行」。"""
+    conn = _trend_env(tmp_path, n=N_BARS)
+    _force_judge(monkeypatch, requires_test=False)
+    rep = run_evaluation(conn, min_days=5)
+    assert rep["test_evaluated"] is False
+    assert rep["counts"]["test_rows"] == 0
+
+
+def _lower_bounds(seg, metric):
+    return {s: seg[metric][s]["delta_ci95"][0] for s in (STATE_UP, STATE_DOWN)}
+
+
+def test_criterion_reason_text_quotes_the_real_ci_lower_bounds():
+    """P21-D2：理由文字里的下界值必须是报告里**实际**的 CI 下界（不得硬编码）。"""
+    seg = _metrics(up=(.0, -.0681, .0014), down=(.0, -.0081, .0336),
+                   m2_up=(.4, .2770, .3976), m2_down=(.4, .2809, .3567))
+    v = judge(validate=seg, days=300)
+    assert v["criteria"] == {"a": False, "b": True}
+    for key, metric in (("a", "M1"), ("b", "M2")):
+        text, lows = v["criteria_reasons"][key], _lower_bounds(seg, metric)
+        for lo in lows.values():
+            assert f"{lo:+.4f}" in text, (key, lo, text)
+
+
+def test_criterion_reason_never_contradicts_the_verdict():
+    """判据不成立时，文字里不许出现「故 (a) 成立」这种反向措辞。"""
+    seg = _metrics(up=(.0, -.0681, .0014), down=(.0, -.0081, .0336),
+                   m2_up=(.4, .2770, .3976), m2_down=(.4, .2809, .3567))
+    v = judge(validate=seg, days=300)
+    a_text, b_text = v["criteria_reasons"]["a"], v["criteria_reasons"]["b"]
+    assert "故 (a) 不成立" in a_text and "故 (a) 成立" not in a_text
+    assert "故 (b) 成立" in b_text and "故 (b) 不成立" not in b_text
+    # 成立/不成立 的开头结论也必须与 criteria 一致
+    assert a_text.startswith("判据 (a) 不成立") and b_text.startswith("判据 (b) 成立")
+
+
+def test_criterion_reason_says_so_when_a_side_has_no_interval():
+    """算不出区间的侧不许被说成「均 > 0」（CI=None → 判不成立）。"""
+    v = judge(validate={"M1": {STATE_UP: {"delta": .1, "delta_ci95": None},
+                               STATE_DOWN: _m(.1, .05, .15)},
+                        "M2": {STATE_UP: _m(.4, .3, .5),
+                               STATE_DOWN: _m(.4, .3, .5)}},
+              days=300)
+    text = v["criteria_reasons"]["a"]
+    assert v["criteria"]["a"] is False
+    assert "均 > 0，故 (a) 成立" not in text
+    assert "算不出 CI" in text and "故 (a) 不成立" in text
+
+
+def test_markdown_criterion_lines_come_from_the_generated_reasons(tmp_path, monkeypatch):
+    """md §3 的两行判据必须**逐字**等于 verdict 里生成的文字（render 不许另写一套）。"""
+    conn = _trend_env(tmp_path, n=N_BARS)
+    rep = run_evaluation(conn, min_days=5)
+    md = evaluate.render_markdown(rep)
+    for key in ("a", "b"):
+        assert f"- {rep['verdict']['criteria_reasons'][key]}" in md
+
+
+def test_selfcheck_explains_the_two_row_sets_from_computed_numbers(tmp_path):
+    """P21-D3：9403 与 13972 各自是哪套行集、差从哪来 —— 由代码算出并写明不得互引。"""
+    conn = _trend_env(tmp_path, n=N_BARS)
+    rep = run_evaluation(conn, min_days=5)
+    rs = rep["selfcheck"]["row_sets"]
+    used = rep["counts"]["rows_used"]
+    outside = rep["data_snapshot"]["unmapped_rows_outside_axis"]
+    assert rs["this_report_full_sample"]["n_rows"] == used
+    assert rs["prereg_explore"]["n_rows"] == evaluate.PREREG_EXPLORE["n_rows"]
+    assert rs["difference"]["calendar_outside_rows"] == outside
+    assert rs["difference"]["rows_total"] == used + outside
+    assert rs["difference"]["this_minus_prereg"] == used - rs["prereg_explore"]["n_rows"]
+    # 差值文字里出现的数字必须是上面算出来的，不是手写的
+    why = rs["difference"]["why"]
+    for n in (used, outside, used + outside, rs["prereg_explore"]["n_rows"]):
+        assert str(n) in why, (n, why)
+    assert "不得互引" in rs["no_cross_citation"]
+
+
+def test_markdown_section6_states_both_row_sets_and_forbids_cross_citation(tmp_path):
+    conn = _trend_env(tmp_path, n=N_BARS)
+    rep = run_evaluation(conn, min_days=5)
+    md = evaluate.render_markdown(rep)
+    sec6 = md.split("## 6.")[1].split("## 7.")[0]
+    assert "不得互引" in sec6
+    assert str(rep["counts"]["rows_used"]) in sec6
+    assert str(evaluate.PREREG_EXPLORE["n_rows"]) in sec6
+    assert str(rep["data_snapshot"]["unmapped_rows_outside_axis"]) in sec6
+
+
 # ---------- 8. 复现性与报告内容 ----------
 
 

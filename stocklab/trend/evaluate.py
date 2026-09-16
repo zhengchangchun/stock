@@ -362,6 +362,37 @@ def criteria_of(seg: Mapping[str, Any]) -> dict[str, bool]:
     return {"a": bool(a), "b": bool(b)}
 
 
+def _criterion_reason(seg: Mapping[str, Any], key: str) -> str:
+    """判据 (a)/(b) 的**理由文字**，由 CI 实际值生成 —— 一个字都不许硬编码。
+
+    (a) 读 M1 的 `delta_ci95`、(b) 读 M2 的；判据本身复用 `_side_holds`
+    （与 `criteria_of` 同一个函数）→ 文字与 verdict **结构上不可能分叉**。
+    同型教训见 `docs/errors/ERROR_DIARY.md` #32 后一条：结论与理由写反过一次。
+    """
+    metric = "M1" if key == "a" else "M2"
+    what = "条件命中率 − 无条件基线" if key == "a" else "延续率 − 该状态无条件频率"
+    blocks = seg.get(metric, {})
+    sides: list[str] = []
+    missing_ci = False
+    for s in TREND_STATES:
+        ci = blocks.get(s, {}).get("delta_ci95")
+        if not ci:
+            missing_ci = True
+            sides.append(f"{s} 侧算不出 CI（有效交易日不足）")
+            continue
+        sides.append(f"{s} 侧 Δ 的 95% CI 下界 {ci[0]:+.4f} "
+                     f"{'>' if ci[0] > 0 else '≤'} 0")
+    held = all(_side_holds(blocks.get(s, {}), "delta_ci95") for s in TREND_STATES)
+    if held:
+        tail = f"两侧 CI 下界均 > 0，故 ({key}) 成立"
+    elif missing_ci:
+        tail = f"有侧算不出 CI，故 ({key}) 不成立"
+    else:
+        tail = f"两侧 CI 下界并未均 > 0，故 ({key}) 不成立"
+    return (f"判据 ({key}) {'成立' if held else '不成立'}（{what}）："
+            + "；".join(sides) + f" → {tail}")
+
+
 def _fmt_side(block: Mapping[str, Any], key: str) -> str:
     d, ci = block.get("delta"), block.get(key)
     if d is None or ci is None:
@@ -387,6 +418,8 @@ def judge(*, validate: Mapping[str, Any], days: int | None = None,
         reasons.append(f"(b) {s} 延续率 − 该状态无条件频率：{_fmt_side(m2[s], 'delta_ci95')}")
 
     base = {"criteria": crit, "n_days": n_days, "min_days": min_days,
+            "criteria_reasons": {k: _criterion_reason(validate, k)
+                                 for k in ("a", "b")},
             "test_evaluated": False}
 
     if n_days < min_days:
@@ -573,13 +606,17 @@ def run_evaluation(conn: sqlite3.Connection, *, from_date: str | None = None,
             "note": ("bars_sha256 = 逐行 `code|date|close` 的 sha256（只含本次读入的行）；"
                      "raw_cache = raw_fetch_cache 的 (cache_id, content_sha256) 摘要"),
         },
+        # 四个 *_rows 都是**样本行数**（同一把尺子）。test_rows 曾错写成
+        # `len(splits["test"])` —— 那是 test 段**指标字典的键数**（7），
+        # 与 md §4 的行数（1962）对不上（P21-D1）。
         "counts": {"rows_total": len(rows) + len(outside),
                    "rows_used": len(rows),
                    "train_rows": len(train_rows), "validate_rows": len(validate_rows),
-                   "test_rows": len(splits["test"]) if test_evaluated else 0},
+                   "test_rows": (int(splits["test"]["n_rows"]) if test_evaluated
+                                 else 0)},
         "robustness": _robustness(series, seg, n_boot=n_boot, seed=seed,
                                   horizon=HORIZON, ma_short=MA_SHORT, ma_long=MA_LONG),
-        "selfcheck": _selfcheck(rows),
+        "selfcheck": _selfcheck(rows, n_outside_axis=len(outside)),
         "criteria_landing": _CRITERIA_LANDING,
         "notes": _NOTES,
     }
@@ -631,7 +668,49 @@ def _robustness(series: Mapping[str, Sequence[tuple[str, float]]],
     return out
 
 
-def _selfcheck(rows: Sequence[Row]) -> dict:
+def _row_sets(*, n_used: int, n_outside_axis: int) -> dict:
+    """两套行集**各是什么、差从哪来** —— 全部由代码算出，不手写数字（P21-D3）。
+
+    §6 的表把「本次全样本」与「预注册 §4.1 探索性读数」并排放，但两者
+    **不是同一套行集**：并排而不说明来源，读的人会把它们当同一口径互引。
+    """
+    prereg_n = int(PREREG_EXPLORE["n_rows"])
+    n_total = n_used + n_outside_axis
+    diff = n_used - prereg_n
+    why = (f"本报告全样本 {n_used} 行 = 实现日落在预注册 §3 交易日轴内的行"
+           f"（`counts.rows_used`）；另有 {n_outside_axis} 行实现日落在轴外被剔除，"
+           f"剔前共 {n_total} 行（`counts.rows_total`）。"
+           f"§4.1 的 {prereg_n} 行是探索性脚本**未按日历裁剪**的全量 bar 行，"
+           f"与本次剔前 {n_total} 行相差 {prereg_n - n_total:+d} 行；"
+           "该脚本源码已不在本仓库 → 这几行的来源**不反推**，也不当作口径差异。"
+           f"两套行集的可比部分只有「未裁剪全量 bar」这一层，差 {n_used - prereg_n:+d} 行"
+           "来自日历裁剪这一步。")
+    return {
+        "this_report_full_sample": {
+            "n_rows": n_used,
+            "definition": "按预注册 §3 的交易日轴（trading_calendar ∩ 行情）裁剪后的样本行",
+            "source": "counts.rows_used",
+        },
+        "prereg_explore": {
+            "n_rows": prereg_n,
+            "definition": "预注册 §4.1 探索性脚本：**未按日历裁剪**的全量 bar 行",
+            "source": f"{PREREG_DOC} §4.1（探索性读数，非结论）",
+        },
+        "difference": {
+            "this_minus_prereg": diff,
+            "calendar_outside_rows": n_outside_axis,
+            "rows_total": n_total,
+            "why": why,
+        },
+        "no_cross_citation": (
+            "两套行集**不得互引**：§6 的两列分别属于「日历裁剪后的正式口径」与"
+            "「未裁剪的探索性读数」，行集不同、且 §4.1 的脚本源码已不在本仓库，"
+            "逐行对比不成立 —— 只能用来核对**量级与方向**是否读的是同一件事。"
+        ),
+    }
+
+
+def _selfcheck(rows: Sequence[Row], *, n_outside_axis: int) -> dict:
     """口径自检（**全样本、非结论**）：我的实现读对了预注册 §4.1 的口径吗？
 
     全样本含 validate/test 两段、无 walk-forward 隔离 → **不构成任何采纳依据**。
@@ -649,13 +728,11 @@ def _selfcheck(rows: Sequence[Row]) -> dict:
                             for s in STATES},
         "prereg_reading": PREREG_EXPLORE,
         "prereg_reading_source": f"{PREREG_DOC} §4.1（探索性读数，非结论）",
-        "universe_note": ("§4.1 的脚本跑在**未按日历裁剪**的全量 bar 上"
-                          "（n=13972 ≈ 本库 13975 行）；正式口径按预注册 §3 "
-                          "限定在 trading_calendar 内 → 两者不可逐行对比。"
-                          "本实现与 §4.1 在 **UP 条件命中率与行数上逐位吻合**"
-                          "（0.5198 vs 0.5199、4454 vs 4453 行），"
-                          "DOWN 侧与两侧基线不吻合（对方脚本已不在，"
-                          "**不拿探索性数字反推口径**）。"),
+        "row_sets": _row_sets(n_used=full["n_rows"], n_outside_axis=n_outside_axis),
+        "universe_note": ("本实现与 §4.1 在 **UP 条件命中率上逐位吻合**"
+                          "（0.5198 vs 0.5199），DOWN 侧与两侧基线不吻合"
+                          "（对方脚本已不在，**不拿探索性数字反推口径**）。"
+                          "行集差异见 `row_sets`。"),
     }
 
 
@@ -817,9 +894,9 @@ def render_markdown(rep: Mapping[str, Any]) -> str:
     A("")
     A(f"**`{v['status']}`**")
     A("")
-    c = v["criteria"]
-    A(f"- 判据 (a)：{'**成立**' if c['a'] else '不成立'}（UP 与 DOWN 两侧 Δ 的 CI 下界均 > 0）")
-    A(f"- 判据 (b)：{'**成立**' if c['b'] else '不成立'}（UP 与 DOWN 两侧延续率差值的 CI 下界均 > 0）")
+    # 理由文字由 CI 实际值生成（`judge` 里算好）—— 这里只打印，不另写一套措辞
+    for key in ("a", "b"):
+        A(f"- {v['criteria_reasons'][key]}")
     A(f"- 有效交易日 {v['n_days']} / 门槛 {v['min_days']}"
       f"（F3：{'满足' if v['n_days'] >= v['min_days'] else '**不满足**'}）")
     for r in v["reasons"]:
@@ -877,6 +954,17 @@ def render_markdown(rep: Mapping[str, Any]) -> str:
         A(f"| {s} 无条件基线 | {_pct(rep['selfcheck']['baseline'][s])} | "
           f"{pr['baseline'][s]:.4f} |")
     A(f"| 样本行 | {rep['selfcheck']['n_rows']} | {pr['n_rows']} |")
+    A("")
+    rs = rep["selfcheck"]["row_sets"]
+    A(f"**两列不是同一套行集 —— {rs['no_cross_citation']}**")
+    A("")
+    A(f"- 「本次全样本」= {rs['this_report_full_sample']['n_rows']} 行："
+      f"{rs['this_report_full_sample']['definition']}"
+      f"（来源：`{rs['this_report_full_sample']['source']}`）")
+    A(f"- 「预注册 §4.1 探索性读数」= {rs['prereg_explore']['n_rows']} 行："
+      f"{rs['prereg_explore']['definition']}"
+      f"（来源：`{rs['prereg_explore']['source']}`）")
+    A(f"- 差异来源：{rs['difference']['why']}")
     A("")
     A("## 7. train 段（**调试区，非证据**）")
     A("")
