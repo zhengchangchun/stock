@@ -432,6 +432,21 @@ def test_markdown_section6_states_both_row_sets_and_forbids_cross_citation(tmp_p
     assert str(rep["data_snapshot"]["unmapped_rows_outside_axis"]) in sec6
 
 
+def test_reproduction_command_carries_the_effective_window(tmp_path):
+    """P21 同型：报告的「复现」命令必须带上**实际生效**的窗口参数。
+
+    默认窗口 = 当下全轴 —— 库里新增一根 bar 就会「复现」出另一套数字。
+    """
+    conn = _trend_env(tmp_path, n=N_BARS)
+    rep = run_evaluation(conn, min_days=5, to_date="2025-01-10")
+    md = evaluate.render_markdown(rep)
+    assert "--to 2025-01-10 " in md and "stocklab trend evaluate --to 2025-01-10 " in md
+    # 没传的窗口参数不许凭空出现
+    assert "--from" not in md.split("## 9.")[1]
+    rep2 = run_evaluation(conn, min_days=5)
+    assert "--to" not in evaluate.render_markdown(rep2).split("## 9.")[1]
+
+
 # ---------- 8. 复现性与报告内容 ----------
 
 

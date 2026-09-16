@@ -803,6 +803,19 @@ def _by_code_table(m: Mapping[str, Any], key: str, value: str) -> list[str]:
     return L
 
 
+def _repro_args(rep: Mapping[str, Any]) -> str:
+    """复现命令里带上**实际生效**的窗口参数（没传就不写）。
+
+    默认窗口是「当下全轴」——库里新增一根 bar，「复现」出来的就是另一套数字。
+    报告必须能把自己复现出来，所以生效的参数要写进去（P21 同型：
+    说法与事实对不上）。
+    """
+    bits = [f" --{name} {rep['range'][key]}"
+            for name, key in (("from", "from_arg"), ("to", "to_arg"))
+            if rep["range"].get(key)]
+    return "".join(bits) + (" " if bits else "")
+
+
 def render_markdown(rep: Mapping[str, Any]) -> str:
     """把报告渲染成 markdown（**确定性**：不含生成时间、不含自身 sha256）。"""
     v = rep["verdict"]
@@ -956,7 +969,9 @@ def render_markdown(rep: Mapping[str, Any]) -> str:
     A(f"| 样本行 | {rep['selfcheck']['n_rows']} | {pr['n_rows']} |")
     A("")
     rs = rep["selfcheck"]["row_sets"]
-    A(f"**两列不是同一套行集 —— {rs['no_cross_citation']}**")
+    A("**上面两列不是同一套行集。**")
+    A("")
+    A(rs["no_cross_citation"])
     A("")
     A(f"- 「本次全样本」= {rs['this_report_full_sample']['n_rows']} 行："
       f"{rs['this_report_full_sample']['definition']}"
@@ -988,7 +1003,9 @@ def render_markdown(rep: Mapping[str, Any]) -> str:
       "**正文里不写它自己**（自指哈希会让「同参数两次运行哈希相同」变成不可能的承诺）；"
       "正文不含时间戳，故同参数两次运行的哈希天然相等，可用 "
       "`sha256sum <报告>.md` 复核")
-    A(f"- 复现：`stocklab trend evaluate --report <path>`（口径全部写死，无随机）")
+    A(f"- 复现：`stocklab trend evaluate{_repro_args(rep)}--report <path>`"
+      "（口径全部写死，无随机；**窗口参数按本次实际生效值写出** —— "
+      "默认窗口取「当下全轴」，库里新增一根 bar 就会复现出另一套数字）")
     A("")
     A("## 10. 口径声明")
     A("")
