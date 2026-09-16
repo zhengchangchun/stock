@@ -245,6 +245,100 @@ def cmd_ingest_index(args: argparse.Namespace) -> int:
     return 0
 
 
+# ---------- ingest valuation / moneyflow（P28：估值 + 资金流） ----------
+
+def _cmd_ingest_series(args: argparse.Namespace, *, kind: str) -> int:
+    """采集估值（`valuation`）或资金流（`moneyflow`）并落 PIT 表（联网）。
+
+    `kind` ∈ {"valuation", "moneyflow"}。二者共享同一套编排，差异只在
+    fetch / insert / 源站代码口径：
+      - valuation：源 = 东财 datacenter，`code` = 6 位；落 `valuation_daily`；
+      - moneyflow：源 = 新浪，`code` = 源站形式 `sz000333`；落 `money_flow_daily`。
+
+    幂等：同 (code,date) 首写保留，重跑 → `rows=0`（验收 d）。源站重算历史 →
+    `restated` 计数 + warn 留痕（不覆盖，非 PIT 对策，见 P28 计划 §4）。
+    """
+    from stocklab.data.fetch import (fetch_money_flow_daily,
+                                     fetch_valuation_daily, policy_from_settings)
+    from stocklab.data.http import HttpClient
+    from stocklab.data.raw_cache import RawCache
+
+    paths.ensure_dirs()
+    settings = load_settings()
+    now = datetime.now(TZ).isoformat(timespec="seconds")
+    start = args.start or (date.today() - timedelta(days=args.days)).isoformat()
+    end = args.end or _today()
+    universe = tuple(i for i in DEFAULT_UNIVERSE
+                     if not args.code or i.code in args.code)
+
+    init_db(paths.DB_PATH)          # 前滚 schema（P28 空表重定义；幂等）
+
+    cache = RawCache(paths.RAW_CACHE_DIR) if settings.cache_enabled else None
+    client = HttpClient(policy_from_settings(settings), cache=cache)
+
+    conn = connect(paths.DB_PATH)
+    out: dict = {"kind": kind, "start": start, "end": end, "codes": {}}
+    failed: list[str] = []
+    try:
+        repo.upsert_instruments(conn, universe, now=now)
+        run_id = repo.record_job(conn, f"ingest_{kind}", status="running",
+                                 started_at=now)
+        for inst in universe:
+            code = inst.code
+            try:
+                if kind == "valuation":
+                    rows = fetch_valuation_daily(client, code=inst.code,
+                                                 start=start, end=end)
+                    written, restated = repo.insert_valuation(conn, rows, now=now)
+                else:
+                    rows = fetch_money_flow_daily(client, code=inst.tencent_code,
+                                                  start=start, end=end)
+                    written, restated = repo.insert_money_flow(conn, rows, now=now)
+            except Exception as exc:                    # noqa: BLE001 — 必须留痕
+                msg = f"{type(exc).__name__}: {exc}"
+                repo.log_event(conn, "ingest", "error",
+                               f"{code} {kind} 采集失败: {msg}",
+                               context={"code": code, "job": f"ingest_{kind}"},
+                               now=now)
+                out["codes"][code] = {"error": msg}
+                failed.append(code)
+                continue
+            if not rows and inst.is_etf:
+                # ETF 没有估值/资金流是**显式覆盖记录**，不许静默缺失（验收 f）
+                repo.log_event(conn, "ingest", "warn",
+                               f"{code}（ETF）无 {kind} 数据（源返回空）",
+                               context={"code": code, "job": f"ingest_{kind}"},
+                               now=now)
+            if restated:
+                repo.log_event(conn, "ingest", "warn",
+                               f"{code} 有 {restated} 行 {kind} 被源站重算"
+                               "（首写保留，未覆盖）",
+                               context={"code": code, "restated": restated},
+                               now=now)
+            out["codes"][code] = {
+                "rows": written, "restated": restated,
+                "first_date": rows[0][0].date if rows else None,
+                "last_date": rows[-1][0].date if rows else None,
+                "fetched": len(rows),
+            }
+        repo.finish_job(conn, run_id, status="ok" if not failed else "failed",
+                        finished_at=now,
+                        detail=f"{len(universe) - len(failed)}/{len(universe)} ok")
+    finally:
+        conn.close()
+    print(json.dumps({"ok": len(universe) - len(failed), "failed": failed, **out},
+                     ensure_ascii=False))
+    return 0 if not failed else 1
+
+
+def cmd_ingest_valuation(args: argparse.Namespace) -> int:
+    return _cmd_ingest_series(args, kind="valuation")
+
+
+def cmd_ingest_moneyflow(args: argparse.Namespace) -> int:
+    return _cmd_ingest_series(args, kind="moneyflow")
+
+
 # ---------- adj rebuild（离线重算因子链 + 缺口） ----------
 
 def cmd_adj_rebuild(args: argparse.Namespace) -> int:
@@ -2078,6 +2172,28 @@ def build_parser() -> argparse.ArgumentParser:
     ing_idx.add_argument("--start", default=None, help="起始日期 YYYY-MM-DD")
     ing_idx.add_argument("--end", default=None, help="结束日期 YYYY-MM-DD")
     ing_idx.set_defaults(func=cmd_ingest_index)
+
+    ing_val = ing_sub.add_parser(
+        "valuation", help="采集估值（东财 datacenter RPT_VALUEANALYSIS_DET，PIT 首写保留）")
+    ing_val.add_argument("--code", action="append", default=None,
+                         help="只采指定 6 位代码，可重复；默认全集")
+    ing_val.add_argument("--days", type=int, default=8000,
+                         help="回补的日历天数（默认 8000 ≈ 22 年，覆盖上市以来全历史；"
+                              "源站决定实际深度）")
+    ing_val.add_argument("--start", default=None, help="起始日期 YYYY-MM-DD")
+    ing_val.add_argument("--end", default=None, help="结束日期 YYYY-MM-DD")
+    ing_val.set_defaults(func=cmd_ingest_valuation)
+
+    ing_mf = ing_sub.add_parser(
+        "moneyflow", help="采集资金流（新浪 MoneyFlow，PIT 首写保留）")
+    ing_mf.add_argument("--code", action="append", default=None,
+                        help="只采指定 6 位代码，可重复；默认全集")
+    ing_mf.add_argument("--days", type=int, default=8000,
+                        help="回补的日历天数（默认 8000 ≈ 22 年；源站实测可回溯至"
+                             " 2013-09-18）")
+    ing_mf.add_argument("--start", default=None, help="起始日期 YYYY-MM-DD")
+    ing_mf.add_argument("--end", default=None, help="结束日期 YYYY-MM-DD")
+    ing_mf.set_defaults(func=cmd_ingest_moneyflow)
 
     adj = sub.add_parser("adj", help="复权因子链（离线，只读 bars_daily + corp_actions）")
     adj_sub = adj.add_subparsers(dest="adj_action")
