@@ -60,6 +60,7 @@
 | 2026-09-15 | 用现价（可能是盘中快照）判「收盘有没有破止损线」（#23） | 口径必须同源：收盘线只用日收盘价 | ✅ |
 | 2026-09-16 | 默认 asof 取「今天」，今天还没数据时返回空列表 → 像「模拟盘不存在」（#31） | 默认值要取「最新已有数据的时点」，取不到要回落并留痕 | ✅ |
 | 2026-09-16 | 测试套件把策略注册进**进程级全局表**且不清理，报告内容因此依赖执行顺序（#35） | 验收夹具要走**子进程**：全局态干净才算 hermetic，否则「谁先跑」会改结果 | ✅ |
+| 2026-09-17 | 迁移只在部分入口前滚 → 收盘链在旧 schema 上写库会断（#41） | 写库入口统一走 `ensure_schema`（幂等前滚）；迁移新写库入口必须接上 | ✅ |
 
 ---
 
@@ -1993,3 +1994,57 @@ DegenerateInput: 000333 在 2026-09-24 的 60 日对数收益标准差为 0.0
 - [ ] 端到端断言里，有没有混进「不需要被测链路就能过」的**顶层字段**？
 - [ ] fixture 的数据量够不够**跑通**（不是「够不够多」）？够不够**非退化**？
 - [ ] 我有没有在测试里**手抄一份清单/映射**？它会不会与上游漂移？
+
+---
+
+## #41 2026-09-17：迁移只在部分入口前滚 → 收盘链在旧 schema 上写库会断（P33）
+
+### 错误描述
+
+P32 给 `predictions` 加了 `origin` 列，迁移 `migrate_p32_predictions_origin` **只经
+`db init` 前滚**。但真实库 `data/stocklab.db` 当时并没有前滚（`PRAGMA table_info(predictions)`
+查不到 origin）。拿迁移前备份副本喂 P32 的 `_INSERT_SQL`（已含 origin 列）实测：
+
+```
+sqlite3.OperationalError: table predictions has no column named origin
+```
+
+15:30 收盘链要为 `target_date` 写**新**预测时就会撞这条 → `predict run` 失败 = 当天预测
+永久缺失（数据链断一天不可恢复）。而**现有巡检/测试全绿看不出来**：测试都跑在 `init_db`
+新建的新 shape 库上，没有一条跑在「真库没前滚」的旧 shape 库上。
+
+### 根本原因
+
+前滚只发生在 `db init`、`_cmd_ingest_series`（valuation/moneyflow）、`features build`、
+`quality/redline` 这几个入口；收盘链其余**写库入口**（`ingest bars` / `predict run` /
+`verify run|backfill|pending` / `review daily` / `paper step` / `session tick` /
+`session backfill-close` / lab 应用）都不调用 `init_db`。即：**迁移动作只挂在少数入口上，
+而不是挂在「写库」这个不变式上**。于是「库有没有前滚」取决于「第一个碰它的入口是谁」——
+谁碰都行、碰错了就断链。
+
+### 教训
+
+1. **迁移要挂在「写库」这个不变式上，不是挂在个别命令上。** 新写库入口出现时，
+   它默认**不**前滚 schema —— 除非它显式调 `ensure_schema`。所以「加了新写库入口」
+   和「它能在旧库上安全写」是两件事，后者需要一句显式接线。
+2. **「测试全绿」证明不了「真库能跑」。** 全量测试都在 `init_db` 的新 shape 库上跑，
+   旧 shape 库的写路径没有任何一条测试覆盖。凡涉及 schema 迁移的功能，
+   必须有一条「**旧 shape 库上跑写入口**」的测试（反向构造缺 marker 列的库）。
+3. **doctor 要报 schema 状态，且只报不改。** 只读巡检入口发现缺列要显式告警
+   （列出每个 marker 在位与否），不能退化成模糊的「all ok」；但也**不擅自迁移**
+   —— 迁移是写库入口的职责，doctor 只报告。
+
+### 修复
+
+- `migrate.ensure_schema(db_path)`：幂等前滚，只在确有结构变更时备份一次（否则每次
+  `predict run` 产一份备份），真失败（老 shape 且有数据 / ALTER 失败）一律抛、不静默。
+- 写库入口全部接 `ensure_schema`；已直接调 `init_db` 的 `_cmd_ingest_series` /
+  `features build` 改走同一入口（不两套并存）。
+- `doctor` 增 `schema` 段：逐个已知迁移 marker（P28 `resp_sha256`、P32 `origin`）在位与否。
+
+### 检查清单（下次必查）
+
+- [ ] 我这次新增/改动的是不是**写库入口**？是的话，它有没有调 `ensure_schema`？
+- [ ] 新迁移 marker 有没有登记进 `_KNOWN_MARKERS`（否则 doctor 看不见它）？
+- [ ] 有没有一条测试跑在「**缺这个 marker 列的旧 shape 库**」上，而不是全跑新 shape？
+- [ ] doctor 对缺列是**显式告警**还是退化成「all ok」？
