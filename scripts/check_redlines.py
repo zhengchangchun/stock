@@ -214,7 +214,8 @@ def write_baseline(path: Path, targets: dict) -> None:
 # 比对
 # --------------------------------------------------------------------------
 
-def check_one(name: str, entry: dict, *, sha: str, payload: dict) -> bool:
+def check_one(name: str, entry: dict, *, sha: str, payload: dict,
+              baseline_file: str = str(BASELINE_RELPATH)) -> bool:
     """跑两档判据。任一红 → 返回 False 并打印可操作失败文案。"""
     lv = leaves(payload)
     diff = compare_leaves(entry["leaves"], lv)
@@ -230,7 +231,7 @@ def check_one(name: str, entry: dict, *, sha: str, payload: dict) -> bool:
         return True
     print(format_failure(name, expected_sha=entry["sha256"], actual_sha=sha,
                          leaf_diff=diff, regen_cmd=REGEN_CMD,
-                         baseline_file=str(BASELINE_RELPATH)))
+                         baseline_file=baseline_file))
     if not is_red(diff):
         print("  ⚠️  数值叶子**全部一致**，只有字节变了 —— 这是「字段集/格式被改动」的特征"
               "（#34 的翻车类型：加了口径回显字段）。\n")
@@ -324,7 +325,8 @@ def main(argv: list[str] | None = None) -> int:
     if "synthetic" in want:
         syn = run_synthetic_predict_report(Path(tempfile.mkdtemp(prefix="p25-syn-")))
         ok &= check_one("predict_synthetic", targets["predict_synthetic"],
-                        sha=sha256_text(canonical_json(syn)), payload=syn)
+                        sha=sha256_text(canonical_json(syn)), payload=syn,
+                        baseline_file=args.baseline)
 
     if db_ready and want & {"predict", "backfill"}:
         with tempfile.TemporaryDirectory(prefix="p25-check-") as td:
@@ -333,13 +335,15 @@ def main(argv: list[str] | None = None) -> int:
                 rep = _predict_real(db, td)
                 ok &= check_one("predict_real_2026-09-14",
                                 targets["predict_real_2026-09-14"],
-                                sha=sha256_text(canonical_json(rep)), payload=rep)
+                                sha=sha256_text(canonical_json(rep)), payload=rep,
+                                baseline_file=args.baseline)
             if "backfill" in want:
                 md, summary = (_backfill_cli(db, td) if args.cli_backfill
                                else _backfill_readonly(db))
                 entry = targets["backfill_real_2013-12-23_2026-09-14"]
                 ok &= check_one("backfill_real_2013-12-23_2026-09-14", entry,
-                                sha=sha256_text(md), payload=summary)
+                                sha=sha256_text(md), payload=summary,
+                                baseline_file=args.baseline)
                 exp = entry.get("summary_sha256")
                 act = sha256_text(canonical_json(summary))
                 if exp and exp != act:

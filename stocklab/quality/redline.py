@@ -19,10 +19,9 @@
 
 from __future__ import annotations
 
-import contextlib
 import hashlib
-import io
 import json
+import sys
 from pathlib import Path
 from typing import Any
 
@@ -315,18 +314,30 @@ def run_synthetic_predict_report(tmpdir: Path | str) -> dict:
 
     返回的是**解析后的 dict**；比较时用 `canonical_json(report)` 还原成
     与 `cmd_predict_run` 写盘时**逐字节相同**的文本（见 `canonical_json`）。
+
+    **为什么走子进程**：报告的 `strategies[]` 段来自进程级全局 `strategy_registry`，
+    而测试套件里有用例把自己的策略注册进这个全局表且**不做清理**
+    （`tests/test_strategies_evaluate.py` 的 `tests_once_per_fold`）。
+    在 pytest 里 in-process 跑，报告内容就**依赖执行顺序** —— P25 首次全量跑就是
+    这样红的（`.`strategies[1].strategy_id: "trend_ma" → "tests_once_per_fold"`）。
+    子进程拿到的是一份**全新解释器**，全局态天然干净，夹具因此在
+    「谁先跑」这个维度上也是 hermetic 的。
     """
-    from stocklab.cli.main import main
+    import subprocess
 
     tmpdir = Path(tmpdir)
     tmpdir.mkdir(parents=True, exist_ok=True)
     db = build_synthetic_db(tmpdir / "synthetic.sqlite")
     report = tmpdir / "predict.json"
-    with contextlib.redirect_stdout(io.StringIO()) as buf:   # 别把 CLI 的 JSON 混进检查输出
-        rc = main(["predict", "run", "--asof", synthetic_asof(), "--db", str(db),
-                   "--report", str(report)])
-    if rc != 0:
-        raise RuntimeError(f"合成夹具 `predict run` 退出码 {rc}\n{buf.getvalue()}")
+    proc = subprocess.run(
+        [sys.executable, "-m", "stocklab.cli.main", "predict", "run",
+         "--asof", synthetic_asof(), "--db", str(db), "--report", str(report)],
+        cwd=str(repo_root()), capture_output=True, text=True,
+    )
+    if proc.returncode != 0:
+        raise RuntimeError(
+            f"合成夹具 `predict run` 退出码 {proc.returncode}\n"
+            f"--- stdout ---\n{proc.stdout}\n--- stderr ---\n{proc.stderr}")
     return json.loads(report.read_text(encoding="utf-8"))
 
 

@@ -69,6 +69,19 @@ else
 fi
 
 echo ""
+echo "--- 4c. 回归红线（P25 / 错误日记 #34）---"
+# 两档判据：字节级 sha256 + 数字叶子级键路径比对。见 docs/baselines/redlines.json。
+# ⚠️ `predict` / `backfill` 两个目标**依赖本机真实库** data/stocklab.db（未提交）；
+#    库不存在时脚本会显式打印「⏭ 跳过」并退出 0 —— **不假装 hermetic**。
+#    hermetic 的那一半是 tests/test_redline_baseline.py（合成夹具），已含在第 4 步里。
+PY="${PY:-.venv/bin/python}"     # 第 4 步若没走到，这里也不能因 set -u 炸掉
+if [ -x "$PY" ] && [ -f scripts/check_redlines.py ]; then
+  "$PY" scripts/check_redlines.py || fail=1
+else
+  echo "  ⚠️  跳过：缺少 $PY 或 scripts/check_redlines.py"
+fi
+
+echo ""
 echo "--- 5. git 工作区状态 ---"
 if git rev-parse --git-dir >/dev/null 2>&1; then
   if [ -n "$(git status --porcelain)" ]; then
