@@ -1,0 +1,9 @@
+{
+  "source": "eastmoney",
+  "url": "https://datacenter-web.eastmoney.com/api/data/v1/get?reportName=RPT_VALUEANALYSIS_DET&columns=ALL&filter=%28SECURITY_CODE%3D%22000333%22%29&pageNumber=1&pageSize=3&sortColumns=TRADE_DATE&sortTypes=-1",
+  "encoding": "utf-8",
+  "fetched_at": "2026-09-16T22:55:24+08:00",
+  "note": "估值第 1 页（pageSize=3，实测 result.pages=705）：分页/解析的真实样本",
+  "sha256": "f6ea61f8cc406f229231ad6602c8d34c3fbecc09e1a34e3f65ebb535642f4c41",
+  "name": "eastmoney_valuation_000333_p1_s3"
+}

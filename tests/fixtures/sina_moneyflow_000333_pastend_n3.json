@@ -1,0 +1,9 @@
+{
+  "source": "sina",
+  "url": "https://vip.stock.finance.sina.com.cn/quotes_service/api/json_v2.php/MoneyFlow.ssl_qsfx_zjlrqs?page=9999&num=3&sort=opendate&asc=0&daima=sz000333",
+  "encoding": "utf-8",
+  "fetched_at": "2026-09-16T22:55:25+08:00",
+  "note": "资金流翻越尽头（num=3）：真实空数组，翻页终止判据样本",
+  "sha256": "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945",
+  "name": "sina_moneyflow_000333_pastend_n3"
+}

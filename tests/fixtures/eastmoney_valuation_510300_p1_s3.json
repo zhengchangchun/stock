@@ -1,0 +1,9 @@
+{
+  "source": "eastmoney",
+  "url": "https://datacenter-web.eastmoney.com/api/data/v1/get?reportName=RPT_VALUEANALYSIS_DET&columns=ALL&filter=%28SECURITY_CODE%3D%22510300%22%29&pageNumber=1&pageSize=3&sortColumns=TRADE_DATE&sortTypes=-1",
+  "encoding": "utf-8",
+  "fetched_at": "2026-09-16T22:55:24+08:00",
+  "note": "估值 ETF 无数据（pages=0 / data 空）：『无数据 → 空列表』的真实样本",
+  "sha256": "ea6528a2204b61a7ee34683a73ca00f8afdc86aadf3f765d4dae39bbfb19dbe7",
+  "name": "eastmoney_valuation_510300_p1_s3"
+}

@@ -1,0 +1,9 @@
+{
+  "source": "sina",
+  "url": "https://vip.stock.finance.sina.com.cn/quotes_service/api/json_v2.php/MoneyFlow.ssl_qsfx_zjlrqs?page=1&num=3&sort=opendate&asc=0&daima=sz000333",
+  "encoding": "utf-8",
+  "fetched_at": "2026-09-16T22:55:24+08:00",
+  "note": "资金流第 1 页（num=3）：3 行真实样本",
+  "sha256": "1576b1f063dd649f74807179d056c38d3c6b52ad39ad0b8b141abcf3e68fcb6f",
+  "name": "sina_moneyflow_000333_p1_n3"
+}
