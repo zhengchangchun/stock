@@ -67,3 +67,44 @@ class CorpAction:
     content: str                 # 源站原文，如 "10派20元转15股"（条款真源）
     fh_sh: float | None = None   # 每 10 股派息（元）；不可信，仅交叉校验
     source: str = "tencent"
+
+
+@dataclass(frozen=True)
+class ValuationDaily:
+    """一行估值（东财 datacenter RPT_VALUEANALYSIS_DET）。
+
+    单位：`total_mv`/`close_price` = 元，`total_shares` = 股，`change_rate` = %。
+    **非 PIT 风险**：东财按最新股本重算整条历史 PE/PB（P28 计划 §4）—— 对策是
+    落库侧「首写保留」，重采值变化只留痕不覆盖。
+    """
+
+    code: str
+    date: str                    # TRADE_DATE 已裁剪为 YYYY-MM-DD
+    pe_ttm: float | None = None
+    pb: float | None = None      # PB_MRQ
+    ps_ttm: float | None = None
+    total_mv: float | None = None
+    total_shares: float | None = None
+    close_price: float | None = None
+    change_rate: float | None = None
+    source: str = "eastmoney-datacenter"
+
+
+@dataclass(frozen=True)
+class MoneyFlowDaily:
+    """一行资金流（新浪 MoneyFlow.ssl_qsfx_zjlrqs）。
+
+    单位：`close`/`ratio_amount` = 元，`change_ratio`/`turnover` = %，
+    `main_net`/`xl_net` = 元（净额，可负）。
+    ⚠️ `turnover` 是**新浪口径**：百分数值 ×100，与 `bars_daily.turnover`（%）差 100 倍。
+    """
+
+    code: str
+    date: str                    # opendate（新浪原生 YYYY-MM-DD）
+    close: float | None = None   # trade
+    change_ratio: float | None = None
+    turnover: float | None = None
+    main_net: float | None = None   # netamount 主力净额
+    xl_net: float | None = None     # r0_net 超大单净额
+    ratio_amount: float | None = None
+    source: str = "sina"

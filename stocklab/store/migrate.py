@@ -7,6 +7,85 @@ from stocklab.store.db import connect
 
 TZ = timezone.utc
 
+# ---------------------------------------------------------------------------
+# P28：估值 / 资金流两表的「空表重定义」迁移。
+#
+# 背景：这两张表在 P28 之前已由旧 schema 建出（老 shape，0 行、无触发器），
+# 而新 shape 与旧 shape 列集不同。`CREATE TABLE IF NOT EXISTS` 不会改已存在的
+# 表，所以老库必须走一次 DROP+CREATE。**只允许在表为空时做** —— 一旦有数据，
+# append-only 铁律要求绝不动历史行（DROP 会丢数据），故直接抛错拒绝。
+# DDL 与 schema.sql 里的 `CREATE TABLE IF NOT EXISTS` **同文**（改一处须同步另一处）。
+# ---------------------------------------------------------------------------
+_MIGRATE_P28_DDL: dict[str, str] = {
+    "money_flow_daily": """
+CREATE TABLE money_flow_daily (
+    code          TEXT NOT NULL,
+    date          TEXT NOT NULL,
+    close         REAL,
+    change_ratio  REAL,
+    turnover      REAL,
+    main_net      REAL,
+    xl_net        REAL,
+    ratio_amount  REAL,
+    source        TEXT NOT NULL,
+    fetched_at    TEXT NOT NULL,
+    created_at    TEXT NOT NULL,
+    resp_sha256   TEXT NOT NULL,
+    cache_key     TEXT,
+    PRIMARY KEY (code, date)
+)""",
+    "valuation_daily": """
+CREATE TABLE valuation_daily (
+    code          TEXT NOT NULL,
+    date          TEXT NOT NULL,
+    pe_ttm        REAL,
+    pb            REAL,
+    ps_ttm        REAL,
+    total_mv      REAL,
+    total_shares  REAL,
+    close_price   REAL,
+    change_rate   REAL,
+    source        TEXT NOT NULL,
+    fetched_at    TEXT NOT NULL,
+    created_at    TEXT NOT NULL,
+    resp_sha256   TEXT NOT NULL,
+    cache_key     TEXT,
+    PRIMARY KEY (code, date)
+)""",
+}
+
+#: 新 shape 的判定列：存在它即视为「已经是新 shape」，跳过迁移。
+_MIGRATE_P28_MARKER = {"money_flow_daily": "resp_sha256",
+                       "valuation_daily": "resp_sha256"}
+
+
+def _table_columns(conn, table: str) -> set[str]:
+    return {r[1] for r in conn.execute(f"PRAGMA table_info({table})")}
+
+
+def migrate_p28_valuation_moneyflow(conn) -> list[str]:
+    """把空的旧-shape 估值/资金流表前滚到新 shape，返回被重建的表名列表。
+
+    有数据的老表**不迁移**（append-only，历史不可丢），直接抛错 —— 让调用方停下来
+    决定，而不是静默删数据。触发器在 `init_db` 的 executescript 里已重建（CREATE
+    TRIGGER IF NOT EXISTS 幂等），故这里只负责表结构。
+    """
+    rebuilt: list[str] = []
+    for table, ddl in _MIGRATE_P28_DDL.items():
+        cols = _table_columns(conn, table)
+        if _MIGRATE_P28_MARKER[table] in cols:
+            continue                              # 已是新 shape
+        n = conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
+        if n:
+            raise RuntimeError(
+                f"{table} 是老 shape 且已有 {n} 行数据 —— 拒绝 DROP 重建"
+                "（append-only：历史行不可丢）。请人工处理后再前滚。"
+            )
+        conn.execute(f"DROP TABLE IF EXISTS {table}")
+        conn.execute(ddl)
+        rebuilt.append(table)
+    return rebuilt
+
 
 def _now_tag() -> str:
     return datetime.now(TZ).strftime("%Y%m%dT%H%M%SZ")
@@ -45,6 +124,9 @@ def init_db(db_path: Path, *, backup_dir: Path | None = None,
     conn = connect(db_path)
     try:
         conn.executescript(sql)
+        # P28：空表重定义（老库的 valuation/money_flow 是旧 shape，见模块 docstring）。
+        # 必须在 executescript 之后跑：触发器已在上面重建，这里只动表结构。
+        migrate_p28_valuation_moneyflow(conn)
         conn.commit()
     finally:
         conn.close()

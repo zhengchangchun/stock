@@ -93,29 +93,50 @@ CREATE VIEW IF NOT EXISTS v_adj_usable AS
 SELECT code, MAX(cqr) AS usable_from, COUNT(*) AS n_unusable
 FROM adj_factor_blackout GROUP BY code;
 
+-- 资金流（P28；append-only，见末尾触发器）。源 = 新浪 MoneyFlow.ssl_qsfx_zjlrqs。
+-- 单位：close/ratio_amount = 元，change_ratio/turnover = %，main_net/xl_net = 元（净额，可负）。
+-- ⚠️ `turnover` 是**新浪口径**（百分数值 ×100）：同一交易日 `bars_daily.turnover`（%）是它的
+--    1/100 —— 两表差 100 倍，消费方不得直接对拍（P28 计划 §2.1 实测结论）。
+-- PIT：下游只允许读 `date <= asof`；历史行一次写入后永不改写（触发器 + 首写保留）。
+-- `resp_sha256` / `cache_key` 让每一行可复现、可溯源（指回 raw_cache 原始响应）。
+-- 与 `store/migrate.py::MIGRATE_P28_DDL` 保持同文（空表重定义的单一真源需两处同步）。
 CREATE TABLE IF NOT EXISTS money_flow_daily (
-    code        TEXT NOT NULL,
-    date        TEXT NOT NULL,
-    main_net    REAL,                  -- 元
-    small_net   REAL,
-    mid_net     REAL,
-    big_net     REAL,
-    xl_net      REAL,
-    source      TEXT NOT NULL,
-    fetched_at  TEXT NOT NULL,
+    code          TEXT NOT NULL,
+    date          TEXT NOT NULL,      -- opendate（新浪原生 YYYY-MM-DD）
+    close         REAL,               -- trade 收盘价 元
+    change_ratio  REAL,               -- changeratio %
+    turnover      REAL,               -- 换手率（新浪口径，见上）
+    main_net      REAL,               -- netamount 主力净额 元（= 超大单 + 大单）
+    xl_net        REAL,               -- r0_net 超大单净额 元
+    ratio_amount  REAL,               -- ratioamount 元
+    source        TEXT NOT NULL,
+    fetched_at    TEXT NOT NULL,
+    created_at    TEXT NOT NULL,
+    resp_sha256   TEXT NOT NULL,
+    cache_key     TEXT,
     PRIMARY KEY (code, date)
 );
 
+-- 估值（P28；append-only，见末尾触发器）。源 = 东财 datacenter RPT_VALUEANALYSIS_DET。
+-- 单位：total_mv/close_price = 元，total_shares = 股，change_rate = %。
+-- ⚠️ 非 PIT 风险：东财按**最新股本重算整条历史 PE/PB**。对策 = 首写保留（不覆盖），
+--    重采检测到同 (code,date) 值变化时只记 warn 不覆盖（P28 计划 §4）。
+-- `pe_pct_3y`（3 年分位）是**派生特征**，由特征层从本表历史算出，不作为原始列存。
 CREATE TABLE IF NOT EXISTS valuation_daily (
-    code        TEXT NOT NULL,
-    date        TEXT NOT NULL,
-    pe_ttm      REAL,
-    pb          REAL,
-    total_mv    REAL,                  -- 元
-    div_yield   REAL,
-    pe_pct_3y   REAL,
-    source      TEXT NOT NULL,
-    fetched_at  TEXT NOT NULL,
+    code          TEXT NOT NULL,
+    date          TEXT NOT NULL,      -- TRADE_DATE 裁剪为 YYYY-MM-DD
+    pe_ttm        REAL,               -- PE_TTM
+    pb            REAL,               -- PB_MRQ（最新季报口径）
+    ps_ttm        REAL,               -- PS_TTM
+    total_mv      REAL,               -- TOTAL_MARKET_CAP 元
+    total_shares  REAL,               -- TOTAL_SHARES 股
+    close_price   REAL,               -- CLOSE_PRICE 元
+    change_rate   REAL,               -- CHANGE_RATE %
+    source        TEXT NOT NULL,
+    fetched_at    TEXT NOT NULL,
+    created_at    TEXT NOT NULL,
+    resp_sha256   TEXT NOT NULL,
+    cache_key     TEXT,
     PRIMARY KEY (code, date)
 );
 
@@ -661,3 +682,20 @@ BEGIN SELECT RAISE(ABORT, 'paper_nav_daily is append-only'); END;
 CREATE TRIGGER IF NOT EXISTS trg_paper_nav_daily_no_delete
 BEFORE DELETE ON paper_nav_daily
 BEGIN SELECT RAISE(ABORT, 'paper_nav_daily is append-only'); END;
+
+-- P28：估值 / 资金流原始表 append-only（历史行一次写入后永不改写；源站重算不覆盖）。
+CREATE TRIGGER IF NOT EXISTS trg_valuation_daily_no_update
+BEFORE UPDATE ON valuation_daily
+BEGIN SELECT RAISE(ABORT, 'valuation_daily is append-only'); END;
+
+CREATE TRIGGER IF NOT EXISTS trg_valuation_daily_no_delete
+BEFORE DELETE ON valuation_daily
+BEGIN SELECT RAISE(ABORT, 'valuation_daily is append-only'); END;
+
+CREATE TRIGGER IF NOT EXISTS trg_money_flow_daily_no_update
+BEFORE UPDATE ON money_flow_daily
+BEGIN SELECT RAISE(ABORT, 'money_flow_daily is append-only'); END;
+
+CREATE TRIGGER IF NOT EXISTS trg_money_flow_daily_no_delete
+BEFORE DELETE ON money_flow_daily
+BEGIN SELECT RAISE(ABORT, 'money_flow_daily is append-only'); END;

@@ -15,6 +15,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import re
 from dataclasses import replace
 from datetime import date, timedelta
@@ -22,8 +23,8 @@ from datetime import date, timedelta
 from stocklab.config.settings import Settings
 from stocklab.data.errors import FetchError
 from stocklab.data.http import RetryPolicy
-from stocklab.data.models import Bar, CorpAction, Quote
-from stocklab.data.sources import tencent
+from stocklab.data.models import Bar, CorpAction, MoneyFlowDaily, Quote, ValuationDaily
+from stocklab.data.sources import eastmoney, sina, tencent
 
 #: 不复权单次上限（ADR-003 实测）
 MAX_COUNT = tencent.MAX_COUNT
@@ -241,3 +242,108 @@ def fetch_corp_actions(
     # 把「零 K 线」当零事件则会把抓取失败静默成「没有除权」。
     return sorted((e for d, e in collected.items() if start <= d <= end),
                   key=lambda e: e.cqr)
+
+
+# ---------------------------------------------------------------------------
+# P28：估值 / 资金流采集。返回 `(row, resp_sha256, cache_key)` 三元组 ——
+# 每行携带**它来自哪一份原始响应**（`resp_sha256` = 该页 utf-8 正文 sha256，
+# `cache_key` = raw_cache params_key），保证任一行可复现、可溯源。
+# 缓存键第 3 段 = 锚点 `end` 日 → ADR-009 的盘中快照判据自动生效
+# （盘中抓的快照不进正式缓存、读侧视为未命中）。
+# ---------------------------------------------------------------------------
+
+def _resp_sha256(text: str) -> str:
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+def fetch_valuation_daily(
+    client,
+    *,
+    code: str,
+    start: str,
+    end: str,
+    page_size: int = eastmoney.VALUATION_PAGE_SIZE,
+    max_pages: int = MAX_PAGES,
+) -> list[tuple[ValuationDaily, str, str]]:
+    """抓取 `[start, end]` 的估值（东财 datacenter），按日期升序返回。
+
+    `code` 是 **6 位代码**（000333，不带市场前缀 —— SECURITY_CODE 口径）。
+    翻页按 `TRADE_DATE` 降序（源站排序）；首请求读 `result.pages` 定总页数，
+    逐页抓全。**fail-closed**：任一非末页行数 != page_size 即抛 `FetchError`
+    （源站截断 = 半截数据，不许当完整）。`pages=0`（无数据）返回 `[]`（合法：
+    ETF 通常没有估值行，由调用方显式留痕）。
+    """
+    out: list[tuple[ValuationDaily, str, str]] = []
+    total_pages: int | None = None
+    page = 1
+    while page <= max_pages:
+        url = eastmoney.valuation_url(code, page=page, page_size=page_size)
+        cache_key = f"valuation:{code}:{end}:{page}:{page_size}"
+        text = client.get_text(url, headers=eastmoney.DATACENTER_HEADERS,
+                               source="eastmoney", cache_key=cache_key)
+        payload = _loads(text)
+        result = (payload or {}).get("result") or {}
+        if total_pages is None:
+            total_pages = int(result.get("pages") or 0)
+        rows = eastmoney.parse_valuation(payload, code)
+        if total_pages and page < total_pages and len(rows) != page_size:
+            raise FetchError(
+                f"{code} 估值第 {page}/{total_pages} 页仅 {len(rows)} 行"
+                f"（期望 {page_size}）—— 源站截断，拒绝把半截当完整"
+            )
+        sha = _resp_sha256(text)
+        out.extend((r, sha, cache_key) for r in rows)
+        if not total_pages or page >= total_pages or not rows:
+            break
+        page += 1
+    else:
+        raise FetchError(
+            f"{code} 估值翻页超过 {max_pages} 页仍未取完（end={end}）——"
+            "拒绝返回不完整的历史"
+        )
+    out = [(r, s, k) for r, s, k in out if start <= r.date <= end]
+    out.sort(key=lambda t: t[0].date)
+    return out
+
+
+def fetch_money_flow_daily(
+    client,
+    *,
+    code: str,
+    start: str,
+    end: str,
+    page_size: int = sina.PAGE_SIZE,
+    max_pages: int = MAX_PAGES,
+) -> list[tuple[MoneyFlowDaily, str, str]]:
+    """抓取 `[start, end]` 的资金流（新浪），按日期升序返回。
+
+    `code` 用**源站形式**（`sz000333` / `sh600690`，`daima` 口径）。
+    翻页按 `opendate` 降序（`asc=0`），翻到空页即止。**fail-closed**：
+    非末页行数 != page_size 即抛（源站截断）；翻页超上限抛（防死循环）。
+    """
+    out: list[tuple[MoneyFlowDaily, str, str]] = []
+    page = 1
+    while page <= max_pages:
+        url = sina.moneyflow_url(code, page=page, num=page_size)
+        cache_key = f"moneyflow:{code}:{end}:{page}:{page_size}"
+        text = client.get_text(url, source="sina", cache_key=cache_key)
+        payload = _loads(text)
+        rows = sina.parse_moneyflow(payload, code)
+        if len(rows) > page_size:
+            raise FetchError(
+                f"{code} 资金流第 {page} 页返回 {len(rows)} 行（> page_size={page_size}）"
+                "—— 源站口径变化，拒绝解析"
+            )
+        sha = _resp_sha256(text)
+        out.extend((r, sha, cache_key) for r in rows)
+        if len(rows) < page_size:
+            break                                  # 到头了
+        page += 1
+    else:
+        raise FetchError(
+            f"{code} 资金流翻页超过 {max_pages} 页仍未取完（end={end}）——"
+            "拒绝返回不完整的历史"
+        )
+    out = [(r, s, k) for r, s, k in out if start <= r.date <= end]
+    out.sort(key=lambda t: t[0].date)
+    return out

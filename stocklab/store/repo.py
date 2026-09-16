@@ -25,7 +25,7 @@ from zoneinfo import ZoneInfo
 
 from stocklab.config.universe import Instrument, instrument_type
 from stocklab.data.adjust import ADJUSTABLE_TYPES
-from stocklab.data.models import Bar, CorpAction
+from stocklab.data.models import Bar, CorpAction, MoneyFlowDaily, ValuationDaily
 from stocklab.quality.checks import Issue
 
 TZ = ZoneInfo("Asia/Shanghai")
@@ -138,6 +138,97 @@ def insert_corp_actions(conn: sqlite3.Connection, actions: Sequence[CorpAction],
     )
     conn.commit()
     return len(rows), restated
+
+
+# ---------------------------------------------------------------------------
+# P28：估值 / 资金流（append-only，首写保留）。
+# 与 `bars_daily` 的「允许覆盖」**相反**：这两类数据会被源站**整体重算**
+# （东财按最新股本重算历史 PE/PB），若允许覆盖，最新一次抓取会用「今天重算的
+# 历史」洗掉「当初抓到的历史」—— 后者更接近 PIT。故同 (code,date) **首写保留**：
+# 重采值一致 → 幂等跳过；重采值不同 → 计入 `restated`（由调用方留 warn，不覆盖）。
+# ---------------------------------------------------------------------------
+
+def _val_tuple(v: ValuationDaily) -> tuple:
+    return (v.pe_ttm, v.pb, v.ps_ttm, v.total_mv, v.total_shares,
+            v.close_price, v.change_rate)
+
+
+def _flow_tuple(v: MoneyFlowDaily) -> tuple:
+    return (v.close, v.change_ratio, v.turnover, v.main_net, v.xl_net,
+            v.ratio_amount)
+
+
+def insert_valuation(conn: sqlite3.Connection,
+                     rows: Sequence[tuple[ValuationDaily, str, str]], *,
+                     now: str) -> tuple[int, int]:
+    """写入估值。`rows` = `(ValuationDaily, resp_sha256, cache_key)` 三元组。
+
+    返回 `(written, restated)`：`written` = 真正新增的行数（幂等重跑 = 0）；
+    `restated` = 同 (code,date) 已存在且**值不同**的行数（源站重算，不覆盖）。
+    """
+    if not rows:
+        return 0, 0
+    code = rows[0][0].code
+    existing = {r["date"]: r for r in conn.execute(
+        "SELECT date, pe_ttm, pb, ps_ttm, total_mv, total_shares, close_price,"
+        " change_rate FROM valuation_daily WHERE code=?", (code,))}
+    restated = 0
+    fresh: list = []
+    for v, sha, cache_key in rows:
+        old = existing.get(v.date)
+        if old is not None:
+            if _val_tuple(v) != (old["pe_ttm"], old["pb"], old["ps_ttm"],
+                                 old["total_mv"], old["total_shares"],
+                                 old["close_price"], old["change_rate"]):
+                restated += 1
+            continue                                  # 首写保留：不覆盖
+        fresh.append((v.code, v.date, v.pe_ttm, v.pb, v.ps_ttm, v.total_mv,
+                      v.total_shares, v.close_price, v.change_rate, v.source,
+                      now, now, sha, cache_key))
+    conn.executemany(
+        "INSERT INTO valuation_daily (code, date, pe_ttm, pb, ps_ttm, total_mv,"
+        " total_shares, close_price, change_rate, source, fetched_at, created_at,"
+        " resp_sha256, cache_key) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        fresh,
+    )
+    conn.commit()
+    return len(fresh), restated
+
+
+def insert_money_flow(conn: sqlite3.Connection,
+                      rows: Sequence[tuple[MoneyFlowDaily, str, str]], *,
+                      now: str) -> tuple[int, int]:
+    """写入资金流。`rows` = `(MoneyFlowDaily, resp_sha256, cache_key)` 三元组。
+
+    返回 `(written, restated)`：语义同 `insert_valuation`（幂等重跑 = 0）。
+    """
+    if not rows:
+        return 0, 0
+    code = rows[0][0].code
+    existing = {r["date"]: r for r in conn.execute(
+        "SELECT date, close, change_ratio, turnover, main_net, xl_net,"
+        " ratio_amount FROM money_flow_daily WHERE code=?", (code,))}
+    restated = 0
+    fresh: list = []
+    for v, sha, cache_key in rows:
+        old = existing.get(v.date)
+        if old is not None:
+            if _flow_tuple(v) != (old["close"], old["change_ratio"],
+                                  old["turnover"], old["main_net"],
+                                  old["xl_net"], old["ratio_amount"]):
+                restated += 1
+            continue                                  # 首写保留：不覆盖
+        fresh.append((v.code, v.date, v.close, v.change_ratio, v.turnover,
+                      v.main_net, v.xl_net, v.ratio_amount, v.source,
+                      now, now, sha, cache_key))
+    conn.executemany(
+        "INSERT INTO money_flow_daily (code, date, close, change_ratio, turnover,"
+        " main_net, xl_net, ratio_amount, source, fetched_at, created_at,"
+        " resp_sha256, cache_key) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        fresh,
+    )
+    conn.commit()
+    return len(fresh), restated
 
 
 def insert_adj_factors(conn: sqlite3.Connection, code: str, chain, *,
