@@ -1884,6 +1884,54 @@ def cmd_paper_show(args: argparse.Namespace) -> int:
     return 0
 
 
+# ---------- chain（P26） ----------
+
+def cmd_chain_accuracy(args: argparse.Namespace) -> int:
+    """链路准确率视图（离线只读）：四段分列，样本不足就明说。
+
+    默认写 `reports/<today>-chain-accuracy.{json,md}`；正文**不含生成时刻**，
+    同输入两次运行逐字节一致（与 `predict` / `review` 报告同纪律）。
+    """
+    from stocklab.chain.accuracy import build_chain_accuracy, render_markdown
+
+    db = Path(args.db) if args.db else paths.DB_PATH
+    if not db.exists():
+        print(json.dumps({"error": "db not found; run `stocklab db init`"},
+                         ensure_ascii=False), file=sys.stderr)
+        return 2
+    conn = connect(db)
+    try:
+        rep = build_chain_accuracy(conn, from_date=args.from_date,
+                                   to_date=args.to_date)
+    finally:
+        conn.close()
+
+    md = render_markdown(rep)
+    date = args.date or _today()
+    path = Path(args.out) if args.out else (
+        paths.REPORT_DIR / f"{date}-chain-accuracy.md")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(md, encoding="utf-8")
+    json_path = path.with_suffix(".json")
+    json_path.write_text(
+        json.dumps(rep, ensure_ascii=False, sort_keys=True, indent=2) + "\n",
+        encoding="utf-8")
+
+    if args.json:
+        print(json.dumps(rep, ensure_ascii=False, sort_keys=True, indent=2))
+        return 0
+    segs = {s["segment"]: {"n_days": s["n_days"],
+                           "sufficient": s["gate"]["sufficient"],
+                           "label": s["gate"]["label"]}
+            for s in rep["segments"]}
+    print(json.dumps({"report": str(path), "json": str(json_path),
+                      "origin_rule": rep["origin_rule"],
+                      "provenance_counts": rep["provenance_counts"],
+                      "segments": segs},
+                     ensure_ascii=False, sort_keys=True, indent=2))
+    return 0
+
+
 # ---------- parser ----------
 
 def build_parser() -> argparse.ArgumentParser:
@@ -2247,6 +2295,21 @@ def build_parser() -> argparse.ArgumentParser:
     pp_show.add_argument("--db")
     pp_show.add_argument("--now", help="覆盖当前时刻（测试用）")
     pp_show.set_defaults(func=cmd_paper_show)
+
+    chain = sub.add_parser(
+        "chain", help="全链路准确率视图（P26）：四段分列，样本不足就明说")
+    chain_sub = chain.add_subparsers(dest="chain_action", required=True)
+    ch_acc = chain_sub.add_parser(
+        "accuracy", help="回放 / 实时 / 模拟盘 / 实盘四段并列（离线只读）")
+    ch_acc.add_argument("--db", help="数据库路径（默认 data/stocklab.db）")
+    ch_acc.add_argument("--from", dest="from_date",
+                        help="起始日 YYYY-MM-DD（默认取库里最早 target_date）")
+    ch_acc.add_argument("--to", dest="to_date",
+                        help="截止日 YYYY-MM-DD（默认取库里最晚 target_date）")
+    ch_acc.add_argument("--date", help="报告文件名里的日期（默认今天）")
+    ch_acc.add_argument("--out", help="报告路径（默认 reports/<today>-chain-accuracy.md）")
+    ch_acc.add_argument("--json", action="store_true", help="把整份报告打到 stdout")
+    ch_acc.set_defaults(func=cmd_chain_accuracy)
 
     doctor = sub.add_parser("doctor", help="数据健康度报告（离线）")
     doctor.set_defaults(func=lambda _a: cmd_doctor())
