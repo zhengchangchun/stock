@@ -87,6 +87,34 @@ def migrate_p28_valuation_moneyflow(conn) -> list[str]:
     return rebuilt
 
 
+#: P32 迁移的判定列：存在它即视为「已有 origin 列」，跳过。
+_MIGRATE_P32_MARKER = "origin"
+
+#: 追加的列定义。与 schema.sql 里 predictions 的 `origin` 列定义**同文**
+#: （改一处须同步另一处）。ALTER TABLE ADD COLUMN 追加到表尾，故 schema.sql 里
+#: 也把 origin 放在 created_at 之后，保证新库/老库列序一致。
+_MIGRATE_P32_ADD_COLUMN = (
+    "ALTER TABLE predictions ADD COLUMN "
+    "origin TEXT CHECK (origin IN ('live','replay'))"
+)
+
+
+def migrate_p32_predictions_origin(conn) -> list[str]:
+    """给 `predictions` 增 `origin` 列（P32），返回变更列表。
+
+    append-only 兼容：**只加列，不碰任何历史行**。`ALTER TABLE ADD COLUMN` 让所有
+    老行 `origin` 为 NULL —— 这正是要的：历史行**不许回填**成 live/replay（那等于
+    按推断结果冒充事实）。NULL 通过 `CHECK (origin IN ('live','replay'))`（`NULL IN
+    (...)` 判 NULL 而非 FALSE），读取侧对 NULL 退回 `created_at[:10] == asof_date`
+    推断（见 `chain.accuracy` / `session.review.classify`）。
+    """
+    cols = _table_columns(conn, "predictions")
+    if _MIGRATE_P32_MARKER in cols:
+        return []
+    conn.execute(_MIGRATE_P32_ADD_COLUMN)
+    return ["predictions.origin"]
+
+
 def _now_tag() -> str:
     return datetime.now(TZ).strftime("%Y%m%dT%H%M%SZ")
 
@@ -127,6 +155,8 @@ def init_db(db_path: Path, *, backup_dir: Path | None = None,
         # P28：空表重定义（老库的 valuation/money_flow 是旧 shape，见模块 docstring）。
         # 必须在 executescript 之后跑：触发器已在上面重建，这里只动表结构。
         migrate_p28_valuation_moneyflow(conn)
+        # P32：给 predictions 增 origin 列（只加列、不回填历史行）。
+        migrate_p32_predictions_origin(conn)
         conn.commit()
     finally:
         conn.close()

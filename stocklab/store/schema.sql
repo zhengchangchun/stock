@@ -277,10 +277,14 @@ CREATE TABLE IF NOT EXISTS predictions (
     feature_snapshot_id INTEGER REFERENCES features_daily (snapshot_id),
     model_version       TEXT NOT NULL,
     status              TEXT NOT NULL DEFAULT 'ok' CHECK (status IN ('ok','failed')),
-    created_at          TEXT NOT NULL
+    created_at          TEXT NOT NULL,
+    -- P32：来源标记（回放 replay / 实时 live）。入库时就由写入路径确定，非事后推断。
+    -- 历史行（加列前已存在的）保持 NULL：NULL 语义 = 「无来源标记，退回
+    -- `created_at[:10] == asof_date` 推断」。NULL 通过 CHECK（NULL IN (...) → NULL 非
+    -- FALSE），不冒充事实。列放在 created_at 之后，与 ALTER TABLE ADD COLUMN
+    -- （append-only 老库的迁移路径）追加到尾部的顺序一致。
+    origin              TEXT CHECK (origin IN ('live','replay'))
 );
-
-CREATE INDEX IF NOT EXISTS idx_predictions_target ON predictions (target_date);
 
 -- 预测的身份键（P6）：同 (code, asof_date, model_version) 只能有一条。
 -- 这是**结构性**防线而不是代码检查：即便将来有别的写入方绕开
