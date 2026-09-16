@@ -111,3 +111,26 @@ def test_doctor_flags_missing_origin_without_migrating(tmp_db, monkeypatch, caps
     cols = {r[1] for r in conn.execute("PRAGMA table_info(predictions)")}
     conn.close()
     assert "origin" not in cols
+
+
+def test_session_tick_refuses_uninitialized_db_before_migrating(tmp_path, monkeypatch, capsys):
+    """`session tick` 的守卫必须先于前滚（P33 顺序回归）。
+
+    实证：`ensure_schema` 会在空库上建出全部 32 张表（含 `quote_snapshots`）——
+    若它跑在 `_has_session_tables` 守卫**之前**，守卫就成了死代码：本该退出 2
+    提示「先跑 db init」的库会被顺手建表并继续 tick。
+    """
+    from stocklab.cli.main import cmd_session_tick
+
+    db = tmp_path / "bare.db"
+    db.touch()                                   # 空库：无任何表
+    monkeypatch.setattr(paths, "DB_PATH", db)
+    args = build_parser().parse_args(["session", "tick", "--no-capture"])
+    assert cmd_session_tick(args) == 2
+    assert "db init" in capsys.readouterr().err
+    conn = connect(db)
+    n = conn.execute(
+        "SELECT COUNT(*) FROM sqlite_master WHERE type='table'"
+        " AND name='quote_snapshots'").fetchone()[0]
+    conn.close()
+    assert n == 0                                # 守卫先拦下 → 一张表都没建

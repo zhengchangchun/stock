@@ -1516,7 +1516,6 @@ def cmd_session_tick(args: argparse.Namespace) -> int:
     settings = load_settings()
     client = HttpClient(policy_from_settings(settings), cache=None)
 
-    ensure_schema(db)   # 写库入口前滚（P33）
     conn = connect(db)
     try:
         if not _has_session_tables(conn):
@@ -1524,6 +1523,7 @@ def cmd_session_tick(args: argparse.Namespace) -> int:
                                        "`stocklab db init` 前滚 schema"},
                              ensure_ascii=False), file=sys.stderr)
             return 2
+        ensure_schema(db)   # 写库入口前滚（P33）：先过 session 表守卫再补列
         universe = tuple(i for i in _tick_universe(conn)
                          if not args.code or i.code in args.code)
         summary = run_tick(
