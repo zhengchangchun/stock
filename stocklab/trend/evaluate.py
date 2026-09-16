@@ -305,16 +305,31 @@ def evaluate_segment(rows: Sequence[Row], *, label: str = "",
                 }
         m1[state] = block
 
+        # F2 的原文是「延续率 **不高于该状态的无条件频率**」—— 基线就是本段里
+        # 该状态的**边际频率**（`len(sub)/len(all_rows)`），不是当日占比。
+        # 当日占比会把 baseline 抬到「出现该状态的那些天」的占比上（选择效应），
+        # 那不是 F2 说的量。当日配对的对照读数另存 `delta_day_matched` 登记备查，
+        # **不参与判定**。
         freq = len(sub) / len(all_rows)
+        daily_p = ([_persist_rate(v) for _, v in sorted(_by_day(sub).items())]
+                   if sub else [])
+        ci = _boot_ci(daily_p, n_boot=n_boot, seed=seed)
         pblock = {"n_rows": len(sub), "state": state,
                   "persistence": _persist_rate(sub) if sub else None,
                   "baseline_freq": freq,
+                  "delta": (statistics.fmean(daily_p) - freq) if daily_p else None,
+                  "delta_ci95": (None if ci is None else [ci[0] - freq, ci[1] - freq]),
+                  "n_days": len(daily_p), "n_boot": n_boot, "seed": seed,
+                  "method": "day_clustered_percentile_bootstrap（日级延续率的区间，"
+                            "整体减去边际频率）",
+                  "baseline_kind": "该状态在本段的无条件频率（预注册 §1 F2 原文）",
                   "by_code": {}}
-        pblock.update(_delta_block(
-            sub, all_rows,
-            day_value=_persist_rate,
+        _dm = _delta_block(
+            sub, all_rows, day_value=_persist_rate,
             base_value=lambda day: len([r for r in day if r.state == state]) / len(day),
-            n_boot=n_boot, seed=seed))
+            n_boot=n_boot, seed=seed)
+        pblock["delta_day_matched"] = _dm["delta"]
+        pblock["delta_day_matched_ci95"] = _dm["delta_ci95"]
         if sub:
             for code in sorted({r.code for r in sub}):
                 cs = [r for r in sub if r.code == code]
@@ -634,6 +649,13 @@ def _selfcheck(rows: Sequence[Row]) -> dict:
                             for s in STATES},
         "prereg_reading": PREREG_EXPLORE,
         "prereg_reading_source": f"{PREREG_DOC} §4.1（探索性读数，非结论）",
+        "universe_note": ("§4.1 的脚本跑在**未按日历裁剪**的全量 bar 上"
+                          "（n=13972 ≈ 本库 13975 行）；正式口径按预注册 §3 "
+                          "限定在 trading_calendar 内 → 两者不可逐行对比。"
+                          "本实现与 §4.1 在 **UP 条件命中率与行数上逐位吻合**"
+                          "（0.5198 vs 0.5199、4454 vs 4453 行），"
+                          "DOWN 侧与两侧基线不吻合（对方脚本已不在，"
+                          "**不拿探索性数字反推口径**）。"),
     }
 
 
@@ -761,6 +783,18 @@ def render_markdown(rep: Mapping[str, Any]) -> str:
     A("### 2.2 M2 状态延续率")
     A("")
     L.extend(_m2_table(rep["splits"]["validate"]))
+    A("")
+    A("M2 判定口径：`Δ = 延续率 − 该状态的**无条件频率**`（F2 原文），"
+      "CI 由**日级延续率**按日聚类 bootstrap 后整体平移；"
+      "表中另登记 `delta_day_matched`（以当日占比为基线的对照读数），"
+      "该列**不参与判定**。")
+    A("")
+    A("| 状态 | 延续率 | 无条件频率 | Δ（判定口径） | 当日配对 Δ（仅登记） |")
+    A("|------|------:|----------:|-------------:|--------------------:|")
+    for s_ in STATES:
+        b = rep["splits"]["validate"]["M2"][s_]
+        A(f"| {s_} | {_pct(b['persistence'])} | {_pct(b['baseline_freq'])} | "
+          f"{_pct(b['delta'])} | {_pct(b.get('delta_day_matched'))} |")
     A("")
     A("### 2.3 逐标的（M1 条件命中率）")
     A("")
