@@ -65,9 +65,12 @@ def sell_to_cash(close: float, qty: int, *,
 
     口径**全程走 `CostModel("stock")`**（佣金 0.025% 且最低 5 元、印花税 0.05%
     仅卖出、过户费 0.001% 双边、滑点 5 个基点卖出下调）。
-    费用总额取 `model.fees()` 这个**权威入口**，逐项明细只是把它拆开展示；
-    两者不一致就是本模块的 bug，`fees_priced_against` 把它暴露出来
-    （正常情况下恒为 0.00，有测试钉住 0.01 以内）。
+    费用总额取 `model.fees()` 这个**权威入口**，逐项明细只是把它拆开展示。
+    `fees_priced_against` = 明细三项各自取到分再相加 − `fee_total`：
+    每项都与 `fees()` 逐分同源，差值只来自「先分别四舍五入再求和」，
+    实测为 0 / ±0.01（`model.fees()` 内部是「先求和再四舍五入」，
+    这是两者唯一的区别，不是费率不一致）。**不得**用明细相加减去顶替
+    `fee_total` —— 那会让页面数字与回测/交割口径分叉，有测试钉住。
     """
     m = model or CostModel(asset_class=ASSET_STOCK)
     fill = m.fill_price("sell", close)          # 卖出：下调滑点后的成交价
