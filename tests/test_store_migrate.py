@@ -3,7 +3,13 @@ import sqlite3
 import pytest
 
 from stocklab.store.db import connect, transaction
-from stocklab.store.migrate import backup_db, init_db, migrate_p32_predictions_origin
+from stocklab.store.migrate import (
+    backup_db,
+    ensure_schema,
+    init_db,
+    migrate_p32_predictions_origin,
+    schema_status,
+)
 
 
 #: P32 之前的旧 shape（无 origin 列），用来模拟「加列前已存在的老库」。
@@ -179,3 +185,64 @@ def test_p32_migration_is_idempotent(tmp_db):
     init_db(tmp_db)                    # 已是新 shape（含 origin）
     with connect(tmp_db) as conn:
         assert migrate_p32_predictions_origin(conn) == []
+
+
+# ---------- P33：ensure_schema（写库入口统一前滚） ----------
+
+def test_ensure_schema_adds_origin_with_null_for_existing_rows(tmp_path):
+    """老库（缺 origin）上跑 ensure_schema：加列 + 老行 NULL + 报告变更。"""
+    db = tmp_path / "legacy.db"
+    _make_legacy_db(db, n_rows=3)
+    changes = ensure_schema(db)
+    assert "predictions.origin" in changes
+    with connect(db) as conn:
+        assert "origin" in _cols(conn, "predictions")
+        assert conn.execute("SELECT COUNT(*) FROM predictions").fetchone()[0] == 3
+        assert conn.execute(
+            "SELECT COUNT(*) FROM predictions WHERE origin IS NULL").fetchone()[0] == 3
+        codes = {r[0] for r in conn.execute("SELECT code FROM predictions")}
+        assert codes == {"000000", "000001", "000002"}
+
+
+def test_ensure_schema_is_idempotent_and_cheap_when_clean(tmp_db):
+    """已是新 shape 时 ensure_schema 零变更、零备份。"""
+    init_db(tmp_db)
+    backup_dir = tmp_db.parent / "backups"
+    n_before = len(list(backup_dir.glob("*"))) if backup_dir.exists() else 0
+    assert ensure_schema(tmp_db) == []
+    n_after = len(list(backup_dir.glob("*"))) if backup_dir.exists() else 0
+    assert n_after == n_before            # 没有新增备份文件
+
+
+def test_ensure_schema_backs_up_once_when_migrating(tmp_path):
+    """确有结构变更时才备份一次；再次调用不再备份。"""
+    db = tmp_path / "legacy.db"
+    _make_legacy_db(db, n_rows=1)
+    backup_dir = tmp_path / "backups"
+    assert ensure_schema(db) == ["predictions.origin"]
+    assert len(list(backup_dir.glob("*.db"))) == 1
+    assert ensure_schema(db) == []        # 已前滚 → 不再备份
+    assert len(list(backup_dir.glob("*.db"))) == 1
+
+
+def test_schema_status_reports_markers(tmp_db):
+    init_db(tmp_db)
+    with connect(tmp_db) as conn:
+        st = schema_status(conn)
+    assert st["ok"] is True
+    assert st["markers"]["p32_predictions_origin"]["present"] is True
+    assert st["markers"]["p28_resp_sha256_valuation"]["present"] is True
+    assert st["markers"]["p28_resp_sha256_moneyflow"]["present"] is True
+
+
+def test_schema_status_flags_missing_origin(tmp_path):
+    """只报告、不迁移：schema_status 对缺列的老库报 present=False。"""
+    db = tmp_path / "legacy.db"
+    _make_legacy_db(db, n_rows=0)
+    with connect(db) as conn:
+        st = schema_status(conn)
+    assert st["ok"] is False
+    assert st["markers"]["p32_predictions_origin"]["present"] is False
+    # schema_status 是只读探测：不迁移
+    with connect(db) as conn:
+        assert "origin" not in _cols(conn, "predictions")

@@ -83,3 +83,31 @@ def test_doctor_exposes_open_issues_and_last_job(tmp_db, monkeypatch, capsys):
     out = json.loads(capsys.readouterr().out)
     assert out["last_job"]["job_name"] == "ingest_daily_bars"
     assert out["last_job"]["status"] == "ok"
+
+
+def test_doctor_reports_schema_markers_ok(tmp_db, monkeypatch, capsys):
+    init_db(tmp_db)
+    monkeypatch.setattr(paths, "DB_PATH", tmp_db)
+    assert cmd_doctor() == 0
+    out = json.loads(capsys.readouterr().out)
+    assert out["schema"]["ok"] is True
+    assert out["schema"]["markers"]["p32_predictions_origin"]["present"] is True
+
+
+def test_doctor_flags_missing_origin_without_migrating(tmp_db, monkeypatch, capsys):
+    """doctor 对缺列的旧库**显式告警**，但只读、不擅自迁移（P33）。"""
+    init_db(tmp_db)
+    conn = connect(tmp_db)
+    conn.execute("ALTER TABLE predictions DROP COLUMN origin")
+    conn.commit()
+    conn.close()
+    monkeypatch.setattr(paths, "DB_PATH", tmp_db)
+    assert cmd_doctor() == 0
+    out = json.loads(capsys.readouterr().out)
+    assert out["schema"]["ok"] is False
+    assert out["schema"]["markers"]["p32_predictions_origin"]["present"] is False
+    # 只报告、不迁移：origin 列仍然缺失
+    conn = connect(tmp_db)
+    cols = {r[1] for r in conn.execute("PRAGMA table_info(predictions)")}
+    conn.close()
+    assert "origin" not in cols

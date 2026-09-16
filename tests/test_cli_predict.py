@@ -107,6 +107,31 @@ def test_predict_run_rejects_a_non_session_date(env, capsys):
     assert "日历" in capsys.readouterr().err
 
 
+def test_predict_run_rolls_forward_missing_origin_column(env, capsys):
+    """写库入口在「缺 origin 列的旧库」上自动前滚，而不是 OperationalError（P33 根因）。
+
+    反向构造：把 env（已 init_db 的新 shape 库）的 `origin` 列 DROP 掉，模拟
+    P32 迁移**没跑到**的真库现场。接线前这里会在 `insert_prediction` 撞
+    `sqlite3.OperationalError: table predictions has no column named origin`；
+    接线后 `ensure_schema` 先补列，写入口照常成功。
+    """
+    conn = connect(env["db"])
+    conn.execute("ALTER TABLE predictions DROP COLUMN origin")
+    conn.commit()
+    conn.close()
+
+    assert run(env) == 0
+    out = capsys.readouterr().out
+    assert "inserted:1" in out                    # 新行已落库（不再是 OperationalError）
+
+    conn = connect(env["db"])
+    cols = {r[1] for r in conn.execute("PRAGMA table_info(predictions)")}
+    assert "origin" in cols                       # 自动前滚补回了列
+    row = conn.execute("SELECT origin FROM predictions").fetchone()
+    assert row["origin"] == "live"                # 写入口按 live 来源落库
+    conn.close()
+
+
 def test_predict_run_exits_nonzero_on_conflict_without_overwriting(env, capsys):
     """同键但载荷不同 → 退出码 1，且**原行一个字节都不变**。
 
