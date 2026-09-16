@@ -155,3 +155,15 @@ def latest_nav(conn: sqlite3.Connection, account_id: str, *,
                asof: str | None = None) -> dict | None:
     rows = load_nav(conn, account_id, asof=asof)
     return rows[-1] if rows else None
+
+
+def latest_nav_date(conn: sqlite3.Connection) -> str | None:
+    """全库**最新净值日期**（任一账户有净值即可）。一条都没有 → `None`。"""
+    row = conn.execute(f"SELECT MAX(date) AS d FROM {TABLE_NAV}").fetchone()
+    return row["d"] if row and row["d"] else None
+
+
+def nav_date_exists(conn: sqlite3.Connection, date: str) -> bool:
+    """该日期是否**已经有**净值行（任一账户）。"""
+    return conn.execute(f"SELECT 1 FROM {TABLE_NAV} WHERE date = ? LIMIT 1",
+                        (date,)).fetchone() is not None

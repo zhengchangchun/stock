@@ -1763,22 +1763,43 @@ def cmd_paper_step(args: argparse.Namespace) -> int:
     return 0
 
 
+def _show_today(args: argparse.Namespace) -> str:
+    """`paper show` 的「今天」：`--now` 给了就按它推，否则取系统日。
+
+    时钟是**参数**不是环境（错误日记 #30）—— 否则「今日还没净值」这条分支
+    在测试里根本钉不住（真实日期一走到 09-16 就自动变绿）。
+    """
+    now = getattr(args, "now", None)
+    if now:
+        try:
+            return datetime.fromisoformat(now).date().isoformat()
+        except ValueError:
+            return now[:10]
+    return _today()
+
+
 def cmd_paper_show(args: argparse.Namespace) -> int:
-    """查模拟盘现状（离线只读，不写任何表、不落报告）。"""
+    """查模拟盘现状（离线只读，不写任何表、不落报告）。
+
+    不带 `--asof` 时 asof 默认取今天；**今天还没有净值行**则回落到最新有净值的
+    日期，并在 `asof_source` / `disclosure` 里如实写明「展示的不是今天」——
+    直接返回 `accounts: []` 会被读成「模拟盘不存在」。
+    """
     from stocklab.paper import engine
 
     conn, code = _paper_conn(args)
     if conn is None:
         return code
-    asof = args.asof or _today()
     try:
-        payload = engine.state_payload(conn, asof)
+        payload = engine.show_payload(conn, _show_today(args), requested=args.asof)
     except engine.PaperError as exc:
         conn.close()
         return _paper_fail(exc)
     conn.close()
     print(json.dumps(payload, ensure_ascii=False, sort_keys=True, indent=2))
-    print(json.dumps({"asof": asof,
+    print(json.dumps({"asof": payload["asof"],
+                      "asof_source": payload["asof_source"],
+                      "latest_nav_date": payload["latest_nav_date"],
                       "accounts": [{"account_id": a["account_id"], "nav": a["nav"],
                                     "cum_return": a["cum_return"],
                                     "max_or_last_drawdown": a["drawdown"]}

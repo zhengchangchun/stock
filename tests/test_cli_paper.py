@@ -159,3 +159,70 @@ def test_json_output_is_stable_sorted(db, tmp_path, capsys):
                     "--out", str(tmp_path / "s.md"), capsys=capsys)
     assert out.strip() == json.dumps(json.loads(out), ensure_ascii=False,
                                      sort_keys=True, indent=2).strip()
+
+
+def run_at(db, now, *argv, capsys):
+    """同 `run`，但显式指定「当前时刻」（`paper show` 的默认 asof 由它推出）。"""
+    code = main([*argv, "--db", str(db), "--now", now])
+    out, err = capsys.readouterr()
+    return code, out, err
+
+
+def test_show_without_asof_falls_back_to_latest_nav_date(db, tmp_path, capsys):
+    """① 今日（2026-09-16）还没跑 step → 不许返回空列表，必须回落到最新净值日。
+
+    改前：`paper show` 直接拿今天当 asof，`state_payload` 按「当日有净值」过滤
+    → `accounts: []`，看起来像「模拟盘不存在」。
+    """
+    run(db, "paper", "init", capsys=capsys)
+    code, _, err = run(db, "paper", "step", "--asof", "2026-09-15",
+                       "--out", str(tmp_path / "s.md"), capsys=capsys)
+    assert code == 0, err
+
+    code, out, err = run_at(db, "2026-09-16T16:00:00+08:00", "paper", "show",
+                            capsys=capsys)
+    assert code == 0, err
+    p = json.loads(out)
+    assert p["asof"] == "2026-09-15", "必须回落到最新有净值的日期"
+    assert p["asof_source"] == "latest_nav"
+    assert p["latest_nav_date"] == "2026-09-15"
+    assert len(p["accounts"]) == 5, "回落之后必须看得到三条臂（5 个账户）"
+    assert "今日净值未生成，展示 2026-09-15" in p["disclosure"], \
+        "必须显式披露「展示的不是今天」"
+    assert json.loads(err)["asof"] == "2026-09-15"
+    assert json.loads(err)["asof_source"] == "latest_nav"
+
+
+def test_show_without_asof_does_not_fall_back_when_today_has_nav(db, tmp_path,
+                                                                 capsys):
+    """② 今日已有净值 → 不回落（有数就不许退到过去）。"""
+    run(db, "paper", "init", capsys=capsys)
+    for d in ("2026-09-15", "2026-09-16"):
+        code, _, err = run(db, "paper", "step", "--asof", d,
+                           "--out", str(tmp_path / f"{d}.md"), capsys=capsys)
+        assert code == 0, err
+
+    code, out, err = run_at(db, "2026-09-16T16:00:00+08:00", "paper", "show",
+                            capsys=capsys)
+    assert code == 0, err
+    p = json.loads(out)
+    assert p["asof"] == "2026-09-16"
+    assert p["asof_source"] == "today"
+    assert p["latest_nav_date"] == "2026-09-16"
+    assert not any("今日净值未生成" in d for d in p["disclosure"])
+    assert len(p["accounts"]) == 5
+
+
+def test_show_with_explicit_asof_is_honoured_verbatim(db, tmp_path, capsys):
+    """显式 `--asof` 一律照用（不回落）—— 用户问哪天就答哪天，空就是空。"""
+    run(db, "paper", "init", capsys=capsys)
+    run(db, "paper", "step", "--asof", "2026-09-15",
+        "--out", str(tmp_path / "s.md"), capsys=capsys)
+
+    code, out, err = run_at(db, "2026-09-16T16:00:00+08:00", "paper", "show",
+                            "--asof", "2026-09-14", capsys=capsys)
+    assert code == 0, err
+    p = json.loads(out)
+    assert p["asof"] == "2026-09-14"
+    assert p["asof_source"] == "explicit"
+    assert p["accounts"] == []      # 那天确实还没跑，如实返回空

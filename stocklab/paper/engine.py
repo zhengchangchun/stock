@@ -597,6 +597,53 @@ def state_payload(conn: sqlite3.Connection, asof: str) -> dict:
 
 # ---------- 报告 ----------
 
+ASOF_SOURCE_EXPLICIT = "explicit"
+ASOF_SOURCE_TODAY = "today"
+ASOF_SOURCE_LATEST_NAV = "latest_nav"
+
+NO_NAV_TODAY_FMT = "今日净值未生成，展示 {date}"
+
+
+def resolve_show_asof(conn: sqlite3.Connection, today: str, *,
+                      requested: str | None = None) -> dict:
+    """`paper show` 的 asof 解析（顺序即优先级）。
+
+    1. 显式给了 `--asof` → **照用**（`explicit`）：用户问哪天就答哪天，空就是空。
+    2. 没给 → 先试今天；**今天已有净值**就用今天（`today`）。
+    3. 今天一行净值都没有 → 回落到 `MAX(paper_nav_daily.date)`（`latest_nav`）。
+       改前这里直接按今天过滤 → `accounts: []`，看起来像「模拟盘不存在」。
+    4. 库里一条净值都没有 → 保持今天（`today`），此时 accounts 为空是**真话**。
+    """
+    latest = store.latest_nav_date(conn)
+    if requested is not None:
+        return {"asof": requested, "asof_source": ASOF_SOURCE_EXPLICIT,
+                "latest_nav_date": latest}
+    if store.nav_date_exists(conn, today):
+        return {"asof": today, "asof_source": ASOF_SOURCE_TODAY,
+                "latest_nav_date": latest}
+    if latest is not None and latest < today:
+        return {"asof": latest, "asof_source": ASOF_SOURCE_LATEST_NAV,
+                "latest_nav_date": latest}
+    return {"asof": today, "asof_source": ASOF_SOURCE_TODAY,
+            "latest_nav_date": latest}
+
+
+def show_payload(conn: sqlite3.Connection, today: str, *,
+                 requested: str | None = None) -> dict:
+    """`paper show` 的对外载荷 = `state_payload` + asof 的实际来源。
+
+    回落时在 `disclosure` 里写明「展示的不是今天」——**不许静默**（铁律③）。
+    """
+    res = resolve_show_asof(conn, today, requested=requested)
+    payload = state_payload(conn, res["asof"])
+    payload["asof_source"] = res["asof_source"]
+    payload["latest_nav_date"] = res["latest_nav_date"]
+    if res["asof_source"] == ASOF_SOURCE_LATEST_NAV:
+        payload["disclosure"] = [*payload["disclosure"],
+                                 NO_NAV_TODAY_FMT.format(date=res["asof"])]
+    return payload
+
+
 def build_report(conn: sqlite3.Connection, asof: str) -> dict:
     """报告数据（纯函数式：同一库 + 同一 asof → 同一结果，不含生成时刻）。"""
     accounts = store.load_accounts(conn)
