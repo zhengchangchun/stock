@@ -47,7 +47,7 @@ def conn(tmp_db):
 
 
 def test_insert_reports_inserted_and_row_is_readable(conn):
-    state, pred_id = insert_prediction(conn, payload(), now="2026-09-14T19:00:00+08:00")
+    state, pred_id = insert_prediction(conn, payload(), now="2026-09-14T19:00:00+08:00", origin="live")
     assert state == "inserted" and pred_id > 0
     row = find_prediction(conn, "000333", "2026-09-14", M.MODEL_VERSION)
     assert row["target_date"] == "2026-09-15"
@@ -59,8 +59,8 @@ def test_insert_reports_inserted_and_row_is_readable(conn):
 
 
 def test_same_payload_is_identical_not_duplicated(conn):
-    insert_prediction(conn, payload(), now="t1")
-    state, pred_id = insert_prediction(conn, payload(), now="t2")
+    insert_prediction(conn, payload(), now="t1", origin="live")
+    state, pred_id = insert_prediction(conn, payload(), now="t2", origin="live")
     assert state == "identical"
     assert conn.execute("SELECT COUNT(*) FROM predictions").fetchone()[0] == 1
     assert pred_id == find_prediction(conn, "000333", "2026-09-14",
@@ -69,9 +69,9 @@ def test_same_payload_is_identical_not_duplicated(conn):
 
 def test_conflicting_payload_for_same_key_is_rejected(conn):
     """同 (code, asof, model_version) 但载荷不同 → **拒绝**，不覆盖、不留痕。"""
-    insert_prediction(conn, payload(), now="t1")
+    insert_prediction(conn, payload(), now="t1", origin="live")
     with pytest.raises(PredictionConflict) as exc:
-        insert_prediction(conn, payload(action="trim", size_pct=62.9), now="t2")
+        insert_prediction(conn, payload(action="trim", size_pct=62.9), now="t2", origin="live")
     assert "append-only" in str(exc.value) or "已被占用" in str(exc.value)
     assert conn.execute("SELECT COUNT(*) FROM predictions").fetchone()[0] == 1
     assert find_prediction(conn, "000333", "2026-09-14",
@@ -84,7 +84,7 @@ def test_silent_upsert_is_structurally_impossible(conn):
     这条测试是「结构性防线」的证据 —— 就算将来有人绕开 `insert_prediction`
     直接写 SQL，覆盖仍然做不到。
     """
-    insert_prediction(conn, payload(), now="t1")
+    insert_prediction(conn, payload(), now="t1", origin="live")
     with pytest.raises(sqlite3.IntegrityError):
         conn.execute(
             "INSERT OR REPLACE INTO predictions (code, asof_date, target_date,"
@@ -103,14 +103,34 @@ def test_row_roundtrip_hash_matches_payload(conn):
     规范化方式不一致，这里就会红。
     """
     p = payload()
-    insert_prediction(conn, p, now="t1")
+    insert_prediction(conn, p, now="t1", origin="live")
     row = find_prediction(conn, "000333", "2026-09-14", M.MODEL_VERSION)
     assert M.payload_hash(payload_from_row(row)) == M.payload_hash(p)
 
 
+def test_insert_writes_origin_and_origin_is_not_part_of_payload_hash(conn):
+    """P32：origin 是**来源元数据**，不是载荷 —— 落库、可读、且不进 hash。
+
+    hash 不含 origin 意味着「回放/实时」与「预测内容」正交：同一份载荷，
+    用 live 或 replay 写进去，载荷 hash 都一样（判据见 `payload_from_row`）。
+    """
+    p = payload()
+    state, _ = insert_prediction(conn, p, now="t1", origin="replay")
+    assert state == "inserted"
+    row = find_prediction(conn, "000333", "2026-09-14", M.MODEL_VERSION)
+    assert row["origin"] == "replay"
+    assert M.payload_hash(payload_from_row(row)) == M.payload_hash(p)
+
+
+def test_insert_requires_origin(conn):
+    """origin 是必填关键字参数：漏传必须 TypeError，而不是静默写 NULL。"""
+    with pytest.raises(TypeError):
+        insert_prediction(conn, payload(), now="t1")  # type: ignore[call-arg]
+
+
 def test_different_model_version_is_a_different_record(conn):
-    insert_prediction(conn, payload(), now="t1")
+    insert_prediction(conn, payload(), now="t1", origin="live")
     state, _ = insert_prediction(conn, payload(model_version=M.MODEL_VERSION + "-next"),
-                                 now="t2")
+                                 now="t2", origin="live")
     assert state == "inserted"
     assert conn.execute("SELECT COUNT(*) FROM predictions").fetchone()[0] == 2

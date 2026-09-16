@@ -28,7 +28,7 @@ def _predict_all(conn, asof):
     rep = build_predictions(conn, asof)
     ids = {}
     for p in rep["predictions"]:
-        _, pid = insert_prediction(conn, p, now=NOW)
+        _, pid = insert_prediction(conn, p, now=NOW, origin="replay")
         ids[p["code"]] = pid
     return rep, ids
 
@@ -123,10 +123,10 @@ def test_groups_by_model_version(tmp_db, tmp_path):
 
     rep = build_predictions(conn, asof)
     pred = rep["predictions"][0]
-    insert_prediction(conn, pred, now=NOW)
+    insert_prediction(conn, pred, now=NOW, origin="replay")
     old = dict(pred, model_version="pit-rw-v1.0.0", direction={"up": 0.2, "flat": 0.2,
                                                               "down": 0.6})
-    insert_prediction(conn, old, now=NOW)
+    insert_prediction(conn, old, now=NOW, origin="replay")
 
     out = VS.verify_target(conn, target)
     groups = out["by_model_version"]

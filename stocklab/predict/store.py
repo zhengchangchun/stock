@@ -43,11 +43,11 @@ _INSERT_SQL = (
     "INSERT INTO predictions (code, asof_date, target_date, direction_up,"
     " direction_flat, direction_down, range_lo, range_hi, key_levels_json,"
     " action, size_pct, invalidate_if, strategy_mix_json, model_version,"
-    " status, created_at)"
+    " status, created_at, origin)"
     " VALUES (:code, :asof_date, :target_date, :direction_up, :direction_flat,"
     " :direction_down, :range_lo, :range_hi, :key_levels_json, :action,"
     " :size_pct, :invalidate_if, :strategy_mix_json, :model_version,"
-    " 'ok', :created_at)"
+    " 'ok', :created_at, :origin)"
 )
 
 
@@ -110,8 +110,14 @@ def payload_to_row(payload: Mapping, *, now: str) -> dict:
 
 
 def insert_prediction(conn: sqlite3.Connection, payload: Mapping, *,
-                      now: str) -> tuple[str, int]:
+                      now: str, origin: str) -> tuple[str, int]:
     """四态写入，返回 `(state, pred_id)`。
+
+    `origin ∈ {"live", "replay"}` 是**必填**关键字参数（P32）：它把「这条预测是
+    回放产生还是实时产生」写成入库时就确定的字段，供 `chain accuracy` 断言分段。
+    判据由**写入路径**定：`predict run` 写 `live`，`verify backfill` 写 `replay`。
+    不设默认值 —— 谁忘了传就 TypeError，杜绝「静默漏标 → 退回推断」的假可信。
+    库里 `origin TEXT CHECK(origin IN ('live','replay'))` 是第二道结构性防线。
 
     `state ∈ {"inserted", "identical"}`；`conflict` 抛 `PredictionConflict`
     而不是返回值 —— 调用方若忘了检查返回值，冲突就会变成静默通过。
@@ -128,6 +134,8 @@ def insert_prediction(conn: sqlite3.Connection, payload: Mapping, *,
             "不改写、不覆盖。要出新预测请升 model_version"
             "（与 features_daily 要改就升 feature_version 同款纪律）"
         )
-    cur = conn.execute(_INSERT_SQL, payload_to_row(payload, now=now))
+    row = payload_to_row(payload, now=now)
+    row["origin"] = origin
+    cur = conn.execute(_INSERT_SQL, row)
     conn.commit()
     return "inserted", int(cur.lastrowid)

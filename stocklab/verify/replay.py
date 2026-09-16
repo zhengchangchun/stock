@@ -98,7 +98,7 @@ def backfill(conn: sqlite3.Connection, from_date: str, to_date: str, *,
             continue
         for p in rep["predictions"]:
             try:
-                state, pred_id = insert_prediction(conn, p, now=now)
+                state, pred_id = insert_prediction(conn, p, now=now, origin="replay")
             except PredictionConflict as exc:
                 conflicts[f"{p['code']}@{asof}"] = str(exc)
                 continue

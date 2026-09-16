@@ -49,10 +49,10 @@ def conn(tmp_path):
     c.close()
 
 
-def _predict(conn, asof: str, *, now: str) -> str:
+def _predict(conn, asof: str, *, now: str, origin: str) -> str:
     rep = build_predictions(conn, asof, [CODE])
     for p in rep["predictions"]:
-        insert_prediction(conn, p, now=now)
+        insert_prediction(conn, p, now=now, origin=origin)
     return rep["target_date"]
 
 
@@ -81,9 +81,9 @@ def test_classify_does_not_fall_into_the_utc_trap():
 # ---------- 分桶 ----------
 
 def test_rolling_splits_live_and_replay(conn):
-    t1 = _predict(conn, "2026-08-30", now=live_now("2026-08-30"))
+    t1 = _predict(conn, "2026-08-30", now=live_now("2026-08-30"), origin="live")
     _verify(conn, t1, now=live_now("2026-08-30"))
-    t2 = _predict(conn, "2026-08-31", now=REPLAY_NOW)
+    t2 = _predict(conn, "2026-08-31", now=REPLAY_NOW, origin="replay")
     _verify(conn, t2, now=REPLAY_NOW)
 
     roll = rolling_accuracy(conn, end_date="2026-09-01", n_sessions=30)
@@ -97,7 +97,7 @@ def test_rolling_splits_live_and_replay(conn):
 
 def test_all_replay_means_no_live_bucket_and_no_live_performance(conn):
     """**红线**：全部是回放时，报告不许出现任何被称为「实盘表现」的数字。"""
-    t = _predict(conn, "2026-08-30", now=REPLAY_NOW)
+    t = _predict(conn, "2026-08-30", now=REPLAY_NOW, origin="replay")
     _verify(conn, t, now=REPLAY_NOW)
 
     rep = build_review(conn, "2026-09-01")
@@ -120,8 +120,8 @@ def test_accuracy_carries_ci_and_daily_clustering(conn):
     两天**一命中一落空**：若两天结果相同，`stdev` 为 0 → 正态近似区间缩成
     `[1.0, 1.0]`，把「2 个样本」说成「确定」—— 那正是本测试最后一条断言要挡的事。
     """
-    p1 = _predict(conn, "2026-08-28", now=live_now("2026-08-28"))
-    p2 = _predict(conn, "2026-08-29", now=live_now("2026-08-29"))
+    p1 = _predict(conn, "2026-08-28", now=live_now("2026-08-28"), origin="live")
+    p2 = _predict(conn, "2026-08-29", now=live_now("2026-08-29"), origin="live")
 
     # 让 2026-08-30（p2 的目标日）涨 +5%，远超 FLAT_BAND(0.5%) → 实际分类 up，
     # 而模型预测 flat → 该日**不命中**。

@@ -811,7 +811,7 @@ def cmd_predict_run(args: argparse.Namespace) -> int:
         conflicts: dict[str, str] = {}
         for p in rep["predictions"]:
             try:
-                state, pred_id = insert_prediction(conn, p, now=now)
+                state, pred_id = insert_prediction(conn, p, now=now, origin="live")
                 states[p["code"]] = f"{state}:{pred_id}"
             except PredictionConflict as exc:
                 conflicts[p["code"]] = str(exc)

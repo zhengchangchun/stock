@@ -263,7 +263,7 @@ def test_tick_scores_today_when_calendar_lags(tmp_path):
                 cal_dates=[d for d in all_dates if d < target])
     rep = build_predictions(conn, asof, [CODE])
     for p in rep["predictions"]:
-        insert_prediction(conn, p, now=f"{asof}T19:00:00+08:00")
+        insert_prediction(conn, p, now=f"{asof}T19:00:00+08:00", origin="live")
     assert rep["target_date"] == target
 
     s = run_tick(conn, now=f"{target}T15:35:00+08:00", universe=(),

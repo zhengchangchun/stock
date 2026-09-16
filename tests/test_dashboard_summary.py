@@ -55,13 +55,13 @@ def conn(tmp_path):
     c.close()
 
 
-def _predict(conn, asof: str, *, now: str) -> str:
+def _predict(conn, asof: str, *, now: str, origin: str) -> str:
     from stocklab.predict.service import build_predictions
     from stocklab.predict.store import insert_prediction
 
     rep = build_predictions(conn, asof, [CODE])
     for p in rep["predictions"]:
-        insert_prediction(conn, p, now=now)
+        insert_prediction(conn, p, now=now, origin=origin)
     return rep["target_date"]
 
 
@@ -108,7 +108,7 @@ def test_live_bucket_is_null_not_zero_when_there_are_no_live_rows(conn):
     `null` = 「没有样本」；`0` = 「测出来是 0」。两者在页面上长得一样、
     含义完全相反（这是本项目最贵的一类错，见 P11 复盘口径）。
     """
-    t = _predict(conn, "2026-08-30", now=REPLAY_NOW)
+    t = _predict(conn, "2026-08-30", now=REPLAY_NOW, origin="replay")
     _verify(conn, t, now=REPLAY_NOW)
     s = build_summary(conn, "2026-09-01")
     assert s["accuracy"]["live"] is None
@@ -117,9 +117,9 @@ def test_live_bucket_is_null_not_zero_when_there_are_no_live_rows(conn):
 
 
 def test_live_and_replay_are_counted_separately(conn):
-    t1 = _predict(conn, "2026-08-30", now=live_now("2026-08-30"))
+    t1 = _predict(conn, "2026-08-30", now=live_now("2026-08-30"), origin="live")
     _verify(conn, t1, now=live_now("2026-08-30"))
-    t2 = _predict(conn, "2026-08-31", now=REPLAY_NOW)
+    t2 = _predict(conn, "2026-08-31", now=REPLAY_NOW, origin="replay")
     _verify(conn, t2, now=REPLAY_NOW)
 
     s = build_summary(conn, "2026-09-01")
@@ -131,7 +131,7 @@ def test_live_and_replay_are_counted_separately(conn):
 
 
 def test_sample_gate_marks_insufficient_below_120_days(conn):
-    t = _predict(conn, "2026-08-30", now=REPLAY_NOW)
+    t = _predict(conn, "2026-08-30", now=REPLAY_NOW, origin="replay")
     _verify(conn, t, now=REPLAY_NOW)
     b = build_summary(conn, "2026-09-01")["accuracy"]["replay"]
     assert b["sample_gate"]["meets"] is False

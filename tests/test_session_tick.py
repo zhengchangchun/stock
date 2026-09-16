@@ -46,7 +46,7 @@ def _predict(conn, asof: str) -> str:
     """落一条 `asof` 的预测，返回它的 `target_date`。"""
     rep = build_predictions(conn, asof, [CODE])
     for p in rep["predictions"]:
-        insert_prediction(conn, p, now=NOW)
+        insert_prediction(conn, p, now=NOW, origin="replay")
     return rep["target_date"]
 
 

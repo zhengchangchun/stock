@@ -42,7 +42,7 @@ def db(tmp_path):
     conn = seed(path, {CODE: _bars()})
     rep = build_predictions(conn, "2026-08-30", [CODE])
     for p in rep["predictions"]:
-        insert_prediction(conn, p, now=NOW)
+        insert_prediction(conn, p, now=NOW, origin="replay")
     conn.close()
     return path
 

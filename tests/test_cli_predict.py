@@ -116,7 +116,7 @@ def test_predict_run_exits_nonzero_on_conflict_without_overwriting(env, capsys):
     conn = connect(env["db"])
     rep = build_predictions(conn, ASOF, [CODE])
     bad = dict(rep["predictions"][0], action="trim", size_pct=12.34)
-    assert insert_prediction(conn, bad, now=NOW)[0] == "inserted"
+    assert insert_prediction(conn, bad, now=NOW, origin="replay")[0] == "inserted"
     conn.close()
 
     assert main(["predict", "run", "--asof", ASOF, "--db", str(env["db"])]) == 1
