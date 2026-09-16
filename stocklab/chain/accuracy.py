@@ -14,11 +14,13 @@
 四者**不许混算**。所以本模块的输出是四个并列的段，每段自带来源说明、样本量、
 口径判据与门槛判定；**任何一段 `n_days < 120` 都不给结论**（只看 n 与原始读数）。
 
-## 回放 / 实时的判据（复用，不另立）
+## 回放 / 实时的判据（P32：断言优先，推断兜底）
 
-库里没有来源列。唯一的可验证判据在 `session/review.py`（ERROR_DIARY #16 定的口径），
-本模块**import 它**而不是重写一份：`LIVE ⟺ created_at 前 10 位 == asof_date`。
-边界（`created_at` 是入库时刻而非决策时刻）照实写进报告，见 `origin_rule`。
+`predictions` 新增 `origin` 来源列（`live`/`replay`，入库时由写入路径确定）后，
+**有 `origin` 的行按字段断言**分段；`origin IS NULL` 的历史行才退回
+`session/review.py` 的 `classify`（ERROR_DIARY #16 定的口径）：
+`LIVE ⟺ created_at 前 10 位 == asof_date`。两者**分列计数**，不许把推断当断言。
+边界（`created_at` 是入库时刻而非决策时刻）照实写进报告，见 `origin_limits`。
 
 ## 本模块是纯函数
 
@@ -37,7 +39,7 @@ from stocklab.risk.kelly import (
     BOOTSTRAP_SEED,
     daily_clustered_winrate_ci,
 )
-from stocklab.session.review import PROVENANCE_RULE, classify, load_rows
+from stocklab.session.review import classify, load_rows
 from stocklab.verify.report import MIN_DAYS, summarize
 
 #: 四段的固定顺序。**顺序本身是设计**：回放 → 实时 → 模拟盘 → 实盘
@@ -56,19 +58,26 @@ NOTICE_TMPL = "样本不足（n={n} < {min_days}），不构成准确率结论"
 
 #: 判定字段说明（进报告，供审计者逐字复核）。
 ORIGIN_FIELDS = (
+    "predictions.origin（P32 来源列，`live`/`replay`，入库时由写入路径确定）；"
+    "`origin IS NULL` 的历史行退回 "
     "predictions.created_at（前 10 位，**字符串比较**，不走 SQLite `date()`："
     "`created_at` 带 `+08:00`，`date()` 会折成 UTC，凌晨的预测会在交易日边界上静默错分）"
     " 与 predictions.asof_date"
 )
 
+#: 分段规则原文（进报告）：断言优先、推断兜底、两者分列计数。
+ORIGIN_ASSERTION_RULE = (
+    "有 `origin` 标记（`live`/`replay`）的行按字段**断言**分段；"
+    "`origin IS NULL` 的历史行退回推断（`created_at` 前 10 位 == `asof_date`）。"
+    "断言行与推断行**分列计数**，不许把推断当断言。"
+)
+
 #: 判定规则的已知边界（不许藏）。
 ORIGIN_LIMITS = (
-    "`created_at` 是**入库时刻**而非决策时刻：当天补跑一个历史 `asof` 会被记成 LIVE；"
-    "反之，跨零点补跑当日预测会被记成 REPLAY。"
-    "库里**没有**可靠的来源标记列 → 这是**推断**而非**断言**。"
-    "建议方案（本轮只报告、不实现）：给 `predictions` 增 `origin TEXT CHECK(origin IN "
-    "('live','replay'))`，由 `predict run` / `verify backfill` 各自显式写入 —— "
-    "append-only 表加列属口径变更，须单独评审后再做。"
+    "`origin` 由 `predict run`（`live`）/ `verify backfill`（`replay`）各自在入库时写入，"
+    "是**断言**；加列前已存在的历史行 `origin` 为 NULL，退回 `created_at[:10] == "
+    "asof_date` 推断，其边界照旧：`created_at` 是**入库时刻**而非决策时刻 —— "
+    "当天补跑一个历史 `asof` 会被记成 LIVE，反之跨零点补跑当日预测会被记成 REPLAY。"
 )
 
 #: 实盘段「能不能算准确率」的判据说明。
@@ -102,6 +111,16 @@ def _num(x: Any, nd: int = 4) -> str:
 
 def _pct(x: Any, nd: int = 2) -> str:
     return "—" if x is None else f"{float(x) * 100:.{nd}f}%"
+
+
+def _provenance_of(asof_date: str, created_at: str, origin: Any) -> str:
+    """有效来源（P32）：有 `origin` 标记按字段**断言**，NULL/未知退回推断。
+
+    `origin` 只可能是 `live` / `replay` / NULL（`TEXT CHECK` 在库里钉死），
+    这里仍显式判 `in ("live", "replay")`：任何落到 CHECK 之外的值都**不许**
+    被当成断言 —— 退回推断是唯一诚实的兜底。
+    """
+    return origin if origin in ("live", "replay") else classify(asof_date, created_at)
 
 
 def _daily_cell(block: Mapping[str, Any] | None) -> str:
@@ -348,13 +367,15 @@ def _written_by_origin(conn: sqlite3.Connection) -> dict[str, int]:
     """**已写入**的预测按来源计数（与「已被验证打分」是两件事）。
 
     没有这一对读数，实时段 `n_days = 0` 会被读成「根本没有实时预测」——
-    而真实情况是「实时预测写了，但它的目标日还没到/还没打分」。判据一律走
-    `classify()`（不在 SQL 里重写一遍规则）。
+    而真实情况是「实时预测写了，但它的目标日还没到/还没打分」。判据走
+    `_provenance_of()`（有 `origin` 断言、无 `origin` 退 `classify()`），
+    不在 SQL 里重写一遍规则。
     """
     rows = conn.execute(
-        "SELECT asof_date, created_at FROM predictions").fetchall()
+        "SELECT asof_date, created_at, origin FROM predictions").fetchall()
     live = sum(1 for r in rows
-               if classify(r["asof_date"], r["created_at"]) == "live")
+               if _provenance_of(r["asof_date"], r["created_at"],
+                                 r["origin"]) == "live")
     return {"live": live, "replay": len(rows) - live}
 
 
@@ -366,8 +387,10 @@ def build_chain_accuracy(conn: sqlite3.Connection, *, from_date: str | None = No
     rows = load_rows(conn, lo, hi)
     by_origin: dict[str, list[dict]] = {"replay": [], "live": []}
     for r in rows:
-        by_origin[r["provenance"]].append(r)
+        by_origin[_provenance_of(r["asof_date"], r["pred_created_at"],
+                                 r.get("origin"))].append(r)
     written = _written_by_origin(conn)
+    asserted = sum(1 for r in rows if r.get("origin") in ("live", "replay"))
 
     segments = [
         _accuracy_segment("replay", by_origin["replay"], from_date=lo,
@@ -387,9 +410,14 @@ def build_chain_accuracy(conn: sqlite3.Connection, *, from_date: str | None = No
         "kind": "chain-accuracy",
         "min_days": min_days,
         "segment_order": list(SEGMENTS),
-        "origin_rule": PROVENANCE_RULE,
+        "origin_rule": ORIGIN_ASSERTION_RULE,
         "origin_fields": ORIGIN_FIELDS,
         "origin_limits": ORIGIN_LIMITS,
+        "origin_segmentation": {
+            "rule": ORIGIN_ASSERTION_RULE,
+            "asserted": asserted,                 # 按 origin 字段断言分段的行数
+            "inferred": len(rows) - asserted,     # 退回推断的行数
+        },
         "provenance_counts": {"live": len(by_origin["live"]),
                               "replay": len(by_origin["replay"])},
         "segments": segments,
@@ -552,6 +580,9 @@ def render_markdown(report: Mapping[str, Any]) -> str:
     L.append("")
     L.append(f"- **判据**：{report['origin_rule']}")
     L.append(f"- **判定字段**：{report['origin_fields']}")
+    seg = report["origin_segmentation"]
+    L.append(f"- **分段方式**：按 `origin` 断言 {seg['asserted']} 行 / "
+             f"退回推断 {seg['inferred']} 行（不混）")
     L.append(f"- **行数**：live {report['provenance_counts']['live']} 行 / "
              f"replay {report['provenance_counts']['replay']} 行")
     L.append(f"- **已知边界**：{report['origin_limits']}")

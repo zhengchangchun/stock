@@ -15,6 +15,7 @@ import json
 import pytest
 
 from stocklab.chain.accuracy import (
+    ORIGIN_ASSERTION_RULE,
     SEGMENTS,
     boot_ci_by_day,
     build_chain_accuracy,
@@ -39,11 +40,17 @@ _PRED_COLS = (
 
 
 def _add_prediction(conn, *, code: str, asof: str, target: str, created_at: str,
-                    mv: str = "pit-rw-v1.0.1") -> int:
-    cur = conn.execute(
-        f"INSERT INTO predictions ({_PRED_COLS}) VALUES"
-        " (?,?,?,0.5,0.2,0.3,1.0,2.0,'[]','hold',50.0,'x',\"{}\",?, 'ok',?)",
-        (code, asof, target, mv, created_at))
+                    mv: str = "pit-rw-v1.0.1", origin: str | None = None) -> int:
+    if origin is None:                      # 历史行：无 origin 标记 → 退回推断
+        cur = conn.execute(
+            f"INSERT INTO predictions ({_PRED_COLS}) VALUES"
+            " (?,?,?,0.5,0.2,0.3,1.0,2.0,'[]','hold',50.0,'x',\"{}\",?, 'ok',?)",
+            (code, asof, target, mv, created_at))
+    else:                                   # P32：带 origin 标记 → 断言分段
+        cur = conn.execute(
+            f"INSERT INTO predictions ({_PRED_COLS}, origin) VALUES"
+            " (?,?,?,0.5,0.2,0.3,1.0,2.0,'[]','hold',50.0,'x',\"{}\",?, 'ok',?,?)",
+            (code, asof, target, mv, created_at, origin))
     conn.commit()
     return int(cur.lastrowid)
 
@@ -267,6 +274,68 @@ def test_origin_classification_reads_created_at_and_asof_date(db):
     assert "created_at" in rep["origin_fields"]
     assert "asof_date" in rep["origin_fields"]
     assert "created_at" in rep["origin_rule"]
+
+
+# ---------- (c2) P32：origin 字段是断言，NULL 才退推断 ----------
+
+def test_origin_field_is_authoritative_over_inference(tmp_db):
+    """`origin` 字段是分段的**唯一**决定：`created_at` 会推出 replay，但 origin='live' 必须算 live。
+
+    反证：若实现忽略 origin、永远走推断，本用例会红（行会掉进 replay 桶、
+    断言行数会是 0）。篡改 origin（live→replay）后，同样的 created_at 分段必须跟着变。
+    """
+    init_db(tmp_db)
+    c = connect(tmp_db)
+    p = _add_prediction(c, code="000333", asof="2026-01-05", target="2026-01-06",
+                        created_at="2026-09-15T07:04:51+08:00", origin="live")
+    _add_verification(c, p, target="2026-01-06", hit=1)
+    c.close()
+
+    rep = _report(tmp_db)
+    assert rep["origin_segmentation"] == {"rule": ORIGIN_ASSERTION_RULE,
+                                          "asserted": 1, "inferred": 0}
+    assert rep["provenance_counts"] == {"live": 1, "replay": 0}
+    assert _seg(rep, "live")["n_rows"] == 1
+    assert _seg(rep, "replay")["n_rows"] == 0
+
+    # 篡改 origin（live→replay），created_at 一字不动 → 分段必须翻转
+    flipped = tmp_db.parent / "flipped.db"
+    init_db(flipped)
+    c2 = connect(flipped)
+    p2 = _add_prediction(c2, code="000333", asof="2026-01-05", target="2026-01-06",
+                         created_at="2026-09-15T07:04:51+08:00", origin="replay")
+    _add_verification(c2, p2, target="2026-01-06", hit=1)
+    c2.close()
+    rep2 = _report(flipped)
+    assert rep2["provenance_counts"] == {"live": 0, "replay": 1}
+    assert _seg(rep2, "replay")["n_rows"] == 1
+    assert _seg(rep2, "live")["n_rows"] == 0
+
+
+def test_origin_null_falls_back_to_inference(tmp_db):
+    """`origin IS NULL` 的历史行退回推断，且计入「推断」而非「断言」。"""
+    init_db(tmp_db)
+    c = connect(tmp_db)
+    p = _add_prediction(c, code="000333", asof="2026-01-05", target="2026-01-06",
+                        created_at="2026-01-05T18:00:00+08:00", origin=None)
+    _add_verification(c, p, target="2026-01-06", hit=1)
+    c.close()
+
+    rep = _report(tmp_db)
+    assert rep["origin_segmentation"]["asserted"] == 0
+    assert rep["origin_segmentation"]["inferred"] == 1
+    assert rep["provenance_counts"] == {"live": 1, "replay": 0}
+    # 报告里显式分列两个数（不混）
+    assert "按 `origin` 断言 0 行 / 退回推断 1 行" in render_markdown(rep)
+
+
+def test_origin_segmentation_counts_appear_in_json(db):
+    """JSON 里必须暴露「断言 n 行 / 推断 n 行」两个数（验收口径）。"""
+    rep = _report(db)
+    assert set(rep["origin_segmentation"]) == {"rule", "asserted", "inferred"}
+    # db 夹具的两条预测都无 origin → 全退回推断
+    assert rep["origin_segmentation"]["asserted"] == 0
+    assert rep["origin_segmentation"]["inferred"] == 2
 
 
 def test_boot_ci_is_day_clustered():

@@ -69,7 +69,8 @@ def load_rows(conn: sqlite3.Connection, from_date: str, to_date: str) -> list[di
 
     rows = conn.execute(
         "SELECT v.*, p.code AS p_code, p.asof_date AS p_asof,"
-        " p.model_version AS p_model_version, p.created_at AS p_created_at"
+        " p.model_version AS p_model_version, p.created_at AS p_created_at,"
+        " p.origin AS p_origin"
         " FROM verifications v JOIN predictions p ON p.pred_id = v.pred_id"
         " WHERE v.target_date BETWEEN ? AND ?"
         " ORDER BY p.model_version, v.target_date, p.code",
@@ -80,6 +81,10 @@ def load_rows(conn: sqlite3.Connection, from_date: str, to_date: str) -> list[di
                     "asof_date": r["p_asof"], "model_version": r["p_model_version"],
                     "verification_id": int(r["verification_id"]),
                     "pred_created_at": r["p_created_at"],
+                    #: `origin`（P32 来源列）原样带出；`provenance` 仍是**推断**
+                    #: （classify）。断言 vs 推断的选择在 `chain.accuracy` 里做，
+                    #: 这里只负责把两样都提供出来（P11 复盘仍用 provenance 推断口径）。
+                    "origin": r["p_origin"],
                     "provenance": classify(r["p_asof"], r["p_created_at"])})
     return out
 
