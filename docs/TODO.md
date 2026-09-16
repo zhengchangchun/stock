@@ -1,7 +1,7 @@
 # stock-lab 待办清单（维护者：nanobot · 生成 2026-09-16 10:0x）
 
 > 口径：**所有数字都能当场复现**。命令与文件出处写在每条后面；拿不出出处的标「未验证」。
-> 状态（2026-09-16 21:40 更新）：自动任务运行中（巡检每 30m）；claude 侧已跑到 **P24**（口径修正，提交 `e95361a`/`99a974a`/`c0011fe`，$3.17/51 turns），nanobot 自跑复验 **pytest 1508 passed / `verify.sh` all ✅**（2026-09-16 21:2x 实测）。
+> 状态（2026-09-16 22:0x 更新）：自动任务运行中（巡检每 30m）；claude 侧已跑到 **P25**（回归红线可执行化，提交 `f8e7995`/`fad689e`，$3.93/76 turns），nanobot 自跑复验 **pytest 1528 passed / `verify.sh` all ✅ / `check_redlines.py` 三目标全绿**（2026-09-16 21:5x 实测）；**P26（链路准确率视图）已起**（21:5x）。
 > ⚠️ **新增缺陷 B7（回归红线失效）**：P8 预注册的回归红线 `predict run --asof 2026-09-14` 报告 sha256 = `a61d026b…f4eb` **已在 2026-09-15 09:13/10:50 静默作废**（`be9c343`/`015c466` 给 `evidence.inputs` 加了口径回显字段，`MODEL_VERSION` 未变）→ 现行实测值 `b69afb71…`。归因证据见 ERROR_DIARY #34；nanobot 独立复核：`sha256sum reports/2026-09-15-predict-2026-09-14.json` = `b69afb711f60ec53…`（该文件 mtime 2026-09-15 16:49 后再未改动）+ `grep -rn a61d026b` 全仓只命中 docs、**无任何测试或脚本引用它**。已起 P25 修复（红线改成可执行不变量）。
 
 ---
@@ -13,6 +13,7 @@
 | A1 | 要不要采「估值」与「资金流」两类数据 | 库里 `valuation_daily` 0 行、`money_flow_daily` 0 行（实测：`select count(*)`），没有采集口径我做不了；不做就只能长期只玩价量类策略 | (a) 给我口径就做 (b) 明确不做，把相关策略（高股息/资金流跟随）永久下架 |
 | A2 | 交易日历只到 2026-09-16（实测 `select max(date) from trading_calendar` → `2026-09-16`，3264 行），之后按「工作日近似」推算 | 会把节假日当交易日，导致预测目标日算错 | (a) 每天自动刷新日历 (b) 你人工维护 (c) 维持近似、但每份报告都标注 |
 | A3 | 决策表里有 4 行历史重复记录（`experiment_decisions` 共 24 行） | 守 append-only 我默认不回删 | (a) 保留（默认） (b) 清理 |
+| A4 | 「同时只 1 个 claude」要不要放宽为「每项目 ≤1 个」 | `stock-lab-dev-30m`（`9e8554c4`）与 `ecom-console-dev-30m`（`eb0a1fac`）都是 30m 节奏，会撞时段；现在靠「有任务在跑就只汇报」自然串行 | (a) 维持全局 1 个（默认，省钱） (b) 放宽为每项目 1 个（并行更快、但成本翻倍） |
 
 ## B. 开发队列（你不发话我不起）
 
@@ -24,8 +25,16 @@
 | B4 | ~~报告文本缺陷（小）~~ | ✅ **已完成（2026-09-16 20:2x，提交 `06fb9af` / `a2a6f01` / `23401fa`）**：`counts.test_rows` 7 → 1962（真实行数）、md §3 判据 (a) 理由改由 CI 实测值生成、§6 两套行集补来源与差值说明；另修 §9 复现命令写出实际生效 `--to`。验证：`pytest` **1506 passed**（+9 测试）/ `verify.sh` all ✅ / 同命令重跑报告 md+json 逐字节一致；verdict 不变 WIN |
 | B5 | ~~收盘回填的快照时刻校验（中）~~ | ✅ **已完成（2026-09-16 20:1x，提交 `e6155f9`）**：新增 `is_closed_snapshot(ts)`，快照时刻 <15:00:00 或解析失败即跳过该标的（fail-closed）、记 `skipped_stale_snapshot` + `system_events` warn，一个值都没补上时 `reason="stale_snapshot"`。验证：`pytest -q` **1497 passed** / `verify.sh` all ✅；真实数据副本复现「只有 09:35+14:30 快照 → 一行未写」，补 15:18 快照后正常写入 2546180000.0 / 0.43 |
 | B6 | 开发通道被 API 额度打断 | 2026-09-16 19:47 P22 任务被 commandcode 429（5 小时额度，limit 14）中断，$4.07/23 turns 未提交；同日 18:52 P21c 亦为 `error_max_budget_usd`（$6.02/32 turns，成果已提交）。实测 429 出现在 19:46/19:47/20:00（`journalctl -u cc-proxy`），20:11 探针恢复，20:12–20:27 P23 正常跑完；20:47–21:11 P24 正常跑完（$3.17） |
-| B7 | 回归红线失效（P8 预注册的 F2 快照常量） | 🔄 **P25 进行中（2026-09-16 21:4x 起）**：把「文档里的 sha 快照常量」改成「仓库内、能被 pytest/verify.sh 自动校验的不变量」；旧值 `a61d026b…f4eb` 原样保留并标注失效时间与原因（append-only）。触发：P24 验收 (b) 首次重跑该红线即失败，见 ERROR_DIARY #34 |
+| B7 | ~~回归红线失效（P8 预注册的 F2 快照常量）~~ | ✅ **已完成（2026-09-16 21:36，提交 `f8e7995`/`fad689e`，$3.93/76 turns）**：新增 `stocklab/quality/redline.py`（叶子提取 + 两档比对 + #34 三步失败文案 + 子进程合成夹具）、`scripts/check_redlines.py`（真实库入口，跑在**库副本**上、库缺失显式「⏭ 跳过」）、`docs/baselines/redlines.json`（基线落 git 跟踪路径）、`tests/test_redline_baseline.py`；已接入 `scripts/verify.sh` 4c 段。验证（nanobot 自跑）：`pytest` **1528 passed**（1508 + 20，只增不减）/ `verify.sh` all ✅ / 三目标全绿（`predict_real` sha `b69afb71…` 叶子 175 项、`backfill_real` sha `18f2eeef…` 叶子 89 项、`predict_synthetic` hermetic）/ **负面测试我自己也做了**：篡改基线叶子数值 → 目标断言分支红、exit=1 并列出差异键路径（非假绿灯）；旧值 `a61d026b…f4eb` 原地保留并标注失效（append-only）。⚠️ 越界记录：commit `fad689e` 里 claude 追加了 1 行 `docs/experiments/README.md`（该目录约定 nanobot 维护）——纯追加 0 删除、内容已核，不追改，写入巡检提醒 |
 | B8 | ~~P24 口径修正（invalidated 子群标注）~~ | ✅ **已完成（2026-09-16 21:11，提交 `e95361a`/`99a974a`/`c0011fe`，$3.17/51 turns）**：`stocklab/verify/report.py` 的 `invalidated` 块补 `note` + `pit_comparable` 两个**纯文字**字段（分组键=次日收盘、结果条件、不可交易、不得作为模型能力证据），数值路径一行未动。验证：nanobot 自跑 **pytest 1508 passed**（+2）/ `verify.sh` all ✅；F1 数字叶子 0 差异 ✅；F2 见 §B7；F3 六条准入未执行（预注册明示） |
+
+## B9. 用户三新需求（2026-09-16 提出，按序做）
+
+| # | 事项 | 现状 |
+|---|---|---|
+| N1 | 减持类建议按整手可执行过滤（100 股整数倍、分标的最小单位） | 🔍 **审计结论：持仓层已覆盖**——`portfolio/decision.py`（`whole_lot_reason`、LOT_SIZE=100、深交所 3.3.8）、`portfolio/discipline.py`（明确不做 10%/20% 减仓判定）、`paper/rules.py::plan_trim`（向下取整）、`risk/sizing.py`（整手）。剩余待查：模型层 `predict/model.py` 的 `action="trim"` 只给百分比、不含股数（自带声明「不是可执行建议」）→ 是否要在报告里加一句「不可执行数量按整手过滤」待定 |
+| N2 | 项目管理每日检查 + 排期 + 给优化功能 | ⏸ 未起（等 N1/N3 或用户指定顺序） |
+| N3 | 全链路（分析→购进方案→模拟持仓→实际交易→持有分析）用**真实数据**看准确率 | 🔄 **P26 进行中（2026-09-16 21:5x 起，$6 预算）**：四段分列（回放 / 实时 / 模拟盘 / 实盘）+ n<120 必须写「样本不足，不构成准确率结论」+ 回放与实时的判定字段须来自库内可验证字段（判不了就如实报告 + 给方案） |
 
 ## C. 实验队列（我自己的活）
 
