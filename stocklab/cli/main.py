@@ -882,6 +882,109 @@ def cmd_verify_backfill(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_verify_pending(args: argparse.Namespace) -> int:
+    """补齐**已到期却没有验证行**的预测（幂等、append-only；P27）。
+
+    ## 为什么需要单独一条命令
+
+    `session tick` 步骤③ 有验证逻辑，但它的 cutoff 只来自 `trading_calendar`，
+    而日历行由 `ingest index` 在 15:30+ 才写 —— 比当天最后一次 tick 晚。
+    于是「今天到期」的预测**永远轮不到它被验证**（实测 2026-09-16：
+    tick 15:23:35 / 日历行 15:32:56 → `verify_inserted+0`）。详见
+    `stocklab/verify/pending.py` 的模块 docstring。
+
+    本命令的到期判据取 `trading_calendar ∪ bars_daily`（日 K 只在收盘后入库，
+    所以「有 bar」本身就是收盘已完成的正面证据），且**只补缺失的行**。
+
+    ## 幂等与 append-only
+
+    - 打分**完全复用** `stocklab/verify/service.verify_target`（不另造阈值/公式）；
+    - 逐 `target_date` 调用，且只传该日**待验证的 `codes`** —— 已评分的行一个字节不碰；
+    - 第二次跑时选择集为空 → 报「无待验证」、**零写入**
+      （结构性保证还叠了一层 `ux_verifications_pred` 唯一索引）；
+    - 命令**自检**：处理完再算一次待验证集合输出 `pending_after`，不为 0 → 退出码 1。
+
+    退出码：0 完成（含无待验证）/ 2 判不出最新已收盘交易日或库不存在 / 1 有冲突或没补干净。
+    """
+    from stocklab.verify.pending import pending_predictions
+    from stocklab.verify.service import NoPredictions, verify_target
+    from stocklab.verify.store import VerificationConflict
+
+    db = Path(args.db) if args.db else paths.DB_PATH
+    if not db.exists():
+        print(json.dumps({"error": "db not found; run `stocklab db init`"},
+                         ensure_ascii=False), file=sys.stderr)
+        return 2
+    now = args.now or datetime.now(TZ).isoformat(timespec="seconds")
+    only = set(args.code or [])
+
+    conn = connect(db)
+    try:
+        pend = pending_predictions(conn, now)
+        if pend["n"] is None:
+            # 判不了就说判不了：绝不给一个 0（0 会被读成「没有缺口」，#36）
+            print(json.dumps({"error": pend["reason"], "note": pend["note"],
+                              "evidence": pend["evidence"]},
+                             ensure_ascii=False, sort_keys=True, indent=2),
+                  file=sys.stderr)
+            return 2
+        rows = [r for r in pend["rows"] if not only or r["code"] in only]
+        by_target: dict[str, list[dict]] = {}
+        for r in rows:
+            by_target.setdefault(r["target_date"], []).append(r)
+
+        agg = {"inserted": 0, "identical": 0, "rescored_after_data_gap": 0}
+        targets: dict[str, dict] = {}
+        unscorable: list[dict] = []
+        failed = False
+        for target_date in sorted(by_target):
+            codes = sorted({r["code"] for r in by_target[target_date]})
+            try:
+                rep = verify_target(conn, target_date, codes=codes, now=now)
+            except (NoPredictions, VerificationConflict) as exc:
+                print(f"❌ {target_date} 补分失败：{exc}", file=sys.stderr)
+                failed = True
+                continue
+            n_inserted = 0
+            for state in rep["storage"].values():
+                key = state.split(":")[0]
+                if key in agg:
+                    agg[key] += 1
+                if key == "inserted":
+                    n_inserted += 1
+                if key == "rescored_after_data_gap":
+                    print(f"⚠️  {target_date} pred_id 上次不可评分（数据未到），"
+                          f"本次已补分（{state}）—— ADR-002 允许的唯一一种结果列更新",
+                          file=sys.stderr)
+            unscorable.extend({"target_date": target_date, **u}
+                              for u in rep["unscorable"])
+            targets[target_date] = {"pending": len(by_target[target_date]),
+                                    "inserted": n_inserted}
+        after = pending_predictions(conn, now)
+    finally:
+        conn.close()
+
+    out = {
+        "latest_closed_session": pend["latest_closed_session"],
+        "pending_before": pend["n"],
+        "pending_after": after["n"],
+        "targets": targets,
+        **agg,
+        "unscorable": unscorable,
+        "note": None if pend["n"] else "无待验证的到期预测",
+        "rule": pend["evidence"]["rule"],
+        "hint": None if rows else pend["hint"],
+    }
+    print(json.dumps(out, ensure_ascii=False, sort_keys=True, indent=2))
+    for u in unscorable:
+        print(f"⚠️  {u['target_date']} {u['code']} [{u['model_version']}] 不可评分："
+              f"{u['reason_code']} —— {u['reason']}", file=sys.stderr)
+    if after["n"]:
+        print(f"❌ 仍有 {after['n']} 条已到期预测没有验证行 —— 补分没补干净",
+              file=sys.stderr)
+    return 1 if (failed or after["n"]) else 0
+
+
 def cmd_experiment_run(args: argparse.Namespace) -> int:
     """跑一个具名变体并产出实验报告（**离线**；**不写任何生产表**）。
 
@@ -1346,6 +1449,10 @@ def cmd_review_daily(args: argparse.Namespace) -> int:
             "n": rep["day"]["verifications"]["n"],
             "scorable": rep["day"]["verifications"]["scorable"],
             "unscorable": rep["day"]["verifications"]["unscorable"]},
+        # 缺步检测（P27）：`null` = 判不了（**不是** 0，见 ERROR_DIARY #36）
+        "pending_verifications": rep["pending"]["n"],
+        "pending_verifications_detail": {
+            k: v for k, v in rep["pending"].items() if k != "evidence"},
         "rolling_window": roll["window"],
         "provenance": {
             "rule": roll["provenance"]["rule"],
@@ -2082,6 +2189,15 @@ def build_parser() -> argparse.ArgumentParser:
     ver_bf.add_argument("--report-dir", dest="report_dir", help="报告目录")
     ver_bf.add_argument("--db", help="数据库路径（默认 data/stocklab.db）")
     ver_bf.set_defaults(func=cmd_verify_backfill)
+
+    ver_pend = ver_sub.add_parser(
+        "pending",
+        help="补齐「已到期且没有验证行」的预测（幂等；收盘链里插在 predict run 之后）")
+    ver_pend.add_argument("--db", help="数据库路径（默认 data/stocklab.db）")
+    ver_pend.add_argument("--now", help="覆盖当前时刻（ISO8601；仅供测试/补跑）")
+    ver_pend.add_argument("--code", action="append", default=None,
+                          help="只处理指定代码，可重复；默认全部")
+    ver_pend.set_defaults(func=cmd_verify_pending)
 
     exp = sub.add_parser(
         "experiment", help="单变量实验（离线；复用 P7 打分口径，**不写任何生产表**）")

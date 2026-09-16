@@ -304,6 +304,7 @@ def build_review(conn: sqlite3.Connection, date: str, *,
                  n_sessions: int = 30) -> dict:
     """组装复盘报告数据（**不含生成时刻**：同输入两次运行 → 逐字节一致）。"""
     from stocklab.session.tick import closed_through, load_calendar
+    from stocklab.verify.pending import pending_predictions
 
     cal, cal_error = load_calendar(conn)
     cal_dates = set(cal.all_dates)
@@ -325,6 +326,10 @@ def build_review(conn: sqlite3.Connection, date: str, *,
         "rolling": rolling_accuracy(conn, end_date=date, n_sessions=n_sessions),
         "experiments": experiments_state(conn),
         "gaps": gap_manifest(conn, date),
+        # 缺步检测（P27）：有没有「已到期却从未被打分」的预测。
+        # 锚点沿用本函数的既有写法（复盘按定义发生在收盘之后）→ 本报告仍然
+        # **无时钟依赖**，「同输入两次运行逐字节一致」的性质不受影响。
+        "pending": pending_predictions(conn, f"{date}T23:59:59+08:00"),
     }
     report["disclosure"] = _disclosure(report)
     return report
@@ -419,6 +424,7 @@ def render_markdown(report: Mapping) -> str:
         f"（{day['predictions']['by_model_version'] or '无'}）",
         f"- 验证：{day['verifications']['n']} 条，其中可评分 "
         f"{day['verifications']['scorable']}、不可评分 {day['verifications']['unscorable']}",
+        _pending_line(report.get("pending")),
         "",
         "## 4. 滚动准确率",
         "",
@@ -458,6 +464,32 @@ def render_markdown(report: Mapping) -> str:
         "",
     ]
     return "\n".join(lines)
+
+
+def _pending_line(pending: Mapping | None) -> str:
+    """「到期未验证」那一行（P27 缺步检测）。
+
+    三种取值**长得完全不一样**，因为它们要求三种不同的行动：
+
+      - `n > 0` → 账本正在丢数据，给出**可操作**的补跑命令；
+      - `n == 0` → 正常；
+      - `n is None` → **判不了**（日历与行情两侧都判不出已收盘交易日），
+        **不许显示成 0** —— 0 会被读成「没有缺口」（ERROR_DIARY #36）。
+    """
+    if not pending:
+        return "- 到期未验证：**未评估**（本报告未带 pending 字段）"
+    n = pending.get("n")
+    if n is None:
+        return (f"- 到期未验证：**判不了**（`{pending.get('reason')}` —— "
+                f"日历与行情两侧都判不出「已收盘交易日」；这是判不了，不是没有缺口）")
+    if n == 0:
+        return (f"- 到期未验证：0 条"
+                f"（判据：`target_date <= "
+                f"{pending['latest_closed_session']}` 且无验证行）")
+    return (f"- ⚠️ **到期未验证：{n} 条**（"
+            + "、".join(f"`{d}`×{c}" for d, c in sorted(pending["by_target_date"].items()))
+            + f"）—— 这些预测的账本正在丢数据，跑 `stocklab verify pending` 补"
+              f"（幂等、append-only；判据：`{pending['evidence']['rule']}`）")
 
 
 def _baseline_line(bucket: dict | None) -> str:

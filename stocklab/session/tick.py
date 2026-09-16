@@ -222,10 +222,19 @@ def run_tick(conn: sqlite3.Connection, *, now: str,
                                         conn, td, now=now)})
 
     # ---------- ③ 验证到期预测 ----------
-    cutoff = closed_through(cal, now_dt)
+    # cutoff 取 `trading_calendar ∪ bars_daily`（P27）。**不能只用日历**：日历行由
+    # `ingest index` 在 15:30+ 才写，而当天最后一次 tick 跑在 15:23 —— 只用日历的话
+    # 「今天到期」的预测**永远轮不到验证**（实测 2026-09-16：tick 15:23:35 /
+    # 日历行 15:32:56 → verify_inserted+0）。日 K 只在收盘后入库，「有 bar」本身就是
+    # 收盘已完成的正面证据。判据实现在 `stocklab/verify/pending.py`（本处 import 是
+    # 函数内的：pending 依赖本模块的 `closed_through` / `is_trade_date_closed`）。
+    from stocklab.verify.pending import latest_closed_session
+
+    cutoff, cutoff_evidence = latest_closed_session(conn, now)
     if cutoff is None:
         summary["verify"] = {"skipped": "no_closed_session_in_calendar",
-                             "calendar_range": summary["calendar"]["range"]}
+                             "calendar_range": summary["calendar"]["range"],
+                             "cutoff_evidence": cutoff_evidence}
     else:
         due = [r["target_date"] for r in conn.execute(
             "SELECT DISTINCT target_date FROM predictions"
@@ -257,6 +266,7 @@ def run_tick(conn: sqlite3.Connection, *, now: str,
                 unscorable.append({"target_date": d, **u})
         summary["verify"] = {
             "cutoff": cutoff,
+            "cutoff_evidence": cutoff_evidence,
             "due_dates": len(due),
             "verified_dates": selected,
             "backlog_skipped": max(0, len(due) - len(selected)),
