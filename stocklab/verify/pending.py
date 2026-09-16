@@ -78,10 +78,13 @@ def latest_closed_session(conn: sqlite3.Connection,
     cal, cal_error = load_calendar(conn)
     calendar_side = closed_through(cal, now)
 
-    bars_max = conn.execute("SELECT MAX(date) AS d FROM bars_daily").fetchone()["d"]
-    # 行情侧只认「已收盘」的那一天：未来日期 / 当天但未到收盘时刻一律不算
-    bars_side = (bars_max if bars_max and is_trade_date_closed(bars_max, now)
-                 else None)
+    # 行情侧：取**已收盘**的日期里最大的那个。刻意取「按日期降序的第一根已收盘日」
+    # 而不是 MAX(date)：若 MAX(date) 恰好是未收盘的一天（未来日 / 当天但未到收盘时刻），
+    # 直接拿它判会把**整侧**证据丢掉 —— 而它下面明明还有一堆已收盘的日子。
+    bars_dates = [r["date"] for r in conn.execute(
+        "SELECT DISTINCT date FROM bars_daily ORDER BY date DESC")]
+    bars_max = bars_dates[0] if bars_dates else None
+    bars_side = next((d for d in bars_dates if is_trade_date_closed(d, now)), None)
 
     candidates = [d for d in (calendar_side, bars_side) if d]
     latest = max(candidates) if candidates else None
