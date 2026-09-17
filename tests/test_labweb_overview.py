@@ -162,14 +162,27 @@ def test_paper_section_shows_only_latest_trading_day(tmp_path):
     assert "19,814.91" not in html and "22,222.22" not in html
 
 
+def _segment(html: str, title: str) -> str:
+    """取出页面里某一段（从它的标题到下一个 `<section>`）。
+
+    断言必须**限定在段内**：整页扫关键字会把别的段（如 `decision.py`
+    的既有措辞「减仓的建议股数」）算进来，于是要么误报、要么逼人改上游文案
+    —— 两种都会把这条测试逼成假的。
+    """
+    start = html.index(f">{title}<")
+    end = html.find('<section class="sec">', start)
+    return html[start:] if end < 0 else html[start:end]
+
+
 def test_paper_section_does_not_pick_a_winner(tmp_path):
-    """多臂**只并列**：页面上不许出现推荐性措辞（同 PAPER_NO_PICK 纪律）。"""
+    """多臂**只并列**：模拟盘段不许出现推荐性措辞（同 PAPER_NO_PICK 纪律）。"""
     path = _db(tmp_path)
     _add_paper(path, [("arm-hold", "2026-09-14", 19814.91),
                       ("arm-discipline-05", "2026-09-14", 19807.21)])
-    html = _html(path)
-    for word in ("建议", "推荐", "应该", "最优", "最佳", "冠军"):
-        assert word not in html, word
+    seg = _segment(_html(path), "模拟盘")
+    assert "19,814.91" in seg and "19,807.21" in seg   # 段确实取到了那两行
+    for word in ("建议", "推荐", "应该", "最优", "最佳", "冠军", "跑赢", "更好"):
+        assert word not in seg, word
 
 
 def test_paper_section_when_empty(tmp_path):
@@ -211,13 +224,23 @@ def test_actions_section_shows_unknown_reason(tmp_path):
 def test_advisory_flags_unexecutable_share_counts(tmp_path):
     """100 股持仓下，折算出的 10 股 / 20 股减仓**执行不了**，必须标注。
 
-    判据用导入的 `LOT_SIZE`（不许在测试里写死 100），并逐条核对：
-    页面里每个「N 股（按当前 …）」若 `N % LOT_SIZE != 0`，同一行必须出现
-    「执行不了」。
+    判据用导入的 `LOT_SIZE`（不许在测试里写死 100），且**逐行**核对：
+    每个含「= N 股（按当前 …）」的 `<li>` 若 `N % LOT_SIZE != 0`，
+    **同一行里**必须出现「执行不了」。
+
+    为什么必须同行：`decision.py` 的 because 里本来就有「执行不了」四个字，
+    整页扫关键字会让这条断言在**标注分支被摘掉之后照样绿** ——
+    实测过（把 `bad` 写成 `False`，整页扫描仍通过）。
     """
     html = _html(_db(tmp_path))
-    hits = re.findall(r"=\s*(\d+)\s*股（按当前", html)
-    assert hits, "至少应有一句「= N 股（按当前 …）」的减仓折算"
-    for n in hits:
-        if int(n) % LOT_SIZE != 0:
-            assert "执行不了" in html, f"{n} 股不可执行却没有标注"
+    items = [li for li in re.findall(r"<li>.*?</li>", html, re.S)
+             if re.search(r"=\s*\d+\s*股（按当前", li)]
+    assert items, "至少应有一句「= N 股（按当前 …）」的减仓折算"
+    for li in items:
+        n = int(re.search(r"=\s*(\d+)\s*股（按当前", li).group(1))
+        if n % LOT_SIZE != 0:
+            assert "执行不了" in li, f"{n} 股不可执行却没有同行标注"
+    # 反向：100 股（整手，可执行）的两条不该被误标成执行不了
+    assert not any("执行不了" in li for li in items
+                   if int(re.search(r"=\s*(\d+)\s*股（按当前", li).group(1))
+                   % LOT_SIZE == 0)

@@ -35,6 +35,11 @@ import re
 from html import escape as _escape
 from typing import Any, Mapping, Sequence
 
+#: 整手规模从**决策层导入**，不在渲染层写 100：卖出须 100 股整数倍这条规则
+#: 全项目只有一个常数来源（`portfolio/decision.LOT_SIZE`），抄一份到这里
+#: 就等着它和上游分叉 —— 那时页面会用旧阈值说「能执行」。
+from stocklab.portfolio.decision import LOT_SIZE
+
 #: 静态资源路径（相对 base-path 之下）。
 CSS_PATH = "static/app.css"
 JS_PATH = "static/app.js"
@@ -688,6 +693,116 @@ def _kelly_line(risk: Mapping | None) -> str:
     return "".join(out)
 
 
+def advisory_list(adv: Sequence[Mapping]) -> str:
+    """「怎么做」的减仓折算回显。**不可执行的股数不许留着误导人**（P36）。
+
+    纪律按 10% / 20% 折算出的股数，在 100 股这种一手仓上会算出 10 股 / 20 股 ——
+    而卖出的申报数量必须是 `LOT_SIZE` 的整数倍（深交所 3.3.8），这两笔**执行不了**。
+    页面上留着一句「减仓 10 股」而不说它下不出去，就是在教人下一张废单。
+
+    判据用 `decision.LOT_SIZE`（**导入**，不在这里写 100）：整手规模全项目只有
+    一个常数来源，抄一份到这里就等着它和上游分叉。
+    """
+    items = []
+    for a in adv:
+        shares = int(a["shares"])
+        bad = shares <= 0 or shares % LOT_SIZE != 0
+        flag = ('<span class="s-warn">　⚠ 该笔执行不了（卖出须 '
+                f'{LOT_SIZE} 股的整数倍）</span>' if bad else "")
+        items.append(f'<li>{rich(a["note"])}{flag}　'
+                     f'<span class="mut">规则 {esc(a["rule"])}</span></li>')
+    return '<ul class="list">' + "".join(items) + "</ul>"
+
+
+def _paper_block(paper: Mapping | None) -> str:
+    """模拟盘各臂**最新一交易日**的净值（P36）。多臂并列，不排名、不挑推荐。
+
+    `paper_nav_daily` 的行是**已落库的事实**，这里只显示，不重算、不补数：
+    没有数据时如实写「暂无模拟盘记录」，而不是显示一行 0。
+    """
+    if not paper or not paper.get("arms"):
+        return ('<p class="note">暂无模拟盘记录'
+                '（`paper_nav_daily` 里没有 ≤ 查询日的净值行）。</p>')
+    rows = []
+    for a in paper["arms"]:
+        ret = a.get("cum_return")
+        cls = sign_cls(ret)
+        rows.append(
+            f'<tr><td class="l">{esc(a["account_id"])}</td>'
+            f'<td>{esc(a["date"])}</td>'
+            f'<td class="num">{money(a.get("cash"))}</td>'
+            f'<td class="num">{money(a.get("market_value"))}</td>'
+            f'<td class="num">{money(a.get("nav"))}</td>'
+            f'<td class="num {cls}">{ratio_pct(ret)}</td>'
+            f'<td class="num">{money(a.get("drawdown"))}</td></tr>')
+    return (f'<p class="note">净值日期 <b>{esc(paper["date"])}</b>　'
+            f'共 {len(paper["arms"])} 条臂（同一天各一行，'
+            f'来自 `paper_nav_daily`，本节不重算）</p>'
+            f'<div class="scroll-x"><table class="tbl">'
+            f'<tr><th>账户</th><th>净值日</th><th>现金</th><th>持仓市值</th>'
+            f'<th>净值</th><th>累计收益</th><th>回撤</th></tr>'
+            + "".join(rows) + '</table></div>'
+            f'<p class="note">{rich(paper.get("policy", ""))}</p>')
+
+
+def actions_block(actions: Mapping | None) -> str:
+    """「能不能动」逐只持仓的结论（P36）：headline + 为什么 + 选项 + 全清试算。
+
+    结论、整手原因（`whole_lot_reason`）、试算金额全部来自
+    `portfolio.decision.position_decision` —— 本函数**只摆出来**，
+    不重写那句话、不重算那笔钱。`state=unknown` 时也照常渲染，
+    因为「判不了」必须带上理由，否则页面看起来像「没事」。
+    """
+    rows = list((actions or {}).get("rows") or [])
+    if not rows:
+        return ('<p class="note">没有可判的持仓（账本里没有未平仓标的）——'
+                '"没有可动的仓"是结论，不是缺数据。</p>')
+    out = []
+    for r in rows:
+        state = str(r.get("state"))
+        cls = {"stop": "fail", "no_add": "warn", "hold": "pass"}.get(state,
+                                                                     "unknown")
+        name = r.get("name") or ""
+        head = f'{esc(r["code"])}'
+        if name:
+            head += f'　{esc(name)}'
+        lines = [f'<p class="act__h"><b>{head}　'
+                 f'<span class="s-{cls}">{rich(r["headline"])}</span></b>'
+                 f'　<span class="mut">状态 {esc(state)}</span></p>']
+        for b in r.get("because") or []:
+            lines.append(f'<p class="note">{rich(b)}</p>')
+        opts = r.get("options") or []
+        if opts:
+            lines.append('<ul class="list">'
+                         + "".join(f'<li>{rich(o)}</li>' for o in opts)
+                         + '</ul>')
+        sell = r.get("sell_all")
+        money_row = r.get("money") or {}
+        close = money_row.get("close")
+        if sell is not None:
+            lines.append(
+                f'<p class="note">全清试算：{money_row.get("qty")} 股 × '
+                f'收盘 {money(sell.get("close"))} 元（成交价 '
+                f'{money(sell.get("fill_price"))}）到手 '
+                f'<b>{money(sell.get("proceeds"))}</b> 元　'
+                f'费用合计 {money(sell.get("fee_total"))} 元'
+                f'（佣金 / 印花税 / 过户费逐项见「查看详细」）</p>')
+        elif close is None:
+            lines.append(
+                f'<p class="note">全清试算：取不到收盘价，算不出这 '
+                f'{money_row.get("qty")} 股到手多少 —— 不拿买入价冒充。</p>')
+        rules = r.get("rules") or []
+        disc = r.get("disclosure") or []
+        detail = ""
+        if rules or disc:
+            detail = more(
+                '<ul class="list">'
+                + "".join(f'<li>{rich(x)}</li>' for x in rules + disc)
+                + '</ul>', label="查看详细：判据与公式")
+        out.append(f'<div class="act">{chr(10).join(lines)}{detail}</div>')
+    return "".join(out)
+
+
 def overview_page(summary: Mapping, *, base: str, built_at: str) -> str:
     view = summary["portfolio"]
     nav = summary["nav"]
@@ -722,15 +837,30 @@ def overview_page(summary: Mapping, *, base: str, built_at: str) -> str:
     # 这一段**常显**，是首屏的主角；其余各块的深度内容一律收进「查看详细」。
     adv = view.get("advisory") or []
     if adv:
-        how = ('<ul class="list">' + "".join(
-            f'<li>{rich(a["note"])}　<span class="mut">规则 {esc(a["rule"])}</span></li>'
-            for a in adv) + '</ul>')
+        how = advisory_list(adv)
     else:
         how = ('<p class="note">无建议（没有持仓或没有可用现价）——'
                '「无建议」本身是结论，不是缺数据。</p>')
     body.append(section("怎么做", how, right="按纪律换算成股数",
                         detail=more(_how_detail(view, nav, base=base),
                                     label="查看详细：成本与口径")))
+
+    # ---------- 能不能动（P36）：结论层已经算好了，这一段只把它摆出来 ----------
+    # 上面「怎么做」是纪律折算的股数；这里回答的是另一个问题：
+    # 「以我现在的持仓，到底动不动得了」。两者都常显 —— 把结论藏进折叠，
+    # 等于让「算了但没说」继续存在。
+    body.append(section("能不能动", actions_block(summary.get("actions")),
+                        right="只看日收盘价"))
+
+    body.append(section(
+        "模拟盘", _paper_block(summary.get("paper")),
+        right="并行对照，不排名",
+        detail=more('<p class="note">'
+                    + rich("模拟盘是同一份行情上**并行运行**的几个机械臂账户，"
+                           "用来对照纪律执行差异，**不含任何模型信号** —— "
+                           "它的涨跌不是系统预测能力的证据。")
+                    + f'完整分段口径见 <a href="{esc(base)}/data">数据</a> 页。</p>',
+                    label="查看详细：模拟盘是什么")))
 
     body.append(section("纪律", glance(_discipline_glance(view)),
                         right="出格项标红，逐条给判据",
@@ -1152,8 +1282,10 @@ def error_page(*, base: str, status: int, message: str, asof: str,
                   built_at=built_at)
 
 
-__all__ = ["CASH_FIELDS", "CHECK_CN", "CSS_PATH", "JS_PATH", "NAV_ITEMS",
-           "STATUS_CN", "TRADE_FIELDS", "alert", "banner", "cash_page",
+__all__ = ["CASH_FIELDS", "CHECK_CN", "CSS_PATH", "JS_PATH", "LOT_SIZE",
+           "NAV_ITEMS",
+           "STATUS_CN", "TRADE_FIELDS", "actions_block", "advisory_list",
+           "alert", "banner", "cash_page",
            "cash_pane", "cell", "data_page", "discipline_rail", "duplicate_page",
            "error_page", "esc", "layout", "money", "nav_svg", "num",
            "overview_page", "pct", "pnl_excl_fee", "positions_table",
