@@ -40,6 +40,10 @@ NAV_SESSIONS = 120
 #: `/data` 页显示多少条最近事件。
 EVENT_LIMIT = 20
 
+#: 模拟盘段的纪律句（与 `chain/accuracy.PAPER_NO_PICK` 同一约束，页面自己的措辞）。
+_PAPER_POLICY = ("各臂是**并行对照**：本节只并列，不排名、不挑「哪条更好」——"
+                 "在几个交易日上挑出的「冠军」是噪声，不是 edge。")
+
 
 def now_iso() -> str:
     return datetime.now(TZ).isoformat(timespec="seconds")
@@ -77,13 +81,47 @@ class Lab:
     # ---------- 各页面 ----------
 
     def overview(self) -> dict:
-        """总览：`build_summary` 的全部分 + 净值曲线 + 标的覆盖 + 「能不能动」。"""
+        """总览：`build_summary` 的全部分 + 净值曲线 + 标的覆盖 + 「能不能动」。
+
+        风险块**与 `/risk` 走同一个来源**（`risk_subject` → `build_risk_block`）：
+        以前这里 `build_summary` 没传 `risk_block`，于是总览的风险摘要恒为
+        `null`，页面只能显示「没算」—— 而**风险其实已经算得出来**。
+        两处各拼一遍就是第二个真相来源，所以这里只调 `self.risk()` 用的那一段。
+        """
         with self.conn() as c:
-            summary = build_summary(c, self.asof)
+            view = build_portfolio(c, self.asof)
+            summary = build_summary(c, self.asof,
+                                    risk_block=_risk_block(c, view, self.asof))
             summary["nav"] = nav_series(c, self.asof, n_sessions=NAV_SESSIONS)
-            summary["actions"] = self._actions(c, summary["portfolio"])
+            summary["actions"] = self._actions(c, view)
+            summary["paper"] = self._paper(c)
         summary["coverage"] = self.coverage()
         return summary
+
+    def _paper(self, conn) -> dict:
+        """模拟盘各臂**最新一交易日**的净值快照（P36）。**只读已落库的表，不重算**。
+
+        取数口径与 `build_summary` 一致：一律 `date <= asof`。这里刻意**不**取
+        全表 `MAX(date)` —— 那会让历史 `--asof` 的截图显示未来某天的净值。
+
+        多臂**只并列**：本方法不做排名、不算「谁更好」，也不挑出哪条是基准
+        （`chain/accuracy.PAPER_NO_PICK` 是同一个纪律）。
+        """
+        row = conn.execute(
+            "SELECT MAX(date) AS d FROM paper_nav_daily WHERE date <= ?",
+            (self.asof,)).fetchone()
+        latest = row["d"] if row is not None else None
+        if latest is None:
+            return {"asof": self.asof, "date": None, "arms": [],
+                    "n_arms": 0,
+                    "policy": _PAPER_POLICY}
+        arms = [dict(r) for r in conn.execute(
+            "SELECT account_id, date, cash, market_value, nav, drawdown,"
+            " cum_cost, cum_return, net_deposits, index_300_level,"
+            " index_300_asof FROM paper_nav_daily"
+            " WHERE date = ? ORDER BY account_id", (latest,))]
+        return {"asof": self.asof, "date": latest, "arms": arms,
+                "n_arms": len(arms), "policy": _PAPER_POLICY}
 
     def _actions(self, conn, view: dict) -> dict:
         """「能不能动」结论区（P1b）：逐只持仓一条结论。
@@ -164,13 +202,15 @@ class Lab:
                 "view": view}
 
     def risk(self) -> dict:
-        """风险页：面板 + 它是挂在哪只标的上的。"""
+        """风险页：面板 + 它是挂在哪只标的上的。
+
+        风险块由 `_risk_block` 产出 —— **与总览用的是同一个函数**，
+        所以 `/` 与 `/risk` 不可能给出两套风险数。
+        """
         with self.conn() as c:
             view = build_portfolio(c, self.asof)
             subject = risk_subject(view)
-            block = (build_risk_block(c, subject["code"], asof=self.asof,
-                                      price=subject["price"])
-                     if subject else None)
+            block = _risk_block(c, view, self.asof)
             summary = build_summary(c, self.asof, risk_block=block)
         return {"asof": self.asof, "subject": subject, "risk": block,
                 "portfolio": view, "summary": summary}
@@ -270,6 +310,19 @@ class Lab:
             out["status"] = "degraded"
             out["error"] = f"{type(exc).__name__}: {exc}"
         return out
+
+
+def _risk_block(conn, view: dict, asof: str) -> dict | None:
+    """风险面板：挂在**市值最大的持仓**上（`risk_subject` 的展示选择）。
+
+    总览与 `/risk` 都调它 —— 「哪只标的是风险主体」这件事只能有一个答案，
+    否则两个页面会对同一账户给出不同标的的风险结论。
+    """
+    subject = risk_subject(view)
+    if subject is None:
+        return None
+    return build_risk_block(conn, subject["code"], asof=asof,
+                            price=subject["price"])
 
 
 def _reversed_trade_ids(rows: list[dict]) -> set[int]:
