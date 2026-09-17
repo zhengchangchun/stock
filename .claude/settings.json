@@ -12,10 +12,10 @@
       "TodoWrite"
     ],
     "deny": [
-      "Bash(curl:*169.254.*)",
-      "Bash(curl:*10.*)",
-      "Bash(curl:*192.168.*)",
-      "Bash(curl:*127.*)",
+      "Bash(curl *169.254*)",
+      "Bash(curl *10.*)",
+      "Bash(curl *192.168*)",
+      "Bash(curl *127.*)",
       "Bash(rm -rf /*)"
     ]
   },
