@@ -111,6 +111,11 @@ def insert_backtest(conn: sqlite3.Connection, *, candidate_script_id: int,
 
 def load_backtests(conn: sqlite3.Connection,
                    *, script_id: int | None = None) -> list[dict]:
+    """返回回测记录列表。
+
+    ``script_id`` 过滤的是 ``candidate_script_id`` 列，**不包含**该脚本作为
+    ``baseline_script_id`` 的回测记录。Task 7 调用时请注意此语义。
+    """
     if script_id is None:
         rows = conn.execute(
             f"SELECT * FROM {TABLE_BACKTESTS} ORDER BY backtest_id").fetchall()

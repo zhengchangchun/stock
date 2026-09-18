@@ -1,5 +1,7 @@
 """Task 1：6 张新表存在、可写、且 append-only。"""
 
+import hashlib
+
 import pytest
 
 from stocklab.store.db import connect
@@ -108,8 +110,6 @@ def test_plugin_audit_and_candidate_tables_append_only(conn):
 
 # ---------- Task 5：版本库读写 ----------
 
-import hashlib
-
 from stocklab.plugin import store
 
 
@@ -180,3 +180,11 @@ def test_insert_backtest_rejects_unknown_verdict(conn):
             conn, candidate_script_id=sid, baseline_script_id=None, pool="short",
             window_start="2023-09-18", window_end="2026-09-17", metrics={},
             verdict="MAYBE", overfit_flag=None, report_sha256="x", now=NOW)
+
+
+def test_insert_audit_rejects_empty_actor(conn):
+    sid = store.insert_script(conn, plugin_id="3", version="1.0.0",
+                              source_text="a", note=None, now=NOW)
+    with pytest.raises(ValueError):
+        store.insert_audit(conn, script_id=sid, action="submit",
+                           actor="", reason=None, now=NOW)
