@@ -19,6 +19,12 @@ EXPECTED_TABLES = {
     "paper_trades",                    # P19：模拟成交（append-only）
     "paper_nav_daily",                 # P19：每日净值（append-only）
     "market_holidays",                 # P30：已公告休市（append-only，前瞻；非 trading_calendar）
+    "plugin_scripts",                  # P插桩：脚本版本库（append-only）
+    "plugin_audit",                    # P插桩：审计事件流（append-only）
+    "plugin_backtests",                # P插桩：回测结果（append-only）
+    "candidate_snapshots",             # P插桩：候选池快照（append-only）
+    "candidate_members",               # P插桩：候选池成员（append-only）
+    "candidate_rejects",               # P插桩：候选池淘汰记录（append-only）
 }
 
 

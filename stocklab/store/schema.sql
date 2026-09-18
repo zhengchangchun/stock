@@ -742,3 +742,130 @@ BEGIN SELECT RAISE(ABORT, 'market_holidays is append-only'); END;
 CREATE TRIGGER IF NOT EXISTS trg_market_holidays_no_delete
 BEFORE DELETE ON market_holidays
 BEGIN SELECT RAISE(ABORT, 'market_holidays is append-only'); END;
+
+-- ---------- 插桩脚本版本库（模块1 骨架）----------
+-- 语义见 docs/superpowers/specs/2026-09-18-插桩候选池骨架-design.md §5。
+-- 状态不存列、由 plugin_audit 事件流推导 —— 审计链必须能回答「谁在什么时候批的」。
+CREATE TABLE IF NOT EXISTS plugin_scripts (
+    script_id     INTEGER PRIMARY KEY AUTOINCREMENT,
+    plugin_id     TEXT NOT NULL,
+    version       TEXT NOT NULL,
+    source_text   TEXT NOT NULL,
+    source_sha256 TEXT NOT NULL,
+    created_at    TEXT NOT NULL,
+    note          TEXT,
+    UNIQUE (plugin_id, version)
+);
+
+CREATE TABLE IF NOT EXISTS plugin_audit (
+    audit_id   INTEGER PRIMARY KEY AUTOINCREMENT,
+    script_id  INTEGER NOT NULL,
+    action     TEXT NOT NULL CHECK (action IN
+                 ('submit','sandbox_pass','sandbox_fail','approve','reject','archive')),
+    actor      TEXT NOT NULL,
+    reason     TEXT,
+    created_at TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_plugin_audit_script
+    ON plugin_audit (script_id, audit_id);
+
+CREATE TABLE IF NOT EXISTS plugin_backtests (
+    backtest_id        INTEGER PRIMARY KEY AUTOINCREMENT,
+    candidate_script_id INTEGER NOT NULL,
+    baseline_script_id  INTEGER,            -- 首版无 baseline，允许 NULL
+    pool               TEXT NOT NULL CHECK (pool IN ('short','mid','long')),
+    window_start       TEXT NOT NULL,
+    window_end         TEXT NOT NULL,
+    metrics_json       TEXT NOT NULL,
+    verdict            TEXT NOT NULL CHECK (verdict IN
+                         ('WIN','LOSE','INCONCLUSIVE')),
+    overfit_flag       TEXT CHECK (overfit_flag IN ('none','suspected')),
+    report_sha256      TEXT NOT NULL,
+    created_at         TEXT NOT NULL
+);
+
+-- ---------- 候选池（模块1 骨架）----------
+
+CREATE TABLE IF NOT EXISTS candidate_snapshots (
+    snapshot_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    asof        TEXT NOT NULL,
+    run_kind    TEXT NOT NULL CHECK (run_kind IN ('light','weekly','quarterly')),
+    params_json TEXT NOT NULL,
+    created_at  TEXT NOT NULL,
+    UNIQUE (asof, run_kind)                  -- 幂等键
+);
+
+-- status 是**该快照时点**的值，行本身不可变；当前状态 = 最新快照里的 status。
+CREATE TABLE IF NOT EXISTS candidate_members (
+    snapshot_id INTEGER NOT NULL,
+    code        TEXT NOT NULL,
+    pool        TEXT NOT NULL CHECK (pool IN ('short','mid','long')),
+    raw_score   REAL NOT NULL,
+    adj_score   REAL NOT NULL,
+    reason      TEXT NOT NULL,
+    risk_json   TEXT NOT NULL,
+    status      TEXT NOT NULL CHECK (status IN
+                  ('观察中','等待买点','已建仓','逻辑证伪移出')),
+    entered_at  TEXT NOT NULL,
+    PRIMARY KEY (snapshot_id, code, pool)
+);
+
+CREATE TABLE IF NOT EXISTS candidate_rejects (
+    snapshot_id INTEGER NOT NULL,
+    code        TEXT NOT NULL,
+    stage       TEXT NOT NULL CHECK (stage IN
+                  ('pre_screen','industry_screen','score')),
+    reason      TEXT NOT NULL,
+    plugin_id   TEXT,
+    PRIMARY KEY (snapshot_id, code, stage)
+);
+
+-- ---------- 新表的 append-only 触发器 ----------
+CREATE TRIGGER IF NOT EXISTS trg_plugin_scripts_no_update
+BEFORE UPDATE ON plugin_scripts
+BEGIN SELECT RAISE(ABORT, 'plugin_scripts is append-only'); END;
+
+CREATE TRIGGER IF NOT EXISTS trg_plugin_scripts_no_delete
+BEFORE DELETE ON plugin_scripts
+BEGIN SELECT RAISE(ABORT, 'plugin_scripts is append-only'); END;
+
+CREATE TRIGGER IF NOT EXISTS trg_plugin_audit_no_update
+BEFORE UPDATE ON plugin_audit
+BEGIN SELECT RAISE(ABORT, 'plugin_audit is append-only'); END;
+
+CREATE TRIGGER IF NOT EXISTS trg_plugin_audit_no_delete
+BEFORE DELETE ON plugin_audit
+BEGIN SELECT RAISE(ABORT, 'plugin_audit is append-only'); END;
+
+CREATE TRIGGER IF NOT EXISTS trg_plugin_backtests_no_update
+BEFORE UPDATE ON plugin_backtests
+BEGIN SELECT RAISE(ABORT, 'plugin_backtests is append-only'); END;
+
+CREATE TRIGGER IF NOT EXISTS trg_plugin_backtests_no_delete
+BEFORE DELETE ON plugin_backtests
+BEGIN SELECT RAISE(ABORT, 'plugin_backtests is append-only'); END;
+
+CREATE TRIGGER IF NOT EXISTS trg_candidate_snapshots_no_update
+BEFORE UPDATE ON candidate_snapshots
+BEGIN SELECT RAISE(ABORT, 'candidate_snapshots is append-only'); END;
+
+CREATE TRIGGER IF NOT EXISTS trg_candidate_snapshots_no_delete
+BEFORE DELETE ON candidate_snapshots
+BEGIN SELECT RAISE(ABORT, 'candidate_snapshots is append-only'); END;
+
+CREATE TRIGGER IF NOT EXISTS trg_candidate_members_no_update
+BEFORE UPDATE ON candidate_members
+BEGIN SELECT RAISE(ABORT, 'candidate_members is append-only'); END;
+
+CREATE TRIGGER IF NOT EXISTS trg_candidate_members_no_delete
+BEFORE DELETE ON candidate_members
+BEGIN SELECT RAISE(ABORT, 'candidate_members is append-only'); END;
+
+CREATE TRIGGER IF NOT EXISTS trg_candidate_rejects_no_update
+BEFORE UPDATE ON candidate_rejects
+BEGIN SELECT RAISE(ABORT, 'candidate_rejects is append-only'); END;
+
+CREATE TRIGGER IF NOT EXISTS trg_candidate_rejects_no_delete
+BEFORE DELETE ON candidate_rejects
+BEGIN SELECT RAISE(ABORT, 'candidate_rejects is append-only'); END;
