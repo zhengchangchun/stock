@@ -104,3 +104,79 @@ def test_plugin_audit_and_candidate_tables_append_only(conn):
         with pytest.raises(Exception) as e:
             conn.execute(f"DELETE FROM {table}")
         assert "append-only" in str(e.value), table
+
+
+# ---------- Task 5：版本库读写 ----------
+
+import hashlib
+
+from stocklab.plugin import store
+
+
+def test_source_sha256_is_stable():
+    a = store.source_sha256("def run(ctx): pass")
+    b = store.source_sha256("def run(ctx): pass")
+    c = store.source_sha256("def run(ctx): pass  # 改一个字")
+    assert a == b == hashlib.sha256("def run(ctx): pass".encode()).hexdigest()
+    assert a != c
+
+
+def test_insert_and_get_script(conn):
+    sid = store.insert_script(conn, plugin_id="3", version="1.0.0",
+                              source_text="def run(ctx): pass", note=None,
+                              now=NOW)
+    row = store.get_script(conn, sid)
+    assert row["plugin_id"] == "3"
+    assert row["version"] == "1.0.0"
+    assert row["source_sha256"] == store.source_sha256("def run(ctx): pass")
+
+
+def test_get_missing_script_returns_none(conn):
+    assert store.get_script(conn, 999) is None
+
+
+def test_list_scripts_filters_by_plugin_id(conn):
+    store.insert_script(conn, plugin_id="3", version="1.0.0",
+                        source_text="a", note=None, now=NOW)
+    store.insert_script(conn, plugin_id="1", version="1.0.0",
+                        source_text="b", note=None, now=NOW)
+    assert len(store.list_scripts(conn)) == 2
+    only3 = store.list_scripts(conn, plugin_id="3")
+    assert [r["plugin_id"] for r in only3] == ["3"]
+
+
+def test_audit_roundtrip(conn):
+    sid = store.insert_script(conn, plugin_id="3", version="1.0.0",
+                              source_text="a", note=None, now=NOW)
+    store.insert_audit(conn, script_id=sid, action="submit", actor="tester",
+                       reason=None, now=NOW)
+    store.insert_audit(conn, script_id=sid, action="sandbox_pass",
+                       actor="tester", reason="样本不足", now=NOW)
+    rows = store.list_audit(conn, script_id=sid)
+    assert [r["action"] for r in rows] == ["submit", "sandbox_pass"]
+    assert rows[0]["actor"] == "tester"
+
+
+def test_insert_backtest_and_load(conn):
+    sid = store.insert_script(conn, plugin_id="3", version="1.0.0",
+                              source_text="a", note=None, now=NOW)
+    bid = store.insert_backtest(
+        conn, candidate_script_id=sid, baseline_script_id=None, pool="short",
+        window_start="2023-09-18", window_end="2026-09-17",
+        metrics={"n_days": 0}, verdict="INCONCLUSIVE", overfit_flag=None,
+        report_sha256="deadbeef", now=NOW)
+    rows = store.load_backtests(conn, script_id=sid)
+    assert len(rows) == 1
+    assert rows[0]["backtest_id"] == bid
+    assert rows[0]["verdict"] == "INCONCLUSIVE"
+    assert rows[0]["metrics"]["n_days"] == 0        # JSON 已解回 dict
+
+
+def test_insert_backtest_rejects_unknown_verdict(conn):
+    sid = store.insert_script(conn, plugin_id="3", version="1.0.0",
+                              source_text="a", note=None, now=NOW)
+    with pytest.raises(Exception):
+        store.insert_backtest(
+            conn, candidate_script_id=sid, baseline_script_id=None, pool="short",
+            window_start="2023-09-18", window_end="2026-09-17", metrics={},
+            verdict="MAYBE", overfit_flag=None, report_sha256="x", now=NOW)
