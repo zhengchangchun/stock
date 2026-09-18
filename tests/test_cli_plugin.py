@@ -13,6 +13,13 @@ SCORE_SCRIPT = (
     "    return {'score': 50.0, 'pass_flag': True, 'reason': 'r',"
     " 'risk_list': []}\n"
 )
+# Uses whitelisted builtins: float(), len(), list() — must not NameError in sandbox
+BUILTIN_SCRIPT = (
+    "def run(ctx):\n"
+    "    items = list(range(3))\n"
+    "    score = float(len(items))\n"
+    "    return {'score': score, 'pass_flag': True, 'reason': 'ok', 'risk_list': []}\n"
+)
 BAD_SCRIPT = "import os\ndef run(ctx): return {}\n"
 
 
@@ -111,3 +118,20 @@ def test_duplicate_version_fails_cleanly(db, tmp_path, capsys):
                       "--version", "1.0.0", "--actor", "tester",
                       "--now", NOW, capsys=capsys)
     assert code != 0
+
+
+def test_submit_script_using_whitelisted_builtins_reaches_pending_review(
+        db, tmp_path, capsys):
+    """回归：占位沙盒必须用 runtime.load_script 的白名单命名空间，
+    而不是 {__builtins__: {}}。若错用空 __builtins__，float/len/list 等
+    白名单内建函数会 NameError，合法脚本被误判为沙盒失败。"""
+    f = write_script(tmp_path, "builtin.py", BUILTIN_SCRIPT)
+    code, out = run(db, "plugin", "submit", str(f), "--plugin-id", "3",
+                    "--version", "1.0.0", "--actor", "tester",
+                    "--now", NOW, capsys=capsys)
+    assert code == 0, f"submit failed (code={code}): {out}"
+    c = connect(db)
+    rows = store.list_scripts(c, plugin_id="3")
+    assert len(rows) == 1
+    assert lifecycle.script_state(c, rows[0]["script_id"]) == "pending_review"
+    c.close()

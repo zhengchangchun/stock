@@ -15,7 +15,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from stocklab.config import paths
-from stocklab.plugin import guard, lifecycle, store
+from stocklab.plugin import guard, lifecycle, runtime, store
 from stocklab.store.db import connect
 from stocklab.store.migrate import ensure_schema
 
@@ -38,20 +38,15 @@ def _run_sandbox_placeholder(source_text: str, plugin_id: str) -> tuple[bool, st
     **返回 True 不等于「策略有效」** —— 这里还没有任何样本外证据。
     真沙盒在 Task 16/17 接入，届时本函数被替换。
 
-    注意：guard.check_source 已经在 cmd_plugin_submit 里跑过一遍了。
-    这里直接 compile+exec，不再重复调用 runtime.load_script（避免二次 guard）。
+    注意：runtime.load_script 内部会再调一次 guard.check_source，与
+    cmd_plugin_submit 里的显式预检重复，但该重复是幂等且廉价的，接受。
+    不能用 {__builtins__: {}} 直接 exec，否则 float/len 等白名单内建
+    函数会 NameError，误判合法脚本为沙盒失败（已有回归测试覆盖）。
     """
     try:
-        from stocklab.plugin import contract  # 局部 import，避免循环
-        ns: dict = {"__builtins__": {}}
-        code = compile(source_text, f"<plugin:{plugin_id}>", "exec")
-        exec(code, ns)                         # noqa: S102 —— 已由调用方 guard 预检
-        run_fn = ns.get("run")
-        if not callable(run_fn):
-            raise contract.PluginContractError("脚本未定义 run(ctx)")
-        result = run_fn({"code": "__probe__", "asof": "1970-01-01"})
-        contract.validate_return(plugin_id, result)
-    except Exception as exc:                   # noqa: BLE001 —— 一律记原因
+        fn = runtime.load_script(source_text, plugin_id=plugin_id)
+        fn({"code": "__probe__", "asof": "1970-01-01"})
+    except Exception as exc:                      # noqa: BLE001 —— 一律记原因
         return False, f"加载/执行失败：{type(exc).__name__}: {exc}"
     return True, "沙盒未接线（Task 16 前）：仅验证了可加载、可执行、契约通过"
 
