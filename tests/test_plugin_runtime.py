@@ -55,12 +55,24 @@ def test_infinite_loop_times_out_and_process_survives():
     assert load_script(SCORE_SCRIPT, plugin_id="1")({"x": 1.0})["score"] == 10.0
 
 
-def test_builtins_are_restricted():
-    """未在白名单里的内建函数不可用（例如 `type` 之外的冷门入口）。"""
+def test_non_whitelisted_builtin_raises_name_error():
+    """A builtin absent from _ALLOWED_BUILTINS must be unreachable inside a script.
+
+    `type` is not on the whitelist and is not blocked by guard.check_source
+    (guard only bans dangerous constructs, not all non-whitelisted names).
+    Calling `type(42)` inside a plugin therefore raises NameError — the name
+    is simply not defined in the restricted exec namespace.
+
+    Discrimination: if `type` were added to _ALLOWED_BUILTINS, the script
+    would return score=1.0 instead of raising, and this test would fail.
+    """
     fn = load_script(
-        "def run(ctx):\n    return {'score': len([1,2,3]), 'pass_flag': True,"
-        " 'reason': 'r', 'risk_list': []}\n", plugin_id="1")
-    assert fn({})["score"] == 3.0
+        "def run(ctx):\n    _ = type(42)\n"
+        "    return {'score': 1.0, 'pass_flag': True, 'reason': 'r', 'risk_list': []}\n",
+        plugin_id="1",
+    )
+    with pytest.raises(NameError):
+        fn({})
 
 
 def test_namespace_builtins_whitelist():
@@ -89,12 +101,14 @@ def test_host_module_names_unreachable_from_script():
     If isolation holds, accessing `runtime` (a name in the host module
     stocklab.plugin.runtime) from inside the script raises NameError — because
     the exec namespace contains only the whitelist, not the host's globals.
+    That NameError propagates out of fn({}) and is caught by pytest.raises.
 
     If isolation were broken (e.g. host globals passed to exec), `runtime`
-    would resolve and the script would return score=1.0 instead of raising.
-
-    We catch NameError in the *test* (not inside the script) so this test
-    cannot pass vacuously on a restricted whitelist.
+    would resolve, the script would return score=1.0, and then
+    validate_return would be called with plugin_id="isolation-test" — an id
+    that is not in SHAPES — raising PluginContractError instead of NameError.
+    pytest.raises(NameError) would NOT be satisfied, so the test correctly
+    fails when isolation is absent.
     """
     fn = load_script(
         "def run(ctx):\n"
