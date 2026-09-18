@@ -76,6 +76,11 @@ def test_plugin_backtests_allows_null_baseline(conn):
 
 def test_plugin_audit_and_candidate_tables_append_only(conn):
     """每一张新表都要被 UPDATE / DELETE 触发器挡住。"""
+    # plugin_audit.script_id=1 需要真实的 plugin_scripts 行作为前提
+    conn.execute(
+        "INSERT INTO plugin_scripts (plugin_id, version, source_text,"
+        " source_sha256, created_at) VALUES ('3','1.0.0','def run(ctx): pass',"
+        " 'abc', ?)", (NOW,))
     # candidate_rejects 无时间戳列，绑定参数为空元组
     inserts = {
         "plugin_audit": ("INSERT INTO plugin_audit (script_id, action, actor,"
