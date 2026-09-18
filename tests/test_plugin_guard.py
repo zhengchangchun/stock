@@ -38,7 +38,7 @@ def test_clean_script_passes():
 def test_dangerous_source_is_rejected(source, label):
     with pytest.raises(PluginGuardError) as e:
         check_source(source)
-    # 所有违规路径的消息都以「禁止」开头并带行号，便于定位
+    # 所有违规路径的消息都包含「禁止」并带行号，便于定位
     assert "禁止" in str(e.value), label
 
 
@@ -49,5 +49,6 @@ def test_error_reports_line_number():
 
 
 def test_syntax_error_is_rejected():
-    with pytest.raises(PluginGuardError):
+    with pytest.raises(PluginGuardError) as e:
         check_source("def run(ctx:\n")
+    assert "禁止" in str(e.value)

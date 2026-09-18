@@ -29,8 +29,10 @@ BANNED_NAMES: frozenset[str] = frozenset({
     "globals", "locals", "vars", "getattr", "setattr", "delattr",
 })
 
-#: 禁止出现的 AST 节点类型（节点类名 → 人类可读的原因）。
-_BANNED_NODES: dict[str, str] = {
+#: 禁止出现的 AST 节点类型对应的错误消息文本（节点类名 → 人类可读的原因）。
+#: 注意：实际拦截逻辑在 check_source 的 walk 循环中用 isinstance 实现，
+#: 此 dict 仅供 _describe() 生成消息文本，新增条目不会自动启用拦截。
+_BANNED_NODE_DESCRIPTIONS: dict[str, str] = {
     "Import": "禁止 import",
     "ImportFrom": "禁止 from ... import",
     "Global": "禁止 global 声明",
@@ -43,7 +45,7 @@ class PluginGuardError(Exception):
 
 
 def _describe(node: ast.AST) -> str:
-    kind = _BANNED_NODES.get(type(node).__name__)
+    kind = _BANNED_NODE_DESCRIPTIONS.get(type(node).__name__)
     if kind:
         return kind
     if isinstance(node, ast.Name) and node.id in BANNED_NAMES:
@@ -61,7 +63,7 @@ def check_source(source_text: str) -> None:
     try:
         tree = ast.parse(source_text)
     except SyntaxError as exc:
-        raise PluginGuardError(f"脚本语法错误（第 {exc.lineno} 行）：{exc.msg}") from exc
+        raise PluginGuardError(f"禁止载入：脚本语法错误（第 {exc.lineno} 行）：{exc.msg}") from exc
 
     for node in ast.walk(tree):
         if isinstance(node, (ast.Import, ast.ImportFrom)):
