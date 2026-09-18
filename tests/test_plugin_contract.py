@@ -78,3 +78,13 @@ def test_unknown_plugin_id_is_rejected():
 def test_plugin5_shape():
     ok = {"analysis_result": {}, "bad_case_list": []}
     assert validate_return("5", ok)["analysis_result"] == {}
+
+
+def test_extra_keys_are_dropped_and_input_is_unchanged():
+    """validate_return 返回的 dict 不含多余键，且原始输入不被修改。"""
+    inp = {**GOOD_SCORE, "injected": "x"}
+    out = validate_return("1", inp)
+    assert "injected" not in out
+    # 原始输入对象必须保持不变
+    assert inp["injected"] == "x"
+    assert set(out.keys()) == {"score", "pass_flag", "reason", "risk_list"}

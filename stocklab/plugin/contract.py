@@ -74,12 +74,12 @@ def _check_field(plugin_id: str, name: str, kind: str, value: object) -> object:
         if not isinstance(value, dict):
             raise PluginContractError(
                 f"{where} 必须是 dict，实际是 {type(value).__name__}（{value!r}）")
-        return value
+        return dict(value)
     if kind == "list":
         if not isinstance(value, list):
             raise PluginContractError(
                 f"{where} 必须是 list，实际是 {type(value).__name__}（{value!r}）")
-        return value
+        return list(value)
     raise AssertionError(f"未知字段种类 {kind!r}")     # 代码 bug，不是脚本 bug
 
 
