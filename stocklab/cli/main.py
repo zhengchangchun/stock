@@ -33,6 +33,8 @@ from stocklab.data.fetch import EARLIEST as EARLIEST_ACTION_START
 from stocklab.store import repo
 from stocklab.store.db import connect
 from stocklab.store.migrate import ensure_schema, init_db
+from stocklab.cli.plugin import (cmd_plugin_approve, cmd_plugin_list,
+                                 cmd_plugin_reject, cmd_plugin_submit)
 
 TZ = ZoneInfo("Asia/Shanghai")
 
@@ -2701,6 +2703,42 @@ def build_parser() -> argparse.ArgumentParser:
     fx_record.add_argument("--key", required=True, help="raw_cache 的 params_key")
     fx_record.add_argument("--note", default=None)
     fx_record.set_defaults(func=_cmd_fixture_record)
+
+    pl = sub.add_parser(
+        "plugin", help="插桩脚本管理：提交 / 审核 / 上线 / 查看（人工审核闸门）")
+    pl_sub = pl.add_subparsers(dest="plugin_action", required=True)
+
+    pl_submit = pl_sub.add_parser("submit", help="提交一版插桩脚本（预检 + 沙盒）")
+    pl_submit.add_argument("file", help="脚本文件路径（.py）")
+    pl_submit.add_argument("--plugin-id", required=True,
+                           help="插桩编号：0-5（本轮）")
+    pl_submit.add_argument("--version", required=True, help="版本号，如 1.0.0")
+    pl_submit.add_argument("--actor", required=True, help="提交人（审计用）")
+    pl_submit.add_argument("--note", help="备注")
+    pl_submit.add_argument("--now", help="覆盖当前时刻（测试用）")
+    pl_submit.add_argument("--db")
+    pl_submit.set_defaults(func=cmd_plugin_submit)
+
+    pl_approve = pl_sub.add_parser("approve", help="人工审核通过并上线（会归档旧版）")
+    pl_approve.add_argument("script_id")
+    pl_approve.add_argument("--actor", required=True)
+    pl_approve.add_argument("--reason", required=True, help="为什么批（审计必填）")
+    pl_approve.add_argument("--now", help="覆盖当前时刻（测试用）")
+    pl_approve.add_argument("--db")
+    pl_approve.set_defaults(func=cmd_plugin_approve)
+
+    pl_reject = pl_sub.add_parser("reject", help="人工审核驳回")
+    pl_reject.add_argument("script_id")
+    pl_reject.add_argument("--actor", required=True)
+    pl_reject.add_argument("--reason", required=True)
+    pl_reject.add_argument("--now", help="覆盖当前时刻（测试用）")
+    pl_reject.add_argument("--db")
+    pl_reject.set_defaults(func=cmd_plugin_reject)
+
+    pl_list = pl_sub.add_parser("list", help="查看版本历史与状态（离线只读）")
+    pl_list.add_argument("--plugin-id", help="只看某个插桩；不给则全部")
+    pl_list.add_argument("--db")
+    pl_list.set_defaults(func=cmd_plugin_list)
 
     return parser
 
