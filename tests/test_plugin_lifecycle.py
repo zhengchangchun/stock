@@ -119,6 +119,26 @@ def test_approve_requires_reason(conn):
         lifecycle.approve(conn, sid, actor="t", reason="", now=NOW)
 
 
+def test_reject_requires_reason(conn):
+    """reject 同样要求 reason 非空；须先到达 pending_review 才能触发 reject 路径。"""
+    sid = _new(conn)
+    lifecycle.record_submit(conn, sid, actor="t", now=NOW)
+    lifecycle.record_sandbox(conn, sid, passed=True, reason="ok", now=NOW)
+    with pytest.raises(ValueError):
+        lifecycle.reject(conn, sid, actor="t", reason="", now=NOW)
+
+
+def test_approve_on_active_raises(conn):
+    """active → approve 必须拒绝（approve 的合法前置状态只有 pending_review / archived）。"""
+    sid = _new(conn)
+    lifecycle.record_submit(conn, sid, actor="t", now=NOW)
+    lifecycle.record_sandbox(conn, sid, passed=True, reason="ok", now=NOW)
+    lifecycle.approve(conn, sid, actor="t", reason="ok", now=NOW)
+    assert lifecycle.script_state(conn, sid) == "active"
+    with pytest.raises(lifecycle.PluginStateError):
+        lifecycle.approve(conn, sid, actor="t", reason="再批一次", now=NOW)
+
+
 def test_no_active_plugin_raises(conn):
     with pytest.raises(lifecycle.NoActivePlugin):
         lifecycle.active_script_id(conn, "3", required=True)
@@ -158,6 +178,10 @@ def test_approve_is_not_reachable_from_non_cli_code():
     """源码扫描：除 CLI 与 lifecycle 自身外，没有任何模块调用 approve/write。
 
     这条钉住设计文档 §9.3「approve 只能由人工 CLI 触发」。
+
+    已知局限：扫描匹配字面串 `lifecycle.approve(` / `lifecycle.reject(`，
+    因此无法捕获 `from stocklab.plugin.lifecycle import approve; approve(...)` 或
+    模块别名（`lc = lifecycle; lc.approve(...)`）等间接调用形式。
     """
     import pathlib
 
