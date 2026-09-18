@@ -63,16 +63,45 @@ def test_builtins_are_restricted():
     assert fn({})["score"] == 3.0
 
 
-def test_script_cannot_see_module_globals():
-    """脚本命名空间里不应有宿主对象（guard/contract/signal 等）泄入。
+def test_namespace_builtins_whitelist():
+    """Namespace factory must expose whitelisted names and exclude dangerous ones.
 
-    `dir()` 在函数内部只返回局部变量名，不返回模块级名称；因此
-    `'__builtins__' in dir()` 在 run() 内为 False（0.0）。
-    __builtins__ 作为内建可正常调用（white‑list），但不出现在局部 dir() 中。
-    这正好验证了脚本的局部作用域是干净的。
+    Asserts on the dict contents of _make_namespace().__builtins__ directly,
+    not through a plugin script that cannot observe the exec namespace.
+    """
+    from stocklab.plugin.runtime import _make_namespace
+
+    ns = _make_namespace()
+    builtins = ns["__builtins__"]
+
+    # Dangerous names must be absent
+    for forbidden in ("open", "__import__", "eval", "exec", "compile", "dir"):
+        assert forbidden not in builtins, f"forbidden builtin leaked: {forbidden!r}"
+
+    # Whitelisted names must be present
+    for allowed in ("len", "max", "sum", "min", "abs", "sorted", "range"):
+        assert allowed in builtins, f"expected whitelisted builtin missing: {allowed!r}"
+
+
+def test_host_module_names_unreachable_from_script():
+    """Host-module globals must not leak into the plugin exec namespace.
+
+    If isolation holds, accessing `runtime` (a name in the host module
+    stocklab.plugin.runtime) from inside the script raises NameError — because
+    the exec namespace contains only the whitelist, not the host's globals.
+
+    If isolation were broken (e.g. host globals passed to exec), `runtime`
+    would resolve and the script would return score=1.0 instead of raising.
+
+    We catch NameError in the *test* (not inside the script) so this test
+    cannot pass vacuously on a restricted whitelist.
     """
     fn = load_script(
-        "def run(ctx):\n    return {'score': float('__builtins__' in dir()),"
-        " 'pass_flag': True, 'reason': 'r', 'risk_list': []}\n", plugin_id="1")
-    # dir() inside a function only lists locals; __builtins__ is not a local var
-    assert fn({})["score"] == 0.0
+        "def run(ctx):\n"
+        "    _ = runtime\n"          # must raise NameError if namespace is clean
+        "    return {'score': 1.0, 'pass_flag': True,"
+        " 'reason': 'r', 'risk_list': []}\n",
+        plugin_id="isolation-test",
+    )
+    with pytest.raises(NameError):
+        fn({})

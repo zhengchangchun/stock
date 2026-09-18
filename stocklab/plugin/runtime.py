@@ -32,7 +32,7 @@ _ALLOWED_BUILTINS: dict[str, Any] = {
     name: __builtins__[name] if isinstance(__builtins__, dict)
     else getattr(__builtins__, name)
     for name in (
-        "abs", "all", "any", "bool", "dict", "dir", "enumerate", "filter", "float",
+        "abs", "all", "any", "bool", "dict", "enumerate", "filter", "float",
         "int", "len", "list", "map", "max", "min", "range", "round", "set",
         "sorted", "str", "sum", "tuple", "zip",
     )
