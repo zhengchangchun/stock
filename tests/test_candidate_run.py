@@ -157,6 +157,70 @@ def test_missing_plugin_aborts_run(tmp_db):
     c.close()
 
 
+def test_member_order_is_identical_between_fresh_and_skipped_run(tmp_db):
+    """回归：新跑和幂等重跑的 RunResult.members/rejects 顺序必须一致。
+
+    构造两只同分标的，按**字典序逆序**插入数据库，使「插入顺序」与
+    load_snapshot 返回的「(pool, -adj_score, code) 顺序」有实质性差异。
+    修复前新跑路径用 members 列表（插入序），重跑路径用 load_snapshot（排序序），
+    两者不一致；修复后必须相同。
+    """
+    from datetime import date as _date, timedelta as _timedelta
+
+    init_db(tmp_db)
+    c = connect(tmp_db)
+
+    # 两只股票，按逆字典序插入（600519 先 → 000333 后）
+    # load_snapshot 会按 code ASC 返回同分成员，使顺序与插入序不同
+    codes_reversed = ["600519", "000333"]
+    c.executemany(
+        "INSERT INTO instruments (code, name, market, board, type, added_at)"
+        " VALUES (?,?,'sz','main','stock',?)",
+        [(code, f"标的{code}", NOW) for code in codes_reversed])
+
+    days: list[str] = []
+    cur = _date(2025, 6, 1)
+    while len(days) < 300:
+        if cur.weekday() < 5:
+            days.append(cur.isoformat())
+        cur += _timedelta(days=1)
+    c.executemany("INSERT INTO trading_calendar (date, is_open, source,"
+                  " created_at) VALUES (?,1,'tencent',?)",
+                  [(d, NOW) for d in days])
+    c.executemany(
+        "INSERT INTO bars_daily (code, date, open, high, low, close, volume,"
+        " adj_mode, source, fetched_at) VALUES (?,?,?,?,?,?,1000,'none','x',?)",
+        [(code, d, 10.0, 10.0, 10.0, 10.0, NOW)
+         for code in codes_reversed for d in days])
+    for pid, text in PLUGINS.items():
+        from stocklab.plugin import lifecycle as _lc, store as _st
+        sid = _st.insert_script(c, plugin_id=pid, version="1.0.0",
+                                source_text=text, note=None, now=NOW)
+        _lc.record_submit(c, sid, actor="t", now=NOW)
+        _lc.record_sandbox(c, sid, passed=True, reason="ok", now=NOW)
+        _lc.approve(c, sid, actor="t", reason="ok", now=NOW)
+    c.commit()
+
+    fresh = candidate_run.run_candidate(c, asof=ASOF, run_kind="weekly",
+                                        now=NOW)
+    skipped = candidate_run.run_candidate(c, asof=ASOF, run_kind="weekly",
+                                          now=NOW)
+
+    assert skipped.skipped is True, "第二次调用应当命中幂等跳过路径"
+
+    fresh_members = [(m.code, m.pool) for m in fresh.members]
+    skipped_members = [(m.code, m.pool) for m in skipped.members]
+    assert fresh_members == skipped_members, (
+        f"members 顺序不一致：\n  新跑={fresh_members}\n  重跑={skipped_members}")
+
+    fresh_rejects = [(r.code, r.stage) for r in fresh.rejects]
+    skipped_rejects = [(r.code, r.stage) for r in skipped.rejects]
+    assert fresh_rejects == skipped_rejects, (
+        f"rejects 顺序不一致：\n  新跑={fresh_rejects}\n  重跑={skipped_rejects}")
+
+    c.close()
+
+
 def test_cli_candidate_run(tmp_db, capsys, tmp_path):
     c = _seed_db(tmp_db)
     c.close()

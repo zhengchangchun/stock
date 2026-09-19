@@ -154,6 +154,17 @@ def run_candidate(conn: sqlite3.Connection, *, asof: str, run_kind: str,
     loaded = snapshot.load_snapshot(conn, snapshot_id)
     md = report.render_report(asof=asof, run_kind=run_kind, loaded=loaded,
                               generated_at=now)
+    # 用 load_snapshot 返回的顺序（pool, adj_score DESC, code / stage, code）
+    # 构建 RunResult，与幂等重跑路径保持一致。
+    members_obj = [snapshot.MemberRow(
+        code=m["code"], pool=m["pool"], raw_score=m["raw_score"],
+        adj_score=m["adj_score"], reason=m["reason"],
+        risk_json=m["risk_json"], status=m["status"])
+        for m in loaded["members"]]
+    rejects_obj = [snapshot.RejectRow(
+        code=r["code"], stage=r["stage"], reason=r["reason"],
+        plugin_id=r.get("plugin_id"))
+        for r in loaded["rejects"]]
     return RunResult(snapshot_id=snapshot_id, asof=asof, run_kind=run_kind,
-                     members=members, rejects=rejects,
+                     members=members_obj, rejects=rejects_obj,
                      report_md=md, skipped=False, params=params)
