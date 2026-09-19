@@ -26,7 +26,11 @@ from __future__ import annotations
 #: 脚本只要读了 ctx["bars"] / ctx["name"] 等文档化字段就不该被误拒。
 #: 刻意不携带真实数据（bars=[]）——这不是回测数据，
 #: 只是让执行路径走通、让 validate_return 能校验返回结构。
-#: IMPORTANT: 此字典的 key 集合必须与 score.py::build_ctx 的输出保持同步。
+#: IMPORTANT: 此字典的 key 集合必须覆盖**所有调用点**传入的 ctx key 的并集：
+#:   - score.py::build_ctx 输出的基础字段（code/name/asof/pool/asset_type/board/bars）
+#:   - risk_adjust.py::adjust 额外覆盖的字段（raw_score/risk_list）
+#: 若有新调用点增加了 key，必须在这里同步追加，否则用 subscript 读该 key
+#: 的脚本会在探针阶段 KeyError 而被误拒，尽管其在生产路径下正常工作。
 PROBE_CTX: dict = {
     "code": "__probe__",
     "name": "__probe__",
@@ -35,6 +39,8 @@ PROBE_CTX: dict = {
     "asset_type": "stock",
     "board": "main",
     "bars": [],
+    "raw_score": 0.0,
+    "risk_list": [],
 }
 
 #: plugin_id → (字段名, 种类) 的有序清单。种类见 `_check_field`。

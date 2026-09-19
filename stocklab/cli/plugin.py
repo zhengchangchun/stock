@@ -111,6 +111,10 @@ def cmd_plugin_submit(args) -> int:
         return 2
     source_text = source_path.read_text(encoding="utf-8")
 
+    if not args.actor or not args.actor.strip():
+        print("--actor 不能为空字符串", file=sys.stderr)
+        return 2
+
     try:
         guard.check_source(source_text)
     except guard.PluginGuardError as exc:

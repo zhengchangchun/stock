@@ -265,3 +265,55 @@ def test_submit_backtest_window_end_matches_now(db, tmp_path, capsys):
     assert rows[0]["window_end"] == "2026-09-18", (
         f"window_end 应为 2026-09-18，实际为 {rows[0]['window_end']!r}"
     )
+
+
+# ---------- Final review fix wave regression tests ----------
+
+
+# M2: A plugin-4-shaped script that reads ctx["raw_score"] by subscript.
+# Before the fix, PROBE_CTX lacked "raw_score", so fn(PROBE_CTX) raised
+# KeyError and the script was rejected even though it runs fine in production.
+PLUGIN4_SUBSCRIPT_SCRIPT = (
+    "def run(ctx):\n"
+    "    score = ctx['raw_score'] * 0.9\n"
+    "    return {'final_score': score, 'risk_out': []}\n"
+)
+
+
+def test_plugin4_subscript_raw_score_reaches_pending_review(db, tmp_path, capsys):
+    """回归（M2）：插桩4 形脚本通过 subscript 读 ctx['raw_score'] 必须通过提交。
+
+    修复前：PROBE_CTX 缺少 raw_score → fn(PROBE_CTX) KeyError → 误拒。
+    修复后：PROBE_CTX 包含 raw_score=0.0 → 探针正常运行 → pending_review。
+    """
+    f = write_script(tmp_path, "p4_subscript.py", PLUGIN4_SUBSCRIPT_SCRIPT)
+    code, out = run(db, "plugin", "submit", str(f), "--plugin-id", "4",
+                    "--version", "1.0.0", "--actor", "tester",
+                    "--now", NOW, capsys=capsys)
+    assert code == 0, f"submit 应成功但返回 {code}；输出：{out}"
+    c = connect(db)
+    rows = store.list_scripts(c, plugin_id="4")
+    assert len(rows) == 1
+    state = lifecycle.script_state(c, rows[0]["script_id"])
+    assert state == "pending_review", f"期望 pending_review，实际={state}；输出：{out}"
+    c.close()
+
+
+# M4: --actor "" must be rejected before any DB write.
+def test_submit_empty_actor_is_rejected_before_db_write(db, tmp_path, capsys):
+    """回归（M4）：--actor "" 必须在落库前被拒绝，且不留孤立 draft 行。
+
+    修复前：insert_script 成功写入 draft 行，record_submit 随后 ValueError，
+    遗留一个不可达的 draft 行污染 UNIQUE(plugin_id, version) 约束。
+    修复后：在任何 DB 写之前校验 actor，返回非零退出码，库中无任何行。
+    """
+    f = write_script(tmp_path, "p3_empty_actor.py", SCORE_SCRIPT)
+    code, out = run(db, "plugin", "submit", str(f), "--plugin-id", "3",
+                    "--version", "1.0.0", "--actor", "",
+                    "--now", NOW, capsys=capsys)
+    assert code != 0, f"空 actor 应返回非零退出码，实际={code}；输出：{out}"
+    c = connect(db)
+    rows = store.list_scripts(c, plugin_id="3")
+    assert rows == [], f"库中不应有任何行，实际={rows}"
+    c.close()
+

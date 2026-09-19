@@ -780,7 +780,7 @@ CREATE TABLE IF NOT EXISTS plugin_backtests (
     metrics_json       TEXT NOT NULL,
     verdict            TEXT NOT NULL CHECK (verdict IN
                          ('WIN','LOSE','INCONCLUSIVE')),
-    overfit_flag       TEXT CHECK (overfit_flag IN ('none','suspected')),
+    overfit_flag       TEXT CHECK (overfit_flag IS NULL OR overfit_flag = 'suspected'),
     report_sha256      TEXT NOT NULL,
     created_at         TEXT NOT NULL
 );
