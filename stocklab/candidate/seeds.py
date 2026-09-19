@@ -1,10 +1,10 @@
-"""种子标的清单（设计文档 §2 D7）：16 只个股 + 4 只 ETF = 20 只，跨 10 个行业。
+"""种子标的清单（设计文档 §2 D7）：17 只个股 + 4 只 ETF = 21 只，跨 10 个行业。
 
 ## 为什么不是「全市场」
 
 文档 07 要求「全标的扫描」，但那需要全市场财报与行业分类的采集路径，
 本轮（骨架）没有 —— 见设计文档 §3「不做」与 §13「已知限制 6」。
-20 只种子是为了让**三池分流与行业排雷这两条主干逻辑真的被跑到**：
+21 只种子是为了让**三池分流与行业排雷这两条主干逻辑真的被跑到**：
 
 - 中期池/长期池需要财报 → 4 只 ETF 进不去，必须有够多的**个股**；
 - 插桩0 是「**行业特殊**排雷」→ 标的全在一个行业就测不出东西。
@@ -25,14 +25,15 @@ from __future__ import annotations
 
 from stocklab.config.universe import ASSET_ETF, ASSET_STOCK, Instrument
 
-#: 20 只种子。**顺序即代码升序**，保证报告与快照的稳定排序。
+#: 21 只种子。**顺序即代码升序**，保证报告与快照的稳定排序。
 SEED_UNIVERSE: tuple[Instrument, ...] = (
-    # 家电（5）
+    # 家电（6）
     Instrument("000333", "美的集团", "sz", "main", ASSET_STOCK),
     Instrument("000651", "格力电器", "sz", "main", ASSET_STOCK),
     Instrument("002032", "苏泊尔", "sz", "main", ASSET_STOCK),
     Instrument("002508", "老板电器", "sz", "main", ASSET_STOCK),
     Instrument("600690", "海尔智家", "sh", "main", ASSET_STOCK),
+    Instrument("603868", "飞科电器", "sh", "main", ASSET_STOCK),
     # 银行 / 保险 / 通信（4）
     Instrument("600036", "招商银行", "sh", "main", ASSET_STOCK),
     Instrument("600941", "中国移动", "sh", "main", ASSET_STOCK),
@@ -48,7 +49,7 @@ SEED_UNIVERSE: tuple[Instrument, ...] = (
     # 科技制造（2）—— 300750 是唯一的创业板，用于涨跌停分支
     Instrument("002415", "海康威视", "sz", "main", ASSET_STOCK),
     Instrument("300750", "宁德时代", "sz", "gem", ASSET_STOCK),
-    # ETF（4）—— 与 paper.config.ETF_WHITELIST 保持一致
+    # ETF（4）—— 扫描宇宙；paper.config.ETF_WHITELIST（2 只）是分散工具白名单，两者不同概念
     Instrument("510300", "沪深300ETF", "sh", "main", ASSET_ETF),
     Instrument("510880", "红利ETF", "sh", "main", ASSET_ETF),
     Instrument("512890", "红利低波ETF", "sh", "main", ASSET_ETF),
