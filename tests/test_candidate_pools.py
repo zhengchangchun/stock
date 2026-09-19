@@ -1,5 +1,7 @@
 """Task 10：三池分流（设计文档 §7.2）。"""
 
+import pytest
+
 from stocklab.candidate.pools import (POOL_LONG, POOL_MID, POOL_SHORT, POOL_TOPN,
                                       eligible_pools, select_top)
 from stocklab.config.universe import ASSET_ETF, ASSET_STOCK, Instrument
@@ -48,3 +50,16 @@ def test_select_top_handles_fewer_than_topn():
 
 def test_select_top_empty():
     assert select_top([], POOL_MID) == []
+
+
+def test_select_top_unknown_pool_raises_on_empty_list():
+    """未知池名必须抛 ValueError（guard 在切片之前）。"""
+    with pytest.raises(ValueError, match="未知池"):
+        select_top([], "invalid")
+
+
+def test_select_top_unknown_pool_raises_on_nonempty_list():
+    """非空列表传入未知池名，guard 也必须在切片前触发，确保不会绕过。"""
+    scored = [{"code": "000001", "adj_score": 1.0}]
+    with pytest.raises(ValueError, match="未知池"):
+        select_top(scored, "bogus_pool")
