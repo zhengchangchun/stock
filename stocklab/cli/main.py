@@ -35,6 +35,7 @@ from stocklab.store.db import connect
 from stocklab.store.migrate import ensure_schema, init_db
 from stocklab.cli.plugin import (cmd_plugin_approve, cmd_plugin_list,
                                  cmd_plugin_reject, cmd_plugin_submit)
+from stocklab.cli.candidate import cmd_candidate_run
 
 TZ = ZoneInfo("Asia/Shanghai")
 
@@ -2739,6 +2740,20 @@ def build_parser() -> argparse.ArgumentParser:
     pl_list.add_argument("--plugin-id", help="只看某个插桩；不给则全部")
     pl_list.add_argument("--db")
     pl_list.set_defaults(func=cmd_plugin_list)
+
+    cand = sub.add_parser(
+        "candidate", help="候选池筛选（模块1）：固定主干 + 插桩脚本")
+    cand_sub = cand.add_subparsers(dest="candidate_action", required=True)
+
+    cand_run = cand_sub.add_parser(
+        "run", help="跑一遍候选池主流程（幂等：同 asof+run_kind 只产出一次）")
+    cand_run.add_argument("--asof", required=True, help="截止日 YYYY-MM-DD（PIT）")
+    cand_run.add_argument("--run-kind", default="weekly",
+                          choices=["light", "weekly", "quarterly"])
+    cand_run.add_argument("--out", help="报告路径（默认 reports/candidate/<asof>-<kind>.md）")
+    cand_run.add_argument("--now", help="覆盖当前时刻（测试用）")
+    cand_run.add_argument("--db")
+    cand_run.set_defaults(func=cmd_candidate_run)
 
     return parser
 
