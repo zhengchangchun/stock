@@ -15,7 +15,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from stocklab.config import paths
-from stocklab.plugin import guard, lifecycle, runtime, store
+from stocklab.plugin import guard, lifecycle, sandbox, store
 from stocklab.store.db import connect
 from stocklab.store.migrate import ensure_schema
 
@@ -32,23 +32,46 @@ def _open(args):
     return connect(db_path)
 
 
-def _run_sandbox_placeholder(source_text: str, plugin_id: str) -> tuple[bool, str]:
-    """Task 16 之前的占位沙盒：只确认脚本加载得起来、跑得出合规结果。
+def _sandbox_window() -> tuple[str, str]:
+    """沙盒默认窗口：最近 3 年（设计文档 §8.2）。"""
+    end = datetime.now(timezone.utc).date()
+    start = end.replace(year=end.year - 3)
+    return start.isoformat(), end.isoformat()
 
-    **返回 True 不等于「策略有效」** —— 这里还没有任何样本外证据。
-    真沙盒在 Task 16/17 接入，届时本函数被替换。
 
-    注意：runtime.load_script 内部会再调一次 guard.check_source，与
-    cmd_plugin_submit 里的显式预检重复，但该重复是幂等且廉价的，接受。
-    不能用 {__builtins__: {}} 直接 exec，否则 float/len 等白名单内建
-    函数会 NameError，误判合法脚本为沙盒失败（已有回归测试覆盖）。
+def _run_sandbox(conn, *, script_id: int, plugin_id: str, source_text: str,
+                 now: str) -> tuple[bool, str]:
+    """跑沙盒并把结果写入 `plugin_backtests`，返回 `(passed, reason)`。
+
+    ## `passed` 的判据**不是** verdict
+
+    - 加载失败 / 契约不符 → `passed=False`（脚本有问题）
+    - `LOSE` → `passed=False`（有证据表明更差）
+    - `INCONCLUSIVE` → **`passed=True`**（样本不足不是脚本的错，
+      把它当「有问题」会让所有首版脚本都被驳回）
     """
+    baseline_id = lifecycle.active_script_id(conn, plugin_id)
+    start, end = _sandbox_window()
     try:
-        fn = runtime.load_script(source_text, plugin_id=plugin_id)
-        fn({"code": "__probe__", "asof": "1970-01-01"})
-    except Exception as exc:                      # noqa: BLE001 —— 一律记原因
-        return False, f"加载/执行失败：{type(exc).__name__}: {exc}"
-    return True, "沙盒未接线（Task 16 前）：仅验证了可加载、可执行、契约通过"
+        verdict = sandbox.run_sandbox(
+            conn, candidate_script_id=script_id,
+            baseline_script_id=baseline_id, pool="short",
+            window_start=start, window_end=end, now=now)
+    except Exception as exc:                       # noqa: BLE001
+        return False, f"沙盒执行失败：{type(exc).__name__}: {exc}"
+
+    flag = sandbox.overfit_flag(verdict.delta, verdict.ci_low, verdict.ci_high)
+    store.insert_backtest(
+        conn, candidate_script_id=script_id, baseline_script_id=baseline_id,
+        pool=verdict.pool, window_start=start, window_end=end,
+        metrics=verdict.as_metrics(), verdict=verdict.verdict,
+        overfit_flag=flag,
+        report_sha256=store.source_sha256(verdict.note), now=now)
+
+    parts = [f"verdict={verdict.verdict}", verdict.note]
+    if flag == "suspected":
+        parts.append("⚠️ 疑似过拟合")
+    return verdict.verdict != "LOSE", "；".join(parts)
 
 
 def cmd_plugin_submit(args) -> int:
@@ -76,7 +99,9 @@ def cmd_plugin_submit(args) -> int:
             return 1
 
         lifecycle.record_submit(conn, script_id, actor=args.actor, now=now)
-        passed, reason = _run_sandbox_placeholder(source_text, args.plugin_id)
+        passed, reason = _run_sandbox(conn, script_id=script_id,
+                                      plugin_id=args.plugin_id,
+                                      source_text=source_text, now=now)
         state = lifecycle.record_sandbox(conn, script_id, passed=passed,
                                          reason=reason, now=now)
         print(f"script_id={script_id} plugin_id={args.plugin_id} "

@@ -135,3 +135,53 @@ def test_submit_script_using_whitelisted_builtins_reaches_pending_review(
     assert len(rows) == 1
     assert lifecycle.script_state(c, rows[0]["script_id"]) == "pending_review"
     c.close()
+
+
+# ---------- Task 17：真沙盒接线 ----------
+
+
+def test_submit_writes_backtest_row(db, tmp_path, capsys):
+    f = write_script(tmp_path, "p3.py", SCORE_SCRIPT)
+    run(db, "plugin", "submit", str(f), "--plugin-id", "3", "--version",
+        "1.0.0", "--actor", "tester", "--now", NOW, capsys=capsys)
+    c = connect(db)
+    rows = store.load_backtests(c)
+    c.close()
+    assert len(rows) == 1
+    assert rows[0]["pool"] == "short"
+    assert rows[0]["verdict"] == "INCONCLUSIVE"
+    assert rows[0]["baseline_script_id"] is None
+
+
+def test_inconclusive_still_allows_pending_review(db, tmp_path, capsys):
+    """样本不足不是脚本的错 —— 不该阻止它进待审队列。"""
+    f = write_script(tmp_path, "p3.py", SCORE_SCRIPT)
+    code, _ = run(db, "plugin", "submit", str(f), "--plugin-id", "3",
+                  "--version", "1.0.0", "--actor", "tester", "--now", NOW,
+                  capsys=capsys)
+    assert code == 0
+    c = connect(db)
+    sid = store.list_scripts(c, plugin_id="3")[0]["script_id"]
+    assert lifecycle.script_state(c, sid) == "pending_review"
+    c.close()
+
+
+def test_second_version_records_baseline(db, tmp_path, capsys):
+    """第二版必须带上 baseline_script_id = 当前 active。"""
+    f1 = write_script(tmp_path, "v1.py", SCORE_SCRIPT)
+    run(db, "plugin", "submit", str(f1), "--plugin-id", "3", "--version",
+        "1.0.0", "--actor", "tester", "--now", NOW, capsys=capsys)
+    c = connect(db)
+    first = store.list_scripts(c, plugin_id="3")[0]["script_id"]
+    c.close()
+    run(db, "plugin", "approve", str(first), "--actor", "claude",
+        "--reason", "ok", "--now", NOW, capsys=capsys)
+
+    f2 = write_script(tmp_path, "v2.py", SCORE_SCRIPT.replace("50.0", "60.0"))
+    run(db, "plugin", "submit", str(f2), "--plugin-id", "3", "--version",
+        "1.1.0", "--actor", "tester", "--now", NOW, capsys=capsys)
+    c = connect(db)
+    rows = store.load_backtests(c)
+    c.close()
+    assert len(rows) == 2
+    assert rows[1]["baseline_script_id"] == first
