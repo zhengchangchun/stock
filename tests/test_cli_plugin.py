@@ -217,7 +217,40 @@ def test_contract_violating_script_is_rejected_by_submit(db, tmp_path, capsys):
     c.close()
 
 
-# ---------- Finding C regression test: window_end must equal --now date ----------
+# ---------- Fix round 2 regression: scripts that read ctx keys must not be rejected ----------
+
+
+# A script that reads documented ctx keys unconditionally.
+# Before the fix, fn({}) raised KeyError("bars"), which the probe's except
+# caught and turned into passed=False → submit rejected.
+CTX_READING_SCRIPT = (
+    "def run(ctx):\n"
+    "    bars = ctx['bars']\n"
+    "    name = ctx['name']\n"
+    "    score = 50.0 + len(bars) * 0.0\n"
+    "    return {'score': score, 'pass_flag': True, 'reason': name, 'risk_list': []}\n"
+)
+
+
+def test_ctx_reading_script_reaches_pending_review(db, tmp_path, capsys):
+    """回归（Fix round 2）：正常读取 ctx 文档化字段（bars/name 等）的脚本
+    必须通过提交并进入 pending_review，不应因探针 ctx 为空 dict 而被误拒。
+
+    修复前：`fn({})` → `KeyError: 'bars'` → `passed=False` → 脚本被驳回。
+    修复后：探针使用 `PROBE_CTX`（契约声明的完整空形状），脚本正常运行。
+    """
+    f = write_script(tmp_path, "ctx_reader.py", CTX_READING_SCRIPT)
+    code, out = run(db, "plugin", "submit", str(f), "--plugin-id", "3",
+                    "--version", "1.0.0", "--actor", "tester",
+                    "--now", NOW, capsys=capsys)
+    assert code == 0, f"submit 应成功但返回 {code}；输出：{out}"
+    c = connect(db)
+    rows = store.list_scripts(c, plugin_id="3")
+    assert len(rows) == 1
+    state = lifecycle.script_state(c, rows[0]["script_id"])
+    assert state == "pending_review", f"期望 pending_review，实际={state}；输出：{out}"
+    c.close()
+
 
 
 def test_submit_backtest_window_end_matches_now(db, tmp_path, capsys):

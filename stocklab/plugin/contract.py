@@ -20,6 +20,23 @@ Python 里 `True` 是 `int` 的子类，所以 `isinstance(True, float)` 走的�
 
 from __future__ import annotations
 
+#: 契约预检用的探针上下文（设计文档 §6.1 的完整空形状）。
+#:
+#: 目的：让结构合规的脚本能「跑起来」而不因缺 key 报 KeyError——
+#: 脚本只要读了 ctx["bars"] / ctx["name"] 等文档化字段就不该被误拒。
+#: 刻意不携带真实数据（bars=[], features={}）——这不是回测数据，
+#: 只是让执行路径走通、让 validate_return 能校验返回结构。
+PROBE_CTX: dict = {
+    "code": "__probe__",
+    "name": "__probe__",
+    "asof": "2000-01-01",
+    "pool": "short",
+    "asset_type": "stock",
+    "board": "main",
+    "bars": [],
+    "features": {},
+}
+
 #: plugin_id → (字段名, 种类) 的有序清单。种类见 `_check_field`。
 SHAPES: dict[str, tuple[tuple[str, str], ...]] = {
     "0": (("pass_flag", "bool"), ("risk_note", "str_list")),

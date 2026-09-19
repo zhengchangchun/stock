@@ -73,7 +73,7 @@ def _run_sandbox(conn, *, script_id: int, plugin_id: str, source_text: str,
     # ── 契约预检：先探针，后沙盒 ────────────────────────────────────
     try:
         fn = runtime.load_script(source_text, plugin_id=plugin_id)
-        fn({})   # 空 ctx 探针；若脚本返回结构不合规则 validate_return 会抛
+        fn(contract.PROBE_CTX)   # 契约定义的完整空探针 ctx；让读 ctx key 的正常脚本能运行
     except contract.PluginContractError as exc:
         return False, f"契约预检未通过：{exc}"
     except Exception as exc:                       # noqa: BLE001
