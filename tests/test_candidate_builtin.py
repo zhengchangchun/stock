@@ -6,6 +6,40 @@ from stocklab.candidate.builtin import BUILTIN_PLUGINS
 from stocklab.plugin import contract, guard, runtime
 
 
+def _make_bars(n):
+    """生成 n 根 K 线，收盘价微幅波动、成交量 > 0，避免除零。"""
+    bars = []
+    close = 10.0
+    for i in range(n):
+        close = close * (1 + (0.005 if i % 3 != 0 else -0.003))
+        bars.append({
+            "date": f"2026-{(i // 20 + 1):02d}-{(i % 20 + 1):02d}",
+            "open": close * 0.99, "high": close * 1.01,
+            "low": close * 0.98, "close": close,
+            "volume": 1000 + i * 10,
+            "amount": None, "turnover": None,
+        })
+    return bars
+
+
+def _short_ctx():
+    return {
+        "code": "000333", "name": "美的集团", "asof": "2026-09-17",
+        "pool": "mid", "asset_type": "stock", "board": "main",
+        "bars": _make_bars(28),
+        "raw_score": 60.0, "risk_list": ["高波动"],
+    }
+
+
+def _long_ctx():
+    return {
+        "code": "000333", "name": "美的集团", "asof": "2026-09-17",
+        "pool": "long", "asset_type": "stock", "board": "main",
+        "bars": _make_bars(130),
+        "raw_score": 60.0, "risk_list": [],
+    }
+
+
 def test_all_six_present():
     assert sorted(BUILTIN_PLUGINS) == ["0", "1", "2", "3", "4", "5"]
 
@@ -18,16 +52,35 @@ def test_passes_guard(plugin_id):
 @pytest.mark.parametrize("plugin_id", ["0", "1", "2", "3", "4", "5"])
 def test_runs_and_satisfies_contract(plugin_id):
     fn = runtime.load_script(BUILTIN_PLUGINS[plugin_id], plugin_id=plugin_id)
-    ctx = {
-        "code": "000333", "name": "美的集团", "asof": "2026-09-17",
-        "pool": "mid", "asset_type": "stock", "board": "main",
-        "bars": [{"date": f"2026-08-{d:02d}", "open": 10.0, "high": 10.5,
-                  "low": 9.5, "close": 10.0 + d * 0.1, "volume": 1000,
-                  "amount": None, "turnover": None} for d in range(1, 29)],
-        "raw_score": 60.0, "risk_list": ["高波动"],
-    }
-    result = fn(ctx)
+    result = fn(_short_ctx())
     assert isinstance(result, dict)
+
+
+def test_plugin2_short_circuit_vs_full_body():
+    """插桩2 短 ctx 走 guard 分支，长 ctx 走真实打分体 —— reason 必须不同。"""
+    fn = runtime.load_script(BUILTIN_PLUGINS["2"], plugin_id="2")
+    short_result = fn(_short_ctx())
+    long_result = fn(_long_ctx())
+    assert isinstance(short_result, dict)
+    assert isinstance(long_result, dict)
+    # 短 ctx 命中长度守卫，长 ctx 进入打分体，两者 reason 不同证明分支都覆盖到
+    assert short_result.get("reason") != long_result.get("reason"), (
+        f"plugin2 short reason={short_result.get('reason')!r} "
+        f"long reason={long_result.get('reason')!r}"
+    )
+
+
+def test_plugin3_short_circuit_vs_full_body():
+    """插桩3 短 ctx 走 guard 分支，长 ctx 走真实打分体 —— reason 必须不同。"""
+    fn = runtime.load_script(BUILTIN_PLUGINS["3"], plugin_id="3")
+    short_result = fn(_short_ctx())
+    long_result = fn(_long_ctx())
+    assert isinstance(short_result, dict)
+    assert isinstance(long_result, dict)
+    assert short_result.get("reason") != long_result.get("reason"), (
+        f"plugin3 short reason={short_result.get('reason')!r} "
+        f"long reason={long_result.get('reason')!r}"
+    )
 
 
 def test_score_plugins_declare_financial_data_is_stubbed():
