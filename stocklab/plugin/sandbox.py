@@ -144,9 +144,15 @@ def overfit_flag(delta: float | None, ci_low: float | None,
 
     骨架判据：CI 下界为负而上界明显为正（区间宽到跨 0 的 2 倍以上），
     说明「看起来赢了但极不稳定」。
+
+    返回值：
+    - ``'suspected'`` — 命中过拟合启发式，建议人工复查。
+    - ``None``        — 无标记：输入缺失（没有证据）或启发式未触发（评估干净）。
+                       两种「无事发生」场景统一用 ``None`` 表达，避免下游
+                       真值判断把 ``'none'`` 字符串误判为阳性。
     """
     if delta is None or ci_low is None or ci_high is None:
         return None
     if ci_low < 0 < ci_high and (ci_high - ci_low) > 2 * abs(delta):
         return "suspected"
-    return "none"
+    return None
