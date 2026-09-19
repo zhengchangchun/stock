@@ -141,7 +141,7 @@ def test_forbidden_diversifier_is_rejected():
 
 
 def test_whitelist_is_exactly_red_dividend_and_hs300():
-    assert set(ETF_WHITELIST) == {"510880", "510300"}
+    assert set(ETF_WHITELIST) == {"510880", "510300", "512890", "518880"}
 
 
 # ---------- ETF 建仓：单次上限 / 现金下限 / 1,000 元摊薄 ----------

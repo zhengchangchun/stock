@@ -38,9 +38,11 @@ DISCIPLINE_PREFIX: str = "arm-discipline-"
 #: 三档只差这一个数，其余规则完全相同 —— 单变量原则。
 ETF_TRANCHES: tuple[float, ...] = (5.0, 10.0, 15.0)
 
-#: 分散工具**白名单**：红利 ETF(510880) / 沪深300 ETF(510300)，按 code 升序取用。
+#: 分散工具**白名单**：沪深300 ETF(510300) / 红利 ETF(510880) /
+#: 红利低波 ETF(512890) / 黄金 ETF(518880)，按 code 升序取用。
 #: **换家电股（600690）或家电 ETF 不算分散** —— 那不是分散，是加倍下注同一个行业。
-ETF_WHITELIST: tuple[str, ...] = ("510300", "510880")
+#: 与 `stocklab/candidate/seeds.py` 的 SEED_UNIVERSE 里所有 ETF 保持一致（有测试断言）。
+ETF_WHITELIST: tuple[str, ...] = ("510300", "510880", "512890", "518880")
 
 #: 整手 = 100 股/份（沪深两市个股与场内 ETF 同为 100，见 `Instrument.lot`）。
 LOT: int = 100
