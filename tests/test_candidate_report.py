@@ -4,7 +4,7 @@ from stocklab.candidate.report import render_report
 
 LOADED = {
     "snapshot": {"snapshot_id": 7, "asof": "2026-09-17", "run_kind": "weekly",
-                 "params": {"seed": 20}},
+                 "params": {"seed_count": 20}},
     "members": [
         {"code": "000333", "pool": "short", "raw_score": 80.0,
          "adj_score": 75.0, "reason": "量价好", "risk_json": '["高波动"]',
@@ -63,6 +63,14 @@ def test_report_states_scope_is_20_seeds_not_full_market():
     assert "全标的扫描" in md
 
 
+def test_report_metadata_line_shows_seed_count():
+    md = render_report(asof="2026-09-17", run_kind="weekly", loaded=LOADED,
+                       generated_at="2026-09-18T16:00:00+08:00")
+    # 元信息行必须包含真实的 seed_count 值（20），而不是占位符 "?"
+    seed_line = next(l for l in md.splitlines() if "种子范围" in l)
+    assert "20" in seed_line
+
+
 def test_report_is_deterministic():
     a = render_report(asof="2026-09-17", run_kind="weekly", loaded=LOADED,
                       generated_at="2026-09-18T16:00:00+08:00")
@@ -78,3 +86,6 @@ def test_report_handles_empty_pool():
     md = render_report(asof="2026-09-17", run_kind="weekly", loaded=loaded,
                        generated_at="2026-09-18T16:00:00+08:00")
     assert md.count("（空）") == 3
+    # 空淘汰清单：淘汰清单段落内必须出现「无」
+    rejects_section = md.split("## 淘汰清单")[1].split("##")[0]
+    assert "无" in rejects_section
