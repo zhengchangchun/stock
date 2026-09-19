@@ -1,6 +1,7 @@
 """Task 11：步骤7 打分（调插桩 0/1/2/3）。"""
 
 import pytest
+import json
 
 from stocklab.candidate import score
 from stocklab.config.universe import ASSET_STOCK, Instrument
@@ -64,7 +65,6 @@ def test_build_ctx_is_pit():
 
 def test_build_ctx_bars_are_json_safe_plain_dicts():
     ctx = score.build_ctx(STOCK, "short", BARS, asof="2026-09-10")
-    import json
     json.dumps(ctx)                      # 不抛 = 可序列化
 
 
@@ -79,7 +79,7 @@ def test_score_pool_short(conn):
     out = score.score_pool(conn, STOCK, "short", ctx)
     assert out.raw_score == 80.0
     assert out.pass_flag is True
-    assert out.risk_list == ["高波动"]
+    assert out.risk_list == ("高波动",)
 
 
 def test_score_pool_mid(conn):

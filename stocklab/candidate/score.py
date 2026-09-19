@@ -36,7 +36,7 @@ class ScoreOutcome:
     raw_score: float
     pass_flag: bool
     reason: str
-    risk_list: list[str]
+    risk_list: tuple[str, ...]
 
 
 def _bar_to_dict(b: Bar) -> dict:
@@ -76,4 +76,4 @@ def score_pool(conn: sqlite3.Connection, inst: Instrument, pool: str,
     return ScoreOutcome(
         code=inst.code, pool=pool, raw_score=float(result["score"]),
         pass_flag=bool(result["pass_flag"]), reason=str(result["reason"]),
-        risk_list=list(result["risk_list"]))
+        risk_list=tuple(result["risk_list"]))
