@@ -8,7 +8,7 @@ from stocklab.data.models import Bar
 STOCK = Instrument("000333", "美的集团", "sz", "main", ASSET_STOCK)
 
 
-def bar(date, close, prev_close=None, volume=1000):
+def bar(date, close, volume=1000):
     return Bar(code=STOCK.code, date=date, open=close, high=close, low=close,
                close=close, volume=volume, amount=None, turnover=None,
                source="t", adj_mode="none")

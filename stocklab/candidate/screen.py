@@ -74,6 +74,11 @@ def screen(inst: Instrument, bars: list[Bar], *, asof: str) -> ScreenResult:
             False, "insufficient_history",
             f"有效 K 线仅 {len(usable)} 个交易日，不足 {MIN_HISTORY_DAYS} 日")
 
+    # ST check comes before the limit-down scan intentionally.
+    # Rule order is deliberate: when an instrument fails multiple checks, the
+    # *first* matching rule supplies the reason tag.  A stock that is both
+    # ST-flagged and in a consecutive limit-down streak will be labelled
+    # "st_flag", not "consecutive_limit_down".  Do not reorder the checks.
     if inst.asset_type != "etf" and _looks_like_st(inst.name):
         return ScreenResult(
             False, "st_flag",
