@@ -11,11 +11,11 @@
 from __future__ import annotations
 
 import sys
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from pathlib import Path
 
 from stocklab.config import paths
-from stocklab.plugin import guard, lifecycle, sandbox, store
+from stocklab.plugin import contract, guard, lifecycle, runtime, sandbox, store
 from stocklab.store.db import connect
 from stocklab.store.migrate import ensure_schema
 
@@ -32,9 +32,13 @@ def _open(args):
     return connect(db_path)
 
 
-def _sandbox_window() -> tuple[str, str]:
-    """沙盒默认窗口：最近 3 年（设计文档 §8.2）。"""
-    end = datetime.now(timezone.utc).date()
+def _sandbox_window(now: str) -> tuple[str, str]:
+    """沙盒默认窗口：最近 3 年（设计文档 §8.2）。
+
+    `now` 取自调用方透传的 `--now` 值（或当前 UTC 时间字符串），
+    以便测试中通过固定的 `--now` 得到确定的 `window_end`。
+    """
+    end = date.fromisoformat(now[:10])
     start = end.replace(year=end.year - 3)
     return start.isoformat(), end.isoformat()
 
@@ -43,15 +47,41 @@ def _run_sandbox(conn, *, script_id: int, plugin_id: str, source_text: str,
                  now: str) -> tuple[bool, str]:
     """跑沙盒并把结果写入 `plugin_backtests`，返回 `(passed, reason)`。
 
+    ## 契约预检（Finding A 修复）
+
+    先用 `runtime.load_script` + 空探针 ctx 执行一次脚本，验证
+    「能加载、能执行、返回结构合规」。这恢复了 Task 7 占位沙盒时的保证：
+    只通过静态 AST 检查（`guard.check_source`）但违反契约的脚本，在这里
+    被拒绝而不是带着无效 payload 进入 `pending_review`。
+
     ## `passed` 的判据**不是** verdict
 
     - 加载失败 / 契约不符 → `passed=False`（脚本有问题）
     - `LOSE` → `passed=False`（有证据表明更差）
     - `INCONCLUSIVE` → **`passed=True`**（样本不足不是脚本的错，
       把它当「有问题」会让所有首版脚本都被驳回）
+
+    ## 失败时的审计落点（Finding B 说明）
+
+    当探针或沙盒失败时，本函数直接返回 `(False, reason)` 而不写
+    `plugin_backtests` —— 没有对比跑完就没有对比报告可写，这是刻意设计。
+    审计链并不因此断掉：调用方 `cmd_plugin_submit` 随即调用
+    `lifecycle.record_sandbox(passed=False, reason=...)` 写入
+    `plugin_audit`（action='sandbox_fail'），任何时候都可以通过
+    `store.list_audit(conn, script_id)` 查到失败原因。
     """
+    # ── 契约预检：先探针，后沙盒 ────────────────────────────────────
+    try:
+        fn = runtime.load_script(source_text, plugin_id=plugin_id)
+        fn({})   # 空 ctx 探针；若脚本返回结构不合规则 validate_return 会抛
+    except contract.PluginContractError as exc:
+        return False, f"契约预检未通过：{exc}"
+    except Exception as exc:                       # noqa: BLE001
+        return False, f"脚本加载/执行失败：{type(exc).__name__}: {exc}"
+
+    # ── 沙盒对比回测 ─────────────────────────────────────────────────
     baseline_id = lifecycle.active_script_id(conn, plugin_id)
-    start, end = _sandbox_window()
+    start, end = _sandbox_window(now)
     try:
         verdict = sandbox.run_sandbox(
             conn, candidate_script_id=script_id,

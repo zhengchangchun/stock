@@ -21,6 +21,11 @@ BUILTIN_SCRIPT = (
     "    return {'score': score, 'pass_flag': True, 'reason': 'ok', 'risk_list': []}\n"
 )
 BAD_SCRIPT = "import os\ndef run(ctx): return {}\n"
+# Passes guard (no forbidden imports) but violates contract: score out of [0,100]
+CONTRACT_VIOLATING_SCRIPT = (
+    "def run(ctx):\n"
+    "    return {'score': 999, 'pass_flag': True, 'reason': 'r', 'risk_list': []}\n"
+)
 
 
 @pytest.fixture
@@ -185,3 +190,45 @@ def test_second_version_records_baseline(db, tmp_path, capsys):
     c.close()
     assert len(rows) == 2
     assert rows[1]["baseline_script_id"] == first
+
+
+# ---------- Finding A regression test ----------
+
+
+def test_contract_violating_script_is_rejected_by_submit(db, tmp_path, capsys):
+    """回归（Finding A）：通过 guard（无危险 import）但违反契约（score > 100）的脚本
+    必须在契约预检阶段被拒绝，且不能进入 pending_review。
+
+    在修复前，`_run_sandbox` 跳过了 runtime.load_script，该脚本会被
+    `sandbox.run_sandbox` 接受（沙盒是骨架，不执行脚本），错误地进入 pending_review。
+    """
+    f = write_script(tmp_path, "bad_contract.py", CONTRACT_VIOLATING_SCRIPT)
+    code, out = run(db, "plugin", "submit", str(f), "--plugin-id", "3",
+                    "--version", "1.0.0", "--actor", "tester",
+                    "--now", NOW, capsys=capsys)
+    assert code != 0, f"submit 应失败但返回 0；输出：{out}"
+    c = connect(db)
+    rows = store.list_scripts(c, plugin_id="3")
+    # The script row is written before the probe runs, but state must be rejected
+    if rows:
+        state = lifecycle.script_state(c, rows[0]["script_id"])
+        assert state != "pending_review", (
+            f"契约违规脚本不应进入 pending_review，实际状态={state}")
+    c.close()
+
+
+# ---------- Finding C regression test: window_end must equal --now date ----------
+
+
+def test_submit_backtest_window_end_matches_now(db, tmp_path, capsys):
+    """Finding C 修复：`window_end` 必须等于 `--now` 的日期部分，而不是系统时钟。"""
+    f = write_script(tmp_path, "p3.py", SCORE_SCRIPT)
+    run(db, "plugin", "submit", str(f), "--plugin-id", "3", "--version",
+        "1.0.0", "--actor", "tester", "--now", NOW, capsys=capsys)
+    c = connect(db)
+    rows = store.load_backtests(c)
+    c.close()
+    assert len(rows) == 1
+    assert rows[0]["window_end"] == "2026-09-18", (
+        f"window_end 应为 2026-09-18，实际为 {rows[0]['window_end']!r}"
+    )
