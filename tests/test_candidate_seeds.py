@@ -4,7 +4,7 @@ from stocklab.candidate.seeds import SEED_CODES, SEED_UNIVERSE
 from stocklab.config.universe import ASSET_ETF, ASSET_STOCK
 
 
-def test_twenty_instruments():
+def test_twentyone_instruments():
     assert len(SEED_UNIVERSE) == 21
 
 
@@ -13,7 +13,7 @@ def test_codes_are_unique_and_six_digits():
     assert all(len(c) == 6 and c.isdigit() for c in SEED_CODES)
 
 
-def test_sixteen_stocks_four_etfs():
+def test_seventeen_stocks_four_etfs():
     stocks = [i for i in SEED_UNIVERSE if i.asset_type == ASSET_STOCK]
     etfs = [i for i in SEED_UNIVERSE if i.asset_type == ASSET_ETF]
     assert len(stocks) == 17
