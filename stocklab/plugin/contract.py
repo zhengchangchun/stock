@@ -24,8 +24,9 @@ from __future__ import annotations
 #:
 #: 目的：让结构合规的脚本能「跑起来」而不因缺 key 报 KeyError——
 #: 脚本只要读了 ctx["bars"] / ctx["name"] 等文档化字段就不该被误拒。
-#: 刻意不携带真实数据（bars=[], features={}）——这不是回测数据，
+#: 刻意不携带真实数据（bars=[]）——这不是回测数据，
 #: 只是让执行路径走通、让 validate_return 能校验返回结构。
+#: IMPORTANT: 此字典的 key 集合必须与 score.py::build_ctx 的输出保持同步。
 PROBE_CTX: dict = {
     "code": "__probe__",
     "name": "__probe__",
@@ -34,7 +35,6 @@ PROBE_CTX: dict = {
     "asset_type": "stock",
     "board": "main",
     "bars": [],
-    "features": {},
 }
 
 #: plugin_id → (字段名, 种类) 的有序清单。种类见 `_check_field`。
