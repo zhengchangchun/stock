@@ -74,6 +74,21 @@ def test_member_status_is_validated(conn):
     bad = snapshot.MemberRow(code="000333", pool="short", raw_score=1.0,
                              adj_score=1.0, reason="r", risk_json="[]",
                              status="随便写的")
-    with pytest.raises(Exception):
+    with pytest.raises(ValueError):
         snapshot.write_snapshot(conn, asof="2026-09-17", run_kind="weekly",
                                 params={}, members=[bad], rejects=[], now=NOW)
+
+
+def test_invalid_status_mid_list_leaves_no_orphan(conn):
+    """回归：第一个成员合法、第二个非法时，不能留下孤儿快照行。"""
+    good = MEMBER
+    bad = snapshot.MemberRow(code="600036", pool="short", raw_score=1.0,
+                             adj_score=1.0, reason="r", risk_json="[]",
+                             status="非法状态")
+    with pytest.raises(ValueError):
+        snapshot.write_snapshot(conn, asof="2026-09-17", run_kind="weekly",
+                                params={}, members=[good, bad], rejects=[],
+                                now=NOW)
+    count = conn.execute(
+        "SELECT COUNT(*) FROM candidate_snapshots").fetchone()[0]
+    assert count == 0, f"期望0行，实际{count}行（孤儿快照）"

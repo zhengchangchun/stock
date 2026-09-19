@@ -71,6 +71,12 @@ def write_snapshot(conn: sqlite3.Connection, *, asof: str, run_kind: str,
     if existing is not None:
         return existing
 
+    # Pre-flight: validate ALL members before writing anything.
+    for m in members:
+        if m.status not in STATUSES:
+            raise ValueError(
+                f"非法状态 {m.status!r}；允许：{list(STATUSES)}")
+
     cur = conn.execute(
         f"INSERT INTO {TABLE_SNAPSHOTS} (asof, run_kind, params_json, created_at)"
         " VALUES (?,?,?,?)",
@@ -79,9 +85,6 @@ def write_snapshot(conn: sqlite3.Connection, *, asof: str, run_kind: str,
     snapshot_id = int(cur.lastrowid)
 
     for m in members:
-        if m.status not in STATUSES:
-            raise ValueError(
-                f"非法状态 {m.status!r}；允许：{list(STATUSES)}")
         conn.execute(
             f"INSERT INTO {TABLE_MEMBERS} (snapshot_id, code, pool, raw_score,"
             " adj_score, reason, risk_json, status, entered_at)"
