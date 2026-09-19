@@ -42,16 +42,14 @@ def test_adjust_applies_deduction(conn):
 
 
 def test_adjust_sees_raw_score_and_risks_in_ctx(conn):
-    """插桩4 的输入必须含 raw_score / risk_list —— 否则它没法做加权。"""
-    seen = {}
-
+    """插桩4 的输入必须来自 ScoreOutcome，而非调用方 ctx —— 传冲突值才能证伪。"""
     _install(conn, "def run(ctx):\n"
                    "    return {'final_score': ctx['raw_score'],"
-                   " 'risk_out': ['got:' + str(sorted(ctx))]}\n")
-    _, risks = risk_adjust.adjust(conn, OUT, {})
-    assert "got:" in risks[0]
-    for key in ("raw_score", "risk_list"):
-        assert key in risks[0]
+                   " 'risk_out': ctx['risk_list']}\n")
+    # 调用方传入与 OUT 冲突的值：若实现从 caller ctx 读取，断言将看到 0.0 / []
+    final, risks = risk_adjust.adjust(conn, OUT, {"raw_score": 0.0, "risk_list": []})
+    assert final == 80.0      # 必须来自 OUT.raw_score，不是调用方的 0.0
+    assert risks == ["高波动"]  # 必须来自 OUT.risk_list，不是调用方的 []
 
 
 def test_adjust_output_is_clamped_by_contract_not_here(conn):
@@ -69,10 +67,11 @@ def test_missing_active_raises(conn):
 
 
 def test_ctx_passed_through(conn):
-    """调用方给的 ctx 里已有的键要保留（如 asof / code）。"""
+    """OutcomeContract 键必须来自 ScoreOutcome；非契约键（如 asof）来自调用方 ctx。"""
     _install(conn, "def run(ctx):\n"
                    "    return {'final_score': 50.0,"
                    " 'risk_out': [ctx['code'] + '@' + ctx['asof']]}\n")
-    _, risks = risk_adjust.adjust(conn, OUT, {"code": "000333",
+    # 传入与 OUT.code 冲突的值；若实现从 caller ctx 读取 code，将看到 "999999"
+    _, risks = risk_adjust.adjust(conn, OUT, {"code": "999999",
                                               "asof": "2026-09-17"})
-    assert risks == ["000333@2026-09-17"]
+    assert risks == ["000333@2026-09-17"]  # code 来自 OUT，asof 来自 caller ctx
