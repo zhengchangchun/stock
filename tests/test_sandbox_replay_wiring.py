@@ -150,3 +150,14 @@ def test_verdict_carries_overfit_flag(conn):
                             window_end="2026-09-18", now=NOW,
                             deps=SandboxDeps(replay=fake_replay))
     assert v.detail["overfit_flag"] == "suspected"
+
+
+def test_no_baseline_detail_carries_overfit_flag_none(conn):
+    """无 baseline 路径 detail 必须含 overfit_flag 键（值 None），
+    使调用方能区分「没有标记」与「detail 完全缺失」。"""
+    v = sandbox.run_sandbox(conn, candidate_script_id=1, baseline_script_id=None,
+                            pool="short", window_start="2015-01-01",
+                            window_end="2026-09-18", now=NOW)
+    assert "overfit_flag" in v.detail
+    assert v.detail["overfit_flag"] is None
+    assert v.detail.get("reason") == "no_baseline"
