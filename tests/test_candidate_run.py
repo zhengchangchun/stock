@@ -261,13 +261,27 @@ def test_score_pipeline_matches_run_candidate_members(tmp_db):
 
     这是「回测跑的就是生产逻辑」的机械保证 —— 两者若分叉，所有回放结论
     都无意义。
+
+    独立性守卫：score_pipeline 故意在 run_candidate 写完快照后调用，
+    以验证它不依赖快照表的内容。若未来重构意外让 score_pipeline 读取
+    candidate_snapshots，下面的断言会立刻暴露问题。
     """
     conn = _seed_db(tmp_db)
-    fresh = conn.execute("SELECT COUNT(*) FROM candidate_snapshots").fetchone()[0]
-    assert fresh == 0
+    assert conn.execute(
+        "SELECT COUNT(*) FROM candidate_snapshots").fetchone()[0] == 0
 
+    # run_candidate 先跑，写入一条快照
     prod = candidate_run.run_candidate(conn, asof=ASOF, run_kind="weekly", now=NOW)
+    assert conn.execute(
+        "SELECT COUNT(*) FROM candidate_snapshots").fetchone()[0] == 1
+
+    # score_pipeline 在快照已存在后才调用 —— 如果它依赖快照表会得到错误结果
     pipe = score_pipeline(conn, asof=ASOF)
+
+    # 快照数量仍为 1：score_pipeline 既没有写入也没有（需要）读取快照
+    assert conn.execute(
+        "SELECT COUNT(*) FROM candidate_snapshots").fetchone()[0] == 1, \
+        "score_pipeline 不得写入快照表"
 
     key = lambda ms: sorted((m.code, m.pool, round(m.adj_score, 9)) for m in ms)
     assert key(pipe.members) == key(prod.members)
@@ -293,16 +307,28 @@ def test_score_pipeline_overrides_plugin_version(tmp_db):
 
 
 def test_score_pipeline_unoverridden_plugin_uses_active(tmp_db):
-    """没被覆盖的插件仍用 active —— 否则就不是单变量了。"""
+    """没被覆盖的插件仍用 active —— 否则就不是单变量了。
+
+    单变量验证场景：为 plugin_id="1" 插入一个非 active 的 v9.9.9（score=100.0），
+    但只通过 plugin_overrides 覆盖 plugin_id="4"，不覆盖 plugin_id="1"。
+    预期：未覆盖的 plugin 1 仍解析到其 active 版本（score=80.0），而非 v9.9.9
+    （100.0）。这正是「单变量」的核心性质：只有被显式覆盖的插件发生变化。
+    """
     conn = _seed_db(tmp_db)
-    sid = store.insert_script(
+    # 插入 plugin 1 的 v9.9.9（score=100.0），但不审批 → 非 active
+    # 目的：证明未覆盖的 plugin 1 不会意外使用这个更高版本号的脚本
+    _sid_v999 = store.insert_script(
         conn, plugin_id="1", version="9.9.9",
         source_text="def run(ctx):\n"
                     "    return {'score': 100.0, 'pass_flag': True,"
                     " 'reason': 'v2', 'risk_list': []}\n",
         note=None, now=NOW)
-    # 只覆盖插桩4，插桩1 应仍走 active（80.0）
+    # 只覆盖插桩4，插桩1 应仍走 active（80.0），而非未审批的 v9.9.9（100.0）
     r4 = store.list_scripts(conn, plugin_id="4")[0]["script_id"]
     over = score_pipeline(conn, asof=ASOF, plugin_overrides={"4": r4})
     short = [m for m in over.members if m.pool == "short"]
-    assert short and all(m.raw_score == 80.0 for m in short)
+    # 分数必须等于 active 版本的 80.0，而非 v9.9.9 的 100.0
+    assert short and all(m.raw_score == 80.0 for m in short), (
+        f"期望 plugin 1 的 active 版本得分 80.0，实际: "
+        f"{[m.raw_score for m in short]}"
+    )
