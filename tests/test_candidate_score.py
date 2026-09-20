@@ -163,28 +163,37 @@ def test_pit_excludes_unannounced_periods(fin_db):
     assert late["features"]["period"] == "2026Q2"
 
 
-def test_features_keys_complete_when_cross_section_omits_dupont(fin_db):
-    """cross_section 不含 dupont 时，build_ctx 本地保证该键仍在 features 中。
+def test_features_keys_complete_when_factors_omits_dupont(fin_db, monkeypatch):
+    """indicators.factors() 不含 dupont 时，build_ctx 本地保证该键仍在 features 中。
 
-    旧代码：只有 setdefault 循环（_pct/_n/period_mixed），dupont 完全依赖
-    indicators.factors() 带进来。若 cross_section 覆写整个 feats（update 路径）
-    且省略了 dupont，旧代码不会补它；新代码在循环后显式 setdefault("dupont", None)。
-
-    这个测试会对旧代码的 dupont 缺失 KeyError 路径失败（falsifiable）。
+    falsifiability：monkeypatch 掉 score.indicators.factors，令其返回一个不含
+    dupont 的 dict（其余 base keys 保留，因 setdefault 循环只补 _pct/_n，不补 base）。
+    update() 只加/覆写键、不删键；cross_section 也不会带 dupont 回来。
+    唯一能把 dupont 补回来的只有 `feats.setdefault("dupont", None)`（fix round 1 那行）。
+    预修复代码缺少该行 → dupont 不在 feats → 断言失败；
+    修复后代码有该行 → dupont 在 feats → 断言通过。
     """
     from stocklab.plugin.contract import FEATURE_KEYS
-    # cross_section dict 故意不含 dupont、roe、gross_margin 等，模拟来源数据残缺
-    incomplete_xsec = {
-        STOCK.code: {
-            "roe_pct": 75.0, "roe_n": 10,
-            "period_mixed": False,
+
+    # 构造一个缺少 dupont（以及 fcf_margin 作为第二个 missing key）的 factors 返回值。
+    # 注意：base keys（roe, gross_margin 等）不被 setdefault 循环覆盖，所以必须保留；
+    # 只省略那些确实由 fix 的 setdefault("dupont", None) 负责的键。
+    def _factors_missing_dupont(_reports):
+        return {
+            "period": None,
+            "roe": None,
+            "gross_margin": None,
+            "gm_yoy_pp": None,
+            "inv_days": None,
+            "fcf_margin": None,
+            # dupont 故意省略 —— 这是本测试验证的 fix 点
+            "na_reasons": ["no data"],
         }
-    }
-    ctx = score.build_ctx(
-        fin_db, STOCK, "mid", BARS, asof="2026-09-17",
-        cross_section=incomplete_xsec,
-    )
+
+    monkeypatch.setattr(score.indicators, "factors", _factors_missing_dupont)
+
+    ctx = score.build_ctx(fin_db, STOCK, "mid", BARS, asof="2026-09-17")
     missing = [k for k in FEATURE_KEYS if k not in ctx["features"]]
     assert missing == [], f"features 缺失键: {missing}"
     # dupont 是本次 fix 专门保证的键
-    assert "dupont" in ctx["features"]
+    assert ctx["features"]["dupont"] is None
