@@ -46,6 +46,10 @@ class Instrument:
     board: str         # "main" | "gem" | "star" | "bse" —— 决定涨跌停幅度
     #: 标的口径（P17）。默认 `stock` 是为了不破坏既有调用点；ETF 必须显式给。
     asset_type: str = ASSET_STOCK
+    #: 财报机构类型（Task 5）。决定东财 F10 报表名（G=通用 / B=银行 / I=保险）。
+    #: 填错会静默拿不到财报 —— 必须与 seeds.py 的标注一致。默认「通用」是为了
+    #: 不破坏既有调用点；银行/保险必须显式给。
+    org_type: str = "通用"
 
     @property
     def secid(self) -> str:

@@ -26,30 +26,32 @@ from __future__ import annotations
 from stocklab.config.universe import ASSET_ETF, ASSET_STOCK, Instrument
 
 #: 21 只种子。**顺序即代码升序**，保证报告与快照的稳定排序。
+#: `org_type` 决定东财 F10 报表名（G=通用 / B=银行 / I=保险），填错会静默拿不到财报。
 SEED_UNIVERSE: tuple[Instrument, ...] = (
-    # 家电（6）
-    Instrument("000333", "美的集团", "sz", "main", ASSET_STOCK),
-    Instrument("000651", "格力电器", "sz", "main", ASSET_STOCK),
-    Instrument("002032", "苏泊尔", "sz", "main", ASSET_STOCK),
-    Instrument("002508", "老板电器", "sz", "main", ASSET_STOCK),
-    Instrument("600690", "海尔智家", "sh", "main", ASSET_STOCK),
-    Instrument("603868", "飞科电器", "sh", "main", ASSET_STOCK),
+    # 家电（6）—— 通用报表（含营业成本行）
+    Instrument("000333", "美的集团", "sz", "main", ASSET_STOCK, "通用"),
+    Instrument("000651", "格力电器", "sz", "main", ASSET_STOCK, "通用"),
+    Instrument("002032", "苏泊尔", "sz", "main", ASSET_STOCK, "通用"),
+    Instrument("002508", "老板电器", "sz", "main", ASSET_STOCK, "通用"),
+    Instrument("600690", "海尔智家", "sh", "main", ASSET_STOCK, "通用"),
+    Instrument("603868", "飞科电器", "sh", "main", ASSET_STOCK, "通用"),
     # 银行 / 保险 / 通信（4）
-    Instrument("600036", "招商银行", "sh", "main", ASSET_STOCK),
-    Instrument("600941", "中国移动", "sh", "main", ASSET_STOCK),
-    Instrument("601318", "中国平安", "sh", "main", ASSET_STOCK),
-    Instrument("601398", "工商银行", "sh", "main", ASSET_STOCK),
+    Instrument("600036", "招商银行", "sh", "main", ASSET_STOCK, "银行"),
+    Instrument("600941", "中国移动", "sh", "main", ASSET_STOCK, "通用"),
+    Instrument("601318", "中国平安", "sh", "main", ASSET_STOCK, "保险"),
+    Instrument("601398", "工商银行", "sh", "main", ASSET_STOCK, "银行"),
     # 能源 / 公用（3）
-    Instrument("600028", "中国石化", "sh", "main", ASSET_STOCK),
-    Instrument("600900", "长江电力", "sh", "main", ASSET_STOCK),
-    Instrument("601088", "中国神华", "sh", "main", ASSET_STOCK),
+    Instrument("600028", "中国石化", "sh", "main", ASSET_STOCK, "通用"),
+    Instrument("600900", "长江电力", "sh", "main", ASSET_STOCK, "通用"),
+    Instrument("601088", "中国神华", "sh", "main", ASSET_STOCK, "通用"),
     # 食品饮料（2）
-    Instrument("000858", "五粮液", "sz", "main", ASSET_STOCK),
-    Instrument("600519", "贵州茅台", "sh", "main", ASSET_STOCK),
+    Instrument("000858", "五粮液", "sz", "main", ASSET_STOCK, "通用"),
+    Instrument("600519", "贵州茅台", "sh", "main", ASSET_STOCK, "通用"),
     # 科技制造（2）—— 300750 是唯一的创业板，用于涨跌停分支
-    Instrument("002415", "海康威视", "sz", "main", ASSET_STOCK),
-    Instrument("300750", "宁德时代", "sz", "gem", ASSET_STOCK),
+    Instrument("002415", "海康威视", "sz", "main", ASSET_STOCK, "通用"),
+    Instrument("300750", "宁德时代", "sz", "gem", ASSET_STOCK, "通用"),
     # ETF（4）—— 扫描宇宙；paper.config.ETF_WHITELIST（2 只）是分散工具白名单，两者不同概念
+    # ETF 没有财报，org_type 取默认"通用"（不会被 fetch_financial_reports 调用）
     Instrument("510300", "沪深300ETF", "sh", "main", ASSET_ETF),
     Instrument("510880", "红利ETF", "sh", "main", ASSET_ETF),
     Instrument("512890", "红利低波ETF", "sh", "main", ASSET_ETF),
