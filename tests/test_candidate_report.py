@@ -43,12 +43,26 @@ def test_report_shows_rejects_with_reason():
     assert "st_flag" in md
 
 
-def test_report_states_financial_data_not_connected():
-    """本轮的诚实声明：财务因子是桩，必须写在报告里（设计文档 §13.3）。"""
+def test_report_states_financial_factors_are_real_and_unvalidated():
+    """Task 12 后：财务因子已接入真实数据，但须注明「横截面分位排序、样本内、未经验证」。
+
+    原测试 test_report_states_financial_data_not_connected 断言「未接」或「留桩」，
+    那是 Task 11 之前的实情；Task 12 替换了桩后继续断言同样的词是合法倒退守卫，
+    故此测试做两件事：
+      (a) 新真相：「横截面分位排序」「样本内」「未经验证」同时出现；
+      (b) 旧假话：「未接」「留桩」**不**出现（防止代码回退）。
+    这是合理反转：我们不是放松检查，而是把守卫从「必须声明未做」
+    换成「必须声明已做但未验证」，两者都是如实声明的正向要求。
+    """
     md = render_report(asof="2026-09-17", run_kind="weekly", loaded=LOADED,
                        generated_at="2026-09-18T16:00:00+08:00")
-    assert "财务" in md
-    assert "未接" in md or "留桩" in md
+    # (a) 新真相：因子真实，但注明样本内、未经验证
+    assert "横截面分位排序" in md
+    assert "样本内" in md
+    assert "未经验证" in md
+    # (b) 旧假话必须消失
+    assert "财务数据未接" not in md
+    assert "留桩" not in md
 
 
 def test_report_states_st_flag_is_not_pit():
