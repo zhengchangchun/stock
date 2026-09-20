@@ -74,34 +74,32 @@ def test_unknown_pool_raises(conn):
 
 
 # ---------------------------------------------------------------------------
-# overfit_flag 启发式直接单元测试
-# 判据：ci_low < 0 < ci_high 且 (ci_high - ci_low) > 2 * |delta|
+# overfit_flag 单元测试
+# 判据（Task 6）：train_gap = train_mean − validate_mean > OVERFIT_TRAIN_GAP
 # ---------------------------------------------------------------------------
 
 def test_overfit_flag_returns_suspected_when_heuristic_fires():
-    """CI 跨 0 且区间宽度大于 |delta| 的 2 倍 → 'suspected'。"""
-    # delta=0.01, ci_low=-0.05, ci_high=0.07
-    # 宽度 = 0.12, 2*|delta| = 0.02  →  0.12 > 0.02  → 触发
-    result = sandbox.overfit_flag(delta=0.01, ci_low=-0.05, ci_high=0.07)
+    """训练段比验证段好看超过阈值 → 'suspected'。"""
+    # train_mean=0.02, validate_mean=0.001 → gap=0.019 > 0.005 → 触发
+    result = sandbox.overfit_flag(train_mean=0.02, validate_mean=0.001)
     assert result == "suspected"
 
 
 def test_overfit_flag_returns_none_when_heuristic_does_not_fire():
-    """CI 跨 0 但区间宽度不超过 2 倍 |delta| → None（无标记）。"""
-    # delta=0.04, ci_low=-0.01, ci_high=0.06
-    # 宽度 = 0.07, 2*|delta| = 0.08  →  0.07 < 0.08  → 不触发
-    result = sandbox.overfit_flag(delta=0.04, ci_low=-0.01, ci_high=0.06)
+    """gap 不超阈值 → None（无标记）。"""
+    # train_mean=0.006, validate_mean=0.005 → gap=0.001 < 0.005 → 不触发
+    result = sandbox.overfit_flag(train_mean=0.006, validate_mean=0.005)
     assert result is None
 
 
 def test_overfit_flag_returns_none_when_inputs_are_none():
     """任一输入为 None → None（无证据，无标记）。"""
-    assert sandbox.overfit_flag(None, None, None) is None
-    assert sandbox.overfit_flag(0.01, None, 0.05) is None
+    assert sandbox.overfit_flag(None, None) is None
+    assert sandbox.overfit_flag(0.01, None) is None
 
 
 def test_overfit_flag_returns_none_when_ci_does_not_cross_zero():
-    """CI 不跨 0（全正）→ None，哪怕区间宽。"""
-    # ci_low > 0：区间不跨零
-    result = sandbox.overfit_flag(delta=0.01, ci_low=0.005, ci_high=0.10)
+    """验证段优于训练段（validate > train）→ None，不是过拟合的形态。"""
+    # validate_mean > train_mean → gap < 0 → 不触发
+    result = sandbox.overfit_flag(train_mean=0.001, validate_mean=0.02)
     assert result is None

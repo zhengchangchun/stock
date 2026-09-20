@@ -77,6 +77,13 @@ class SandboxDeps:
     rebalance_marks: Callable | None = None
 
 
+#: 训练段比验证段好看的容忍上限。
+#:
+#: ⚠️ **这个数是我定的**（设计文档 §8.3），来源是「两段差距到了半个
+#: 百分点，多半不是噪声」这个直觉的数值化 —— 编不出来源。与 ADR-012
+#: 的跌破线、ADR-016 的断更阈值同属**自创取值**，已列在 ADR-017 里。
+OVERFIT_TRAIN_GAP: float = 0.005
+
 #: 日度超额收益的 bootstrap 重采样次数与随机种子（固定 = 可复现）。
 _BOOTSTRAP_N = 2000
 _BOOTSTRAP_SEED = 20260918
@@ -113,6 +120,25 @@ def _bootstrap_ci(values: list[float]) -> tuple[float, float]:
     return lo, hi
 
 
+def overfit_flag(train_mean: float | None,
+                 validate_mean: float | None) -> str | None:
+    """过拟合标记：**训练段比验证段好看**超过阈值即 `'suspected'`。
+
+    方向固定 —— `train_gap = train_mean − validate_mean`，只有 **> 0**
+    （训练段更好）才是过拟合的形态；验证段反而更好不标记。
+
+    返回：
+    - ``'suspected'`` — 命中，建议人工复查。
+    - ``None``        — 输入缺失或未命中。两种「无标记」统一用 ``None``，
+      避免下游真值判断把 ``'none'`` 字符串误判为阳性。
+    """
+    if train_mean is None or validate_mean is None:
+        return None
+    if train_mean - validate_mean > OVERFIT_TRAIN_GAP:
+        return "suspected"
+    return None
+
+
 def run_sandbox(conn: sqlite3.Connection, *, candidate_script_id: int,
                 baseline_script_id: int | None, pool: str, window_start: str,
                 window_end: str, now: str,
@@ -144,11 +170,13 @@ def run_sandbox(conn: sqlite3.Connection, *, candidate_script_id: int,
             window_start=window_start, window_end=window_end)
 
     n_periods = len(validate)
+    train_mean = (sum(train) / len(train)) if train else None
+    validate_mean = (sum(validate) / len(validate)) if validate else None
     detail = {"rebalance_days": REBALANCE_DAYS[pool],
               "train_n": len(train), "validate_n": n_periods,
-              "train_mean": (sum(train) / len(train)) if train else None,
-              "validate_mean": (sum(validate) / len(validate))
-                               if validate else None}
+              "train_mean": train_mean,
+              "validate_mean": validate_mean,
+              "overfit_flag": overfit_flag(train_mean, validate_mean)}
 
     if n_periods < MIN_VALID_PERIODS:
         return SandboxVerdict(
@@ -165,23 +193,3 @@ def run_sandbox(conn: sqlite3.Connection, *, candidate_script_id: int,
         ci_low=lo, ci_high=hi, baseline_script_id=baseline_script_id,
         note=f"验证段 Δ 周期均值 {delta:+.4%}，95% CI [{lo:+.4%}, {hi:+.4%}]，"
              f"周期数 n={n_periods}", detail=detail)
-
-
-def overfit_flag(delta: float | None, ci_low: float | None,
-                 ci_high: float | None) -> str | None:
-    """过拟合标记（设计文档 §8.4）。
-
-    骨架判据：CI 下界为负而上界明显为正（区间宽到跨 0 的 2 倍以上），
-    说明「看起来赢了但极不稳定」。
-
-    返回值：
-    - ``'suspected'`` — 命中过拟合启发式，建议人工复查。
-    - ``None``        — 无标记：输入缺失（没有证据）或启发式未触发（评估干净）。
-                       两种「无事发生」场景统一用 ``None`` 表达，避免下游
-                       真值判断把 ``'none'`` 字符串误判为阳性。
-    """
-    if delta is None or ci_low is None or ci_high is None:
-        return None
-    if ci_low < 0 < ci_high and (ci_high - ci_low) > 2 * abs(delta):
-        return "suspected"
-    return None

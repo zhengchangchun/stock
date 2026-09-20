@@ -101,3 +101,52 @@ def test_train_segment_is_reported_in_detail(conn):
     assert v.detail["validate_mean"] == pytest.approx(0.001)
     assert v.detail["train_n"] == 80
     assert v.detail["validate_n"] == 130
+
+
+# ---------- Task 6：train_gap 驱动 overfit ----------
+
+def test_train_gap_threshold_constant():
+    assert sandbox.OVERFIT_TRAIN_GAP == 0.005
+
+
+def test_train_better_than_validate_is_suspected():
+    """过拟合的形态：训练段比验证段好看。"""
+    assert sandbox.overfit_flag(0.02, 0.001) == "suspected"
+
+
+def test_validate_better_than_train_is_not_flagged():
+    assert sandbox.overfit_flag(0.001, 0.02) is None
+
+
+def test_small_gap_is_not_flagged():
+    assert sandbox.overfit_flag(0.006, 0.005) is None      # gap=0.001 < 0.005
+
+
+def test_gap_exactly_at_threshold_is_not_flagged():
+    assert sandbox.overfit_flag(0.01, 0.005) is None       # gap=0.005
+
+
+def test_missing_inputs_give_none():
+    assert sandbox.overfit_flag(None, 0.01) is None
+    assert sandbox.overfit_flag(0.01, None) is None
+    assert sandbox.overfit_flag(None, None) is None
+
+
+def test_old_ci_width_heuristic_is_gone():
+    """旧的 CI 宽度启发式必须删除 —— 留着会让两种判据打架。"""
+    import inspect
+    src = inspect.getsource(sandbox)
+    assert "ci_high - ci_low" not in src
+    assert "2 * abs(delta)" not in src
+
+
+def test_verdict_carries_overfit_flag(conn):
+    def fake_replay(conn, *, candidate_script_id, baseline_script_id, pool,
+                    window_start, window_end, **kw):
+        return ([0.05] * 80, [0.001] * 130)
+
+    v = sandbox.run_sandbox(conn, candidate_script_id=1, baseline_script_id=2,
+                            pool="short", window_start="2015-01-01",
+                            window_end="2026-09-18", now=NOW,
+                            deps=SandboxDeps(replay=fake_replay))
+    assert v.detail["overfit_flag"] == "suspected"

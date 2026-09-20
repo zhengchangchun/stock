@@ -90,7 +90,7 @@ def _run_sandbox(conn, *, script_id: int, plugin_id: str, source_text: str,
     except Exception as exc:                       # noqa: BLE001
         return False, f"沙盒执行失败：{type(exc).__name__}: {exc}"
 
-    flag = sandbox.overfit_flag(verdict.delta, verdict.ci_low, verdict.ci_high)
+    flag = verdict.detail.get("overfit_flag")
     store.insert_backtest(
         conn, candidate_script_id=script_id, baseline_script_id=baseline_id,
         pool=verdict.pool, window_start=start, window_end=end,
