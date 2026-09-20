@@ -212,6 +212,8 @@ def _feat(**over):
         base[k] = 0.5
         base[f"{k}_pct"] = 0.5
         base[f"{k}_n"] = 17
+    # dupont is carried in the runtime features dict but neither p2 nor p3
+    # currently scores on it — present for completeness, not part of scoring contract.
     base["dupont"] = {"net_margin": 0.1, "asset_turnover": 0.8,
                       "equity_multiplier": 2.0}
     base.update(over)
@@ -249,17 +251,33 @@ def test_financial_stock_with_na_still_scores(pid, pool):
 
 @pytest.mark.parametrize("pid,pool", [("2", "mid"), ("3", "long")])
 def test_no_usable_factor_marks_fail(pid, pool):
+    """全部 *_pct 为 None 时，可用因子计数分支触发，pass_flag=False，reason 提名缺失因子。
+
+    注意：period 故意保留（"2026Q2"），以确保执行绕过 period 早返回守卫，
+    真正落到 usable < MIN_FACTORS 的判据分支。period=None 分支由下方独立测试覆盖。
+    """
     feats = _feat(na_reasons=["全部缺失"])
     for k in ("roe", "gross_margin", "gm_yoy_pp", "inv_days", "fcf_margin"):
         feats[k] = None
         feats[f"{k}_pct"] = None
         feats[f"{k}_n"] = 0
     feats["dupont"] = None
+    # period intentionally kept set — we want the factor-count guard, not the period guard
+    fn = runtime.load_script(BUILTIN_PLUGINS[pid], plugin_id=pid)
+    out = fn(_ctx(feats, pool))
+    assert out["pass_flag"] is False
+    assert "可用财务因子不足" in out["reason"]
+
+
+@pytest.mark.parametrize("pid,pool", [("2", "mid"), ("3", "long")])
+def test_period_none_marks_fail(pid, pool):
+    """period=None 时 period 早返回守卫触发，pass_flag=False，reason 含"期数"。"""
+    feats = _feat()
     feats["period"] = None
     fn = runtime.load_script(BUILTIN_PLUGINS[pid], plugin_id=pid)
     out = fn(_ctx(feats, pool))
     assert out["pass_flag"] is False
-    assert "财务" in out["reason"] or "期数" in out["reason"]
+    assert "期数" in out["reason"]
 
 
 @pytest.mark.parametrize("pid", ["2", "3"])
