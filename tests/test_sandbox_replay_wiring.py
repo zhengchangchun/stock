@@ -45,7 +45,7 @@ def test_no_replay_stays_fail_closed(conn):
                             pool="short", window_start="2026-01-01",
                             window_end="2026-09-18", now=NOW)
     assert v.verdict == "INCONCLUSIVE"
-    assert v.n_days == 0
+    assert v.n_periods == 0
 
 
 def test_verdict_uses_validate_segment_only(conn):
@@ -59,7 +59,7 @@ def test_verdict_uses_validate_segment_only(conn):
                             window_end="2026-09-18", now=NOW,
                             deps=SandboxDeps(replay=fake_replay))
     assert v.verdict == "WIN"
-    assert v.n_days == 130, "n_days 必须是验证段周期数"
+    assert v.n_periods == 130, "n_periods 必须是验证段周期数"
 
 
 def test_insufficient_validate_periods_is_inconclusive(conn):
@@ -99,3 +99,5 @@ def test_train_segment_is_reported_in_detail(conn):
                             deps=SandboxDeps(replay=fake_replay))
     assert v.detail["train_mean"] == pytest.approx(0.02)
     assert v.detail["validate_mean"] == pytest.approx(0.001)
+    assert v.detail["train_n"] == 80
+    assert v.detail["validate_n"] == 130

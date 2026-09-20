@@ -86,7 +86,7 @@ _BOOTSTRAP_SEED = 20260918
 class SandboxVerdict:
     verdict: str                     # WIN / LOSE / INCONCLUSIVE
     pool: str
-    n_days: int
+    n_periods: int
     delta: float | None
     ci_low: float | None
     ci_high: float | None
@@ -95,7 +95,7 @@ class SandboxVerdict:
     detail: dict = field(default_factory=dict)
 
     def as_metrics(self) -> dict:
-        return {"n_days": self.n_days, "delta": self.delta,
+        return {"n_periods": self.n_periods, "delta": self.delta,
                 "ci_low": self.ci_low, "ci_high": self.ci_high,
                 "pool": self.pool, "note": self.note, **self.detail}
 
@@ -122,7 +122,7 @@ def run_sandbox(conn: sqlite3.Connection, *, candidate_script_id: int,
 
     if baseline_script_id is None:
         return SandboxVerdict(
-            verdict="INCONCLUSIVE", pool=pool, n_days=0, delta=None,
+            verdict="INCONCLUSIVE", pool=pool, n_periods=0, delta=None,
             ci_low=None, ci_high=None, baseline_script_id=None,
             note="首版没有 baseline，只能看绝对表现，不构成新旧对比结论")
 
@@ -152,7 +152,7 @@ def run_sandbox(conn: sqlite3.Connection, *, candidate_script_id: int,
 
     if n_periods < MIN_VALID_PERIODS:
         return SandboxVerdict(
-            verdict="INCONCLUSIVE", pool=pool, n_days=n_periods, delta=None,
+            verdict="INCONCLUSIVE", pool=pool, n_periods=n_periods, delta=None,
             ci_low=None, ci_high=None, baseline_script_id=baseline_script_id,
             note=f"样本不足（{n_periods} 个有效调仓周期 < "
                  f"{MIN_VALID_PERIODS}），不构成结论", detail=detail)
@@ -161,7 +161,7 @@ def run_sandbox(conn: sqlite3.Connection, *, candidate_script_id: int,
     lo, hi = _bootstrap_ci(validate)
     verdict = "WIN" if lo > 0 else "LOSE"
     return SandboxVerdict(
-        verdict=verdict, pool=pool, n_days=n_periods, delta=delta,
+        verdict=verdict, pool=pool, n_periods=n_periods, delta=delta,
         ci_low=lo, ci_high=hi, baseline_script_id=baseline_script_id,
         note=f"验证段 Δ 周期均值 {delta:+.4%}，95% CI [{lo:+.4%}, {hi:+.4%}]，"
              f"周期数 n={n_periods}", detail=detail)

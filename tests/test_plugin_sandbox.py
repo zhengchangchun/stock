@@ -20,7 +20,7 @@ def test_first_version_has_no_baseline_so_inconclusive(conn):
                             pool="short", window_start="2025-06-01",
                             window_end="2026-09-17", now="2026-09-18T16:00:00+08:00")
     assert v.verdict == "INCONCLUSIVE"
-    assert v.n_days == 0
+    assert v.n_periods == 0
     assert v.baseline_script_id is None
     assert "baseline" in v.note or "首版" in v.note
 
@@ -29,14 +29,14 @@ def test_short_window_below_120_periods_is_inconclusive(conn):
     """不足 120 个有效调仓周期 → 不出结论（CLAUDE.md 度量纪律③）。
 
     注意：本测试通过是因为 deps=None（无注入回放）时 fail-closed 保持
-    空序列（n_days=0），而非真的根据 window_start/window_end 日期范围计算了
+    空序列（n_periods=0），而非真的根据 window_start/window_end 日期范围计算了
     周期数。周期数门槛本身由 test_sandbox_replay_wiring.py 覆盖。
     """
     v = sandbox.run_sandbox(conn, candidate_script_id=1, baseline_script_id=1,
                             pool="short", window_start="2026-08-01",
                             window_end="2026-09-17", now="2026-09-18T16:00:00+08:00")
     assert v.verdict == "INCONCLUSIVE"
-    assert v.n_days < sandbox.MIN_VALID_PERIODS
+    assert v.n_periods < sandbox.MIN_VALID_PERIODS
     assert "样本不足" in v.note
 
 
