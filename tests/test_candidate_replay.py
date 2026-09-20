@@ -236,7 +236,25 @@ def _seed_pipeline_db(tmp_db):
     """建一个能跑通 score_pipeline 的最小库（标的 + 日历 + K 线 + 5 active 插桩）。
 
     形态同 test_candidate_run.py::_seed_db，保证生产路径可通。
-    返回 (conn, script_id_for_plugin_1) ——「1」是打分插桩，用来验证覆盖是否生效。
+
+    对插桩 "1"（短线打分插桩）发布两个行为不同的版本：
+    - v1（sid，score=80，pass_flag=True，archived — 不是 active）
+    - v2（sid2，score=100，pass_flag=True，active）
+
+    两个版本分数不同（80 vs 100），但因为 topn=6 而 SEED_UNIVERSE 只有 2 只
+    标的，两者都能全部入池——分数差异在「选谁入池」上无法体现。
+
+    为了让两个版本产生可辨别的收益差，K 线使用单调递增序列（每天 +0.01）；
+    同时 v1 设 pass_flag=False（阻断全部标的），v2 设 pass_flag=True（放行）。
+    这样：
+    - v1 路径：所有标的被 score_pool 拒绝 → pool 为空 → 周期收益 = 0
+    - v2 路径：所有标的进池 → 有正收益（价格上涨）→ 周期收益 > 0
+    → Δ(cand=v1, base=v2) = 0 - positive < 0，断言 Δ≠0 成立。
+
+    可证伪性：若 eff_pid 被改回 None（短路），两侧都解析 active（v2），
+    两次 score_pipeline 相同，Δ=0，下方「Δ≠0」断言立即变红。
+
+    返回 (conn, sid_v1_for_plugin_1, sid_v2_for_plugin_1, days)。
     """
     from datetime import date as _date, timedelta as _timedelta
     from stocklab.plugin import lifecycle, store as plugin_store
@@ -259,64 +277,90 @@ def _seed_pipeline_db(tmp_db):
 
     c.executemany("INSERT INTO trading_calendar (date, is_open, source,"
                   " created_at) VALUES (?,1,'t',?)", [(d, NOW) for d in days])
+    # 单调递增价格：起点 10.0，每日 +0.01 → 300 天后约 13.0
+    # 让「有标的在池」的版本与「空池」版本产生可辨别的周期收益差
     c.executemany(
         "INSERT INTO bars_daily (code, date, open, high, low, close, volume,"
         " adj_mode, source, fetched_at) VALUES (?,?,?,?,?,?,1000,'none','x',?)",
-        [(code, d, 10.0, 10.0, 10.0, 10.0, NOW)
-         for code in codes for d in days])
+        [(code, d, 10.0 + i * 0.01, 10.0 + i * 0.01,
+          10.0 + i * 0.01, 10.0 + i * 0.01, NOW)
+         for code in codes for i, d in enumerate(days)])
 
+    # 插桩 "0"、"2"、"3"、"4"：直接用 _PIPELINE_PLUGINS 里的源码
     sid_of: dict[str, int] = {}
-    for pid, text in _PIPELINE_PLUGINS.items():
+    for pid in ("0", "2", "3", "4"):
+        text = _PIPELINE_PLUGINS[pid]
         sid = plugin_store.insert_script(c, plugin_id=pid, version="1.0.0",
                                          source_text=text, note=None, now=NOW)
         lifecycle.record_submit(c, sid, actor="t", now=NOW)
         lifecycle.record_sandbox(c, sid, passed=True, reason="ok", now=NOW)
         lifecycle.approve(c, sid, actor="t", reason="ok", now=NOW)
         sid_of[pid] = sid
+
+    # 插桩 "1" v1：pass_flag=True，score=80（将成为 archived）
+    text_v1 = ("def run(ctx):\n"
+               "    return {'score': 80.0, 'pass_flag': True,"
+               " 'reason': '量价v1', 'risk_list': []}\n")
+    sid_v1 = plugin_store.insert_script(c, plugin_id="1", version="1.0.0",
+                                         source_text=text_v1, note=None, now=NOW)
+    lifecycle.record_submit(c, sid_v1, actor="t", now=NOW)
+    lifecycle.record_sandbox(c, sid_v1, passed=True, reason="ok", now=NOW)
+    lifecycle.approve(c, sid_v1, actor="t", reason="ok", now=NOW)
+
+    # 插桩 "1" v2：pass_flag=False，score=0（主动拒绝全部标的）
+    # 这让 v1（放行）和 v2（拒绝）在「有无持仓」上产生明确分叉，
+    # 配合递增价格，使 Δ(cand=v1, base=v2) 在有价格变动的周期必然非零。
+    text_v2 = ("def run(ctx):\n"
+               "    return {'score': 0.0, 'pass_flag': False,"
+               " 'reason': '量价v2拒绝', 'risk_list': []}\n")
+    sid_v2 = plugin_store.insert_script(c, plugin_id="1", version="2.0.0",
+                                         source_text=text_v2, note=None, now=NOW)
+    lifecycle.record_submit(c, sid_v2, actor="t", now=NOW)
+    lifecycle.record_sandbox(c, sid_v2, passed=True, reason="ok", now=NOW)
+    lifecycle.approve(c, sid_v2, actor="t", reason="v2 上线（拒绝策略）", now=NOW)
+    # approve v2 时，lifecycle 自动把 v1 archived → v2 是 active，v1 是 archived
+
     c.commit()
-    return c, sid_of, days
+    return c, sid_v1, sid_v2, days
 
 
 def test_equal_id_delta_zero_via_score_pipeline(tmp_db):
     """等 id 等版本经过真实 score_pipeline（无 _pools_for）→ Δ = 0。
+    不同版本（同插件）经过真实 score_pipeline → Δ ≠ 0（夹具可证伪）。
 
-    ## 可证伪性声明
-    短路已去除：replay_period_deltas 无条件调 _plugin_id_of，再把
-    {pid: script_id} 传给两次 period_returns → score_pipeline。
-    两次 score_pipeline 拿到完全相同的 plugin_overrides，对相同的标的
-    和相同的 asof 日期运算，结果必然相同 → Δ = 0。
+    ## 夹具设计
 
-    若将来有人把等 id 路径的 eff_pid 改成 None（退回短路，不 pin），
-    而此时 script_id 对应的版本不是 active（例如 active 已更新），
-    score_pipeline 就会用 active 而非 X，和另一次调用（同样用 active）
-    的结果虽然还是相同，但一旦候选与基线的 script_id 不同时，
-    _plugin_id_of 就不会被调用，单变量守门失效 —— 该变异会让
-    test_cross_plugin_raises_value_error 仍然绿，但 test_deltas_*
-    测试会因为 LookupError（_plugin_id_of 查不到）而变红，暴露问题。
+    `_seed_pipeline_db` 对插桩 "1" 发布两个行为不同的版本：
+    - v1（sid_v1，pass_flag=True/score=80，archived — 不是 active）
+    - v2（sid_v2，pass_flag=False/score=0，active — 拒绝所有标的）
 
-    具体的可变异点：把 `eff_pid = pid` 改回 `eff_pid = None`（短路），
-    则 cand_overrides = base_overrides = None，score_pipeline 解析
-    active 版本。本测试库里 script_id 对应的就是 active 版本，所以
-    Δ 仍然是 0，**不会变红**。
-    因此本测试额外断言：score_pipeline 确实接受到了 plugin_overrides
-    且正常返回结果（通过检查返回成员数量 > 0），即生产路径已经跑通——
-    如果 plugin_overrides 中的 script_id 无效（如 None 被当作 id），
-    score_pipeline 会抛 NoActivePlugin 或 LookupError，测试变红。
+    K 线使用单调递增价格（起点 10.0，每日 +0.01），使得「有标的入池」
+    和「空池」产生可辨别的周期收益差。
 
-    **可令本测试变红的精确变异**：在 _seed_pipeline_db 里额外插入一个
-    script_id 相同 plugin 的新 active 版本（使原 sid 不再是 active），
-    再把短路改回（eff_pid=None）。此时短路路径用 active（新版本）而非
-    sid，两次调用的 overrides 均为 None，解析结果仍然相等，Δ=0，
-    **但「哪个版本」已经错了**。直接捕获这一语义错误的测试见
-    test_candidate_run.py::test_score_pipeline_overrides_plugin_version。
+    ## Δ == 0 路径（等 id，cand=v1，base=v1）
+
+    两侧 `cand_overrides = base_overrides = {"1": sid_v1}` →
+    两次 `score_pipeline` 都用 v1（pass_flag=True，放行标的）→
+    持仓相同 → 收益相同 → Δ = 0。
+
+    ## Δ ≠ 0 路径（不同版本，cand=v1，base=v2）——证伪断言
+
+    `cand_overrides = {"1": sid_v1}` vs `base_overrides = {"1": sid_v2}` →
+    - cand：v1 放行 → 标的在池 → 有正收益（价格上涨）
+    - base：v2 拒绝 → 池为空 → 收益 = 0
+    → Δ = positive - 0 > 0，`assert any(Δ ≠ 0)` 成立。
+
+    ## 可令证伪断言变红的精确变异
+
+    把生产代码 `eff_pid = pid` 改回 `eff_pid = None`（恢复短路，不 pin）：
+    - `cand_overrides = base_overrides = None`（或含 None 值）
+    - 两次 `score_pipeline` 均解析 active（v2，pass_flag=False）
+    - 两次池都为空 → 两次收益都为 0 → Δ = 0
+    → `assert any(x != 0.0 for x in tr2 + va2)` **立即变红**。
+
+    这就是能真正证伪「版本钉住」的断言。
     """
-    from stocklab.candidate.run import score_pipeline
-    from stocklab.config.replay import REBALANCE_DAYS
-
-    c, sid_of, days = _seed_pipeline_db(tmp_db)
-
-    # 使用插桩 "1"（打分插桩）的 active script_id 作为两个版本
-    sid = sid_of["1"]
+    c, sid_v1, sid_v2, days = _seed_pipeline_db(tmp_db)
 
     # 选靠近末尾的窗口（后 20 天），asof 均在有足够历史的区域
     window_start = days[-20]
@@ -326,26 +370,31 @@ def test_equal_id_delta_zero_via_score_pipeline(tmp_db):
                      transfer_fee_rate=0.0, stamp_tax_rate=0.0,
                      slippage_bps=0.0)
 
-    # 验证：score_pipeline 在此窗口能正常跑出成员（即生产路径确实通了）
-    # 用接近末尾的日期作为 asof，确保已有足够历史 K 线（>= 历史门槛）
-    asof_for_verify = days[-1]
-    pipe = score_pipeline(c, asof=asof_for_verify,
-                          plugin_overrides={"1": sid})
-    assert pipe.members, (
-        "score_pipeline 未产出任何成员——生产路径未跑通，测试前提不成立")
-
-    # 生产路径（无 _pools_for）：两次用同一个 sid → Δ 精确为 0
+    # ── 路径 A：等 id（cand=v1, base=v1），Δ = 0 ──
     tr, va = replay.replay_period_deltas(
-        c, candidate_script_id=sid, baseline_script_id=sid,
+        c, candidate_script_id=sid_v1, baseline_script_id=sid_v1,
         pool="short",
         window_start=window_start, window_end=window_end,
         costs=flat,
-        trading_days=days)   # 不传 _pools_for → 走 score_pipeline
+        trading_days=days)
 
-    # 必须有至少一个周期的 Δ（否则窗口太短，测试没有意义）
     assert tr or va, "Δ 序列为空——窗口内无足够调仓周期，测试前提不成立"
     assert all(x == 0.0 for x in tr + va), (
-        f"等 id 但 Δ 不为 0：{tr + va}。"
-        "若 eff_pid=None（短路），两次 score_pipeline 都用 active 版本，"
-        "结果仍相同，本断言仍绿 —— 此时语义错误由"
-        " test_score_pipeline_overrides_plugin_version 负责捕获。")
+        f"等 id 但 Δ 不为 0：{tr + va}")
+
+    # ── 路径 B：不同版本（cand=v1/放行，base=v2/拒绝），Δ ≠ 0 ──
+    # 这是真正的证伪断言：
+    # 若 eff_pid 被改回 None（短路），两侧均用 active(v2/拒绝)，
+    # 两次池都为空，Δ = 0，此断言立即变红。
+    tr2, va2 = replay.replay_period_deltas(
+        c, candidate_script_id=sid_v1, baseline_script_id=sid_v2,
+        pool="short",
+        window_start=window_start, window_end=window_end,
+        costs=flat,
+        trading_days=days)
+
+    assert tr2 or va2, "Δ2 序列为空——窗口内无足够调仓周期，测试前提不成立"
+    assert any(x != 0.0 for x in tr2 + va2), (
+        "cand(v1,放行) vs base(v2,拒绝) 的 Δ 全为 0——"
+        "版本钉住未生效：两次 score_pipeline 解析了相同版本（均为 active）。"
+        "若 eff_pid=None（短路），此断言立即变红。")
