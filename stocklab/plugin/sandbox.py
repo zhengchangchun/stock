@@ -13,16 +13,23 @@
 
 ## 判定守铁律
 
-- 有效交易日 < 120 → `INCONCLUSIVE`，报告逐字写「样本不足，不构成结论」
-- Δ 的 bootstrap 95% CI 不跨 0 且方向为正 → `WIN`
+- 有效调仓周期数 < 120 → `INCONCLUSIVE`，报告逐字写「样本不足，不构成结论」
+- 验证段 Δ 的 bootstrap 95% CI 不跨 0 且方向为正 → `WIN`
 - 其余 → `LOSE`
 
-**有效交易日按日聚类计数**，不是行数 —— 20 只标的同一天 ≠ 20 个样本。
+**观测单元是调仓周期**，不是交易日 —— 同一周期内的多个交易日是同一持仓
+产生的、高度自相关，不可当独立样本。
 
 ## 首版没有 baseline
 
 `baseline_script_id is None` 时只能看绝对表现，verdict 一律
-`INCONCLUSIVE`。**不美化**：没有对照就说没有对照。
+`INCONCLUSIVE`。**不美化**：没有对照就说没有对照。此时 **不调用 replay**。
+
+## verdict 只看验证段
+
+回放产出的 Δ 序列由 `split_train_validate`（Task 4）切成训练段（前 70%）
+与验证段（后 30%）。**只有验证段用于出 verdict**；训练段均值进 `detail`
+供 Task 6 的过拟合标记使用。
 """
 
 from __future__ import annotations
@@ -30,14 +37,45 @@ from __future__ import annotations
 import random
 import sqlite3
 from dataclasses import dataclass, field
+from typing import Callable
 
+from stocklab.config.replay import REBALANCE_DAYS
 from stocklab.plugin import store
 
-#: 各池的调仓周期（交易日）。**固定常量**，见模块 docstring。
-REBALANCE_DAYS: dict[str, int] = {"short": 5, "mid": 20, "long": 60}
+#: 出结论所需的最少有效**调仓周期**数。
+#:
+#: ⚠️ **它比原来的 `MIN_VALID_DAYS = 120`（120 个交易日）严格得多** ——
+#: 一个 60 日调仓周期含 60 个交易日，所以 120 个周期 ≈ 7200 个交易日 ≈ 29 年。
+#: 这是「观测单元改成周期」的算术后果（设计文档 §2 D1），不是缺陷。
+#: **不许为了让某个池能出结论而调低它** —— 那是改口径迁就结果。
+MIN_VALID_PERIODS: int = 120
 
-#: 出结论所需的最少有效交易日（CLAUDE.md 度量纪律③）。
-MIN_VALID_DAYS: int = 120
+#: 注入的回放函数：`(conn, *, candidate_script_id, baseline_script_id, pool,
+#: window_start, window_end, **kw) -> (训练段 Δ, 验证段 Δ)`。
+#:
+#: **为什么要注入而不是直接调**：回放要跑 `candidate/` 的打分内核，而
+#: `plugin/` 不得 import `candidate/`（依赖方向）。注入保住分层，也沿用
+#: 项目既有模式（`ingest_daily_bars` 的 `fetch` 同样注入）。
+#: **不注入 → 保持 fail-closed**（空序列 → `INCONCLUSIVE`），绝不假装
+#: 「没有回放」等于「没有差异」。
+ReplayFn = Callable[..., tuple[list[float], list[float]]]
+
+
+@dataclass(frozen=True)
+class SandboxDeps:
+    """sandbox 所需的注入依赖（Task 5 起开始填充）。
+
+    `replay`：回放函数（Task 5 接线）。
+    `benchmark_excess`：基准超额函数（Task 7 接线）。
+    `rebalance_marks`：调仓日序列函数（Task 7 接线）。
+
+    `deps is None` 或 `deps.replay is None` → fail-closed（空序列 →
+    `INCONCLUSIVE`）。
+    """
+    replay: ReplayFn | None = None
+    benchmark_excess: Callable | None = None
+    rebalance_marks: Callable | None = None
+
 
 #: 日度超额收益的 bootstrap 重采样次数与随机种子（固定 = 可复现）。
 _BOOTSTRAP_N = 2000
@@ -63,7 +101,7 @@ class SandboxVerdict:
 
 
 def _bootstrap_ci(values: list[float]) -> tuple[float, float]:
-    """日度序列的均值 bootstrap 95% CI（按日聚类：每天一个值）。"""
+    """周期序列的均值 bootstrap 95% CI（每个周期一个值）。"""
     rng = random.Random(_BOOTSTRAP_SEED)
     n = len(values)
     means = []
@@ -77,7 +115,8 @@ def _bootstrap_ci(values: list[float]) -> tuple[float, float]:
 
 def run_sandbox(conn: sqlite3.Connection, *, candidate_script_id: int,
                 baseline_script_id: int | None, pool: str, window_start: str,
-                window_end: str, now: str) -> SandboxVerdict:
+                window_end: str, now: str,
+                deps: SandboxDeps | None = None) -> SandboxVerdict:
     if pool not in REBALANCE_DAYS:
         raise ValueError(f"未知池 {pool!r}；已知：{sorted(REBALANCE_DAYS)}")
 
@@ -94,48 +133,38 @@ def run_sandbox(conn: sqlite3.Connection, *, candidate_script_id: int,
             f"脚本不存在：candidate={candidate_script_id} "
             f"baseline={baseline_script_id}")
 
-    daily = _replay_daily_excess(conn, candidate, baseline, pool=pool,
-                                 window_start=window_start,
-                                 window_end=window_end)
+    replay = deps.replay if deps is not None else None
 
-    n_days = len(daily)
-    if n_days < MIN_VALID_DAYS:
-        return SandboxVerdict(
-            verdict="INCONCLUSIVE", pool=pool, n_days=n_days, delta=None,
-            ci_low=None, ci_high=None, baseline_script_id=baseline_script_id,
-            note=f"样本不足（{n_days} 个有效交易日 < {MIN_VALID_DAYS}），"
-                 "不构成结论",
-            detail={"rebalance_days": REBALANCE_DAYS[pool]})
-
-    delta = sum(daily) / n_days
-    lo, hi = _bootstrap_ci(daily)
-    if lo > 0:
-        verdict = "WIN"
+    if replay is None:
+        train, validate = [], []
     else:
-        verdict = "LOSE"
+        train, validate = replay(
+            conn, candidate_script_id=candidate_script_id,
+            baseline_script_id=baseline_script_id, pool=pool,
+            window_start=window_start, window_end=window_end)
+
+    n_periods = len(validate)
+    detail = {"rebalance_days": REBALANCE_DAYS[pool],
+              "train_n": len(train), "validate_n": n_periods,
+              "train_mean": (sum(train) / len(train)) if train else None,
+              "validate_mean": (sum(validate) / len(validate))
+                               if validate else None}
+
+    if n_periods < MIN_VALID_PERIODS:
+        return SandboxVerdict(
+            verdict="INCONCLUSIVE", pool=pool, n_days=n_periods, delta=None,
+            ci_low=None, ci_high=None, baseline_script_id=baseline_script_id,
+            note=f"样本不足（{n_periods} 个有效调仓周期 < "
+                 f"{MIN_VALID_PERIODS}），不构成结论", detail=detail)
+
+    delta = sum(validate) / n_periods
+    lo, hi = _bootstrap_ci(validate)
+    verdict = "WIN" if lo > 0 else "LOSE"
     return SandboxVerdict(
-        verdict=verdict, pool=pool, n_days=n_days, delta=delta, ci_low=lo,
-        ci_high=hi, baseline_script_id=baseline_script_id,
-        note=f"Δ 日均超额 {delta:+.4%}，95% CI [{lo:+.4%}, {hi:+.4%}]，"
-             f"按日聚类 n={n_days}",
-        detail={"rebalance_days": REBALANCE_DAYS[pool]})
-
-
-def _replay_daily_excess(conn: sqlite3.Connection, candidate: dict,
-                         baseline: dict, *, pool: str, window_start: str,
-                         window_end: str) -> list[float]:
-    """在窗口内逐调仓日重放两个版本，返回逐日超额收益序列。
-
-    **本轮是骨架实现**：插桩脚本的输入需求会随业务演进，这里先返回空
-    序列 —— 于是任何调用方都会走 `INCONCLUSIVE` 分支，**不会**因为
-    「回放没实现」而误判成 WIN。这是刻意的 fail-closed：
-    宁可不出结论，也不能出一个假的结论。
-
-    接入真实回放是 Task 16 之后的第一件后续工作（见设计文档 §13
-    「未决项」）。
-    """
-    _ = (conn, candidate, baseline, pool, window_start, window_end)
-    return []
+        verdict=verdict, pool=pool, n_days=n_periods, delta=delta,
+        ci_low=lo, ci_high=hi, baseline_script_id=baseline_script_id,
+        note=f"验证段 Δ 周期均值 {delta:+.4%}，95% CI [{lo:+.4%}, {hi:+.4%}]，"
+             f"周期数 n={n_periods}", detail=detail)
 
 
 def overfit_flag(delta: float | None, ci_low: float | None,

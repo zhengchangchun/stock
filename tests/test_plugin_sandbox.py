@@ -25,18 +25,18 @@ def test_first_version_has_no_baseline_so_inconclusive(conn):
     assert "baseline" in v.note or "首版" in v.note
 
 
-def test_short_window_below_120_days_is_inconclusive(conn):
-    """不足 120 个有效交易日 → 不出结论（CLAUDE.md 度量纪律③）。
+def test_short_window_below_120_periods_is_inconclusive(conn):
+    """不足 120 个有效调仓周期 → 不出结论（CLAUDE.md 度量纪律③）。
 
-    注意：本测试通过是因为 fail-closed 骨架的 _replay_daily_excess 始终返回
-    空列表（n_days=0），而非真的根据 window_start/window_end 日期范围计算了
-    交易日数。日期范围门槛本身尚无覆盖。
+    注意：本测试通过是因为 deps=None（无注入回放）时 fail-closed 保持
+    空序列（n_days=0），而非真的根据 window_start/window_end 日期范围计算了
+    周期数。周期数门槛本身由 test_sandbox_replay_wiring.py 覆盖。
     """
     v = sandbox.run_sandbox(conn, candidate_script_id=1, baseline_script_id=1,
                             pool="short", window_start="2026-08-01",
                             window_end="2026-09-17", now="2026-09-18T16:00:00+08:00")
     assert v.verdict == "INCONCLUSIVE"
-    assert v.n_days < sandbox.MIN_VALID_DAYS
+    assert v.n_days < sandbox.MIN_VALID_PERIODS
     assert "样本不足" in v.note
 
 
@@ -54,8 +54,8 @@ def test_rebalance_days_match_doc():
     assert sandbox.REBALANCE_DAYS == {"short": 5, "mid": 20, "long": 60}
 
 
-def test_min_valid_days_is_120():
-    assert sandbox.MIN_VALID_DAYS == 120
+def test_min_valid_periods_is_120():
+    assert sandbox.MIN_VALID_PERIODS == 120
 
 
 def test_verdict_is_json_serializable(conn):
