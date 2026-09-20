@@ -99,3 +99,73 @@ def test_flat_prices_give_zero_return_before_costs(tmp_db):
                         slippage_bps=0.0),
         _pools_for_test={dates[0]: [], dates[5]: []})
     assert len(r) == 1 and r[0] == 0.0
+
+
+# ---------- Task 4：Δ 与切分 ----------
+
+def test_split_is_by_period_index_not_calendar():
+    """按周期**序号**切 70/30。"""
+    deltas = list(range(10))
+    tr, va = replay.split_train_validate(deltas)
+    assert tr == [0, 1, 2, 3, 4, 5, 6]
+    assert va == [7, 8, 9]
+
+
+def test_split_handles_short_series():
+    tr, va = replay.split_train_validate([1.0, 2.0])
+    assert tr == [1.0]
+    assert va == [2.0]
+
+
+def test_split_empty():
+    assert replay.split_train_validate([]) == ([], [])
+
+
+def test_split_keeps_order():
+    tr, va = replay.split_train_validate([1, 2, 3, 4, 5])
+    assert tr == [1, 2, 3]
+    assert va == [4, 5]
+
+
+def test_split_ratio_is_constant():
+    assert replay.SPLIT_TRAIN_RATIO == 0.7
+
+
+def test_deltas_are_candidate_minus_baseline(tmp_db):
+    """Δ = 候选版本周期收益 − 基线版本周期收益。
+
+    候选：持有 000333（nxt 里有它，从 dates[0]→dates[5] 涨 50%）；
+    基线：两期都空仓（nxt 为空，收益=0）→ Δ > 0。
+
+    注：`period_returns` 按 `nxt`（d1 的池成员）计算周期收益，因此要让
+    候选真的「持有」000333，d1（dates[5]）的 pool 里必须包含它。
+    """
+    dates = _dates(6)
+    c = _db_with_bars(tmp_db, {"000333": [10.0, 11.0, 12.0, 13.0, 14.0, 15.0]},
+                      dates)
+    flat = CostModel(commission_rate=0.0, min_commission=0.0,
+                     transfer_fee_rate=0.0, stamp_tax_rate=0.0,
+                     slippage_bps=0.0)
+    # 候选：d1（dates[5]）的 nxt 包含 000333 → 计算 10→15 的收益（+50%）
+    # 基线：两期都空仓（nxt 为空 → 收益 = 0）→ Δ = 0.5 > 0
+    tr, va = replay.replay_period_deltas(
+        c, candidate_script_id=1, baseline_script_id=1, pool="short",
+        window_start=dates[0], window_end=dates[-1], costs=flat,
+        _pools_for={"cand": {dates[0]: ["000333"], dates[5]: ["000333"]},
+                    "base": {dates[0]: [], dates[5]: []}})
+    allv = tr + va
+    assert allv and all(x > 0 for x in allv)      # 涨了且基线空仓 → Δ > 0
+
+
+def test_deltas_zero_when_versions_identical(tmp_db):
+    dates = _dates(6)
+    c = _db_with_bars(tmp_db, {"000333": [10.0] * 6}, dates)
+    flat = CostModel(commission_rate=0.0, min_commission=0.0,
+                     transfer_fee_rate=0.0, stamp_tax_rate=0.0,
+                     slippage_bps=0.0)
+    same = {dates[0]: ["000333"], dates[5]: ["000333"]}
+    tr, va = replay.replay_period_deltas(
+        c, candidate_script_id=1, baseline_script_id=1, pool="short",
+        window_start=dates[0], window_end=dates[-1], costs=flat,
+        _pools_for={"cand": same, "base": same})
+    assert all(x == 0.0 for x in tr + va)

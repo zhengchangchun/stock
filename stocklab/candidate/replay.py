@@ -28,6 +28,7 @@ import sqlite3
 
 from stocklab.backtest.portfolio import BoardUnknown, LIMIT_BY_BOARD, LIMIT_TOLERANCE
 from stocklab.config.costs import CostModel
+from stocklab.config.replay import REBALANCE_DAYS
 
 #: 空池时的处置：持现金。**不是**「跳过该周期」—— 卖出上一期持仓是要付
 #: 成本的，跳过会把那笔成本抹掉。
@@ -169,3 +170,105 @@ def period_returns(conn: sqlite3.Connection, *, asof_dates: list[str],
 
         out.append(gross - fee_ratio)
     return out
+
+
+# ---------------------------------------------------------------------------
+# Task 4：Δ 序列与训练/验证切分
+# ---------------------------------------------------------------------------
+
+#: 训练段占比。按**周期序号**切，不按日历 —— 保证两段周期长度相同。
+SPLIT_TRAIN_RATIO: float = 0.7
+
+
+def split_train_validate(deltas: list[float]) -> tuple[list[float], list[float]]:
+    """按周期序号切训练段（前 70%）与验证段（后 30%）。
+
+    两段**周期长度相同**（都来自同一套 `REBALANCE_DAYS`），所以 Δ 可比。
+
+    边界情况：
+    - 空列表 → ([], [])
+    - 长度 1 → 整个列表放训练段，验证段为空（不满足 len > 1 的前提，不做切分）
+    - 长度 2 → ([首], [尾])，保证验证段至少有一条
+    """
+    if not deltas:
+        return [], []
+    n_train = int(len(deltas) * SPLIT_TRAIN_RATIO)
+    # 长度 > 1 时：至少 1 训练 + 1 验证；长度 == 1 时：整个归训练
+    n_train = max(1, min(n_train, len(deltas) - 1)) if len(deltas) > 1 else 1
+    return deltas[:n_train], deltas[n_train:]
+
+
+def replay_period_deltas(conn: sqlite3.Connection, *, candidate_script_id: int,
+                         baseline_script_id: int, pool: str,
+                         window_start: str, window_end: str,
+                         costs: CostModel | None = None,
+                         trading_days: list[str] | None = None,
+                         _pools_for: dict | None = None
+                         ) -> tuple[list[float], list[float]]:
+    """回放两个版本，返回 `(训练段 Δ, 验证段 Δ)`。
+
+    Δ = 候选版本周期收益 − 基线版本周期收益。
+
+    **单变量**：只有该 `plugin_id` 的两个版本不同；其余插件由
+    `score_pipeline` 解析 active 版本（见 `period_returns`）。
+
+    `_pools_for`：测试接缝，`{"cand": {日期: [code,...]}, "base": {...}}`，
+    直接指定两个版本各自的成员，绕开 `score_pipeline` 调用。生产路径不传。
+
+    注：`from stocklab.candidate.run import SEED_UNIVERSE` 在本函数里**不需要**。
+    `score_pipeline`（在 `period_returns` 里延迟 import）自身已从 `candidate.run`
+    导入 `SEED_UNIVERSE`，调用时 SEED_UNIVERSE 必然已在内存中。
+    若不传 `_pools_for`，`period_returns` 会调 `score_pipeline`；
+    若传了 `_pools_for`，直接走接缝，`score_pipeline` 不被调用。
+    两种路径都不需要在这里额外 import SEED_UNIVERSE。
+    """
+    # 单变量检查：两个版本必须属于同一个 plugin_id。
+    # 当 candidate_script_id == baseline_script_id 时同一脚本必然同一插件，跳过查库。
+    # 当两者不同时才需要查 plugin_scripts 表确认。
+    if candidate_script_id != baseline_script_id:
+        pid = _plugin_id_of(conn, candidate_script_id)
+        base_pid = _plugin_id_of(conn, baseline_script_id)
+        if pid != base_pid:
+            raise ValueError(
+                f"两个版本属于不同插件（{pid!r} vs {base_pid!r}）—— 单变量原则"
+                "要求只换同一个 plugin_id 的版本")
+        eff_pid = pid
+    else:
+        eff_pid = None  # 同一脚本，无需查库
+
+    period = REBALANCE_DAYS[pool]
+    days = trading_days or _trading_days(conn, window_start, window_end)
+    marks = rebalance_dates(days, period=period, start=window_start,
+                            end=window_end)
+
+    cand_overrides = ({eff_pid: candidate_script_id} if eff_pid is not None
+                      else None)
+    base_overrides = ({eff_pid: baseline_script_id} if eff_pid is not None
+                      else None)
+
+    cand = period_returns(
+        conn, asof_dates=marks, pool=pool,
+        plugin_overrides=cand_overrides, costs=costs,
+        _pools_for_test=(_pools_for or {}).get("cand"))
+    base = period_returns(
+        conn, asof_dates=marks, pool=pool,
+        plugin_overrides=base_overrides, costs=costs,
+        _pools_for_test=(_pools_for or {}).get("base"))
+
+    deltas = [c - b for c, b in zip(cand, base)]
+    return split_train_validate(deltas)
+
+
+def _plugin_id_of(conn: sqlite3.Connection, script_id: int) -> str:
+    from stocklab.plugin import store
+    row = store.get_script(conn, script_id)
+    if row is None:
+        raise LookupError(f"脚本 {script_id} 不存在")
+    return str(row["plugin_id"])
+
+
+def _trading_days(conn: sqlite3.Connection, start: str,
+                  end: str) -> list[str]:
+    return [r[0] for r in conn.execute(
+        "SELECT date FROM trading_calendar WHERE date BETWEEN ? AND ?"
+        " ORDER BY date", (start, end))]
