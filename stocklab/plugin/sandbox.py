@@ -41,6 +41,7 @@ from typing import Callable
 
 from stocklab.config.replay import REBALANCE_DAYS
 from stocklab.plugin import store
+from stocklab.plugin.lifecycle import active_script_id
 
 #: 出结论所需的最少有效**调仓周期**数。
 #:
@@ -142,7 +143,17 @@ def overfit_flag(train_mean: float | None,
 def run_sandbox(conn: sqlite3.Connection, *, candidate_script_id: int,
                 baseline_script_id: int | None, pool: str, window_start: str,
                 window_end: str, now: str,
-                deps: SandboxDeps | None = None) -> SandboxVerdict:
+                deps: SandboxDeps | None = None,
+                replay: Callable | None = None,
+                benchmark_excess: Callable | None = None,
+                rebalance_marks: Callable | None = None) -> SandboxVerdict:
+    # Direct kwargs take precedence over deps fields (test injection convenience).
+    _replay = replay if replay is not None else (deps.replay if deps is not None else None)
+    _benchmark_excess = (benchmark_excess if benchmark_excess is not None
+                         else (deps.benchmark_excess if deps is not None else None))
+    _rebalance_marks = (rebalance_marks if rebalance_marks is not None
+                        else (deps.rebalance_marks if deps is not None else None))
+
     if pool not in REBALANCE_DAYS:
         raise ValueError(f"未知池 {pool!r}；已知：{sorted(REBALANCE_DAYS)}")
 
@@ -160,12 +171,10 @@ def run_sandbox(conn: sqlite3.Connection, *, candidate_script_id: int,
             f"脚本不存在：candidate={candidate_script_id} "
             f"baseline={baseline_script_id}")
 
-    replay = deps.replay if deps is not None else None
-
-    if replay is None:
+    if _replay is None:
         train, validate = [], []
     else:
-        train, validate = replay(
+        train, validate = _replay(
             conn, candidate_script_id=candidate_script_id,
             baseline_script_id=baseline_script_id, pool=pool,
             window_start=window_start, window_end=window_end)
@@ -173,11 +182,39 @@ def run_sandbox(conn: sqlite3.Connection, *, candidate_script_id: int,
     n_periods = len(validate)
     train_mean = (sum(train) / len(train)) if train else None
     validate_mean = (sum(validate) / len(validate)) if validate else None
-    detail = {"rebalance_days": REBALANCE_DAYS[pool],
-              "train_n": len(train), "validate_n": n_periods,
-              "train_mean": train_mean,
-              "validate_mean": validate_mean,
-              "overfit_flag": overfit_flag(train_mean, validate_mean)}
+    detail: dict = {"rebalance_days": REBALANCE_DAYS[pool],
+                    "train_n": len(train), "validate_n": n_periods,
+                    "train_mean": train_mean,
+                    "validate_mean": validate_mean,
+                    "overfit_flag": overfit_flag(train_mean, validate_mean)}
+
+    # script_id 留痕：candidate / baseline + 其余插件的当前 active 版本。
+    # `active_script_id` 返回 None 表示该插件尚无 active 版本——此时
+    # replay_period_deltas 会调 score_pipeline，而 score_pipeline 对无
+    # active 版本的插件会抛 NoActivePlugin，所以回放本身就不会成功；
+    # 因此这里记 None 是合法状态（仅出现在测试里），不静默忽略。
+    detail["scripts"] = {
+        "candidate": candidate_script_id,
+        "baseline": baseline_script_id,
+        "active": {pid: active_script_id(conn, pid)
+                   for pid in ("0", "1", "2", "3", "4")},
+    }
+
+    # 两版相对 index_300 的超额（铁律：跑不赢就明说，并列报告）。
+    # 未注入 benchmark_excess 时不写进 detail，避免「算出来是 0」与「未算」混淆。
+    if _benchmark_excess is not None:
+        marks = (_rebalance_marks(conn, pool=pool, start=window_start,
+                                  end=window_end)
+                 if _rebalance_marks is not None else [])
+        # 单变量：candidate 只换被测插件，baseline 同理。
+        # plugin_id 由 candidate_script_id 所属的插件决定。
+        pid = str(store.get_script(conn, candidate_script_id)["plugin_id"])
+        detail["candidate_excess_index300"] = _benchmark_excess(
+            conn, asof_dates=marks, pool=pool,
+            plugin_overrides={pid: candidate_script_id})
+        detail["baseline_excess_index300"] = _benchmark_excess(
+            conn, asof_dates=marks, pool=pool,
+            plugin_overrides={pid: baseline_script_id})
 
     if n_periods < MIN_VALID_PERIODS:
         return SandboxVerdict(

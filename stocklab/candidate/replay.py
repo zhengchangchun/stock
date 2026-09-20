@@ -254,6 +254,44 @@ def replay_period_deltas(conn: sqlite3.Connection, *, candidate_script_id: int,
     return split_train_validate(deltas)
 
 
+# ---------------------------------------------------------------------------
+# Task 7：基准超额与调仓日公开薄封装（供 sandbox 经注入调用）
+# ---------------------------------------------------------------------------
+
+#: 基准指数代码（腾讯口径，见 ADR-003 的指数源）。
+BENCHMARK_CODE = "sh000300"
+
+
+def benchmark_excess(conn: sqlite3.Connection, *, asof_dates: list[str],
+                     pool: str, plugin_overrides: dict[str, int] | None = None,
+                     benchmark: str = BENCHMARK_CODE,
+                     costs: CostModel | None = None) -> float:
+    """候选池相对基准指数的**超额收益**（同区间、同调仓日）。
+
+    铁律要求「任何策略必须与 index_300 比较，跑不赢就明说」—— 所以这个
+    数与版本 Δ **并列报告**，不是替代。
+    """
+    if len(asof_dates) < 2:
+        return 0.0
+    pool_r = period_returns(conn, asof_dates=asof_dates, pool=pool,
+                            plugin_overrides=plugin_overrides, costs=costs)
+    bench_r: list[float] = []
+    for d0, d1 in zip(asof_dates, asof_dates[1:]):
+        a, b = _close_on(conn, benchmark, d0), _close_on(conn, benchmark, d1)
+        bench_r.append((b / a - 1.0) if (a and b) else 0.0)
+    if not pool_r:
+        return 0.0
+    return sum(pool_r) / len(pool_r) - sum(bench_r) / len(bench_r)
+
+
+def rebalance_marks(conn: sqlite3.Connection, *, pool: str, start: str,
+                    end: str) -> list[str]:
+    """窗口内的调仓日序列。供 `sandbox` 经注入调用（它不能 import 本模块）。"""
+    days = _trading_days(conn, start, end)
+    return rebalance_dates(days, period=REBALANCE_DAYS[pool],
+                           start=start, end=end)
+
+
 def _plugin_id_of(conn: sqlite3.Connection, script_id: int) -> str:
     from stocklab.plugin import store
     row = store.get_script(conn, script_id)

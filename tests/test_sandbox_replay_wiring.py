@@ -161,3 +161,55 @@ def test_no_baseline_detail_carries_overfit_flag_none(conn):
     assert "overfit_flag" in v.detail
     assert v.detail["overfit_flag"] is None
     assert v.detail.get("reason") == "no_baseline"
+
+
+# ---------- Task 7：双超额与 script_id 留痕 ----------
+
+def test_verdict_records_both_benchmark_excess(conn):
+    """两版相对 index_300 的超额都要在 detail 里 —— 铁律要求「跑不赢就明说」。"""
+    def fake_replay(conn, *, candidate_script_id, baseline_script_id, pool,
+                    window_start, window_end, **kw):
+        return ([0.01] * 80, [0.01] * 130)
+
+    def fake_excess(conn, *, asof_dates, pool, plugin_overrides, **kw):
+        return 0.05 if plugin_overrides else -0.05
+
+    v = sandbox.run_sandbox(conn, candidate_script_id=1, baseline_script_id=2,
+                            pool="short", window_start="2015-01-01",
+                            window_end="2026-09-18", now=NOW,
+                            replay=fake_replay, benchmark_excess=fake_excess)
+    assert "candidate_excess_index300" in v.detail
+    assert "baseline_excess_index300" in v.detail
+
+
+def test_verdict_records_script_ids(conn):
+    """回放时各插件的 script_id 要留痕 —— 否则同一份回放重跑对不上。"""
+    def fake_replay(conn, *, candidate_script_id, baseline_script_id, pool,
+                    window_start, window_end, **kw):
+        return ([0.01] * 80, [0.01] * 130)
+
+    v = sandbox.run_sandbox(conn, candidate_script_id=1, baseline_script_id=2,
+                            pool="short", window_start="2015-01-01",
+                            window_end="2026-09-18", now=NOW,
+                            replay=fake_replay)
+    assert v.detail["scripts"]["candidate"] == 1
+    assert v.detail["scripts"]["baseline"] == 2
+    assert v.detail["scripts"]["active"], "其余插件的 active 版本也要记"
+
+
+def test_win_verdict_can_still_report_negative_excess(conn):
+    """「新版跑赢旧版、但两者都跑输指数」必须能同时看见。"""
+    def fake_replay(conn, *, candidate_script_id, baseline_script_id, pool,
+                    window_start, window_end, **kw):
+        return ([0.02] * 80, [0.01] * 130)
+
+    def neg_excess(conn, *, asof_dates, pool, plugin_overrides, **kw):
+        return -0.03
+
+    v = sandbox.run_sandbox(conn, candidate_script_id=1, baseline_script_id=2,
+                            pool="short", window_start="2015-01-01",
+                            window_end="2026-09-18", now=NOW,
+                            replay=fake_replay, benchmark_excess=neg_excess)
+    assert v.verdict == "WIN"
+    assert v.detail["candidate_excess_index300"] < 0
+    assert v.detail["baseline_excess_index300"] < 0
