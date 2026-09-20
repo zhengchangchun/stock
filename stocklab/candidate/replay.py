@@ -26,7 +26,7 @@ from __future__ import annotations
 
 import sqlite3
 
-from stocklab.backtest.portfolio import BoardUnknown, LIMIT_BY_BOARD
+from stocklab.backtest.portfolio import BoardUnknown, LIMIT_BY_BOARD, LIMIT_TOLERANCE
 from stocklab.config.costs import CostModel
 
 #: 空池时的处置：持现金。**不是**「跳过该周期」—— 卖出上一期持仓是要付
@@ -35,6 +35,11 @@ EMPTY_POOL_IS_CASH: bool = True
 
 #: 每期等权买入的目标手数（整手）。
 LOT = 100
+
+#: 涨跌停判定时的比较容差（同 `backtest.portfolio.LIMIT_TOLERANCE`）。
+#: `portfolio.py` 使用 1e-6 处理浮点表示误差（如 1.1*10 = 10.999…）。
+#: 本模块使用同一常量，语义完全一致；若两处将来发散，需要统一评审后再改。
+_LIMIT_SLACK = LIMIT_TOLERANCE
 
 
 def rebalance_dates(trading_days: list[str], *, period: int, start: str,
@@ -65,9 +70,9 @@ def _limit_hit(prev_close: float, close: float, board: str) -> str | None:
         raise BoardUnknown(f"板别 {board!r} 不在 {sorted(LIMIT_BY_BOARD)} 中")
     limit = LIMIT_BY_BOARD[board]
     chg = (close - prev_close) / prev_close
-    if chg >= limit - 0.002:
+    if chg >= limit - _LIMIT_SLACK:
         return "up"
-    if chg <= -(limit - 0.002):
+    if chg <= -(limit - _LIMIT_SLACK):
         return "down"
     return None
 
@@ -97,16 +102,10 @@ def period_returns(conn: sqlite3.Connection, *, asof_dates: list[str],
     返回长度 = `len(asof_dates) - 1`。
 
     `_pools_for_test`：**测试接缝**，`{调仓日: [code, ...]}`。生产路径不传，
-    此时池成员由 `score_pipeline` 现算。当 `_pools_for_test` 提供且
-    `asof_dates` 为空时，以 `sorted(_pools_for_test)` 作为调仓日序列，
-    方便测试只传入一张日期→池成员的映射表而不必额外传日期。
+    此时池成员由 `score_pipeline` 现算。接缝只控制**池成员**；调仓日序列
+    一律由 `asof_dates` 参数传入，两者职责不混。
     """
-    # 若测试接缝提供了池映射且 asof_dates 未传，则从接缝键推导调仓日
-    effective_dates: list[str]
-    if _pools_for_test is not None and not asof_dates:
-        effective_dates = sorted(_pools_for_test)
-    else:
-        effective_dates = list(asof_dates)
+    effective_dates = list(asof_dates)
 
     if len(effective_dates) < 2:
         return []

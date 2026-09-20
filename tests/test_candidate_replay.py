@@ -4,7 +4,6 @@ import pytest
 
 from stocklab.candidate import replay
 from stocklab.config.costs import CostModel
-from stocklab.data.models import Bar
 from stocklab.store.db import connect
 from stocklab.store.migrate import init_db
 
@@ -39,7 +38,7 @@ def test_rebalance_dates_respect_window_bounds():
     assert got == [days[5], days[15], days[25]]
 
 
-def test_rebalance_dates_empty_when_window_shorter_than_period():
+def test_rebalance_dates_yields_only_start_when_window_shorter_than_period():
     days = _dates(3)
     assert replay.rebalance_dates(days, period=5, start=days[0],
                                   end=days[-1]) == [days[0]]
@@ -83,7 +82,7 @@ def test_empty_pool_holds_cash_but_pays_liquidation_cost(tmp_db):
     expected = -expected_fee / 1000.0
 
     r = replay.period_returns(
-        c, asof_dates=[], pool="short", costs=costs,
+        c, asof_dates=[dates[0], dates[5]], pool="short", costs=costs,
         _pools_for_test={dates[0]: ["000333"], dates[5]: []})
     assert len(r) == 1
     assert r[0] == pytest.approx(expected)
@@ -94,9 +93,9 @@ def test_flat_prices_give_zero_return_before_costs(tmp_db):
     dates = _dates(6)
     c = _db_with_bars(tmp_db, {"000333": [10.0] * 6}, dates)
     r = replay.period_returns(
-        c, asof_dates=[], pool="short",
+        c, asof_dates=[dates[0], dates[5]], pool="short",
         costs=CostModel(commission_rate=0.0, min_commission=0.0,
                         transfer_fee_rate=0.0, stamp_tax_rate=0.0,
                         slippage_bps=0.0),
         _pools_for_test={dates[0]: [], dates[5]: []})
-    assert r == [] or all(x == 0.0 for x in r)
+    assert len(r) == 1 and r[0] == 0.0
