@@ -194,3 +194,73 @@ def test_zero_equity_does_not_produce_inf():
 def test_period_is_reported():
     f = ind.factors(_two_years())
     assert f["period"] == "2026Q4"
+
+
+# ---------- Fix round 1: NA deduplication ----------
+
+def test_missing_profit_na_no_duplicate_root_cause():
+    """缺 parent_netprofit 时，na_reasons 里只出现一条关于它的条目（dupont 不重复）。"""
+    import dataclasses
+
+    stripped = [dataclasses.replace(r, parent_netprofit=None)
+                for r in _two_years()]
+    f = ind.factors(stripped)
+    assert f["dupont"] is None
+    # dupont 的根因是 profit（flow 字段），已被 _need 汇报；不应再出现第二条
+    profit_entries = [r for r in f["na_reasons"] if "parent_netprofit" in r]
+    assert len(profit_entries) <= 1, (
+        f"parent_netprofit 根因出现了 {len(profit_entries)} 次: {f['na_reasons']}")
+    dupont_entries = [r for r in f["na_reasons"] if "dupont" in r]
+    assert len(dupont_entries) == 0, (
+        f"dupont 条目应被压制，但仍出现: {dupont_entries}")
+
+
+def test_dupont_na_fires_for_own_missing_stock_fields():
+    """缺 total_assets 时（flow 字段均齐），na_reasons 中应有一条 dupont 专属条目。"""
+    import dataclasses
+
+    stripped = [dataclasses.replace(r, total_assets=None)
+                for r in _two_years()]
+    f = ind.factors(stripped)
+    assert f["dupont"] is None
+    dupont_entries = [r for r in f["na_reasons"] if "dupont" in r]
+    assert len(dupont_entries) == 1, (
+        f"期望恰好一条 dupont NA 条目，实际: {dupont_entries}")
+    # 确保没有因 profit/income 缺失而导致虚假重复
+    assert len(dupont_entries) <= 1
+
+
+def test_every_none_factor_has_an_explaining_na_entry():
+    """对任意 None 因子，na_reasons 里必须有至少一条可解释条目。"""
+    import dataclasses
+
+    stripped = [dataclasses.replace(r, operate_cost=None, inventory=None,
+                                    total_assets=None)
+                for r in _two_years()]
+    f = ind.factors(stripped)
+    for key in ("roe", "gross_margin", "gm_yoy_pp", "inv_days",
+                "fcf_margin", "dupont"):
+        if f[key] is None:
+            has_entry = any(key in r for r in f["na_reasons"])
+            # gross_margin covers gm_yoy_pp indirectly; check either
+            if key == "gm_yoy_pp":
+                has_entry = any("gm_yoy" in r or "gross_margin" in r
+                                for r in f["na_reasons"])
+            assert has_entry, (
+                f"因子 {key!r} 是 None 但 na_reasons 里找不到解释条目: "
+                f"{f['na_reasons']}")
+
+
+def test_gm_yoy_na_message_when_gm_is_none():
+    """当 gm 本身为 None 时，gm_yoy 的 NA 消息应说明真正根因，不说「去年同期」。"""
+    import dataclasses
+
+    stripped = [dataclasses.replace(r, operate_cost=None)
+                for r in _two_years()]
+    f = ind.factors(stripped)
+    assert f["gm_yoy_pp"] is None
+    gm_yoy_entries = [r for r in f["na_reasons"] if "gm_yoy" in r]
+    assert len(gm_yoy_entries) == 1
+    # 消息不应把责任推给「去年同期」（真正的根因是当期 gm 缺失）
+    assert "去年同期" not in gm_yoy_entries[0], (
+        f"消息误称「去年同期」，实际根因是当期 gm 缺失: {gm_yoy_entries[0]}")

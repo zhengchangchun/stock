@@ -121,8 +121,7 @@ def factors(reports: list[FinancialReport]) -> dict:
     if period is None:
         return {"period": None,
                 **{k: None for k in _FACTOR_KEYS},
-                "na_reasons": ["没有任何财报期"],
-                "dupont": None}
+                "na_reasons": ["没有任何财报期"]}
     year, quarter = period
     period_str = f"{year}Q{quarter}"
 
@@ -165,7 +164,10 @@ def factors(reports: list[FinancialReport]) -> dict:
         if gm is not None and inc_p not in (None, 0) and cost_p is not None:
             gm_yoy = (gm - (inc_p - cost_p) / inc_p) * 100.0
     if gm_yoy is None:
-        na.append("gm_yoy_pp: 去年同期毛利率不可算（需 8 个单季）")
+        if gm is None:
+            na.append("gm_yoy_pp: 当期毛利率不可算（gross_margin 已缺失）")
+        else:
+            na.append("gm_yoy_pp: 去年同期毛利率不可算（需 8 个单季）")
 
     inv_days = None
     if cost not in (None, 0) and inv_avg not in (None, 0):
@@ -189,7 +191,16 @@ def factors(reports: list[FinancialReport]) -> dict:
             "equity_multiplier": assets_now / parent_eq_now,
         }
     else:
-        na.append("dupont: 归母净利/营收/总资产/期末归母权益不齐")
+        # Only append a dupont-specific entry when the missing piece belongs to
+        # dupont's own stock inputs (total_assets / parent_equity_now).  Flow
+        # fields (profit / income) are already reported by the _need() calls
+        # above, so adding a second entry here would be a duplicate root cause.
+        _dupont_own_missing = (
+            profit is not None and income not in (None, 0)
+            and (not assets_now or parent_eq_now in (None, 0))
+        )
+        if _dupont_own_missing:
+            na.append("dupont: 期末总资产或期末归母权益缺失")
 
     return {"period": period_str, "roe": roe, "gross_margin": gm,
             "gm_yoy_pp": gm_yoy, "inv_days": inv_days,
