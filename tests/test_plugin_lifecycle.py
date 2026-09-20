@@ -174,6 +174,45 @@ def test_two_active_versions_is_a_bug(conn):
     assert "两个" in str(e.value) or "2" in str(e.value)
 
 
+# ---------- Task 1：call_active 支持指定版本 ----------
+
+def test_call_active_with_explicit_script_id_uses_that_version(conn):
+    """指定版本时用它，即使它不是 active。"""
+    a = _new(conn, version="1.0.0")
+    lifecycle.record_submit(conn, a, actor="t", now=NOW)
+    lifecycle.record_sandbox(conn, a, passed=True, reason="ok", now=NOW)
+    lifecycle.approve(conn, a, actor="t", reason="ok", now=NOW)
+
+    b = _new(conn, version="2.0.0",
+             text=SCORE_SCRIPT.replace("score': 50.0", "score': 90.0"))
+    lifecycle.record_submit(conn, b, actor="t", now=NOW)
+    lifecycle.record_sandbox(conn, b, passed=True, reason="ok", now=NOW)
+    # b 处于 pending_review，不是 active
+
+    assert lifecycle.call_active(conn, "3", {})["score"] == 50.0          # active
+    assert lifecycle.call_active(conn, "3", {}, script_id=b)["score"] == 90.0
+
+
+def test_call_active_explicit_script_id_of_wrong_plugin_is_rejected(conn):
+    """指定版本必须属于该 plugin_id —— 否则就是拿 A 插件冒名 B 插件。"""
+    sid = store.insert_script(conn, plugin_id="1", version="1.0.0",
+                              source_text=SCORE_SCRIPT, note=None, now=NOW)
+    with pytest.raises(ValueError) as e:
+        lifecycle.call_active(conn, "3", {}, script_id=sid)
+    assert "plugin_id" in str(e.value)
+
+
+def test_call_active_explicit_missing_script_is_lookup_error(conn):
+    with pytest.raises(LookupError):
+        lifecycle.call_active(conn, "3", {}, script_id=99999)
+
+
+def test_call_active_without_override_still_requires_active(conn):
+    _new(conn)                       # 只有 draft
+    with pytest.raises(lifecycle.NoActivePlugin):
+        lifecycle.call_active(conn, "3", {})
+
+
 def test_approve_is_not_reachable_from_non_cli_code():
     """源码扫描：除 CLI 与 lifecycle 自身外，没有任何模块调用 approve/write。
 

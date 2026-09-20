@@ -128,10 +128,27 @@ def reject(conn: sqlite3.Connection, script_id: int, *, actor: str,
 
 
 def call_active(conn: sqlite3.Connection, plugin_id: str, ctx: dict,
-                *, timeout_s: float = runtime.DEFAULT_TIMEOUT_S) -> dict:
-    """解析该 plugin_id 的 active 版本并执行。没有 active → `NoActivePlugin`。"""
-    script_id = active_script_id(conn, plugin_id, required=True)
+                *, script_id: int | None = None,
+                timeout_s: float = runtime.DEFAULT_TIMEOUT_S) -> dict:
+    """执行插桩。
+
+    `script_id is None`（默认）→ 解析该 plugin_id 的 active 版本，没有则
+    `NoActivePlugin`（**不兜底**）。
+
+    `script_id` 指定时 → **用该版本，且不要求它是 active** —— 沙盒要比的
+    正是待审/归档版本。但该版本**必须属于同一个 plugin_id**：拿插桩1 的
+    版本去跑插桩3，会让「比的是哪个插件」这件事失去意义，直接拒绝。
+    """
+    if script_id is None:
+        script_id = active_script_id(conn, plugin_id, required=True)
+
     row = store.get_script(conn, script_id)
+    if row is None:
+        raise LookupError(f"脚本 {script_id} 不存在")
+    if row["plugin_id"] != plugin_id:
+        raise ValueError(
+            f"脚本 {script_id} 的 plugin_id 是 {row['plugin_id']!r}，"
+            f"与请求的 {plugin_id!r} 不符 —— 拒绝跨插件执行")
     fn = runtime.load_script(row["source_text"], plugin_id=plugin_id,
                              timeout_s=timeout_s)
     return fn(ctx)
