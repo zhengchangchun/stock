@@ -21,9 +21,10 @@ from dataclasses import replace
 from datetime import date, timedelta
 
 from stocklab.config.settings import Settings
+from stocklab.data import notice_date
 from stocklab.data.errors import FetchError
 from stocklab.data.http import RetryPolicy
-from stocklab.data.models import Bar, CorpAction, MoneyFlowDaily, Quote, ValuationDaily
+from stocklab.data.models import Bar, CorpAction, FinancialReport, MoneyFlowDaily, Quote, ValuationDaily
 from stocklab.data.sources import eastmoney, sina, sse, tencent
 
 #: 不复权单次上限（ADR-003 实测）
@@ -385,3 +386,92 @@ def fetch_holiday_notices(
             raise FetchError(
                 f"休市公告解析失败：{art['title']}（{art['url']}）：{exc}") from exc
     return sorted(out, key=lambda h: (h.date, h.source_url))
+
+
+def _fetch_datacenter(client, report_name: str, *, secucode: str,
+                      fetched_date: str, refs: list[dict]) -> list[dict]:
+    """抓一张 datacenter 表，翻全页。`result=null` → `[]`（合法空）。"""
+    out: list[dict] = []
+    total_pages: int | None = None
+    page = 1
+    while page <= MAX_PAGES:
+        url = eastmoney.datacenter_url(report_name, secucode=secucode,
+                                       page=page,
+                                       page_size=eastmoney.FINANCIAL_PAGE_SIZE)
+        cache_key = (f"financial:{secucode[:6]}:{fetched_date}:"
+                     f"{report_name}:{page}")
+        text = client.get_text(url, headers=eastmoney.DATACENTER_HEADERS,
+                               source="eastmoney", cache_key=cache_key)
+        payload = _loads(text)
+        result = (payload or {}).get("result") or {}
+        if total_pages is None:
+            total_pages = int(result.get("pages") or 0)
+        rows = eastmoney.parse_datacenter_rows(payload)
+        if (total_pages and page < total_pages
+                and len(rows) != eastmoney.FINANCIAL_PAGE_SIZE):
+            raise FetchError(
+                f"{secucode} {report_name} 第 {page}/{total_pages} 页仅 {len(rows)} 行"
+                f"（期望 {eastmoney.FINANCIAL_PAGE_SIZE}）—— 源站截断，"
+                "拒绝把半截当完整")
+        refs.append({"endpoint": report_name, "resp_sha256": _resp_sha256(text),
+                     "cache_key": cache_key, "page": page})
+        out.extend(rows)
+        if not total_pages or page >= total_pages or not rows:
+            break
+        page += 1
+    else:
+        raise FetchError(
+            f"{secucode} {report_name} 翻页超过 {MAX_PAGES} 页仍未取完"
+            " —— 拒绝返回不完整的历史")
+    return out
+
+
+def fetch_financial_reports(client, *, code: str, org_type: str,
+                            fetched_date: str
+                            ) -> tuple[list[FinancialReport], list[dict]]:
+    """抓一只标的的全部历史财报，返回 `(报告列表, raw_refs)`。
+
+    - 数值来自 DMSK 三表；公告日与归母权益来自 F10 三变体（按 `org_type` 选）
+    - **`result=null` 是合法空**（ETF 如此），不是抓取失败
+    - 公告日走 `notice_date.resolve` 的三级回退
+    """
+    secucode = f"{code}.{'SH' if code.startswith(('6', '5')) else 'SZ'}"
+    refs: list[dict] = []
+
+    acc: dict[str, dict] = {}
+    for report_name in eastmoney.DMSK_REPORTS:
+        for row in _fetch_datacenter(client, report_name, secucode=secucode,
+                                     fetched_date=fetched_date, refs=refs):
+            rd = (row.get("REPORT_DATE") or "")[:10]
+            if not rd:
+                continue
+            slot = acc.setdefault(rd, {})
+            for src_col, dst in eastmoney.DMSK_FIELD_MAP.items():
+                if row.get(src_col) is not None:
+                    slot[dst] = row[src_col]
+
+    f10_notice: dict[str, str] = {}
+    f10_parent: dict[str, float] = {}
+    for statement in ("BALANCE", "INCOME", "CASHFLOW"):
+        name = eastmoney.f10_report_name(org_type, statement)
+        for row in _fetch_datacenter(client, name, secucode=secucode,
+                                     fetched_date=fetched_date, refs=refs):
+            rd = (row.get("REPORT_DATE") or "")[:10]
+            if not rd:
+                continue
+            if row.get("NOTICE_DATE") and rd not in f10_notice:
+                f10_notice[rd] = row["NOTICE_DATE"][:10]
+            if row.get("TOTAL_PARENT_EQUITY") is not None:
+                f10_parent.setdefault(rd, row["TOTAL_PARENT_EQUITY"])
+
+    out: list[FinancialReport] = []
+    for rd, slot in acc.items():
+        notice, source, _suspect = notice_date.resolve(
+            f10_notice.get(rd), report_date=rd)
+        out.append(FinancialReport(
+            code=code, report_date=rd, notice_date=notice,
+            notice_date_source=source,
+            report_type=notice_date.report_type_of(rd),
+            parent_equity=f10_parent.get(rd), **slot))
+    out.sort(key=lambda r: r.report_date)
+    return out, refs

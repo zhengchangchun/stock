@@ -42,6 +42,9 @@ DATACENTER_HEADERS = {"User-Agent": "Mozilla/5.0"}
 #: 估值单页上限（数据中心 pageSize 上限 500，取 500 减少请求数）。
 VALUATION_PAGE_SIZE = 500
 
+#: 实测 500 可一次取回 79 行（pages=1）；默认口径下是 40 页。
+FINANCIAL_PAGE_SIZE = 500
+
 
 def valuation_url(code: str, *, page: int, page_size: int = VALUATION_PAGE_SIZE) -> str:
     """估值 URL（`datacenter-web`，非行情主站）。`code` 是 6 位代码（000333）。
