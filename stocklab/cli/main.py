@@ -345,6 +345,61 @@ def cmd_ingest_moneyflow(args: argparse.Namespace) -> int:
     return _cmd_ingest_series(args, kind="moneyflow")
 
 
+# ---------- ingest financials（财报，东财 DMSK + F10，PIT 首写保留） ----------
+
+def cmd_ingest_financials(args) -> int:
+    """采集财报并落 `financial_reports`（联网；东财 DMSK 三表 + F10 公告日）。
+
+    幂等：`(code, report_date, notice_date)` 已存在即跳过。
+    首写保留：同键重采值变了 → 保留旧值 + `conflicts` 计数，不覆盖。
+    会计恒等式与量级异常**只记 issue，不拒写**（留痕不丢数据）。
+    """
+    from datetime import date, datetime, timezone
+
+    from stocklab.candidate.seeds import SEED_UNIVERSE
+    from stocklab.data.fetch import fetch_financial_reports
+    from stocklab.data.http import HttpClient
+    from stocklab.data.ingest import ingest_financial_reports
+    from stocklab.store.migrate import ensure_schema
+
+    db_path = Path(args.db) if args.db else paths.DB_PATH
+    ensure_schema(db_path)
+    now = datetime.now(timezone.utc).isoformat()
+    fetched_date = args.fetched_date or date.today().isoformat()
+    wanted = set(args.code) if args.code else {i.code for i in SEED_UNIVERSE}
+    client = HttpClient()
+    conn = connect(db_path)
+    written = conflicts = failed = 0
+    try:
+        for inst in SEED_UNIVERSE:
+            if inst.code not in wanted:
+                continue
+            try:
+                reports, refs = fetch_financial_reports(
+                    client, code=inst.code, org_type=inst.org_type,
+                    fetched_date=fetched_date)
+            except Exception as exc:                       # noqa: BLE001
+                failed += 1
+                print(f"❌ {inst.code} {type(exc).__name__}: {exc}", file=sys.stderr)
+                repo.log_event(conn, "ingest", "warn",
+                               f"ingest financials {inst.code} 失败: {exc}",
+                               now=now)
+                continue
+            r = ingest_financial_reports(conn, reports, refs, now=now)
+            written += r.rows_written
+            conflicts += r.conflicts
+            period = (f"{reports[0].report_date}~{reports[-1].report_date}"
+                      if reports else "（无财报，合法空）")
+            print(f"{inst.code} 抓到 {len(reports)} 期 {period}"
+                  f" 新写 {r.rows_written} 冲突 {r.conflicts}")
+            for issue in r.issues:
+                print(f"  ⚠️ {issue}", file=sys.stderr)
+        print(f"合计：新写 {written} 行 / 首写保留冲突 {conflicts} / 失败 {failed} 只")
+        return 1 if failed else 0
+    finally:
+        conn.close()
+
+
 # ---------- adj rebuild（离线重算因子链 + 缺口） ----------
 
 def cmd_adj_rebuild(args: argparse.Namespace) -> int:
@@ -2292,6 +2347,14 @@ def build_parser() -> argparse.ArgumentParser:
     ing_mf.add_argument("--start", default=None, help="起始日期 YYYY-MM-DD")
     ing_mf.add_argument("--end", default=None, help="结束日期 YYYY-MM-DD")
     ing_mf.set_defaults(func=cmd_ingest_moneyflow)
+
+    ing_fin = ing_sub.add_parser(
+        "financials", help="采集财报（东财 DMSK 数值 + F10 公告日/归母权益）")
+    ing_fin.add_argument("--code", action="append", default=None,
+                         help="只采指定代码，可重复；默认全部种子标的")
+    ing_fin.add_argument("--fetched-date", help="采集日 YYYY-MM-DD（默认今天）")
+    ing_fin.add_argument("--db")
+    ing_fin.set_defaults(func=cmd_ingest_financials)
 
     adj = sub.add_parser("adj", help="复权因子链（离线，只读 bars_daily + corp_actions）")
     adj_sub = adj.add_subparsers(dest="adj_action")

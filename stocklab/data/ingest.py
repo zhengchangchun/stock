@@ -17,6 +17,7 @@
 
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass, field
 from typing import Callable, Sequence
 
@@ -119,3 +120,98 @@ def ingest_daily_bars(
                     detail=f"{report.ok_count}/{len(instruments)} ok, "
                            f"{report.total_issues} issues")
     return report
+
+
+# ---------------------------------------------------------------------------
+# Task 5：财报落库（幂等、首写保留、勾稽留痕）
+# ---------------------------------------------------------------------------
+
+#: 总资产的合理量级（元）。超出即怀疑量纲错（万元当元、千元当元）。
+_ASSET_MIN, _ASSET_MAX = 1e8, 1e14
+
+
+@dataclass(frozen=True)
+class IngestResultF:
+    """财报采集结果。`conflicts` 是「同键重采值变了」的次数。"""
+
+    code: str
+    ok: bool
+    rows_written: int
+    conflicts: int = 0
+    issues: tuple[str, ...] = ()
+    error: str = ""
+
+
+def _sanitize(r) -> list[str]:
+    """会计恒等式勾稽 + 量级检查。返回 issue 文案列表（可能为空）。
+
+    **只记不拒**：财报是公开数据，异常值可能是真实的（巨额商誉减值之类），
+    丢掉它等于静默篡改历史。留痕，让下游自己判。
+    """
+    out: list[str] = []
+    if r.total_assets is not None and not (_ASSET_MIN <= r.total_assets <= _ASSET_MAX):
+        out.append(f"量级异常：total_assets={r.total_assets!r} 不在 "
+                   f"[{_ASSET_MIN:.0e}, {_ASSET_MAX:.0e}] 元")
+    if (r.total_assets and r.total_liabilities is not None
+            and r.total_equity is not None):
+        diff = abs(r.total_assets - r.total_liabilities - r.total_equity)
+        if diff / abs(r.total_assets) >= 1e-6:
+            out.append(
+                f"会计恒等式不成立：|资产−负债−权益|/资产 = "
+                f"{diff / abs(r.total_assets):.2e}（口径探针：若此处长期不过，"
+                "检查 TOTAL_EQUITY 是不是被当成了归母权益）")
+    return out
+
+
+_F_COLS = ("code", "report_date", "notice_date", "notice_date_source",
+           "report_type", "total_assets", "parent_equity", "total_equity",
+           "total_liabilities", "inventory", "total_operate_income",
+           "operate_cost", "parent_netprofit", "netcash_operate",
+           "construct_long_asset", "industry_name", "source", "fetched_at",
+           "created_at", "raw_refs_json", "cache_key", "unit")
+
+
+def ingest_financial_reports(conn, reports, raw_refs, *, now: str) -> IngestResultF:
+    """把一批财报写入 `financial_reports`。
+
+    - **幂等**：`(code, report_date, notice_date)` 已存在即跳过
+    - **首写保留**：已存在但值不同 → 保留旧值、`conflicts += 1`，**不覆盖**
+    - 会计恒等式与量级异常**只记 issue，不拒写**
+    """
+    if not reports:
+        return IngestResultF(code="", ok=True, rows_written=0)
+    code = reports[0].code
+    refs_json = json.dumps(raw_refs, ensure_ascii=False, sort_keys=True)
+    issues: list[str] = []
+    written = conflicts = 0
+
+    for r in reports:
+        issues.extend(_sanitize(r))
+        existing = conn.execute(
+            f"SELECT {', '.join(_F_COLS)} FROM financial_reports"
+            " WHERE code=? AND report_date=? AND notice_date=?",
+            (r.code, r.report_date, r.notice_date)).fetchone()
+        if existing is not None:
+            incoming = {c: getattr(r, c, None) for c in _F_COLS}
+            for col in _F_COLS:
+                if col in ("created_at", "fetched_at", "raw_refs_json",
+                           "cache_key", "unit", "source"):
+                    continue
+                if incoming.get(col) != existing[col]:
+                    conflicts += 1
+                    break
+            continue
+
+        conn.execute(
+            f"INSERT INTO financial_reports ({', '.join(_F_COLS)})"
+            f" VALUES ({', '.join('?' * len(_F_COLS))})",
+            (r.code, r.report_date, r.notice_date, r.notice_date_source,
+             r.report_type, r.total_assets, r.parent_equity, r.total_equity,
+             r.total_liabilities, r.inventory, r.total_operate_income,
+             r.operate_cost, r.parent_netprofit, r.netcash_operate,
+             r.construct_long_asset, r.industry_name, r.source, now, now,
+             refs_json, raw_refs[0]["cache_key"] if raw_refs else None, "CNY"))
+        written += 1
+    conn.commit()
+    return IngestResultF(code=code, ok=True, rows_written=written,
+                         conflicts=conflicts, issues=tuple(issues))
