@@ -31,8 +31,10 @@ def test_short_window_below_120_periods_is_inconclusive(conn):
     注意：本测试通过是因为 deps=None（无注入回放）时 fail-closed 保持
     空序列（n_periods=0），而非真的根据 window_start/window_end 日期范围计算了
     周期数。周期数门槛本身由 test_sandbox_replay_wiring.py 覆盖。
+    使用 candidate=1, baseline=2（不同脚本）以绕过自比较短路，测试原始的
+    fail-closed / 样本不足路径。
     """
-    v = sandbox.run_sandbox(conn, candidate_script_id=1, baseline_script_id=1,
+    v = sandbox.run_sandbox(conn, candidate_script_id=1, baseline_script_id=2,
                             pool="short", window_start="2026-08-01",
                             window_end="2026-09-17", now="2026-09-18T16:00:00+08:00")
     assert v.verdict == "INCONCLUSIVE"
@@ -40,14 +42,14 @@ def test_short_window_below_120_periods_is_inconclusive(conn):
     assert "样本不足" in v.note
 
 
-def test_identical_versions_produce_lose_or_inconclusive(conn):
-    """同一份脚本跟自己比，Δ 必然为 0 —— 绝不允许判 WIN。"""
+def test_identical_versions_produce_inconclusive(conn):
+    """同一份脚本跟自己比 → INCONCLUSIVE（reason='self_comparison'），
+    Δ 恒为 0 不构成任何评估意义；绝不允许判 WIN 或 LOSE。"""
     v = sandbox.run_sandbox(conn, candidate_script_id=1, baseline_script_id=1,
                             pool="short", window_start="2024-01-01",
                             window_end="2026-09-17", now="2026-09-18T16:00:00+08:00")
-    assert v.verdict in ("LOSE", "INCONCLUSIVE")
-    if v.verdict == "LOSE":
-        assert v.delta == pytest.approx(0.0, abs=1e-9)
+    assert v.verdict == "INCONCLUSIVE"
+    assert v.detail.get("reason") == "self_comparison"
 
 
 def test_rebalance_days_match_doc():

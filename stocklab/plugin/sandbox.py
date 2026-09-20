@@ -158,6 +158,13 @@ def run_sandbox(conn: sqlite3.Connection, *, candidate_script_id: int,
             note="首版没有 baseline，只能看绝对表现，不构成新旧对比结论",
             detail={"overfit_flag": None, "reason": "no_baseline"})
 
+    if baseline_script_id == candidate_script_id:
+        return SandboxVerdict(
+            verdict="INCONCLUSIVE", pool=pool, n_periods=0, delta=None,
+            ci_low=None, ci_high=None, baseline_script_id=baseline_script_id,
+            note="候选与基线是同一脚本，Δ 恒为 0，不构成任何对比结论",
+            detail={"overfit_flag": None, "reason": "self_comparison"})
+
     candidate = store.get_script(conn, candidate_script_id)
     baseline = store.get_script(conn, baseline_script_id)
     if candidate is None or baseline is None:

@@ -87,6 +87,21 @@ def test_first_version_still_inconclusive(conn):
     assert v.verdict == "INCONCLUSIVE"
 
 
+def test_self_comparison_is_inconclusive_and_skips_replay(conn):
+    """候选与基线是同一脚本 → INCONCLUSIVE，reason='self_comparison'，
+    且不调用 replay（Δ 恒为 0，回放无意义）。"""
+    def boom(*a, **kw):
+        raise AssertionError("自比较不应调用 replay")
+
+    v = sandbox.run_sandbox(conn, candidate_script_id=1, baseline_script_id=1,
+                            pool="short", window_start="2015-01-01",
+                            window_end="2026-09-18", now=NOW,
+                            deps=SandboxDeps(replay=boom))
+    assert v.verdict == "INCONCLUSIVE"
+    assert v.detail.get("reason") == "self_comparison"
+    assert "同一脚本" in v.note or "self" in v.note.lower() or "Δ 恒" in v.note
+
+
 def test_train_segment_is_reported_in_detail(conn):
     """训练段的 Δ 均值要进 detail —— 过拟合标记要用它。"""
     def fake_replay(conn, *, candidate_script_id, baseline_script_id, pool,
