@@ -83,3 +83,119 @@ def latest_period(reports: list[FinancialReport]) -> tuple[int, int] | None:
     """最新可用报告期 `(年, 季)`。"""
     qs = sorted({quarter_of(r.report_date) for r in reports})
     return qs[-1] if qs else None
+
+
+_FACTOR_KEYS = ("roe", "gross_margin", "gm_yoy_pp", "inv_days",
+                "fcf_margin", "dupont")
+
+
+def _avg(reports, field, year, quarter) -> float | None:
+    """期初期末均值：本期存量 与 上一年年末存量 的平均。
+
+    上一期不存在 → `None`（不拿本期期末值充数）。
+    """
+    cur = _value_at(reports, field, year, quarter)
+    prev = _value_at(reports, field, year - 1, 4)
+    if cur is None or prev is None:
+        return None
+    return (prev + cur) / 2.0
+
+
+def _value_at(reports, field, year, quarter) -> float | None:
+    for r in reports:
+        if quarter_of(r.report_date) == (year, quarter):
+            v = getattr(r, field, None)
+            return None if v is None else float(v)
+    return None
+
+
+def factors(reports: list[FinancialReport]) -> dict:
+    """算出六个因子。**不落库**。
+
+    返回的 dict **键永远齐全**：不可算的因子给 `None`，并在 `na_reasons`
+    写明原因（设计 §6.3）。`dupont` 用**期末**口径，`roe` 用**均值**口径
+    —— 两者不构成恒等，见设计 §7.1.1。
+    """
+    na: list[str] = []
+    period = latest_period(reports)
+    if period is None:
+        return {"period": None,
+                **{k: None for k in _FACTOR_KEYS},
+                "na_reasons": ["没有任何财报期"],
+                "dupont": None}
+    year, quarter = period
+    period_str = f"{year}Q{quarter}"
+
+    def _need(field: str, name: str):
+        qs = single_quarters(reports, field)
+        v = ttm(qs, year=year, quarter=quarter, field=field)
+        if v is None:
+            na.append(f"{name}: {field} 的 TTM 四季不齐")
+        return v
+
+    income = _need("total_operate_income", "total_operate_income")
+    cost = _need("operate_cost", "operate_cost")
+    profit = _need("parent_netprofit", "parent_netprofit")
+    ocf = _need("netcash_operate", "netcash_operate")
+    capex = _need("construct_long_asset", "construct_long_asset")
+
+    parent_eq_avg = _avg(reports, "parent_equity", year, quarter)
+    inv_avg = _avg(reports, "inventory", year, quarter)
+    assets_now = _value_at(reports, "total_assets", year, quarter)
+    parent_eq_now = _value_at(reports, "parent_equity", year, quarter)
+
+    roe = None
+    if profit is not None and parent_eq_avg not in (None, 0):
+        roe = profit / parent_eq_avg
+    elif profit is not None:
+        na.append("roe: 平均归母权益缺失或为零")
+
+    gm = None
+    if income not in (None, 0) and cost is not None:
+        gm = (income - cost) / income
+    else:
+        na.append("gross_margin: operate_cost 或 total_operate_income 缺失"
+                  "（金融股报表结构无营业成本，属预期 NA）")
+
+    gm_yoy = None
+    prev_year = year - 1
+    if prev_year >= 1:
+        inc_p = _value_at_ttm(reports, "total_operate_income", prev_year, quarter)
+        cost_p = _value_at_ttm(reports, "operate_cost", prev_year, quarter)
+        if gm is not None and inc_p not in (None, 0) and cost_p is not None:
+            gm_yoy = (gm - (inc_p - cost_p) / inc_p) * 100.0
+    if gm_yoy is None:
+        na.append("gm_yoy_pp: 去年同期毛利率不可算（需 8 个单季）")
+
+    inv_days = None
+    if cost not in (None, 0) and inv_avg not in (None, 0):
+        inv_days = 365.0 * inv_avg / cost
+    else:
+        na.append("inv_days: operate_cost 或 inventory 缺失"
+                  "（金融股报表结构无存货，属预期 NA）")
+
+    fcf_margin = None
+    if ocf is not None and capex is not None and income not in (None, 0):
+        fcf_margin = (ocf - capex) / income
+    else:
+        na.append("fcf_margin: 现金流或营收缺失")
+
+    dupont = None
+    if (profit is not None and income not in (None, 0) and assets_now
+            and parent_eq_now not in (None, 0)):
+        dupont = {
+            "net_margin": profit / income,
+            "asset_turnover": income / assets_now,
+            "equity_multiplier": assets_now / parent_eq_now,
+        }
+    else:
+        na.append("dupont: 归母净利/营收/总资产/期末归母权益不齐")
+
+    return {"period": period_str, "roe": roe, "gross_margin": gm,
+            "gm_yoy_pp": gm_yoy, "inv_days": inv_days,
+            "fcf_margin": fcf_margin, "dupont": dupont, "na_reasons": na}
+
+
+def _value_at_ttm(reports, field, year, quarter) -> float | None:
+    qs = single_quarters(reports, field)
+    return ttm(qs, year=year, quarter=quarter, field=field)
