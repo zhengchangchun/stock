@@ -26,6 +26,7 @@
 from __future__ import annotations
 
 import argparse
+import datetime
 import sys
 from pathlib import Path
 
@@ -81,7 +82,7 @@ def extend_one(conn, client, code: str, *, now: str) -> tuple[str, int]:
     report = ingest_daily_bars(
         conn,
         client,
-        None,
+        None,       # cache — safe: ingest_daily_bars never reads it when fetch= is injected
         [inst],
         start=EARLIEST_START,
         end=end_date,
@@ -94,7 +95,6 @@ def extend_one(conn, client, code: str, *, now: str) -> tuple[str, int]:
 
 
 def _today() -> str:
-    import datetime
     return datetime.date.today().isoformat()
 
 
