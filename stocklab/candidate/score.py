@@ -92,18 +92,28 @@ def build_ctx(conn, inst: Instrument, pool: str, bars: list[Bar], *,
 
 
 def industry_screen(conn: sqlite3.Connection, inst: Instrument,
-                    ctx: dict) -> dict:
-    """步骤4：调用插桩0 行业特殊排雷。没有 active 版本 → `NoActivePlugin`。"""
-    return lifecycle.call_active(conn, INDUSTRY_SCREEN_PLUGIN, ctx)
+                    ctx: dict, *, plugin_overrides: dict[str, int] | None = None) -> dict:
+    """步骤4：调用插桩0 行业特殊排雷。没有 active 版本 → `NoActivePlugin`。
+
+    `plugin_overrides`：`{plugin_id: script_id}`，指定时用该版本（不要求 active）。
+    """
+    return lifecycle.call_active(
+        conn, INDUSTRY_SCREEN_PLUGIN, ctx,
+        script_id=(plugin_overrides or {}).get(INDUSTRY_SCREEN_PLUGIN))
 
 
 def score_pool(conn: sqlite3.Connection, inst: Instrument, pool: str,
-               ctx: dict) -> ScoreOutcome:
-    """步骤7：按池调用对应的打分插桩。"""
+               ctx: dict, *, plugin_overrides: dict[str, int] | None = None) -> ScoreOutcome:
+    """步骤7：按池调用对应的打分插桩。
+
+    `plugin_overrides`：`{plugin_id: script_id}`，指定时用该版本（不要求 active）。
+    """
     if pool not in POOL_PLUGIN:
         raise ValueError(f"未知池 {pool!r}；已知：{sorted(POOL_PLUGIN)}")
     plugin_id = POOL_PLUGIN[pool]
-    result = lifecycle.call_active(conn, plugin_id, ctx)
+    result = lifecycle.call_active(
+        conn, plugin_id, ctx,
+        script_id=(plugin_overrides or {}).get(plugin_id))
     return ScoreOutcome(
         code=inst.code, pool=pool, raw_score=float(result["score"]),
         pass_flag=bool(result["pass_flag"]), reason=str(result["reason"]),

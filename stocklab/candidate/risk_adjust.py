@@ -20,13 +20,18 @@ RISK_PLUGIN = "4"
 
 
 def adjust(conn: sqlite3.Connection, outcome: ScoreOutcome,
-           ctx: dict) -> tuple[float, list[str]]:
-    """返回 `(final_score, risk_out)`。没有 active 插桩4 → `NoActivePlugin`。"""
+           ctx: dict, *, plugin_overrides: dict[str, int] | None = None) -> tuple[float, list[str]]:
+    """返回 `(final_score, risk_out)`。没有 active 插桩4 → `NoActivePlugin`。
+
+    `plugin_overrides`：`{plugin_id: script_id}`，指定时用该版本（不要求 active）。
+    """
     payload = dict(ctx)
     payload["raw_score"] = outcome.raw_score
     payload["risk_list"] = list(outcome.risk_list)
     payload["pool"] = outcome.pool
     payload["code"] = outcome.code
 
-    result = lifecycle.call_active(conn, RISK_PLUGIN, payload)
+    result = lifecycle.call_active(
+        conn, RISK_PLUGIN, payload,
+        script_id=(plugin_overrides or {}).get(RISK_PLUGIN))
     return float(result["final_score"]), list(result["risk_out"])

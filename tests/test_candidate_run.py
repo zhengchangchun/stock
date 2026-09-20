@@ -231,3 +231,78 @@ def test_cli_candidate_run(tmp_db, capsys, tmp_path):
     text = out.read_text(encoding="utf-8")
     assert "候选池报告" in text
     assert "## 短期池" in text
+
+
+# ---------- Task 2：score_pipeline 只读内核 ----------
+
+from stocklab.candidate.run import PipelineResult, score_pipeline
+
+
+def test_score_pipeline_writes_nothing(tmp_db):
+    """内核不许写任何 candidate_* 表。"""
+    conn = _seed_db(tmp_db)
+    before = {
+        t: conn.execute(f"SELECT COUNT(*) FROM {t}").fetchone()[0]
+        for t in ("candidate_snapshots", "candidate_members",
+                  "candidate_rejects")
+    }
+    result = score_pipeline(conn, asof=ASOF)
+    after = {
+        t: conn.execute(f"SELECT COUNT(*) FROM {t}").fetchone()[0]
+        for t in ("candidate_snapshots", "candidate_members",
+                  "candidate_rejects")
+    }
+    assert before == after, "回放内核不得产生副作用"
+    assert isinstance(result, PipelineResult)
+
+
+def test_score_pipeline_matches_run_candidate_members(tmp_db):
+    """回放内核与生产主流程在同一 asof 上必须选出完全相同的池成员。
+
+    这是「回测跑的就是生产逻辑」的机械保证 —— 两者若分叉，所有回放结论
+    都无意义。
+    """
+    conn = _seed_db(tmp_db)
+    fresh = conn.execute("SELECT COUNT(*) FROM candidate_snapshots").fetchone()[0]
+    assert fresh == 0
+
+    prod = candidate_run.run_candidate(conn, asof=ASOF, run_kind="weekly", now=NOW)
+    pipe = score_pipeline(conn, asof=ASOF)
+
+    key = lambda ms: sorted((m.code, m.pool, round(m.adj_score, 9)) for m in ms)
+    assert key(pipe.members) == key(prod.members)
+    assert sorted((r.code, r.stage, r.reason) for r in pipe.rejects) == \
+           sorted((r.code, r.stage, r.reason) for r in prod.rejects)
+
+
+def test_score_pipeline_overrides_plugin_version(tmp_db):
+    """plugin_overrides 生效：换一版打分插桩，分数随之改变。"""
+    conn = _seed_db(tmp_db)
+    base = score_pipeline(conn, asof=ASOF)
+    sid = store.insert_script(
+        conn, plugin_id="1", version="9.9.9",
+        source_text="def run(ctx):\n"
+                    "    return {'score': 100.0, 'pass_flag': True,"
+                    " 'reason': 'v2', 'risk_list': []}\n",
+        note=None, now=NOW)
+    over = score_pipeline(conn, asof=ASOF, plugin_overrides={"1": sid})
+    short_base = {m.code: m.raw_score for m in base.members if m.pool == "short"}
+    short_over = {m.code: m.raw_score for m in over.members if m.pool == "short"}
+    assert short_over and all(v == 100.0 for v in short_over.values())
+    assert short_over != short_base
+
+
+def test_score_pipeline_unoverridden_plugin_uses_active(tmp_db):
+    """没被覆盖的插件仍用 active —— 否则就不是单变量了。"""
+    conn = _seed_db(tmp_db)
+    sid = store.insert_script(
+        conn, plugin_id="1", version="9.9.9",
+        source_text="def run(ctx):\n"
+                    "    return {'score': 100.0, 'pass_flag': True,"
+                    " 'reason': 'v2', 'risk_list': []}\n",
+        note=None, now=NOW)
+    # 只覆盖插桩4，插桩1 应仍走 active（80.0）
+    r4 = store.list_scripts(conn, plugin_id="4")[0]["script_id"]
+    over = score_pipeline(conn, asof=ASOF, plugin_overrides={"4": r4})
+    short = [m for m in over.members if m.pool == "short"]
+    assert short and all(m.raw_score == 80.0 for m in short)

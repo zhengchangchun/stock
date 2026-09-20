@@ -51,6 +51,15 @@ class RunResult:
     params: dict = field(default_factory=dict)
 
 
+@dataclass(frozen=True)
+class PipelineResult:
+    """打分内核的产物。**只读** —— 不含任何落库副作用。"""
+
+    members: list
+    rejects: list
+    params: dict
+
+
 def _hydrate(loaded: dict) -> tuple[list[snapshot.MemberRow], list[snapshot.RejectRow]]:
     """将 load_snapshot 返回的原始字典列表水合为 MemberRow/RejectRow 对象。
 
@@ -98,6 +107,73 @@ def recommend_optimization(result: RunResult) -> bool:
     return any(counts[p] < low[p] for p in pools.ALL_POOLS)
 
 
+def score_pipeline(conn: sqlite3.Connection, *, asof: str,
+                   plugin_overrides: dict[str, int] | None = None
+                   ) -> PipelineResult:
+    """跑一遍候选池打分（步骤 3–8），**只返回、不写库**。
+
+    回放要跑几百个历史调仓日，绝不能往 `candidate_snapshots` 灌历史回放行。
+    生产主流程 `run_candidate` 也走这里 —— 两者必须产出相同成员，否则
+    「回测跑的就是生产逻辑」不成立。
+
+    `plugin_overrides`：`{plugin_id: script_id}`，用于沙盒的单变量对比
+    （只换被比较的那个插件，其余仍解析 active）。
+    """
+    members: list[snapshot.MemberRow] = []
+    rejects: list[snapshot.RejectRow] = []
+    scored: dict[str, list[dict]] = {p: [] for p in pools.ALL_POOLS}
+
+    xsec = _cross_section_map(conn, asof=asof)
+
+    for inst in SEED_UNIVERSE:
+        bars = _load_bars(conn, inst.code, asof=asof)
+
+        verdict = screen.screen(inst, bars, asof=asof)
+        if not verdict.passed:
+            rejects.append(snapshot.RejectRow(
+                code=inst.code, stage="pre_screen", reason=verdict.reason,
+                plugin_id=None))
+            continue
+
+        ctx = score.build_ctx(conn, inst, pools.POOL_SHORT, bars, asof=asof,
+                              cross_section=xsec)
+        industry = score.industry_screen(conn, inst, ctx,
+                                         plugin_overrides=plugin_overrides)
+        if not industry["pass_flag"]:
+            rejects.append(snapshot.RejectRow(
+                code=inst.code, stage="industry_screen",
+                reason="; ".join(industry["risk_note"]) or "行业排雷未通过",
+                plugin_id=score.INDUSTRY_SCREEN_PLUGIN))
+            continue
+
+        for pool in pools.eligible_pools(inst):
+            pool_ctx = score.build_ctx(conn, inst, pool, bars, asof=asof,
+                                       cross_section=xsec)
+            outcome = score.score_pool(conn, inst, pool, pool_ctx,
+                                       plugin_overrides=plugin_overrides)
+            if not outcome.pass_flag:
+                rejects.append(snapshot.RejectRow(
+                    code=inst.code, stage="score",
+                    reason=f"{pool}池打分未通过：{outcome.reason}",
+                    plugin_id=score.POOL_PLUGIN[pool]))
+                continue
+            final, risks = risk_adjust.adjust(conn, outcome, pool_ctx,
+                                              plugin_overrides=plugin_overrides)
+            scored[pool].append({
+                "code": inst.code, "pool": pool,
+                "raw_score": outcome.raw_score, "adj_score": final,
+                "reason": outcome.reason,
+                "risk_json": json.dumps(risks, ensure_ascii=False)})
+
+    for pool in pools.ALL_POOLS:
+        for row in pools.select_top(scored[pool], pool):
+            members.append(snapshot.MemberRow(**row))
+
+    return PipelineResult(members=members, rejects=rejects,
+                          params={"seed_count": len(SEED_UNIVERSE),
+                                  "topn": dict(pools.POOL_TOPN)})
+
+
 def run_candidate(conn: sqlite3.Connection, *, asof: str, run_kind: str,
                   now: str) -> RunResult:
     if run_kind not in RUN_KINDS:
@@ -114,66 +190,10 @@ def run_candidate(conn: sqlite3.Connection, *, asof: str, run_kind: str,
                          report_md=md, skipped=True,
                          params=loaded["snapshot"]["params"])
 
-    members: list[snapshot.MemberRow] = []
-    rejects: list[snapshot.RejectRow] = []
-    scored: dict[str, list[dict]] = {p: [] for p in pools.ALL_POOLS}
-
-    # 每轮算一次横截面，避免对每个标的重复计算全样本（Task 9）
-    xsec = _cross_section_map(conn, asof=asof)
-
-    for inst in SEED_UNIVERSE:
-        bars = _load_bars(conn, inst.code, asof=asof)
-
-        # 步骤3：固定前置排雷（主干，AI 不可改）
-        verdict = screen.screen(inst, bars, asof=asof)
-        if not verdict.passed:
-            rejects.append(snapshot.RejectRow(
-                code=inst.code, stage="pre_screen", reason=verdict.reason,
-                plugin_id=None))
-            continue
-
-        # 步骤4：插桩0 行业特殊排雷（先用短期池的 ctx）
-        ctx = score.build_ctx(conn, inst, pools.POOL_SHORT, bars, asof=asof,
-                              cross_section=xsec)
-        industry = score.industry_screen(conn, inst, ctx)
-
-        # 步骤5：不通过 → 淘汰库
-        if not industry["pass_flag"]:
-            rejects.append(snapshot.RejectRow(
-                code=inst.code, stage="industry_screen",
-                reason="; ".join(industry["risk_note"]) or "行业排雷未通过",
-                plugin_id=score.INDUSTRY_SCREEN_PLUGIN))
-            continue
-
-        # 步骤6-8：三池分流 → 打分 → 风险加权（先全收集，后面才截断）
-        for pool in pools.eligible_pools(inst):
-            pool_ctx = score.build_ctx(conn, inst, pool, bars, asof=asof,
-                                       cross_section=xsec)
-            outcome = score.score_pool(conn, inst, pool, pool_ctx)
-            if not outcome.pass_flag:
-                rejects.append(snapshot.RejectRow(
-                    code=inst.code, stage="score",
-                    reason=f"{pool}池打分未通过：{outcome.reason}",
-                    plugin_id=score.POOL_PLUGIN[pool]))
-                continue
-            final, risks = risk_adjust.adjust(conn, outcome, pool_ctx)
-            scored[pool].append({
-                "code": inst.code, "pool": pool,
-                "raw_score": outcome.raw_score, "adj_score": final,
-                "reason": outcome.reason,
-                "risk_json": json.dumps(risks, ensure_ascii=False)})
-
-    # 步骤6 的后半：按 adj_score 降序取前 N（文档 01 §候选池数量建议）
-    for pool in pools.ALL_POOLS:
-        for row in pools.select_top(scored[pool], pool):
-            members.append(snapshot.MemberRow(**row))
-
-    # 步骤9-10：入库 + 快照
-    params = {"seed_count": len(SEED_UNIVERSE),
-              "topn": dict(pools.POOL_TOPN)}
+    pipe = score_pipeline(conn, asof=asof)
     snapshot_id = snapshot.write_snapshot(
-        conn, asof=asof, run_kind=run_kind, params=params, members=members,
-        rejects=rejects, now=now)
+        conn, asof=asof, run_kind=run_kind, params=pipe.params,
+        members=pipe.members, rejects=pipe.rejects, now=now)
 
     loaded = snapshot.load_snapshot(conn, snapshot_id)
     md = report.render_report(asof=asof, run_kind=run_kind, loaded=loaded,
@@ -183,4 +203,4 @@ def run_candidate(conn: sqlite3.Connection, *, asof: str, run_kind: str,
     members_obj, rejects_obj = _hydrate(loaded)
     return RunResult(snapshot_id=snapshot_id, asof=asof, run_kind=run_kind,
                      members=members_obj, rejects=rejects_obj,
-                     report_md=md, skipped=False, params=params)
+                     report_md=md, skipped=False, params=pipe.params)
