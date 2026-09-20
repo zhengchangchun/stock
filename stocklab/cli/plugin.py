@@ -119,6 +119,9 @@ def cmd_plugin_sandbox(args) -> int:
     conn = _open(args)
     try:
         sid = int(args.script_id)
+        now_str = _now(args.now)
+        window_end = args.window_end if args.window_end is not None \
+            else now_str[:10]
         row = store.get_script(conn, sid)
         if row is None:
             # 首版（或 script_id 不存在）→ baseline=None → INCONCLUSIVE
@@ -133,7 +136,7 @@ def cmd_plugin_sandbox(args) -> int:
         verdict = sandbox.run_sandbox(
             conn, candidate_script_id=sid, baseline_script_id=baseline,
             pool=args.pool, window_start=args.window_start,
-            window_end=args.window_end, now=_now(args.now),
+            window_end=window_end, now=now_str,
             deps=_deps)
         print(f"verdict={verdict.verdict} pool={verdict.pool} "
               f"n_periods={verdict.n_periods}")
@@ -146,7 +149,9 @@ def cmd_plugin_sandbox(args) -> int:
                   f"{d['baseline_excess_index300']:+.4%}")
         if d.get("overfit_flag") == "suspected":
             print("⚠️ 疑似过拟合（训练段明显好于验证段）")
-        print(f"回放时插件版本：{d.get('scripts')}")
+        scripts = d.get("scripts")
+        if scripts is not None:
+            print(f"回放时插件版本：{scripts}")
         return 0
     finally:
         conn.close()

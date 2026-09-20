@@ -2811,8 +2811,8 @@ def build_parser() -> argparse.ArgumentParser:
     pl_sandbox.add_argument("--pool", default="short",
                             choices=["short", "mid", "long"])
     pl_sandbox.add_argument("--window-start", default="2015-01-01")
-    pl_sandbox.add_argument("--window-end",
-                            default=datetime.now(timezone.utc).date().isoformat())
+    pl_sandbox.add_argument("--window-end", default=None,
+                            help="回放窗口结束日期（默认：命令执行当天，YYYY-MM-DD）")
     pl_sandbox.add_argument("--now", help="覆盖当前时刻（测试用）")
     pl_sandbox.add_argument("--db")
     pl_sandbox.set_defaults(func=cmd_plugin_sandbox)

@@ -328,6 +328,18 @@ def test_sandbox_cli_runs_and_reports(db, capsys):
     # 库里没有行情 → 回放得到空序列 → INCONCLUSIVE，但命令本身成功
     assert code == 0
     assert "INCONCLUSIVE" in out
+    # 验证 --pool 参数接线：pool 值出现在输出中
+    assert "pool=short" in out
+
+
+def test_sandbox_no_baseline_does_not_print_none(db, capsys):
+    """Finding 1 修复回归：no-baseline 路径的输出中不得包含字面量 'None'（在 scripts 行）。"""
+    code, out = run(db, "plugin", "sandbox", "1", "--pool", "short",
+                    "--now", NOW, capsys=capsys)
+    assert code == 0
+    assert "None" not in out, (
+        f"no-baseline 路径不应将缺失的 script_id 渲染为 None，实际输出：{out!r}"
+    )
 
 
 def test_sandbox_cli_unknown_pool_fails(db, capsys):
