@@ -143,16 +143,10 @@ def overfit_flag(train_mean: float | None,
 def run_sandbox(conn: sqlite3.Connection, *, candidate_script_id: int,
                 baseline_script_id: int | None, pool: str, window_start: str,
                 window_end: str, now: str,
-                deps: SandboxDeps | None = None,
-                replay: Callable | None = None,
-                benchmark_excess: Callable | None = None,
-                rebalance_marks: Callable | None = None) -> SandboxVerdict:
-    # Direct kwargs take precedence over deps fields (test injection convenience).
-    _replay = replay if replay is not None else (deps.replay if deps is not None else None)
-    _benchmark_excess = (benchmark_excess if benchmark_excess is not None
-                         else (deps.benchmark_excess if deps is not None else None))
-    _rebalance_marks = (rebalance_marks if rebalance_marks is not None
-                        else (deps.rebalance_marks if deps is not None else None))
+                deps: SandboxDeps | None = None) -> SandboxVerdict:
+    _replay = deps.replay if deps is not None else None
+    _benchmark_excess = deps.benchmark_excess if deps is not None else None
+    _rebalance_marks = deps.rebalance_marks if deps is not None else None
 
     if pool not in REBALANCE_DAYS:
         raise ValueError(f"未知池 {pool!r}；已知：{sorted(REBALANCE_DAYS)}")
@@ -202,10 +196,11 @@ def run_sandbox(conn: sqlite3.Connection, *, candidate_script_id: int,
 
     # 两版相对 index_300 的超额（铁律：跑不赢就明说，并列报告）。
     # 未注入 benchmark_excess 时不写进 detail，避免「算出来是 0」与「未算」混淆。
-    if _benchmark_excess is not None:
-        marks = (_rebalance_marks(conn, pool=pool, start=window_start,
-                                  end=window_end)
-                 if _rebalance_marks is not None else [])
+    # 注入了 benchmark_excess 但未注入 rebalance_marks 时，同样不写（写 None 而非
+    # 0.0，确保「不可区分于真零」的情况不会静默发生）。
+    if _benchmark_excess is not None and _rebalance_marks is not None:
+        marks = _rebalance_marks(conn, pool=pool, start=window_start,
+                                 end=window_end)
         # 单变量：candidate 只换被测插件，baseline 同理。
         # plugin_id 由 candidate_script_id 所属的插件决定。
         pid = str(store.get_script(conn, candidate_script_id)["plugin_id"])

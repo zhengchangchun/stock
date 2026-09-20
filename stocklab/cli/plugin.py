@@ -16,6 +16,7 @@ from pathlib import Path
 
 from stocklab.config import paths
 from stocklab.plugin import contract, guard, lifecycle, runtime, sandbox, store
+from stocklab.plugin.sandbox import SandboxDeps
 from stocklab.store.db import connect
 from stocklab.store.migrate import ensure_schema
 
@@ -83,10 +84,17 @@ def _run_sandbox(conn, *, script_id: int, plugin_id: str, source_text: str,
     baseline_id = lifecycle.active_script_id(conn, plugin_id)
     start, end = _sandbox_window(now)
     try:
+        from stocklab.candidate import replay as _replay_mod
+        _deps = SandboxDeps(
+            replay=_replay_mod.replay_period_deltas,
+            benchmark_excess=_replay_mod.benchmark_excess,
+            rebalance_marks=_replay_mod.rebalance_marks,
+        )
         verdict = sandbox.run_sandbox(
             conn, candidate_script_id=script_id,
             baseline_script_id=baseline_id, pool="short",
-            window_start=start, window_end=end, now=now)
+            window_start=start, window_end=end, now=now,
+            deps=_deps)
     except Exception as exc:                       # noqa: BLE001
         return False, f"沙盒执行失败：{type(exc).__name__}: {exc}"
 

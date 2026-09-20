@@ -172,14 +172,25 @@ def test_verdict_records_both_benchmark_excess(conn):
         return ([0.01] * 80, [0.01] * 130)
 
     def fake_excess(conn, *, asof_dates, pool, plugin_overrides, **kw):
-        return 0.05 if plugin_overrides else -0.05
+        # Key on script_id inside the override dict to distinguish candidate/baseline.
+        sid = next(iter(plugin_overrides.values()))
+        return -0.03 if sid == 1 else -0.01
+
+    def fake_marks(conn, *, pool, start, end, **kw):
+        return ["2026-01-05", "2026-01-12"]
 
     v = sandbox.run_sandbox(conn, candidate_script_id=1, baseline_script_id=2,
                             pool="short", window_start="2015-01-01",
                             window_end="2026-09-18", now=NOW,
-                            replay=fake_replay, benchmark_excess=fake_excess)
+                            deps=SandboxDeps(replay=fake_replay,
+                                             benchmark_excess=fake_excess,
+                                             rebalance_marks=fake_marks))
     assert "candidate_excess_index300" in v.detail
     assert "baseline_excess_index300" in v.detail
+    # Pairing: candidate (sid=1) → -0.03, baseline (sid=2) → -0.01; must differ.
+    assert v.detail["candidate_excess_index300"] == pytest.approx(-0.03)
+    assert v.detail["baseline_excess_index300"] == pytest.approx(-0.01)
+    assert v.detail["candidate_excess_index300"] != v.detail["baseline_excess_index300"]
 
 
 def test_verdict_records_script_ids(conn):
@@ -191,7 +202,7 @@ def test_verdict_records_script_ids(conn):
     v = sandbox.run_sandbox(conn, candidate_script_id=1, baseline_script_id=2,
                             pool="short", window_start="2015-01-01",
                             window_end="2026-09-18", now=NOW,
-                            replay=fake_replay)
+                            deps=SandboxDeps(replay=fake_replay))
     assert v.detail["scripts"]["candidate"] == 1
     assert v.detail["scripts"]["baseline"] == 2
     assert v.detail["scripts"]["active"], "其余插件的 active 版本也要记"
@@ -206,10 +217,15 @@ def test_win_verdict_can_still_report_negative_excess(conn):
     def neg_excess(conn, *, asof_dates, pool, plugin_overrides, **kw):
         return -0.03
 
+    def fake_marks(conn, *, pool, start, end, **kw):
+        return ["2026-01-05", "2026-01-12"]
+
     v = sandbox.run_sandbox(conn, candidate_script_id=1, baseline_script_id=2,
                             pool="short", window_start="2015-01-01",
                             window_end="2026-09-18", now=NOW,
-                            replay=fake_replay, benchmark_excess=neg_excess)
+                            deps=SandboxDeps(replay=fake_replay,
+                                             benchmark_excess=neg_excess,
+                                             rebalance_marks=fake_marks))
     assert v.verdict == "WIN"
     assert v.detail["candidate_excess_index300"] < 0
     assert v.detail["baseline_excess_index300"] < 0
