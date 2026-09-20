@@ -94,3 +94,27 @@ def test_score_plugins_declare_financial_data_is_stubbed():
 def test_industry_screen_is_per_industry():
     """插桩0 必须按行业分支 —— 否则「行业特殊排雷」名不副实。"""
     assert "sector" in BUILTIN_PLUGINS["0"] or "行业" in BUILTIN_PLUGINS["0"]
+
+
+def test_plugin0_prefers_ctx_sector_over_name_guessing():
+    """有 sector 时用 sector；行业口径只允许一套。"""
+    fn = runtime.load_script(BUILTIN_PLUGINS["0"], plugin_id="0")
+    ctx = {"code": "600036", "name": "招商银行", "asof": "2026-09-17",
+           "pool": "short", "sector": "银行Ⅱ", "asset_type": "stock",
+           "board": "main", "bars": [], "features": {}, "risk_list": []}
+    out = fn(ctx)
+    assert out["pass_flag"] is True
+    assert any("银行" in r for r in out["risk_note"])
+
+
+def test_plugin0_falls_back_to_name_when_sector_missing():
+    fn = runtime.load_script(BUILTIN_PLUGINS["0"], plugin_id="0")
+    ctx = {"code": "000333", "name": "美的集团", "asof": "2026-09-17",
+           "pool": "short", "sector": None, "asset_type": "stock",
+           "board": "main", "bars": [], "features": {}, "risk_list": []}
+    out = fn(ctx)
+    assert out["pass_flag"] is True
+
+
+def test_plugin0_source_reads_sector():
+    assert 'ctx' in BUILTIN_PLUGINS["0"] and 'sector' in BUILTIN_PLUGINS["0"]
