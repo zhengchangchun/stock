@@ -77,6 +77,7 @@ def build_ctx(conn, inst: Instrument, pool: str, bars: list[Bar], *,
         feats.setdefault(f"{key}_pct", None)
         feats.setdefault(f"{key}_n", 0)
     feats.setdefault("period_mixed", False)
+    feats.setdefault("dupont", None)
     feats["asof"] = asof
 
     sector = conn.execute("SELECT sector FROM instruments WHERE code = ?",

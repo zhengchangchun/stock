@@ -106,9 +106,6 @@ def test_missing_active_plugin_raises(tmp_db):
 
 # ---------- Task 9：features 与 sector ----------
 
-from stocklab.candidate import cross_section as cs
-from stocklab.store.migrate import init_db
-
 FEATURE_KEYS = (
     "period", "roe", "roe_pct", "roe_n", "gross_margin", "gross_margin_pct",
     "gross_margin_n", "gm_yoy_pp", "gm_yoy_pp_pct", "gm_yoy_pp_n",
@@ -164,3 +161,30 @@ def test_pit_excludes_unannounced_periods(fin_db):
     late = score.build_ctx(fin_db, STOCK, "mid", BARS, asof="2026-09-17")
     assert early["features"]["period"] is None, "公告日之前的期不许可见"
     assert late["features"]["period"] == "2026Q2"
+
+
+def test_features_keys_complete_when_cross_section_omits_dupont(fin_db):
+    """cross_section 不含 dupont 时，build_ctx 本地保证该键仍在 features 中。
+
+    旧代码：只有 setdefault 循环（_pct/_n/period_mixed），dupont 完全依赖
+    indicators.factors() 带进来。若 cross_section 覆写整个 feats（update 路径）
+    且省略了 dupont，旧代码不会补它；新代码在循环后显式 setdefault("dupont", None)。
+
+    这个测试会对旧代码的 dupont 缺失 KeyError 路径失败（falsifiable）。
+    """
+    from stocklab.plugin.contract import FEATURE_KEYS
+    # cross_section dict 故意不含 dupont、roe、gross_margin 等，模拟来源数据残缺
+    incomplete_xsec = {
+        STOCK.code: {
+            "roe_pct": 75.0, "roe_n": 10,
+            "period_mixed": False,
+        }
+    }
+    ctx = score.build_ctx(
+        fin_db, STOCK, "mid", BARS, asof="2026-09-17",
+        cross_section=incomplete_xsec,
+    )
+    missing = [k for k in FEATURE_KEYS if k not in ctx["features"]]
+    assert missing == [], f"features 缺失键: {missing}"
+    # dupont 是本次 fix 专门保证的键
+    assert "dupont" in ctx["features"]
