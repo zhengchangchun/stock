@@ -22,7 +22,7 @@
 from __future__ import annotations
 
 import urllib.parse
-from urllib.parse import urlencode, quote as _quote
+from urllib.parse import urlencode
 
 from stocklab.data.models import Bar, ValuationDaily
 from stocklab.data.sources._common import LOT, to_float

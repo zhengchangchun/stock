@@ -1,7 +1,5 @@
 """Task 2/4：东财财报适配器（离线，JSON 直接喂）。"""
 
-import pytest
-
 from stocklab.data.errors import FetchError
 from stocklab.data.models import FinancialReport
 from stocklab.data.sources import eastmoney
