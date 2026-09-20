@@ -22,7 +22,7 @@ import hashlib
 import json
 import sqlite3
 import sys
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
@@ -34,7 +34,8 @@ from stocklab.store import repo
 from stocklab.store.db import connect
 from stocklab.store.migrate import ensure_schema, init_db
 from stocklab.cli.plugin import (cmd_plugin_approve, cmd_plugin_list,
-                                 cmd_plugin_reject, cmd_plugin_submit)
+                                 cmd_plugin_reject, cmd_plugin_sandbox,
+                                 cmd_plugin_submit)
 from stocklab.cli.candidate import cmd_candidate_run
 
 TZ = ZoneInfo("Asia/Shanghai")
@@ -2803,6 +2804,18 @@ def build_parser() -> argparse.ArgumentParser:
     pl_list.add_argument("--plugin-id", help="只看某个插桩；不给则全部")
     pl_list.add_argument("--db")
     pl_list.set_defaults(func=cmd_plugin_list)
+
+    pl_sandbox = pl_sub.add_parser(
+        "sandbox", help="回放对比：该版本 vs 当前 active（离线只读）")
+    pl_sandbox.add_argument("script_id")
+    pl_sandbox.add_argument("--pool", default="short",
+                            choices=["short", "mid", "long"])
+    pl_sandbox.add_argument("--window-start", default="2015-01-01")
+    pl_sandbox.add_argument("--window-end",
+                            default=datetime.now(timezone.utc).date().isoformat())
+    pl_sandbox.add_argument("--now", help="覆盖当前时刻（测试用）")
+    pl_sandbox.add_argument("--db")
+    pl_sandbox.set_defaults(func=cmd_plugin_sandbox)
 
     cand = sub.add_parser(
         "candidate", help="候选池筛选（模块1）：固定主干 + 插桩脚本")

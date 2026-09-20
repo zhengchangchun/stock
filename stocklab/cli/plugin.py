@@ -112,6 +112,46 @@ def _run_sandbox(conn, *, script_id: int, plugin_id: str, source_text: str,
     return verdict.verdict != "LOSE", "；".join(parts)
 
 
+def cmd_plugin_sandbox(args) -> int:
+    from stocklab.candidate import replay as _replay_mod
+    from stocklab.plugin import sandbox
+
+    conn = _open(args)
+    try:
+        sid = int(args.script_id)
+        row = store.get_script(conn, sid)
+        if row is None:
+            # 首版（或 script_id 不存在）→ baseline=None → INCONCLUSIVE
+            baseline = None
+        else:
+            baseline = lifecycle.active_script_id(conn, row["plugin_id"])
+        _deps = SandboxDeps(
+            replay=_replay_mod.replay_period_deltas,
+            benchmark_excess=_replay_mod.benchmark_excess,
+            rebalance_marks=_replay_mod.rebalance_marks,
+        )
+        verdict = sandbox.run_sandbox(
+            conn, candidate_script_id=sid, baseline_script_id=baseline,
+            pool=args.pool, window_start=args.window_start,
+            window_end=args.window_end, now=_now(args.now),
+            deps=_deps)
+        print(f"verdict={verdict.verdict} pool={verdict.pool} "
+              f"n_periods={verdict.n_periods}")
+        print(verdict.note)
+        d = verdict.detail
+        if d.get("candidate_excess_index300") is not None:
+            print(f"候选版本相对 index_300 超额："
+                  f"{d['candidate_excess_index300']:+.4%}")
+            print(f"基线版本相对 index_300 超额："
+                  f"{d['baseline_excess_index300']:+.4%}")
+        if d.get("overfit_flag") == "suspected":
+            print("⚠️ 疑似过拟合（训练段明显好于验证段）")
+        print(f"回放时插件版本：{d.get('scripts')}")
+        return 0
+    finally:
+        conn.close()
+
+
 def cmd_plugin_submit(args) -> int:
     source_path = Path(args.file)
     if not source_path.is_file():

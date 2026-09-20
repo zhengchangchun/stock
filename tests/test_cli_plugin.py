@@ -317,3 +317,28 @@ def test_submit_empty_actor_is_rejected_before_db_write(db, tmp_path, capsys):
     assert rows == [], f"库中不应有任何行，实际={rows}"
     c.close()
 
+
+# ---------- Task 8：plugin sandbox 子命令 ----------
+
+
+def test_sandbox_cli_runs_and_reports(db, capsys):
+    code, out = run(db, "plugin", "sandbox", "1", "--pool", "short",
+                    "--window-start", "2015-01-01",
+                    "--window-end", "2026-09-18", "--now", NOW, capsys=capsys)
+    # 库里没有行情 → 回放得到空序列 → INCONCLUSIVE，但命令本身成功
+    assert code == 0
+    assert "INCONCLUSIVE" in out
+
+
+def test_sandbox_cli_unknown_pool_fails(db, capsys):
+    code, out = run(db, "plugin", "sandbox", "1", "--pool", "nope",
+                    "--now", NOW, capsys=capsys)
+    assert code != 0
+
+
+def test_sandbox_cli_first_version_has_no_baseline(db, capsys):
+    code, out = run(db, "plugin", "sandbox", "1", "--pool", "short",
+                    "--now", NOW, capsys=capsys)
+    assert code == 0
+    assert "baseline" in out.lower() or "INCONCLUSIVE" in out
+
