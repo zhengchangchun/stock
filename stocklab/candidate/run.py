@@ -32,6 +32,7 @@ import sqlite3
 from dataclasses import dataclass, field
 
 from stocklab.candidate import pools, report, risk_adjust, score, screen, snapshot
+from stocklab.candidate import cross_section, indicators
 from stocklab.candidate.seeds import SEED_UNIVERSE
 from stocklab.data.models import Bar
 
@@ -75,6 +76,15 @@ def _load_bars(conn: sqlite3.Connection, code: str, *, asof: str) -> list[Bar]:
     return [Bar(**dict(r)) for r in rows]
 
 
+def _cross_section_map(conn, *, asof: str) -> dict:
+    """每轮算一次横截面分位，避免对每个标的重复计算全样本。"""
+    rows = {}
+    for inst in SEED_UNIVERSE:
+        rows[inst.code] = indicators.factors(
+            score.load_financials(conn, inst.code, asof=asof))
+    return cross_section.build(rows, asof=asof)
+
+
 def recommend_optimization(result: RunResult) -> bool:
     """步骤12：是否触发 AI 优化子任务。
 
@@ -108,6 +118,9 @@ def run_candidate(conn: sqlite3.Connection, *, asof: str, run_kind: str,
     rejects: list[snapshot.RejectRow] = []
     scored: dict[str, list[dict]] = {p: [] for p in pools.ALL_POOLS}
 
+    # 每轮算一次横截面，避免对每个标的重复计算全样本（Task 9）
+    xsec = _cross_section_map(conn, asof=asof)
+
     for inst in SEED_UNIVERSE:
         bars = _load_bars(conn, inst.code, asof=asof)
 
@@ -120,7 +133,8 @@ def run_candidate(conn: sqlite3.Connection, *, asof: str, run_kind: str,
             continue
 
         # 步骤4：插桩0 行业特殊排雷（先用短期池的 ctx）
-        ctx = score.build_ctx(inst, pools.POOL_SHORT, bars, asof=asof)
+        ctx = score.build_ctx(conn, inst, pools.POOL_SHORT, bars, asof=asof,
+                              cross_section=xsec)
         industry = score.industry_screen(conn, inst, ctx)
 
         # 步骤5：不通过 → 淘汰库
@@ -133,7 +147,8 @@ def run_candidate(conn: sqlite3.Connection, *, asof: str, run_kind: str,
 
         # 步骤6-8：三池分流 → 打分 → 风险加权（先全收集，后面才截断）
         for pool in pools.eligible_pools(inst):
-            pool_ctx = score.build_ctx(inst, pool, bars, asof=asof)
+            pool_ctx = score.build_ctx(conn, inst, pool, bars, asof=asof,
+                                       cross_section=xsec)
             outcome = score.score_pool(conn, inst, pool, pool_ctx)
             if not outcome.pass_flag:
                 rejects.append(snapshot.RejectRow(

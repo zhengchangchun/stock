@@ -20,27 +20,48 @@ Python 里 `True` 是 `int` 的子类，所以 `isinstance(True, float)` 走的�
 
 from __future__ import annotations
 
+#: `ctx["features"]` 必须齐全的键。**运行期与探针期都要满足** ——
+#: 少一个键，插桩里 `ctx["features"]["roe_pct"]` 就会 KeyError，
+#: 而沙盒探针会把它判成脚本 bug 从而误拒。
+FEATURE_KEYS: tuple[str, ...] = (
+    "period",
+    "roe", "roe_pct", "roe_n",
+    "gross_margin", "gross_margin_pct", "gross_margin_n",
+    "gm_yoy_pp", "gm_yoy_pp_pct", "gm_yoy_pp_n",
+    "inv_days", "inv_days_pct", "inv_days_n",
+    "fcf_margin", "fcf_margin_pct", "fcf_margin_n",
+    "dupont", "na_reasons", "period_mixed", "asof",
+)
+
 #: 契约预检用的探针上下文（设计文档 §6.1 的完整空形状）。
 #:
-#: 目的：让结构合规的脚本能「跑起来」而不因缺 key 报 KeyError——
-#: 脚本只要读了 ctx["bars"] / ctx["name"] 等文档化字段就不该被误拒。
-#: 刻意不携带真实数据（bars=[]）——这不是回测数据，
-#: 只是让执行路径走通、让 validate_return 能校验返回结构。
-#: IMPORTANT: 此字典的 key 集合必须覆盖**所有调用点**传入的 ctx key 的并集：
-#:   - score.py::build_ctx 输出的基础字段（code/name/asof/pool/asset_type/board/bars）
-#:   - risk_adjust.py::adjust 额外覆盖的字段（raw_score/risk_list）
-#: 若有新调用点增加了 key，必须在这里同步追加，否则用 subscript 读该 key
-#: 的脚本会在探针阶段 KeyError 而被误拒，尽管其在生产路径下正常工作。
+#: 探针上下文：**结构完整但无数据**。它的职责是让一个写法正常的脚本
+#: 能跑完并交出合规结果 —— 不是给它喂真实数据。
+#:
+#: ⚠️ 这里必须覆盖**所有调用点 ctx 键的并集**（`build_ctx` ∪
+#: `risk_adjust.adjust` 追加的 `raw_score`/`risk_list`）。少一个键，
+#: 读它的正常脚本就会被探针误拒。
 PROBE_CTX: dict = {
     "code": "__probe__",
     "name": "__probe__",
-    "asof": "2000-01-01",
+    "asof": "1970-01-01",
     "pool": "short",
     "asset_type": "stock",
     "board": "main",
+    "sector": "__probe__",
     "bars": [],
     "raw_score": 0.0,
     "risk_list": [],
+    "features": {
+        "period": None,
+        "roe": None, "roe_pct": None, "roe_n": 0,
+        "gross_margin": None, "gross_margin_pct": None, "gross_margin_n": 0,
+        "gm_yoy_pp": None, "gm_yoy_pp_pct": None, "gm_yoy_pp_n": 0,
+        "inv_days": None, "inv_days_pct": None, "inv_days_n": 0,
+        "fcf_margin": None, "fcf_margin_pct": None, "fcf_margin_n": 0,
+        "dupont": None, "na_reasons": [], "period_mixed": False,
+        "asof": "1970-01-01",
+    },
 }
 
 #: plugin_id → (字段名, 种类) 的有序清单。种类见 `_check_field`。

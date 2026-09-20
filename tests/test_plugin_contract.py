@@ -88,3 +88,18 @@ def test_extra_keys_are_dropped_and_input_is_unchanged():
     # 原始输入对象必须保持不变
     assert inp["injected"] == "x"
     assert set(out.keys()) == {"score", "pass_flag", "reason", "risk_list"}
+
+
+def test_probe_ctx_has_complete_feature_shape():
+    """探针 ctx 必须让读 features 任意键的脚本都能跑起来（上一轮的坑）。"""
+    from stocklab.plugin import contract
+    feats = contract.PROBE_CTX["features"]
+    for key in contract.FEATURE_KEYS:
+        assert key in feats, f"PROBE_CTX['features'] 缺 {key}"
+    assert contract.PROBE_CTX["sector"]
+
+
+def test_probe_ctx_is_json_serializable():
+    import json
+    from stocklab.plugin import contract
+    json.dumps(contract.PROBE_CTX)

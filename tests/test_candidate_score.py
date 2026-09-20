@@ -47,8 +47,8 @@ def conn(tmp_db):
     c.close()
 
 
-def test_build_ctx_contains_required_keys():
-    ctx = score.build_ctx(STOCK, "short", BARS, asof="2026-09-10")
+def test_build_ctx_contains_required_keys(conn):
+    ctx = score.build_ctx(conn, STOCK, "short", BARS, asof="2026-09-10")
     assert ctx["code"] == "000333"
     assert ctx["name"] == "美的集团"
     assert ctx["asof"] == "2026-09-10"
@@ -57,25 +57,25 @@ def test_build_ctx_contains_required_keys():
     assert len(ctx["bars"]) == 10
 
 
-def test_build_ctx_is_pit():
+def test_build_ctx_is_pit(conn):
     """asof 之后的行不得进 ctx。"""
-    ctx = score.build_ctx(STOCK, "short", BARS, asof="2026-09-05")
+    ctx = score.build_ctx(conn, STOCK, "short", BARS, asof="2026-09-05")
     assert all(b["date"] <= "2026-09-05" for b in ctx["bars"])
 
 
-def test_build_ctx_bars_are_json_safe_plain_dicts():
-    ctx = score.build_ctx(STOCK, "short", BARS, asof="2026-09-10")
+def test_build_ctx_bars_are_json_safe_plain_dicts(conn):
+    ctx = score.build_ctx(conn, STOCK, "short", BARS, asof="2026-09-10")
     json.dumps(ctx)                      # 不抛 = 可序列化
 
 
 def test_industry_screen_passes(conn):
-    ctx = score.build_ctx(STOCK, "short", BARS, asof="2026-09-10")
+    ctx = score.build_ctx(conn, STOCK, "short", BARS, asof="2026-09-10")
     r = score.industry_screen(conn, STOCK, ctx)
     assert r["pass_flag"] is True
 
 
 def test_score_pool_short(conn):
-    ctx = score.build_ctx(STOCK, "short", BARS, asof="2026-09-10")
+    ctx = score.build_ctx(conn, STOCK, "short", BARS, asof="2026-09-10")
     out = score.score_pool(conn, STOCK, "short", ctx)
     assert out.raw_score == 80.0
     assert out.pass_flag is True
@@ -83,12 +83,12 @@ def test_score_pool_short(conn):
 
 
 def test_score_pool_mid(conn):
-    ctx = score.build_ctx(STOCK, "mid", BARS, asof="2026-09-10")
+    ctx = score.build_ctx(conn, STOCK, "mid", BARS, asof="2026-09-10")
     assert score.score_pool(conn, STOCK, "mid", ctx).raw_score == 60.0
 
 
 def test_score_pool_long_fails_flag(conn):
-    ctx = score.build_ctx(STOCK, "long", BARS, asof="2026-09-10")
+    ctx = score.build_ctx(conn, STOCK, "long", BARS, asof="2026-09-10")
     out = score.score_pool(conn, STOCK, "long", ctx)
     assert out.raw_score == 40.0
     assert out.pass_flag is False
@@ -98,7 +98,69 @@ def test_missing_active_plugin_raises(tmp_db):
     """没有任何 active 版本时，主流程必须明确报错，不兜底。"""
     init_db(tmp_db)
     c = connect(tmp_db)
-    ctx = score.build_ctx(STOCK, "short", BARS, asof="2026-09-10")
+    ctx = score.build_ctx(c, STOCK, "short", BARS, asof="2026-09-10")
     with pytest.raises(lifecycle.NoActivePlugin):
         score.score_pool(c, STOCK, "short", ctx)
     c.close()
+
+
+# ---------- Task 9：features 与 sector ----------
+
+from stocklab.candidate import cross_section as cs
+from stocklab.store.migrate import init_db
+
+FEATURE_KEYS = (
+    "period", "roe", "roe_pct", "roe_n", "gross_margin", "gross_margin_pct",
+    "gross_margin_n", "gm_yoy_pp", "gm_yoy_pp_pct", "gm_yoy_pp_n",
+    "inv_days", "inv_days_pct", "inv_days_n", "fcf_margin", "fcf_margin_pct",
+    "fcf_margin_n", "dupont", "na_reasons", "period_mixed", "asof",
+)
+
+
+@pytest.fixture
+def fin_db(tmp_db):
+    """一个只有标的、没有财报的库。"""
+    init_db(tmp_db)
+    c = connect(tmp_db)
+    c.execute("INSERT INTO instruments (code, name, market, board, type, sector,"
+              " added_at) VALUES ('000333','美的集团','sz','main','stock',"
+              " '白色家电', ?)", (NOW,))
+    c.commit()
+    yield c
+    c.close()
+
+
+def test_features_keys_always_complete_without_data(fin_db):
+    """没有财报时 features 的**键仍须齐全**，值为 None —— 否则插桩里
+    ctx['features']['roe_pct'] 会 KeyError，被沙盒探针判成脚本 bug。"""
+    ctx = score.build_ctx(fin_db, STOCK, "mid", BARS, asof="2026-09-17")
+    assert set(ctx["features"]) == set(FEATURE_KEYS)
+    assert ctx["features"]["roe"] is None
+    assert ctx["features"]["roe_pct"] is None
+    assert ctx["features"]["na_reasons"]
+
+
+def test_sector_comes_from_instruments(fin_db):
+    ctx = score.build_ctx(fin_db, STOCK, "mid", BARS, asof="2026-09-17")
+    assert ctx["sector"] == "白色家电"
+
+
+def test_ctx_is_json_serializable_with_features(fin_db):
+    import json
+    ctx = score.build_ctx(fin_db, STOCK, "mid", BARS, asof="2026-09-17")
+    json.dumps(ctx)
+
+
+def test_pit_excludes_unannounced_periods(fin_db):
+    """notice_date > asof 的期绝不进 features（设计 §7.1）。"""
+    fin_db.execute(
+        "INSERT INTO financial_reports (code, report_date, notice_date,"
+        " notice_date_source, report_type, total_assets, parent_equity,"
+        " total_equity, total_liabilities, total_operate_income,"
+        " parent_netprofit, source, fetched_at, created_at, raw_refs_json)"
+        " VALUES ('000333','2026-06-30','2026-08-29','f10','中报',"
+        " 1e11, 4e10, 4.4e10, 5.6e10, 5e10, 5e9, 'x', ?, ?, '[]')", (NOW, NOW))
+    early = score.build_ctx(fin_db, STOCK, "mid", BARS, asof="2026-08-01")
+    late = score.build_ctx(fin_db, STOCK, "mid", BARS, asof="2026-09-17")
+    assert early["features"]["period"] is None, "公告日之前的期不许可见"
+    assert late["features"]["period"] == "2026Q2"

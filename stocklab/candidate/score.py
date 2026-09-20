@@ -18,8 +18,9 @@ from __future__ import annotations
 import sqlite3
 from dataclasses import dataclass
 
+from stocklab.candidate import indicators
 from stocklab.config.universe import Instrument
-from stocklab.data.models import Bar
+from stocklab.data.models import Bar, FinancialReport
 from stocklab.plugin import lifecycle
 
 #: 池 → 打分插桩编号。
@@ -45,18 +46,47 @@ def _bar_to_dict(b: Bar) -> dict:
             "turnover": b.turnover}
 
 
-def build_ctx(inst: Instrument, pool: str, bars: list[Bar], *,
-              asof: str) -> dict:
-    """构造喂给插桩的上下文。**PIT**：只放 `date <= asof` 的 K 线。"""
+_FIN_COLS = ("code", "report_date", "notice_date", "notice_date_source",
+             "report_type", "total_assets", "parent_equity", "total_equity",
+             "total_liabilities", "inventory", "total_operate_income",
+             "operate_cost", "parent_netprofit", "netcash_operate",
+             "construct_long_asset", "industry_name", "source")
+
+
+def load_financials(conn, code: str, *, asof: str) -> list:
+    """按 PIT 读该标的**已公告**的财报期（`notice_date <= asof`），按报告期升序。"""
+    rows = conn.execute(
+        "SELECT * FROM financial_reports WHERE code = ? AND notice_date <= ?"
+        " ORDER BY report_date", (code, asof)).fetchall()
+    return [FinancialReport(**{k: r[k] for k in _FIN_COLS}) for r in rows]
+
+
+def build_ctx(conn, inst: Instrument, pool: str, bars: list[Bar], *,
+              asof: str, cross_section: dict | None = None) -> dict:
+    """构造喂给插桩的上下文。**PIT**：K 线只放 `date <= asof`，
+    财报只放 `notice_date <= asof`。
+
+    `features` 的键**永远齐全**（不可算给 `None` + `na_reasons`）——
+    缺键会让插桩 KeyError，被沙盒探针判成脚本 bug。
+    """
     usable = sorted((b for b in bars if b.date <= asof), key=lambda b: b.date)
+    feats = indicators.factors(load_financials(conn, inst.code, asof=asof))
+    if cross_section and inst.code in cross_section:
+        feats.update(cross_section[inst.code])
+    for key in ("roe", "gross_margin", "gm_yoy_pp", "inv_days", "fcf_margin"):
+        feats.setdefault(f"{key}_pct", None)
+        feats.setdefault(f"{key}_n", 0)
+    feats.setdefault("period_mixed", False)
+    feats["asof"] = asof
+
+    sector = conn.execute("SELECT sector FROM instruments WHERE code = ?",
+                          (inst.code,)).fetchone()
     return {
-        "code": inst.code,
-        "name": inst.name,
-        "asof": asof,
-        "pool": pool,
-        "asset_type": inst.asset_type,
-        "board": inst.board,
+        "code": inst.code, "name": inst.name, "asof": asof, "pool": pool,
+        "asset_type": inst.asset_type, "board": inst.board,
+        "sector": (sector["sector"] if sector else None),
         "bars": [_bar_to_dict(b) for b in usable],
+        "features": feats,
     }
 
 
