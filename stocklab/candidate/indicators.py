@@ -59,7 +59,14 @@ def single_quarters(reports: list[FinancialReport],
 
 def ttm(quarters: dict[tuple[int, int], float], *, year: int, quarter: int,
         field: str) -> float | None:
-    """滚动四季之和。任一季缺失 → `None`。"""
+    """滚动四季之和。任一季缺失 → `None`。
+
+    `quarters` 是由 `single_quarters(reports, field)` 预先算好的单季字典，
+    传入前字段已经解析完毕。因此 `field` **不影响计算结果**——它仅用于调用方
+    可读性（让调用处 ``ttm(q, year=y, quarter=q, field="net_profit")`` 一眼看出
+    ``q`` 对应哪个字段）。向 `field` 传错误名称**不会报错，也不会改变返回值**；
+    如需字段名校验，请在 `single_quarters` 调用处检查。
+    """
     need: list[tuple[int, int]] = []
     y, q = year, quarter
     for _ in range(4):

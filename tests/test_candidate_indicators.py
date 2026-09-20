@@ -67,3 +67,18 @@ def test_missing_field_is_skipped_not_zero():
     q = ind.single_quarters(reports, "total_operate_income")
     assert q[(2026, 1)] == 10.0
     assert (2026, 2) not in q
+
+
+def test_latest_period_empty_returns_none():
+    assert ind.latest_period([]) is None
+
+
+def test_latest_period_returns_latest_tuple():
+    reports = [rep("2026-03-31", income=10.0), rep("2026-06-30", income=25.0),
+               rep("2025-12-31", income=8.0)]
+    assert ind.latest_period(reports) == (2026, 2)
+
+
+def test_quarter_of_non_quarter_end_raises():
+    with pytest.raises(ValueError):
+        ind.quarter_of("2026-05-15")
