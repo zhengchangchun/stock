@@ -39,10 +39,15 @@ HEADERS = {
 #: 数据中心（datacenter-web）只要 UA；`Referer` 不是必须（实测 200）。
 DATACENTER_HEADERS = {"User-Agent": "Mozilla/5.0"}
 
-#: 估值单页上限（数据中心 pageSize 上限 500，取 500 减少请求数）。
+#: 估值单页上限（数据中心 RPT_VALUEANALYSIS_DET 的 pageSize 上限为 500，
+#: 取 500 减少请求数）。**仅适用于估值端点**，与 FINANCIAL_PAGE_SIZE 刻意分开：
+#: 两端点的分页行为独立，日后若任一端点调整上限时只改对应常量，不影响另一个。
 VALUATION_PAGE_SIZE = 500
 
-#: 实测 500 可一次取回 79 行（pages=1）；默认口径下是 40 页。
+#: 财报端点（RPT_DMSK_FN_* / RPT_F10_FINANCE_*）的单页上限。
+#: 实测 pageSize=500 时 RPT_DMSK_FN_BALANCE 可一次取回 79 期（pages=1），
+#: 默认口径（pageSize=20）需约 40 页。**仅适用于财报端点**，与 VALUATION_PAGE_SIZE
+#: 刻意分开：两端点独立测量、独立维护，数值相同纯属巧合，不代表它们必须保持一致。
 FINANCIAL_PAGE_SIZE = 500
 
 

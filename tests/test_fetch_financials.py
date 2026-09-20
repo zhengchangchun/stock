@@ -103,8 +103,16 @@ F10_G = {
         {"REPORT_DATE": "2025-12-31 00:00:00", "NOTICE_DATE": "2026-03-31 00:00:00",
          "TOTAL_PARENT_EQUITY": 2.0e11},
     ]},
-    "RPT_F10_FINANCE_GINCOME": {1: []},
-    "RPT_F10_FINANCE_GCASHFLOW": {1: []},
+    # GINCOME: 提供一行，NOTICE_DATE 故意与 GBALANCE 不同（晚 1 天）；
+    # 用于验证合并顺序：F10 循环按 BALANCE→INCOME→CASHFLOW 顺序、首见优先，
+    # 故 GBALANCE 的日期应赢，GINCOME 的日期被忽略。
+    "RPT_F10_FINANCE_GINCOME": {1: [
+        {"REPORT_DATE": "2026-06-30 00:00:00", "NOTICE_DATE": "2026-08-30 00:00:00"},
+    ]},
+    # GCASHFLOW: 提供一行（无 NOTICE_DATE），覆盖现金流合并路径。
+    "RPT_F10_FINANCE_GCASHFLOW": {1: [
+        {"REPORT_DATE": "2026-06-30 00:00:00"},
+    ]},
 }
 
 
@@ -116,8 +124,11 @@ def test_fetch_merges_dmsk_and_f10():
     assert set(by_date) == {"2026-06-30", "2025-12-31"}
 
     june = by_date["2026-06-30"]
-    assert june.notice_date == "2026-08-29"
+    assert june.notice_date == "2026-08-29"          # GBALANCE 优先（BALANCE→INCOME→CASHFLOW 首见）
     assert june.notice_date_source == "f10"
+    # GINCOME 的 NOTICE_DATE（2026-08-30）不得覆盖 GBALANCE 的（2026-08-29）：
+    # 合并顺序是 BALANCE→INCOME→CASHFLOW，首见优先（`rd not in f10_notice` 守卫）。
+    assert june.notice_date != "2026-08-30", "GINCOME 的日期不应覆盖 GBALANCE 的日期"
     assert june.parent_equity == 212861055000.0            # 来自 F10
     assert june.total_assets == 643101789000.0             # 来自 DMSK
     assert june.parent_netprofit == 2.6e10
