@@ -175,7 +175,7 @@ def ingest_financial_reports(conn, reports, raw_refs, *, now: str) -> IngestResu
     """把一批财报写入 `financial_reports`。
 
     - **幂等**：`(code, report_date, notice_date)` 已存在即跳过
-    - **首写保留**：已存在但值不同 → 保留旧值、`conflicts += 1`，**不覆盖**
+    - **首写保留**：已存在但值不同 → 保留旧值、`conflicts += 1`（不写 system_events），**不覆盖**
     - 会计恒等式与量级异常**只记 issue，不拒写**
     """
     if not reports:
@@ -205,12 +205,32 @@ def ingest_financial_reports(conn, reports, raw_refs, *, now: str) -> IngestResu
         conn.execute(
             f"INSERT INTO financial_reports ({', '.join(_F_COLS)})"
             f" VALUES ({', '.join('?' * len(_F_COLS))})",
-            (r.code, r.report_date, r.notice_date, r.notice_date_source,
-             r.report_type, r.total_assets, r.parent_equity, r.total_equity,
-             r.total_liabilities, r.inventory, r.total_operate_income,
-             r.operate_cost, r.parent_netprofit, r.netcash_operate,
-             r.construct_long_asset, r.industry_name, r.source, now, now,
-             refs_json, raw_refs[0]["cache_key"] if raw_refs else None, "CNY"))
+            tuple(
+                {
+                    "code": r.code,
+                    "report_date": r.report_date,
+                    "notice_date": r.notice_date,
+                    "notice_date_source": r.notice_date_source,
+                    "report_type": r.report_type,
+                    "total_assets": r.total_assets,
+                    "parent_equity": r.parent_equity,
+                    "total_equity": r.total_equity,
+                    "total_liabilities": r.total_liabilities,
+                    "inventory": r.inventory,
+                    "total_operate_income": r.total_operate_income,
+                    "operate_cost": r.operate_cost,
+                    "parent_netprofit": r.parent_netprofit,
+                    "netcash_operate": r.netcash_operate,
+                    "construct_long_asset": r.construct_long_asset,
+                    "industry_name": r.industry_name,
+                    "source": r.source,
+                    "fetched_at": now,
+                    "created_at": now,
+                    "raw_refs_json": refs_json,
+                    "cache_key": raw_refs[0]["cache_key"] if raw_refs else None,
+                    "unit": "CNY",
+                }[col] for col in _F_COLS
+            ))
         written += 1
     conn.commit()
     return IngestResultF(code=code, ok=True, rows_written=written,

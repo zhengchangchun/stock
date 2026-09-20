@@ -99,3 +99,38 @@ def test_seed_org_types_are_valid():
     assert by_code["601398"] == "银行"
     assert by_code["601318"] == "保险"
     assert by_code["000333"] == "通用"
+
+
+def test_insert_bind_tuple_order_matches_f_cols(conn):
+    """INSERT 绑定元组必须与 _F_COLS 顺序一一对应，否则列值错位。
+
+    做法：写入一行后从数据库按 _F_COLS 顺序逐列读出，校验关键列的值。
+    若将来 _F_COLS 被重排但 dict 建值逻辑未跟上，tuple(d[col] for col in _F_COLS)
+    会因 KeyError 立即报错；若 dict 键与 _F_COLS 存在遗漏，同样会 KeyError。
+    本测试额外断言实际落库的 parent_equity / total_equity 与入参一致，
+    确保「同一 dict 派生顺序」没有在某列悄悄写错值。
+    """
+    from stocklab.data.ingest import _F_COLS
+
+    rep = _rep()
+    ingest_financial_reports(conn, [rep], _refs(), now=NOW)
+
+    row = conn.execute(
+        f"SELECT {', '.join(_F_COLS)} FROM financial_reports"
+    ).fetchone()
+
+    # 验证绑定元组长度等于 _F_COLS
+    assert len(_F_COLS) == len(row), (
+        f"SELECT 列数({len(row)}) ≠ _F_COLS 长度({len(_F_COLS)})"
+    )
+
+    # 按列名定位索引，断言关键财务字段值正确
+    idx_pe = _F_COLS.index("parent_equity")
+    idx_te = _F_COLS.index("total_equity")
+
+    assert row[idx_pe] == rep.parent_equity, (
+        f"parent_equity 列值错位：期望 {rep.parent_equity}, 得到 {row[idx_pe]}"
+    )
+    assert row[idx_te] == rep.total_equity, (
+        f"total_equity 列值错位：期望 {rep.total_equity}, 得到 {row[idx_te]}"
+    )
