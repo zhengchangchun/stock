@@ -40,7 +40,7 @@ def run(ctx):
     risks = []
     if sector is None:
         risks.append("行业未能判定，已按通用规则处理（非 PIT，仅为近似）")
-    if not from_ctx:
+    elif not from_ctx:
         risks.append("行业由标的名称推断（sector 字段缺失），非 PIT，仅为近似")
     if sector and any(k in sector for k in FINANCIAL_KEYWORDS):
         risks.append("金融业（" + sector + "）：高杠杆经营，通用排雷指标不完全适用；"
