@@ -223,32 +223,23 @@ def replay_period_deltas(conn: sqlite3.Connection, *, candidate_script_id: int,
     两种路径都不需要在这里额外 import SEED_UNIVERSE。
     """
     # 单变量检查：两个版本必须属于同一个 plugin_id。
-    # 当 candidate_script_id == baseline_script_id 时同一脚本必然同一插件，跳过查库。
-    # 此时 cand_overrides = base_overrides = None，两次 period_returns 调用完全等价
-    # （均使用 active 版本，或在测试接缝下使用相同的 _pools_for 数据），所以 Δ 必然为 0。
-    # 这里的等价性是「两次调用参数一致」的算术结论，不依赖 score_pipeline 解析结果。
-    # 当两者不同时才需要查 plugin_scripts 表确认是否同一插件（单变量原则）。
-    if candidate_script_id != baseline_script_id:
-        pid = _plugin_id_of(conn, candidate_script_id)
-        base_pid = _plugin_id_of(conn, baseline_script_id)
-        if pid != base_pid:
-            raise ValueError(
-                f"两个版本属于不同插件（{pid!r} vs {base_pid!r}）—— 单变量原则"
-                "要求只换同一个 plugin_id 的版本")
-        eff_pid = pid
-    else:
-        # 短路：同 id 无需查库；两次调用等价 → Δ = 0（见上注释）。
-        eff_pid = None
+    # 无论两个 script_id 是否相同，都查库拿 plugin_id。
+    # 这确保「pin X」语义：score_pipeline 收到 {pid: X}，不会静默解析成 active 版本。
+    pid = _plugin_id_of(conn, candidate_script_id)
+    base_pid = _plugin_id_of(conn, baseline_script_id)
+    if pid != base_pid:
+        raise ValueError(
+            f"两个版本属于不同插件（{pid!r} vs {base_pid!r}）—— 单变量原则"
+            "要求只换同一个 plugin_id 的版本")
+    eff_pid = pid
 
     period = REBALANCE_DAYS[pool]
     days = trading_days or _trading_days(conn, window_start, window_end)
     marks = rebalance_dates(days, period=period, start=window_start,
                             end=window_end)
 
-    cand_overrides = ({eff_pid: candidate_script_id} if eff_pid is not None
-                      else None)
-    base_overrides = ({eff_pid: baseline_script_id} if eff_pid is not None
-                      else None)
+    cand_overrides = {eff_pid: candidate_script_id}
+    base_overrides = {eff_pid: baseline_script_id}
 
     cand = period_returns(
         conn, asof_dates=marks, pool=pool,
