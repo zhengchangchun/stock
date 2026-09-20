@@ -115,3 +115,36 @@ class MoneyFlowDaily:
     xl_net: float | None = None     # r0_net 超大单净额
     ratio_amount: float | None = None
     source: str = "sina"
+
+
+@dataclass(frozen=True)
+class FinancialReport:
+    """一期财报（合并了东财 DMSK 三表的数值 + F10 的公告日与归母权益）。
+
+    **单位一律：元。**
+
+    `notice_date` 是 PIT 锚点（公告日），不是报告期；下游只允许读
+    `notice_date <= asof` 的行。`notice_date_source` 区分实测（'f10'）与
+    法定截止日推定（'statutory'）。
+
+    `parent_equity` 是归母权益；`total_equity` 是**含少数股东权益的合计**
+    （实测 == 总资产 − 总负债）。`roe`/`dupont` 一律用归母口径。
+    """
+
+    code: str
+    report_date: str
+    notice_date: str
+    notice_date_source: str          # 'f10' | 'statutory'
+    report_type: str                 # 一季报 / 中报 / 三季报 / 年报
+    total_assets: float | None = None
+    parent_equity: float | None = None
+    total_equity: float | None = None
+    total_liabilities: float | None = None
+    inventory: float | None = None
+    total_operate_income: float | None = None
+    operate_cost: float | None = None
+    parent_netprofit: float | None = None
+    netcash_operate: float | None = None
+    construct_long_asset: float | None = None
+    industry_name: str | None = None
+    source: str = "eastmoney-datacenter"

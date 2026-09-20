@@ -21,7 +21,8 @@
 
 from __future__ import annotations
 
-from urllib.parse import urlencode
+import urllib.parse
+from urllib.parse import urlencode, quote as _quote
 
 from stocklab.data.models import Bar, ValuationDaily
 from stocklab.data.sources._common import LOT, to_float
@@ -154,3 +155,57 @@ def parse_money_flow(payload: dict) -> list[dict]:
             "xl_net": vals[4],
         })
     return out
+
+
+# ---------- 财报（本轮）----------
+
+DMSK_REPORTS: tuple[str, ...] = (
+    "RPT_DMSK_FN_BALANCE", "RPT_DMSK_FN_INCOME", "RPT_DMSK_FN_CASHFLOW",
+)
+
+#: 报表名按机构类型选择。实测：一般工商走 G、银行走 B、保险走 I ——
+#: **银行/保险的资产负债表并非缺失，只是报表名不同**（这一条决定了金融股
+#: 能不能算 ROE）。
+_ORG_PREFIX: dict[str, str] = {"银行": "B", "保险": "I"}
+_DEFAULT_ORG_PREFIX = "G"
+
+#: DMSK 三表 → FinancialReport 字段的映射（列名不同，值口径一致）。
+#: 注意：DMSK 的 `TOTAL_EQUITY` 是**权益合计**（含少数股东），不是归母。
+DMSK_FIELD_MAP: dict[str, str] = {
+    "TOTAL_ASSETS": "total_assets",
+    "TOTAL_EQUITY": "total_equity",
+    "TOTAL_LIABILITIES": "total_liabilities",
+    "INVENTORY": "inventory",
+    "TOTAL_OPERATE_INCOME": "total_operate_income",
+    "OPERATE_COST": "operate_cost",
+    "PARENT_NETPROFIT": "parent_netprofit",
+    "NETCASH_OPERATE": "netcash_operate",
+    "CONSTRUCT_LONG_ASSET": "construct_long_asset",
+    "INDUSTRY_NAME": "industry_name",
+}
+
+
+def f10_report_name(org_type: str, statement: str) -> str:
+    """按机构类型拼 F10 报表名。未知类型回退通用的 `G`。"""
+    prefix = _ORG_PREFIX.get(org_type or "", _DEFAULT_ORG_PREFIX)
+    return f"RPT_F10_FINANCE_{prefix}{statement}"
+
+
+def datacenter_url(report_name: str, *, secucode: str, page: int,
+                   page_size: int) -> str:
+    """构造 datacenter 请求 URL。
+
+    ⚠️ **必须 `columns=ALL`** —— 显式列清单在缺该列的标的上会让**整个请求**
+    返回 `code 9501「XXX返回字段不存在」`（实测 `601318.SH` / `510300.SH` +
+    `INVENTORY` 复现）。这不是「少一列」，是「一行都拿不到」。
+    """
+    f = urllib.parse.quote(f'(SECUCODE="{secucode}")', safe="")
+    return (f"{VALUATION_URL}?reportName={report_name}&columns=ALL&filter={f}"
+            f"&pageNumber={page}&pageSize={page_size}"
+            "&sortColumns=REPORT_DATE&sortTypes=-1")
+
+
+def parse_datacenter_rows(payload: dict) -> list[dict]:
+    """取 `result.data`。`result` 为 null 或缺失 → `[]`（**合法空**，ETF 如此）。"""
+    result = (payload or {}).get("result") or {}
+    return list(result.get("data") or [])
