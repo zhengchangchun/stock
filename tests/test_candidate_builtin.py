@@ -97,15 +97,17 @@ def test_industry_screen_is_per_industry():
 
 
 def test_plugin0_ctx_sector_wins_over_name_keyword():
-    """ctx["sector"] と name-keyword が食い違うとき ctx が勝つ（可証偽）。
+    """ctx["sector"] 与 name-keyword 冲突时，ctx 优先（可证伪，基线 ab1f30e）。
 
-    招商银行 の name には "银行" が含まれ、旧コードは SECTOR_KEYWORDS で
-    sector="银行" にマッチして金融 note に "银行" を埋め込む。
-    新コードは ctx["sector"]="其他金融Ⅱ" を優先し、"银行" ではなく
-    "其他金融Ⅱ" を note に埋め込む。
+    Task 10 之前的基线（ab1f30e）：插桩0 没有 sector 处理，只用 name 猜行业。
+    对 name="招商银行", sector="其他金融Ⅱ" 的 ctx：
+      - ab1f30e（旧）：_guess_sector("招商银行") 命中 SECTOR_KEYWORDS["银行"]
+                        → risk_note=['银行业：高杠杆经营，通用排雷指标不完全适用']（含"银行"）
+      - 当前（新）：   优先读 ctx["sector"]="其他金融Ⅱ"，不触发银行 note
+                        → risk_note=[] 或不含"银行"的 note
 
-    Falsifiability: the assertion `not any("银行" in r …)` would FAIL against
-    the pre-fix source (name-keyword path), which emits "银行業（银行）：…".
+    实证可证伪：ab1f30e 跑本断言 `not any("银行" in r …)` 会红（实测）。
+    上述 ab1f30e 输出由 `git show ab1f30e:…/p0_industry.py` + load_script 实测得到。
     """
     fn = runtime.load_script(BUILTIN_PLUGINS["0"], plugin_id="0")
     # name="招商银行" → old code would match SECTOR_KEYWORDS["银行"] → emit "银行"
@@ -143,9 +145,11 @@ def test_plugin0_falls_back_to_name_when_sector_missing():
 def test_plugin0_unknown_sector_emits_only_one_note():
     """sector=None かつ name にもキーワードなし → note は 1 つだけ（二重発火なし）。
 
-    Finding 2 fix: when neither source produces a sector, only the
-    "行业未能判定" note should fire; the "sector 字段缺失" (name-inferred) note
-    must NOT also appear — that would contradict "nothing was inferred".
+    Task 10 之前基线（ab1f30e）：sector=None 且 name 无 keyword → 两个 if 都走旧分支，
+    仅 emit "行业未能从名称推断…"；不含 "行业未能判定" → assert any("行业未能判定" …) 红。
+    当前：elif 结构确保只发一条 "行业未能判定" note，不重复发 "sector 字段缺失"。
+
+    if→elif 改动（round 1）覆盖此路径；ab1f30e 对本测试的两个 assert 均会红（实测）。
     """
     fn = runtime.load_script(BUILTIN_PLUGINS["0"], plugin_id="0")
     ctx = {"code": "888888", "name": "某未知标的XYZ", "asof": "2026-09-17",
