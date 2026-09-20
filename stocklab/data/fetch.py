@@ -452,6 +452,9 @@ def fetch_financial_reports(client, *, code: str, org_type: str,
 
     f10_notice: dict[str, str] = {}
     f10_parent: dict[str, float] = {}
+    # 迭代顺序**刻意固定**为 BALANCE → INCOME → CASHFLOW：
+    # 对同一 report_date，第一张表提供非空 NOTICE_DATE 即胜出（`rd not in f10_notice` 守卫），
+    # 后续表的日期被静默忽略——这决定了 PIT 锚点来自哪张表。改变顺序即改变锚点来源。
     for statement in ("BALANCE", "INCOME", "CASHFLOW"):
         name = eastmoney.f10_report_name(org_type, statement)
         for row in _fetch_datacenter(client, name, secucode=secucode,
