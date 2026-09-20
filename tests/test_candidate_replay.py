@@ -121,6 +121,13 @@ def test_split_empty():
     assert replay.split_train_validate([]) == ([], [])
 
 
+def test_split_len_one():
+    """长度 1 时整个序列归训练段，验证段为空（无法切分，无推断价值）。"""
+    tr, va = replay.split_train_validate([3.14])
+    assert tr == [3.14]
+    assert va == []
+
+
 def test_split_keeps_order():
     tr, va = replay.split_train_validate([1, 2, 3, 4, 5])
     assert tr == [1, 2, 3]
@@ -168,4 +175,25 @@ def test_deltas_zero_when_versions_identical(tmp_db):
         c, candidate_script_id=1, baseline_script_id=1, pool="short",
         window_start=dates[0], window_end=dates[-1], costs=flat,
         _pools_for={"cand": same, "base": same})
+    # 短路路径（equal ids）：两次 period_returns 参数完全一致 → Δ 精确为 0。
+    # 此断言钉住「等价性」而非依赖隐式假设。
     assert all(x == 0.0 for x in tr + va)
+
+
+def test_cross_plugin_raises_value_error(tmp_db):
+    """不同 plugin_id 的两个版本必须 raise ValueError（单变量原则守门）。"""
+    from stocklab.plugin import store as plugin_store
+
+    init_db(tmp_db)
+    c = connect(tmp_db)
+    sid_a = plugin_store.insert_script(
+        c, plugin_id="plug_a", version="1", source_text="pass_a",
+        note=None, now=NOW)
+    sid_b = plugin_store.insert_script(
+        c, plugin_id="plug_b", version="1", source_text="pass_b",
+        note=None, now=NOW)
+
+    with pytest.raises(ValueError, match="单变量原则"):
+        replay.replay_period_deltas(
+            c, candidate_script_id=sid_a, baseline_script_id=sid_b,
+            pool="short", window_start="2026-01-01", window_end="2026-01-31")

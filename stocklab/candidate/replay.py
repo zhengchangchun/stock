@@ -224,7 +224,10 @@ def replay_period_deltas(conn: sqlite3.Connection, *, candidate_script_id: int,
     """
     # 单变量检查：两个版本必须属于同一个 plugin_id。
     # 当 candidate_script_id == baseline_script_id 时同一脚本必然同一插件，跳过查库。
-    # 当两者不同时才需要查 plugin_scripts 表确认。
+    # 此时 cand_overrides = base_overrides = None，两次 period_returns 调用完全等价
+    # （均使用 active 版本，或在测试接缝下使用相同的 _pools_for 数据），所以 Δ 必然为 0。
+    # 这里的等价性是「两次调用参数一致」的算术结论，不依赖 score_pipeline 解析结果。
+    # 当两者不同时才需要查 plugin_scripts 表确认是否同一插件（单变量原则）。
     if candidate_script_id != baseline_script_id:
         pid = _plugin_id_of(conn, candidate_script_id)
         base_pid = _plugin_id_of(conn, baseline_script_id)
@@ -234,7 +237,8 @@ def replay_period_deltas(conn: sqlite3.Connection, *, candidate_script_id: int,
                 "要求只换同一个 plugin_id 的版本")
         eff_pid = pid
     else:
-        eff_pid = None  # 同一脚本，无需查库
+        # 短路：同 id 无需查库；两次调用等价 → Δ = 0（见上注释）。
+        eff_pid = None
 
     period = REBALANCE_DAYS[pool]
     days = trading_days or _trading_days(conn, window_start, window_end)
