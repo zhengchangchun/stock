@@ -869,3 +869,56 @@ BEGIN SELECT RAISE(ABORT, 'candidate_rejects is append-only'); END;
 CREATE TRIGGER IF NOT EXISTS trg_candidate_rejects_no_delete
 BEFORE DELETE ON candidate_rejects
 BEGIN SELECT RAISE(ABORT, 'candidate_rejects is append-only'); END;
+
+-- ---------- 财报（本轮的采集层）----------
+-- 单位一律：元。PIT 锚点是 `notice_date`（公告日），**不是** `report_date`（报告期）。
+--
+-- `notice_date_source` 区分实测与推定：
+--   'f10'       —— 取自 F10 报表的 NOTICE_DATE（实测与真实公告日吻合）
+--   'statutory' —— F10 取不到或合理性检查不过，回退法定披露截止日（保守，最多晚约一个月）
+--
+-- 为什么主键带 `notice_date`：财报被更正/重述时是一条新公告，同一报告期可有多个版本，
+-- 读取侧取「notice_date <= asof 中最晚的那个」。主键不含它就只能靠覆盖，而覆盖是禁区。
+--
+-- `total_equity` 是**含少数股东权益的所有者权益合计**（实测 == 总资产 − 总负债），
+-- **不是归母**。归母权益在 `parent_equity`。两者混用会让 roe 系统性低估且 dupont 恒等式不成立。
+--
+-- `raw_refs_json` 是溯源数组：一行来自多个端点（DMSK 三表 + F10 三变体），单列装不下。
+CREATE TABLE IF NOT EXISTS financial_reports (
+    code                 TEXT NOT NULL,
+    report_date          TEXT NOT NULL,
+    notice_date          TEXT NOT NULL,
+    notice_date_source   TEXT NOT NULL
+                         CHECK (notice_date_source IN ('f10', 'statutory')),
+    report_type          TEXT NOT NULL
+                         CHECK (report_type IN ('一季报', '中报', '三季报', '年报')),
+    total_assets         REAL,
+    parent_equity        REAL,      -- 归母股东权益
+    total_equity         REAL,      -- 所有者权益合计（含少数股东权益）
+    total_liabilities    REAL,
+    inventory            REAL,
+    total_operate_income REAL,      -- 年内累计
+    operate_cost         REAL,      -- 年内累计
+    parent_netprofit     REAL,      -- 年内累计
+    netcash_operate      REAL,      -- 年内累计
+    construct_long_asset REAL,      -- 年内累计
+    industry_name        TEXT,      -- 东财 INDUSTRY_NAME（**非 PIT**）
+    source               TEXT NOT NULL,
+    fetched_at           TEXT NOT NULL,
+    created_at           TEXT NOT NULL,
+    raw_refs_json        TEXT NOT NULL,
+    cache_key            TEXT,
+    unit                 TEXT NOT NULL DEFAULT 'CNY',
+    PRIMARY KEY (code, report_date, notice_date)
+);
+
+CREATE INDEX IF NOT EXISTS idx_financial_reports_code_notice
+    ON financial_reports (code, notice_date);
+
+CREATE TRIGGER IF NOT EXISTS trg_financial_reports_no_update
+BEFORE UPDATE ON financial_reports
+BEGIN SELECT RAISE(ABORT, 'financial_reports is append-only'); END;
+
+CREATE TRIGGER IF NOT EXISTS trg_financial_reports_no_delete
+BEFORE DELETE ON financial_reports
+BEGIN SELECT RAISE(ABORT, 'financial_reports is append-only'); END;
