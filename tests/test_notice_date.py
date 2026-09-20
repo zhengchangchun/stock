@@ -58,3 +58,10 @@ def test_exactly_120_days_is_kept():
 def test_121_days_is_not_kept():
     got, src, suspect = nd.resolve("2026-05-01", report_date="2025-12-31")
     assert src == "statutory" and suspect is True
+
+
+def test_notice_date_before_report_date_falls_back():
+    """公告日早于报告期 = 数据错位，必须回退法定截止日（不许把它当有效日期）。"""
+    got, src, suspect = nd.resolve("2025-06-30", report_date="2025-12-31")
+    assert (got, src) == ("2026-04-30", "statutory")
+    assert suspect is True
