@@ -403,8 +403,17 @@ code {
 
 .chart { margin: 0; background: var(--paper); border: 1px solid var(--rule);
          padding: 10px 12px 6px; }
-.chart svg { display: block; width: 100%; height: auto; }
+/* 图里的 svg 铺满；图例里的色块也是 svg —— 不能被它拉满（拉满会把图例挤成竖排）*/
+.chart > svg { display: block; width: 100%; height: auto; }
 .chart figcaption { font-size: 11.5px; color: var(--ink2); padding: 4px 0 6px; }
+
+/* 图例：色块 + 名称 + 最新值。颜色**不是**唯一信号 —— 每条线都有文字。 */
+.legend { display: flex; flex-wrap: wrap; gap: 4px 16px; margin: 8px 0 0;
+          font-size: 12px; line-height: 1.6; }
+.legend__i { display: inline-flex; align-items: center; gap: 5px; }
+.legend__i b { font-weight: 600; }
+.swatch { flex: none; display: inline-block; width: 28px; height: 8px; }
+.tbl .swatch { margin-right: 6px; vertical-align: middle; }
 
 /* ---------- 确认框 ---------- */
 

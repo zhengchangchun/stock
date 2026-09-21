@@ -2185,6 +2185,7 @@ def cmd_lab_serve(args: argparse.Namespace) -> int:
     host, port = args.host, httpd.server_port
     print(f"✅ 持仓管理应用已启动：{host}:{port}（仅回环；可读可写）")
     print(f"   总览    http://{host}:{port}{base_path}/")
+    print(f"   模拟盘  http://{host}:{port}{base_path}/paper")
     print(f"   候选池  http://{host}:{port}{base_path}/candidate")
     print(f"   成交    http://{host}:{port}{base_path}/trades")
     print(f"   健康    http://{host}:{port}{base_path}/health")

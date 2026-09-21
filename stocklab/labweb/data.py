@@ -25,6 +25,7 @@ from pathlib import Path
 from zoneinfo import ZoneInfo
 
 from stocklab.dashboard.summary import build_summary
+from stocklab.labweb import paper_data
 from stocklab.portfolio.decision import position_decision
 from stocklab.portfolio.prices import resolve_prices
 from stocklab.portfolio.view import build_portfolio, daily_close, nav_series
@@ -100,6 +101,15 @@ class Lab:
             summary["paper"] = self._paper(c)
         summary["coverage"] = self.coverage()
         return summary
+
+    def paper_track(self) -> dict:
+        """模拟盘对照页取数（P19 展示层）—— 见 `paper_data.track`。
+
+        本方法不产生口径：净值/收益/回撤/超额都走 `paper.engine.build_report`，
+        逐日序列读 `paper_nav_daily.cum_return` 列。
+        """
+        with self.conn() as c:
+            return paper_data.track(c, self.asof)
 
     def _paper(self, conn) -> dict:
         """模拟盘各臂**最新一交易日**的净值快照（P36）。**只读已落库的表，不重算**。

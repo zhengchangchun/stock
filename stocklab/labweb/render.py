@@ -65,6 +65,7 @@ CHECK_CN = {
 
 NAV_ITEMS = (
     ("/", "总览"),
+    ("/paper", "模拟盘对照"),
     ("/candidate", "候选池"),
     ("/trades", "成交流水"),
     ("/cash", "现金流"),

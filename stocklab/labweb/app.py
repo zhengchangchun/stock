@@ -42,7 +42,7 @@ from urllib.parse import parse_qs, quote, urlsplit
 from stocklab.dashboard.server import (LOOPBACK_HOSTS, NonLoopbackHost,
                                        assert_loopback)
 from stocklab.labweb import SERVICE, VERSION
-from stocklab.labweb import cand_data, cand_render
+from stocklab.labweb import cand_data, cand_render, paper_data, paper_render
 from stocklab.labweb.cand_data import CandLab
 from stocklab.labweb.data import Lab, now_iso
 from stocklab.labweb.render import (CASH_FIELDS, CSS_PATH, JS_PATH,
@@ -689,6 +689,9 @@ def _get(ctx: Context, rel: str, query: dict, built_at: str) -> Response:
     if rel == "/risk":
         return html_response(200, risk_page(ctx.lab.risk(), base=base,
                                             built_at=built_at))
+    if rel == "/paper":
+        return html_response(200, paper_render.paper_page(
+            ctx.lab.paper_track(), base=base, built_at=built_at))
     if rel == "/candidate":
         return _get_candidate(ctx, query, built_at)
     if rel == "/data":
