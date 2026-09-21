@@ -102,6 +102,24 @@ def period_returns(conn: sqlite3.Connection, *, asof_dates: list[str],
     `asof_dates`：调仓日序列，两两之间构成一个周期（长度 = len-1）。
     返回长度 = `len(asof_dates) - 1`。
 
+    ## 语义（**无未来函数**）
+
+    在调仓日 `d0`：观察 → 决策 → 以 `d0` 收盘价成交建立本期持仓 `hold`。
+    在下一调仓日 `d1`：把 `hold` 转成 `nxt`（同样在 `d1` 观察决策）。
+
+    - **周期 `[d0, d1]` 的毛收益** = 「在 `d0` 决定的」`hold` 池的等权收益，
+      按 `p1/p0 - 1` 计。**不是** `nxt`（`nxt` 要 `d1` 才知道，用它算
+      `[d0, d1]` 收益 = 未来函数，本次修复的核心）。
+    - **本期成本** = 在 `d1` 执行的调仓账单（把 `hold` 转成 `nxt`）：
+      - 卖出 `hold - nxt`（按 `d1` 价格与 `d1` 涨跌停判定）
+      - 买入 `nxt - hold`（按 `d1` 价格与 `d1` 涨跌停判定）
+      按 `n_hold` 归一化。首期无起点建仓成本；末期不再计后续新买入。
+    - **涨跌停（Finding 2）**：`d0` 涨停买不进 → 本期不持有该只 → 不算入
+      gross（原代码仅挡了 fee 侧、漏挡收益侧，是本次修复的一部分）。
+      `d1` 涨/跌停挡住的仅是**本期末**的调仓账单。
+    - **空池 `hold == []`**：`gross = 0`（持现金），但若上期非空则本期末仍
+      会有卖出账单——「持有→空」的正常清仓成本。
+
     `_pools_for_test`：**测试接缝**，`{调仓日: [code, ...]}`。生产路径不传，
     此时池成员由 `score_pipeline` 现算。接缝只控制**池成员**；调仓日序列
     一律由 `asof_dates` 参数传入，两者职责不混。
@@ -111,6 +129,20 @@ def period_returns(conn: sqlite3.Connection, *, asof_dates: list[str],
     if len(effective_dates) < 2:
         return []
 
+    # ADR-008 记：ETF 与 stock 印花税/过户费口径不同，混用会算错成本方向。
+    # 这里保留**单一 stock 口径 CostModel**（默认 `CostModel()`），理由如下：
+    # 1) 本函数只跑一次，两版本调用两次；由于两次都用同一 `costs`，Δ 抵消
+    #    了绝对成本水平——即使把 ETF 按 stock 费率计（多算了印花税/过户费），
+    #    这多算的部分在 candidate 与 baseline 上完全相同，对 Δ 无影响；
+    # 2) `benchmark_excess` 打印的是相对基准的**报告数**，不进 verdict；
+    #    此时 stock 口径给 ETF 略高的成本，会让「候选/基线相对基准的超额」
+    #    略小一点点——方向偏保守，不会让一个真实劣于基准的池看起来好；
+    # 3) 逐标的按 `instruments.type` 选口径需要在费用循环里读库；本模块的
+    #    调用频率是 O(N_periods × N_pool) ≈ 每次沙盒回放几千次，值得记
+    #    这笔账，但目前 SEED_UNIVERSE 里 ETF 只 4/21，且都不参与短期动量池
+    #    的实际选中（见 `stocklab.candidate.seeds` 注释），保守单口径是
+    #    「简单且不会撬动结论」的合理默认。如果将来把 ETF 作为分散工具真的
+    #    大量入池，应改为逐标的按 `asset_class` 取 CostModel（见 ADR-008）。
     costs = costs or CostModel()
 
     from stocklab.candidate.run import score_pipeline  # 延迟 import，避免环
@@ -124,49 +156,69 @@ def period_returns(conn: sqlite3.Connection, *, asof_dates: list[str],
     out: list[float] = []
     for i in range(len(effective_dates) - 1):
         d0, d1 = effective_dates[i], effective_dates[i + 1]
-        hold = _members_on(d0)
-        nxt = _members_on(d1)
+        hold = _members_on(d0)   # 本期实际持仓（d0 决定，[d0,d1] 持有）
+        nxt = _members_on(d1)    # 下期持仓（d1 决定），仅用于本期末的调仓账单
 
-        # 期初在持 / 期末离场 / 期末新进
-        entering = [c for c in hold if c not in nxt]   # 本期卖出（下期不持有）
-        new = [c for c in nxt if c not in hold]        # 下期新买入
-
+        # 收益侧：iterate `hold`（**不是** `nxt`）。
+        # `nxt` 是 d1 才能知道的池，用它算 [d0,d1] 的收益 = 未来函数。
+        # 每只 c ∈ hold 需要通过 d0 的可交易性检查：涨停买不进的标的等价于
+        # 「无法在 d0 建仓 → [d0,d1] 期间不持有它 → 不产生该只的收益」。
+        # `hold - tradable_at_d0` 的部分等价于持现金（该只贡献 0，但仍摊薄 n）。
         p0 = {c: _close_on(conn, c, d0) for c in set(hold) | set(nxt)}
         p1 = {c: _close_on(conn, c, d1) for c in set(hold) | set(nxt)}
 
-        # 周期收益：下一期持仓在 [d0, d1] 的价格变动（等权）
-        gains: list[float] = []
-        for c in nxt:
-            if p0.get(c) and p1.get(c):
-                gains.append(p1[c] / p0[c] - 1.0)
-        gross = (sum(gains) / len(gains)) if gains else 0.0
-
-        # 成本：卖出 entering（下期清仓）+ 买入 new（下期新建仓）
-        # 费用比例相对于「每只标的名义市值 px * LOT」，再除以下期持仓数（等权分摊）
-        n_next = max(len(nxt), 1)  # 空池时用 1 做分母，保持费用比例的量纲一致
-        fee_ratio = 0.0
-
-        for c in entering:
+        # 计算 d0 的可交易过滤（涨停不可买 → 该只从 hold 剔除，不进 gross）
+        tradable_hold: list[str] = []
+        for c in hold:
             px = p0.get(c)
             if px is None:
-                continue
-            board = _board_of(conn, c)
-            prev = _prev_close(conn, c, d0)
-            if _limit_hit(prev if prev is not None else px, px, board) == "down":
-                continue  # 跌停卖不出
-            _, fee = costs.total("sell", px, LOT)
-            fee_ratio += fee / (px * LOT) / n_next
-
-        for c in new:
-            px = p0.get(c)
-            if px is None:
-                continue
+                continue  # 无 d0 价 → 无法建仓，不进 gross（与「无价」不可交易一致）
             board = _board_of(conn, c)
             prev = _prev_close(conn, c, d0)
             if _limit_hit(prev if prev is not None else px, px, board) == "up":
-                continue  # 涨停买不进
+                continue  # 涨停 d0 买不进 → 期间不持有 → 不进 gross（Finding 2）
+            tradable_hold.append(c)
+
+        gains: list[float] = []
+        for c in tradable_hold:
+            if p0.get(c) and p1.get(c):
+                gains.append(p1[c] / p0[c] - 1.0)
+        # 等权：分母是 hold 的**目标持仓数**（含无法买入的部分——它们占权重但收益 0）。
+        # 空 hold → 无持仓收益（持现金）；仅在下方产生清仓成本。
+        n_hold = max(len(hold), 1)
+        gross = (sum(gains) / n_hold) if hold else 0.0
+
+        # 成本：本期**末**（d1）执行调仓账单——把 hold 转成 nxt。
+        # 卖出 = hold - nxt（在 d1 卖），买入 = nxt - hold（在 d1 买）。
+        # 使用 **d1 价格与 d1 涨跌停**（trades 实际发生在 d1）。
+        # 归一化用 `n_hold`——本期的等权分母；空 hold 时用 1（此时唯一可能的 fee
+        # 是「新一期买入」，但那属于下一期的持仓建立而非本期成本；本模型把它
+        # 也计入本期，与「空池→现金→下一期新建仓」的算账语义一致）。
+        entering = [c for c in hold if c not in nxt]   # d1 卖出
+        new = [c for c in nxt if c not in hold]        # d1 买入
+        fee_ratio = 0.0
+
+        for c in entering:
+            px = p1.get(c)
+            if px is None:
+                continue
+            board = _board_of(conn, c)
+            prev = _prev_close(conn, c, d1)
+            if _limit_hit(prev if prev is not None else px, px, board) == "down":
+                continue  # d1 跌停卖不出（免费用）
+            _, fee = costs.total("sell", px, LOT)
+            fee_ratio += fee / (px * LOT) / n_hold
+
+        for c in new:
+            px = p1.get(c)
+            if px is None:
+                continue
+            board = _board_of(conn, c)
+            prev = _prev_close(conn, c, d1)
+            if _limit_hit(prev if prev is not None else px, px, board) == "up":
+                continue  # d1 涨停买不进（免费用，且该只不会进下一期 gross）
             _, fee = costs.total("buy", px, LOT)
-            fee_ratio += fee / (px * LOT) / n_next
+            fee_ratio += fee / (px * LOT) / n_hold
 
         out.append(gross - fee_ratio)
     return out
@@ -270,18 +322,37 @@ def benchmark_excess(conn: sqlite3.Connection, *, asof_dates: list[str],
 
     铁律要求「任何策略必须与 index_300 比较，跑不赢就明说」—— 所以这个
     数与版本 Δ **并列报告**，不是替代。
+
+    ## 缺失基准 bar 的处理（Finding 3，显式记账）
+
+    某个调仓边界 `d0`/`d1` 在 `bars_daily` 里查不到基准收盘价时（例如
+    历史扩充覆盖不全、或指数于该日无行情），本函数**跳过该周期**——
+    池收益侧与基准侧同步跳过，保证「同区间对齐」。这与旧实现「零填充」
+    的差别：零填充会把「缺数据的周期」当成「基准零涨跌」参与均值，
+    人为压低基准均值 → 虚增超额。跳过是更保守的选择：宁少一期，也
+    不把无观测当零。
+
+    该数仅进入报告 `detail`（打印给用户看的行），**不进 verdict**——
+    verdict 只看 Δ 序列。所以此处的口径选择不会撬动结论。
     """
     if len(asof_dates) < 2:
         return 0.0
-    pool_r = period_returns(conn, asof_dates=asof_dates, pool=pool,
-                            plugin_overrides=plugin_overrides, costs=costs)
-    bench_r: list[float] = []
-    for d0, d1 in zip(asof_dates, asof_dates[1:]):
+    pool_r_all = period_returns(conn, asof_dates=asof_dates, pool=pool,
+                                plugin_overrides=plugin_overrides, costs=costs)
+    # 同区间对齐：pool_r_all 的第 i 项对应 (asof_dates[i], asof_dates[i+1])。
+    # 缺基准 bar 的周期，池收益侧与基准侧同步跳过（不零填充）。
+    aligned_pool: list[float] = []
+    aligned_bench: list[float] = []
+    for i, (d0, d1) in enumerate(zip(asof_dates, asof_dates[1:])):
         a, b = _close_on(conn, benchmark, d0), _close_on(conn, benchmark, d1)
-        bench_r.append((b / a - 1.0) if (a and b) else 0.0)
-    if not pool_r:
+        if not (a and b):
+            continue  # 缺基准 bar：整个周期都不参与均值
+        aligned_bench.append(b / a - 1.0)
+        aligned_pool.append(pool_r_all[i])
+    if not aligned_pool:
         return 0.0
-    return sum(pool_r) / len(pool_r) - sum(bench_r) / len(bench_r)
+    return (sum(aligned_pool) / len(aligned_pool)
+            - sum(aligned_bench) / len(aligned_bench))
 
 
 def rebalance_marks(conn: sqlite3.Connection, *, pool: str, start: str,

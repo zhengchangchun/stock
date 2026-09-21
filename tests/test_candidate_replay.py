@@ -101,6 +101,152 @@ def test_flat_prices_give_zero_return_before_costs(tmp_db):
     assert len(r) == 1 and r[0] == 0.0
 
 
+# ---------------------------------------------------------------------------
+# Finding 1（look-ahead）证伪测试：d0 池 != d1 池，且两池收益不同
+# ---------------------------------------------------------------------------
+
+def test_gross_uses_d0_pool_not_d1_pool(tmp_db):
+    """周期 [d0, d1] 的毛收益必须来自 **d0 池**（hold），不是 d1 池（nxt）。
+
+    ## 夹具
+    - A 涨（10 → 20，+100%）；B 跌（10 → 5，-50%）
+    - d0 池 = ["A"]（在 d0 决定的持仓 → 本期实际持有 A）
+    - d1 池 = ["B"]（在 d1 才知道 → 属于下一期）
+    - 期望：本期毛收益 = A 的 [d0,d1] 收益 = +100%
+    - 旧代码（gross iterate nxt=["B"]）：+50% 变成 -50%，红。
+
+    ## 可证伪性
+    把 `period_returns` 的 `for c in tradable_hold` 改回 `for c in nxt`，
+    本测试立即变红（结果由 +100% 变成 -50%）。
+    """
+    dates = _dates(6)
+    c = _db_with_bars(
+        tmp_db,
+        {
+            "000A00": [10.0, 12.0, 14.0, 16.0, 18.0, 20.0],  # +100%
+            "000B00": [10.0, 9.0, 8.0, 7.0, 6.0, 5.0],       # -50%
+        },
+        dates,
+    )
+    flat = CostModel(commission_rate=0.0, min_commission=0.0,
+                     transfer_fee_rate=0.0, stamp_tax_rate=0.0,
+                     slippage_bps=0.0)
+    r = replay.period_returns(
+        c, asof_dates=[dates[0], dates[5]], pool="short", costs=flat,
+        _pools_for_test={dates[0]: ["000A00"], dates[5]: ["000B00"]})
+    assert len(r) == 1
+    # 期望：hold=A 在 [d0,d5] 涨 100%，扣掉「d1 处 A→B 调仓」的免佣费用（flat）。
+    # flat costs 下 fee=0，因此结果精确等于 +1.0。
+    assert r[0] == pytest.approx(1.0), (
+        f"期望 hold 池 A 的 +100% 收益，实际 {r[0]}——"
+        "若为 -0.5，说明 gross 仍在 iterate nxt（look-ahead 未修复）")
+
+
+def test_limit_up_at_d0_excludes_from_gross(tmp_db):
+    """Finding 2：`d0` 涨停买不进的标的**不进 gross**（原代码仅挡了 fee）。
+
+    ## 夹具
+    - A: prev_close 10.0，d0 close 11.0（+10%，主板涨停）；随后跌回 5.0
+    - d0 池 = ["A"]，d1 池 = ["A"]（同一只，无调仓变化）
+    - 旧代码：gross iterate nxt=[A]，把 [d0=11 → d1=5] 的 -54.5% 记为收益。
+      **Finding 2 揭示**：即便 fee 侧挡了，收益侧照样错。
+    - 新代码：A 在 d0 涨停 → 从 gross 里剔除 → gross=0；持现金。
+
+    ## 可证伪性
+    移除 tradable_hold 里的涨停过滤（即改回 `for c in hold`），本测试立即变红。
+    """
+    # 5 天：d(-1) prev_close=10.0，d0=11.0（涨停），d1..d3=5.0
+    # 用 6 个交易日，让 prev_close(d0) = day[0] 的 close
+    days = _dates(6)
+    prices = [10.0, 11.0, 8.0, 6.0, 5.0, 5.0]
+    c = _db_with_bars(tmp_db, {"000A00": prices}, days)
+    flat = CostModel(commission_rate=0.0, min_commission=0.0,
+                     transfer_fee_rate=0.0, stamp_tax_rate=0.0,
+                     slippage_bps=0.0)
+    # d0 = days[1]（close=11.0，prev_close=10.0，涨停），d1 = days[5]（close=5.0）
+    r = replay.period_returns(
+        c, asof_dates=[days[1], days[5]], pool="short", costs=flat,
+        _pools_for_test={days[1]: ["000A00"], days[5]: ["000A00"]})
+    assert len(r) == 1
+    # 期望：A 在 d0 涨停不可买 → 不进 gross → gross=0；hold=nxt=[A] → 无调仓账单
+    # 结果 = 0.0
+    assert r[0] == pytest.approx(0.0), (
+        f"期望涨停剔除后 gross=0，实际 {r[0]}——"
+        "涨跌停仍只挡了 fee，收益侧仍被计入（Finding 2 未修复）")
+
+
+def test_cost_leg_uses_d1_prices_and_limits(tmp_db):
+    """Finding 1 知会效应：调仓账单的价格/涨跌停判定在 **d1**（交易实际发生日）。
+
+    ## 夹具
+    - A：从 10 涨到 20（供 sell-at-d1 用）
+    - d0 池 = ["A"]，d1 池 = []（清仓）
+    - 期望：gross = A 从 [d0,d1] 的 +100%；成本 = 在 d1 卖 A（p1=20）
+      fee_ratio = fee(sell, 20, 100) / (20 * 100) / 1
+    - 旧代码：fee 用 p0=10 → 结果不同。
+
+    ## 可证伪性
+    把成本循环里的 `p1.get(c)` 改回 `p0.get(c)`，本测试即变红。
+    """
+    from stocklab.config.costs import CostModel as CM
+    dates = _dates(6)
+    c = _db_with_bars(tmp_db, {"000A00": [10.0, 12.0, 14.0, 16.0, 18.0, 20.0]},
+                      dates)
+    costs = CM()  # 非零费率，可以体现价格差异
+    p1 = 20.0
+    fill = costs.fill_price("sell", p1)
+    expected_fee = costs.fees("sell", fill, 100)
+    expected = 1.0 - expected_fee / (p1 * 100)
+    r = replay.period_returns(
+        c, asof_dates=[dates[0], dates[5]], pool="short", costs=costs,
+        _pools_for_test={dates[0]: ["000A00"], dates[5]: []})
+    assert len(r) == 1
+    assert r[0] == pytest.approx(expected), (
+        f"期望调仓 fee 用 d1 价格 {p1}，实际 {r[0]} vs {expected}——"
+        "若接近旧值，说明 fee 仍在用 p0 价格")
+
+
+def test_benchmark_excess_skips_missing_bench_periods(tmp_db):
+    """Finding 3：基准 bar 缺失时**跳过该周期**（不零填充）。
+
+    ## 夹具
+    - 池：A（+50% 每期）
+    - 基准 sh000300：只有 dates[0] 和 dates[5] 有 bar；中间的 dates[2] 无 bar
+    - 用三段调仓：dates[0] → dates[2] → dates[5]
+      - 段 1 `[d0,d2]`：基准缺 d2 bar → 跳过
+      - 段 2 `[d2,d5]`：基准缺 d2 bar → 跳过
+    - 期望：所有段都跳过 → aligned 空 → 返回 0.0（不是零填充参与均值）
+    """
+    dates = _dates(6)
+    c = _db_with_bars(tmp_db,
+                      {"000A00": [10.0, 12.0, 14.0, 16.0, 18.0, 20.0]},
+                      dates)
+    # 只给基准 dates[0] 与 dates[5] 有 bar
+    c.execute("INSERT INTO instruments (code, name, market, board, type,"
+              " added_at) VALUES ('sh000300','沪深300指数','sh','main',"
+              "'index',?)", (NOW,))
+    c.executemany(
+        "INSERT INTO bars_daily (code, date, open, high, low, close, volume,"
+        " adj_mode, source, fetched_at) VALUES ('sh000300',?,?,?,?,?,1000,"
+        "'none','x',?)",
+        [(dates[0], 100.0, 100.0, 100.0, 100.0, NOW),
+         (dates[5], 200.0, 200.0, 200.0, 200.0, NOW)])
+    c.commit()
+    flat = CostModel(commission_rate=0.0, min_commission=0.0,
+                     transfer_fee_rate=0.0, stamp_tax_rate=0.0,
+                     slippage_bps=0.0)
+    # 三段：[d0,d2],[d2,d5]，基准都缺 d2 bar → 全部跳过 → 返回 0.0
+    # 用 _pools_for_test 走进 period_returns；但 benchmark_excess 会先算池收益
+    # 池：三段都持有 A → gross 每段都为正
+    # 结论：即使池有真实正收益，基准全跳过 → 无法比较 → 返回 0.0
+    val = replay.benchmark_excess(
+        c, asof_dates=[dates[0], dates[2], dates[5]], pool="short",
+        plugin_overrides=None, benchmark="sh000300", costs=flat)
+    assert val == 0.0, (
+        f"期望基准全跳过时返回 0.0（无对齐周期），实际 {val}——"
+        "若非 0，说明仍在用零填充（Finding 3 未修复）")
+
+
 # ---------- Task 4：Δ 与切分 ----------
 
 def test_split_is_by_period_index_not_calendar():
@@ -149,11 +295,12 @@ def _insert_script(conn, plugin_id="plug_x", version="1"):
 def test_deltas_are_candidate_minus_baseline(tmp_db):
     """Δ = 候选版本周期收益 − 基线版本周期收益。
 
-    候选：持有 000333（nxt 里有它，从 dates[0]→dates[5] 涨 50%）；
-    基线：两期都空仓（nxt 为空，收益=0）→ Δ > 0。
+    候选：持有 000333（hold 里有它，从 dates[0]→dates[5] 涨 50%）；
+    基线：两期都空仓（hold 为空，收益=0）→ Δ > 0。
 
-    注：`period_returns` 按 `nxt`（d1 的池成员）计算周期收益，因此要让
-    候选真的「持有」000333，d1（dates[5]）的 pool 里必须包含它。
+    注：**Finding 1 修复后**，`period_returns` 按 `hold`（d0 池成员）计算
+    周期收益（不再是 nxt）。要让候选真的「持有」000333 并在本期得到 +50%，
+    d0（dates[0]）的 pool 里必须包含它。
 
     短路已去除：replay_period_deltas 无论等 id 与否都调 _plugin_id_of，
     所以这里必须先插入真实的 plugin_scripts 行。
@@ -165,8 +312,8 @@ def test_deltas_are_candidate_minus_baseline(tmp_db):
     flat = CostModel(commission_rate=0.0, min_commission=0.0,
                      transfer_fee_rate=0.0, stamp_tax_rate=0.0,
                      slippage_bps=0.0)
-    # 候选：d1（dates[5]）的 nxt 包含 000333 → 计算 10→15 的收益（+50%）
-    # 基线：两期都空仓（nxt 为空 → 收益 = 0）→ Δ = 0.5 > 0
+    # 候选：d0（dates[0]）的 hold 包含 000333 → 计算 10→15 的收益（+50%）
+    # 基线：两期都空仓（hold 为空 → 收益 = 0）→ Δ = 0.5 > 0
     tr, va = replay.replay_period_deltas(
         c, candidate_script_id=sid, baseline_script_id=sid, pool="short",
         window_start=dates[0], window_end=dates[-1], costs=flat,
