@@ -116,6 +116,13 @@ stocklab portfolio show --asof 2026-09-15 --json     # P13 消费的稳定接口
   `paper_agent_decisions` append-only 台账（`n_trials`/`prompt_sha256`/`context_sha256` 全留痕）、
   PIT 门禁与可复现判据、`改函数`走既有插桩状态机（人工 approve 是硬门槛）、
   预注册结论判据（`Δ(agent−random)` CI 下界>0）与「什么结果不算证据」清单，澄清点 D-16–D-22
+  已全部拍板（2026-09-21）
+- [`superpowers/specs/2026-09-21-智能体动态编排臂-design.md`](superpowers/specs/2026-09-21-智能体动态编排臂-design.md)
+  — **P37 实现用设计**：`paper_agent_decisions` DDL（含 append-only 触发器）、spec 白名单表、
+  模块接口（`agent_spec` / `agent_context` / `engine` 分派 / CLI / 报告字段）、
+  阶段 1 的 8 条可执行验收（含**静态臂逐字节对拍**）、阶段 5 的「走子进程而不是 import plugin」约束
+- [`tasks/2026-09-21-p37-动态编排臂-阶段1.md`](tasks/2026-09-21-p37-动态编排臂-阶段1.md)
+  — **今晚开发任务书**（T1–T7，含开工前置对拍基线 sha `92a5ce8b…d941`、风险点与收尾复核清单）
 - [`plans/2026-09-15-p11-调度链.md`](plans/2026-09-15-p11-调度链.md) — P11 设计稿：
   快照幂等键、收盘回填、LIVE/REPLAY 口径分列
 - [`tasks/2026-09-15-p11-调度链-task45-52.md`](tasks/2026-09-15-p11-调度链-task45-52.md) —
