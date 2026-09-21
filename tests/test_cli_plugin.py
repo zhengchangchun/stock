@@ -354,3 +354,72 @@ def test_sandbox_cli_first_version_has_no_baseline(db, capsys):
     assert code == 0
     assert "baseline" in out.lower() or "INCONCLUSIVE" in out
 
+
+# ---------- 默认基线不许选到「自己」（否则自比较短路） ----------
+
+
+def _register(db, plugin_id, version, text=SCORE_SCRIPT):
+    """走完 submit → sandbox → approve，返回 script_id（上线后为 active）。"""
+    c = connect(db)
+    sid = store.insert_script(c, plugin_id=plugin_id, version=version,
+                              source_text=text, note=None, now=NOW)
+    lifecycle.record_submit(c, sid, actor="t", now=NOW)
+    lifecycle.record_sandbox(c, sid, passed=True, reason="ok", now=NOW)
+    lifecycle.approve(c, sid, actor="t", reason="ok", now=NOW)
+    c.close()
+    return sid
+
+
+def test_sandbox_cli_active_version_uses_previous_as_baseline(db, capsys):
+    """被比版本**就是** active → 基线退到上一个版本，不再自比较。
+
+    这是本次修复的核心：`plugin sandbox <active_id>` 是常见用法，修前
+    baseline 解析成它自己 → run_sandbox 短路成 INCONCLUSIVE(self_comparison)。
+    """
+    a = _register(db, "3", "1.0.0")
+    b = _register(db, "3", "2.0.0")          # 上线后 b 是 active、a 归档
+    code, out = run(db, "plugin", "sandbox", str(b), "--pool", "short",
+                    "--now", NOW, capsys=capsys)
+    assert code == 0
+    assert "self_comparison" not in out, f"仍然自比较了：{out!r}"
+    assert f"'baseline': {a}," in out, f"基线应为上一个版本 {a}，实际：{out!r}"
+
+
+def test_sandbox_cli_explicit_baseline_overrides_default(db, capsys):
+    """`--baseline` 显式指定时用它，而不是默认的「上一个版本」。"""
+    v1 = _register(db, "3", "1.0.0")
+    _register(db, "3", "2.0.0")              # 默认基线会选它
+    v3 = _register(db, "3", "3.0.0")         # active
+    code, out = run(db, "plugin", "sandbox", str(v3), "--baseline", str(v1),
+                    "--pool", "short", "--now", NOW, capsys=capsys)
+    assert code == 0
+    assert f"'baseline': {v1}," in out, f"--baseline 未被采用：{out!r}"
+
+
+def test_sandbox_cli_explicit_baseline_missing_is_rejected(db, capsys):
+    """--baseline 指向不存在的脚本 → 退出码 2 + 明确文案（不抛栈）。"""
+    a = _register(db, "3", "1.0.0")
+    code, out = run(db, "plugin", "sandbox", str(a), "--baseline", "99999",
+                    "--pool", "short", "--now", NOW, capsys=capsys)
+    assert code == 2
+    assert "不存在" in out
+
+
+def test_sandbox_cli_explicit_baseline_from_other_plugin_is_rejected(db, capsys):
+    """--baseline 与候选不同插件 → 退出码 2（单变量原则，不抛栈）。"""
+    a = _register(db, "3", "1.0.0")
+    other = _register(db, "4", "1.0.0")
+    code, out = run(db, "plugin", "sandbox", str(a), "--baseline", str(other),
+                    "--pool", "short", "--now", NOW, capsys=capsys)
+    assert code == 2
+    assert "插件" in out
+
+
+def test_sandbox_cli_explicit_baseline_equal_to_candidate_is_rejected(db, capsys):
+    """--baseline 就是候选自己 → 退出码 2（显式要求自比较是用户错误）。"""
+    a = _register(db, "3", "1.0.0")
+    code, out = run(db, "plugin", "sandbox", str(a), "--baseline", str(a),
+                    "--pool", "short", "--now", NOW, capsys=capsys)
+    assert code == 2
+    assert "同一个脚本" in out
+

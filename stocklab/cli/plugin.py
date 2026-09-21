@@ -123,11 +123,25 @@ def cmd_plugin_sandbox(args) -> int:
         window_end = args.window_end if args.window_end is not None \
             else now_str[:10]
         row = store.get_script(conn, sid)
-        if row is None:
-            # 首版（或 script_id 不存在）→ baseline=None → INCONCLUSIVE
-            baseline = None
+        if args.baseline is not None:
+            baseline = int(args.baseline)
+            b = store.get_script(conn, baseline)
+            if b is None:
+                print(f"--baseline 指定的脚本 {baseline} 不存在", file=sys.stderr)
+                return 2
+            if row is not None and b["plugin_id"] != row["plugin_id"]:
+                print(f"--baseline 的插件是 {b['plugin_id']!r}，候选是 "
+                      f"{row['plugin_id']!r} —— 单变量原则要求两者同插件",
+                      file=sys.stderr)
+                return 2
+            if baseline == sid:
+                print(f"--baseline 与候选是同一个脚本（{sid}）—— Δ 恒为 0，"
+                      "不构成对比", file=sys.stderr)
+                return 2
         else:
-            baseline = lifecycle.active_script_id(conn, row["plugin_id"])
+            # 默认基线：非 active → 现役 active；被比版本**就是** active →
+            # 上一个版本。刻意不选自己（否则 run_sandbox 短路成自比较）。
+            baseline = lifecycle.baseline_for(conn, sid)
         _deps = SandboxDeps(
             replay=_replay_mod.replay_period_deltas,
             benchmark_excess=_replay_mod.benchmark_excess,

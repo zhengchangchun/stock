@@ -214,6 +214,56 @@ def test_call_active_without_override_still_requires_active(conn):
         lifecycle.call_active(conn, "3", {})
 
 
+# ---------- 沙盒默认基线：不许选到「自己」 ----------
+
+def _approve(conn, sid):
+    lifecycle.record_submit(conn, sid, actor="t", now=NOW)
+    lifecycle.record_sandbox(conn, sid, passed=True, reason="ok", now=NOW)
+    lifecycle.approve(conn, sid, actor="t", reason="ok", now=NOW)
+
+
+def test_baseline_for_pending_version_picks_active(conn):
+    """被比版本**不是** active（待审/归档）→ 基线取现役 active。"""
+    a = _new(conn, version="1.0.0")
+    _approve(conn, a)
+    b = _new(conn, version="2.0.0")          # 只到 draft，不是 active
+    assert lifecycle.baseline_for(conn, b) == a
+
+
+def test_baseline_for_active_version_falls_back_to_previous(conn):
+    """被比版本**就是** active → 基线退到**上一个版本**，绝不选到自己。
+
+    这正是 CLI `plugin sandbox <active_id>` 的默认场景：修前会解析出
+    baseline == candidate → run_sandbox 短路成 INCONCLUSIVE(self_comparison)。
+    """
+    a = _new(conn, version="1.0.0")
+    _approve(conn, a)
+    b = _new(conn, version="2.0.0")
+    _approve(conn, b)                        # 上线 b → a 自动 archived
+    assert lifecycle.active_script_id(conn, "3") == b
+    assert lifecycle.baseline_for(conn, b) == a
+
+
+def test_baseline_for_archived_version_picks_active(conn):
+    """归档版本被比时，基线取现役 —— 即「拿旧版跟当前冠军比」。"""
+    a = _new(conn, version="1.0.0")
+    _approve(conn, a)
+    b = _new(conn, version="2.0.0")
+    _approve(conn, b)
+    assert lifecycle.baseline_for(conn, a) == b
+
+
+def test_baseline_for_first_and_only_version_is_none(conn):
+    """首版且是唯一版本 → 没有可比对象 → None（不编一个基线出来）。"""
+    a = _new(conn, version="1.0.0")
+    _approve(conn, a)
+    assert lifecycle.baseline_for(conn, a) is None
+
+
+def test_baseline_for_missing_script_is_none(conn):
+    assert lifecycle.baseline_for(conn, 99999) is None
+
+
 def test_approve_is_not_reachable_from_non_cli_code():
     """源码扫描：除 CLI 与 lifecycle 自身外，没有任何模块调用 approve/write。
 

@@ -2806,8 +2806,11 @@ def build_parser() -> argparse.ArgumentParser:
     pl_list.set_defaults(func=cmd_plugin_list)
 
     pl_sandbox = pl_sub.add_parser(
-        "sandbox", help="回放对比：该版本 vs 当前 active（离线只读）")
+        "sandbox", help="回放对比：该版本 vs 基线版本（离线只读；未指定 --baseline "
+                        "时用现役 active，被比版本就是 active 则退到上一个版本）")
     pl_sandbox.add_argument("script_id")
+    pl_sandbox.add_argument("--baseline", default=None,
+                            help="基线版本 script_id（默认见上；须与候选同插件）")
     pl_sandbox.add_argument("--pool", default="short",
                             choices=["short", "mid", "long"])
     pl_sandbox.add_argument("--window-start", default="2015-01-01")

@@ -80,6 +80,33 @@ def active_script_id(conn: sqlite3.Connection, plugin_id: str,
     return active[0]
 
 
+def baseline_for(conn: sqlite3.Connection, script_id: int) -> int | None:
+    """给沙盒对比挑一个**默认基线**版本（`plugin sandbox <id>` 不传 `--baseline` 时用）。
+
+    规则（顺序敏感）：
+
+    1. 该插件有 active 版本、且**不是** `script_id` 本身 → 用 active
+       （拿现役版本当基线，对比待审 / 归档版本）。
+    2. 否则（`script_id` 就是 active，或该插件无 active）→ 同插件下
+       `script_id` 更小的最大者，即**上一个版本**。
+    3. 都不存在（首版）→ `None`。
+
+    **必须避开「自己」**：`run_sandbox` 对 candidate == baseline 会短路成
+    `INCONCLUSIVE(self_comparison)`。而 `plugin sandbox <active_id>`（拿现役
+    版本去比）恰恰是最常见的用法 —— 选了它自己就等于跑了个寂寞。
+    """
+    row = store.get_script(conn, script_id)
+    if row is None:
+        return None
+    pid = row["plugin_id"]
+    active = active_script_id(conn, pid)
+    if active is not None and active != script_id:
+        return active
+    older = [s["script_id"] for s in store.list_scripts(conn, plugin_id=pid)
+             if s["script_id"] < script_id]
+    return max(older) if older else None
+
+
 def record_submit(conn: sqlite3.Connection, script_id: int, *, actor: str,
                   now: str) -> None:
     store.insert_audit(conn, script_id=script_id, action="submit", actor=actor,
