@@ -85,12 +85,40 @@ def cmd_doctor(db_path: Path | None = None) -> int:
 
 # ---------- ingest ----------
 
+def _bars_universe(conn):
+    """K 线采集的标的集合：**库里的 `instruments`（股票 + ETF）**，库为空时退回 `DEFAULT_UNIVERSE`。
+
+    为什么不再直接用 `DEFAULT_UNIVERSE`：库里现有 21 只种子（`candidate/seeds.py`），
+    其中 **15 只不在 `DEFAULT_UNIVERSE`**（它只有 6 只，是首次建库的种子）——
+    旧写法会静默只采 6 只，其余 15 只的 K 线永远停在旧日期（ERROR_DIARY #44 的同类坑，
+    但那次是 `--code`，这次是**默认全量**）。
+
+    与 `_tick_universe` 的差别只有一个：本函数连 ETF 一起采（基准/红利 ETF 也要日线），
+    而 tick 只看 `type='stock'`。库是**真源**（`instruments` 可增删）。
+    """
+    from stocklab.config.universe import Instrument
+
+    try:
+        rows = conn.execute(
+            "SELECT code, name, market, board, type FROM instruments"
+            " WHERE active=1 ORDER BY code").fetchall()
+    except sqlite3.Error:
+        return tuple(DEFAULT_UNIVERSE)
+    loaded = tuple(
+        Instrument(r["code"], r["name"], r["market"], r["board"], r["type"])
+        for r in rows)
+    return loaded or tuple(DEFAULT_UNIVERSE)
+
+
 def cmd_ingest_bars(args: argparse.Namespace) -> int:
     """真实抓取日K（联网）。这是 P2 的端到端验收命令。
 
     数据源：腾讯 `fqkline` **不复权** + `end` 锚点分页（ADR-003）。
     东财在本环境不可达（ADR-003 实测），且 qfq 不得落库（铁律①），
     故这里**没有**降级到 qfq 的分支 —— 宁可失败留痕，也不写口径错误的数据。
+
+    标的集合取自**库里的 `instruments`**（股票 + ETF，见 `_bars_universe`）；`--code` 里出现
+    库里没有的代码时**不静默跳过**：print 到 stderr 并退出 1（ERROR_DIARY #44）。
     """
     from stocklab.data.fetch import fetch_daily_bars, policy_from_settings
     from stocklab.data.http import HttpClient
@@ -102,19 +130,28 @@ def cmd_ingest_bars(args: argparse.Namespace) -> int:
     now = datetime.now(TZ).isoformat(timespec="seconds")
     start = (date.today() - timedelta(days=args.days)).isoformat()
     end = _today()
-    universe = tuple(i for i in DEFAULT_UNIVERSE
-                     if not args.code or i.code in args.code)
-
-    cache = RawCache(paths.RAW_CACHE_DIR) if settings.cache_enabled else None
-    client = HttpClient(policy_from_settings(settings), cache=cache)
-
-    def fetch(code: str):
-        inst = next(i for i in universe if i.code == code)
-        return fetch_daily_bars(client, code=inst.tencent_code, start=start, end=end)
 
     ensure_schema(paths.DB_PATH)   # 写库入口前滚（P33）：链路上任一步都不许在旧 schema 上写
     conn = connect(paths.DB_PATH)
     try:
+        universe = _bars_universe(conn)
+        if args.code:
+            known = {i.code for i in universe}
+            unknown = [c for c in dict.fromkeys(args.code) if c not in known]
+            if unknown:
+                print(f"❌ --code 里有不在库 instruments 的代码，拒绝静默跳过: {unknown}",
+                      file=sys.stderr)
+                return 1
+            wanted = set(args.code)
+            universe = tuple(i for i in universe if i.code in wanted)
+
+        cache = RawCache(paths.RAW_CACHE_DIR) if settings.cache_enabled else None
+        client = HttpClient(policy_from_settings(settings), cache=cache)
+
+        def fetch(code: str):
+            inst = next(i for i in universe if i.code == code)
+            return fetch_daily_bars(client, code=inst.tencent_code, start=start, end=end)
+
         repo.upsert_instruments(conn, universe, now=now)
         report = ingest_daily_bars(conn, client, cache, universe,
                                    start=start, end=end, now=now, fetch=fetch)
