@@ -16,6 +16,16 @@
 不可成交。**规则不随插桩版本变化** —— 否则「改下游」会成为另一条提分
 路径，归因失效。
 
+### 成本口径（ADR-017 D-13 / D-14）
+
+- **按每只名义仓位计**（`POSITION_NOTIONAL`），**不按 1 手**。用 1 手接
+  固定 5 元最低佣金，会把成本除成大费率（低价股放大 19 倍）——
+  见 `stocklab/config/replay.py` 的注释。
+- **费用用 `CostModel.fees()`（参考价）**，不用 `total()`（滑点价）：
+  滑点由下面单独计，避免同一笔滑点被算两遍。
+- **滑点如实计入**（铁律 4）：每**成交一条腿**收 `slippage_bps × (1/n_hold)`。
+  持仓不动不成交、也就不产生滑点；被涨跌停挡住的腿**没成交**，同样不收。
+
 ## 本模块在 candidate/ 下，不在 plugin/ 下
 
 回放要调打分内核；`plugin/` 不得 import `candidate/`。所以回放住在这里，
@@ -28,14 +38,11 @@ import sqlite3
 
 from stocklab.backtest.portfolio import BoardUnknown, LIMIT_BY_BOARD, LIMIT_TOLERANCE
 from stocklab.config.costs import CostModel
-from stocklab.config.replay import REBALANCE_DAYS
+from stocklab.config.replay import POSITION_NOTIONAL, REBALANCE_DAYS
 
 #: 空池时的处置：持现金。**不是**「跳过该周期」—— 卖出上一期持仓是要付
 #: 成本的，跳过会把那笔成本抹掉。
 EMPTY_POOL_IS_CASH: bool = True
-
-#: 每期等权买入的目标手数（整手）。
-LOT = 100
 
 #: 涨跌停判定时的比较容差（同 `backtest.portfolio.LIMIT_TOLERANCE`）。
 #: `portfolio.py` 使用 1e-6 处理浮点表示误差（如 1.1*10 = 10.999…）。
@@ -92,6 +99,17 @@ def _prev_close(conn: sqlite3.Connection, code: str, date: str) -> float | None:
     return None if row is None else float(row["close"])
 
 
+def _qty_for(px: float) -> int:
+    """每只的名义仓位换算成股数：`max(1, int(POSITION_NOTIONAL / px))`。
+
+    保留 `int()` 的**整股截断**（不是四舍五入）—— 真实下单也不能买半股。
+    代价是实际名义额 `px × qty` 可能**略小于** `POSITION_NOTIONAL`（最多差 1 股），
+    所以「最低佣金不生效」的充分条件要落在 **`px × qty ≥ 20000`** 上，
+    而不是设定的名义额上（见设计文档 §3）。
+    """
+    return max(1, int(POSITION_NOTIONAL / px))
+
+
 def period_returns(conn: sqlite3.Connection, *, asof_dates: list[str],
                    pool: str, plugin_overrides: dict[str, int] | None = None,
                    costs: CostModel | None = None,
@@ -113,7 +131,9 @@ def period_returns(conn: sqlite3.Connection, *, asof_dates: list[str],
     - **本期成本** = 在 `d1` 执行的调仓账单（把 `hold` 转成 `nxt`）：
       - 卖出 `hold - nxt`（按 `d1` 价格与 `d1` 涨跌停判定）
       - 买入 `nxt - hold`（按 `d1` 价格与 `d1` 涨跌停判定）
-      按 `n_hold` 归一化。首期无起点建仓成本；末期不再计后续新买入。
+      按 `n_hold` 归一化，每只的名义仓位见 `_qty_for`（ADR-017 D-13）。
+      首期无起点建仓成本；末期不再计后续新买入。
+      另收**滑点**：每成交一条腿 `slippage_bps × (1/n_hold)`（ADR-017 D-14）。
     - **涨跌停（Finding 2）**：`d0` 涨停买不进 → 本期不持有该只 → 不算入
       gross（原代码仅挡了 fee 侧、漏挡收益侧，是本次修复的一部分）。
       `d1` 涨/跌停挡住的仅是**本期末**的调仓账单。
@@ -197,6 +217,9 @@ def period_returns(conn: sqlite3.Connection, *, asof_dates: list[str],
         entering = [c for c in hold if c not in nxt]   # d1 卖出
         new = [c for c in nxt if c not in hold]        # d1 买入
         fee_ratio = 0.0
+        #: 成交的腿数（滑点在下面按它计）。被涨跌停挡住的腿**没成交**，
+        #: 所以既不收费也不收滑点 —— 与费用严格同形。
+        n_filled = 0
 
         for c in entering:
             px = p1.get(c)
@@ -206,8 +229,9 @@ def period_returns(conn: sqlite3.Connection, *, asof_dates: list[str],
             prev = _prev_close(conn, c, d1)
             if _limit_hit(prev if prev is not None else px, px, board) == "down":
                 continue  # d1 跌停卖不出（免费用）
-            _, fee = costs.total("sell", px, LOT)
-            fee_ratio += fee / (px * LOT) / n_hold
+            qty = _qty_for(px)
+            fee_ratio += costs.fees("sell", px, qty) / (px * qty) / n_hold
+            n_filled += 1
 
         for c in new:
             px = p1.get(c)
@@ -217,10 +241,17 @@ def period_returns(conn: sqlite3.Connection, *, asof_dates: list[str],
             prev = _prev_close(conn, c, d1)
             if _limit_hit(prev if prev is not None else px, px, board) == "up":
                 continue  # d1 涨停买不进（免费用，且该只不会进下一期 gross）
-            _, fee = costs.total("buy", px, LOT)
-            fee_ratio += fee / (px * LOT) / n_hold
+            qty = _qty_for(px)
+            fee_ratio += costs.fees("buy", px, qty) / (px * qty) / n_hold
+            n_filled += 1
 
-        out.append(gross - fee_ratio)
+        # 滑点（ADR-017 D-14）：铁律 4 要求滑点必须进净值曲线。
+        # 等权下每只占 1/n_hold，所以一条腿的滑点 = slippage_bps × (1/n_hold)。
+        # 旧实现把 `costs.total()` 的第一个返回值（滑点价）丢掉 → **等于没算滑点**：
+        # 滑点只让费用基数大了 5bp，对 0.025% 的佣金可忽略。
+        slippage_ratio = (costs.slippage_bps / 10_000.0) * n_filled / n_hold
+
+        out.append(gross - fee_ratio - slippage_ratio)
     return out
 
 

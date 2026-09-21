@@ -69,17 +69,22 @@ def _db_with_bars(tmp_db, prices: dict[str, list[float]], dates: list[str]):
 def test_empty_pool_holds_cash_but_pays_liquidation_cost(tmp_db):
     """空池 → 不产生持仓收益，但仍要卖掉上一期持仓、付清仓成本。
 
-    收益**不是 0** —— 是清仓成本的负值。这里手工算：第 0 期持有 100 股
-    @10.00，第 1 期池空 → 必须卖出，费用 = `CostModel.fees('sell', 10.00, 100)`，
-    以「占初始市值 1000 元」的比例计，即 `-fees/1000`。
+    收益**不是 0** —— 是清仓成本的负值。成本按**每只名义仓位**
+    `POSITION_NOTIONAL` 换算（ADR-017 D-13，不是 1 手），且滑点如实计入（D-14）。
+    这里手工算：第 0 期持有 A，第 1 期池空 → 卖出 1 条腿。
     """
     from stocklab.config.costs import CostModel as CM
+    from stocklab.config.replay import POSITION_NOTIONAL
 
     dates = _dates(6)
     c = _db_with_bars(tmp_db, {"000333": [10.0] * 6}, dates)
     costs = CM()
-    expected_fee = costs.fees("sell", costs.fill_price("sell", 10.0), 100)
-    expected = -expected_fee / 1000.0
+    px = 10.0
+    qty = int(POSITION_NOTIONAL / px)          # 与实现同式（整股截断）
+    expected_fee_ratio = costs.fees("sell", px, qty) / (px * qty)
+    # n_hold = 1（hold 只有一只），成交 1 条腿
+    expected_slippage = costs.slippage_bps / 10_000.0
+    expected = -(expected_fee_ratio + expected_slippage)
 
     r = replay.period_returns(
         c, asof_dates=[dates[0], dates[5]], pool="short", costs=costs,
@@ -87,6 +92,8 @@ def test_empty_pool_holds_cash_but_pays_liquidation_cost(tmp_db):
     assert len(r) == 1
     assert r[0] == pytest.approx(expected)
     assert r[0] < 0, "空池不是零收益 —— 清仓要付钱"
+    # 口径哨兵：按 1 手（100 股）算会差一个数量级（0.5010% vs 0.0260% 费率）
+    assert abs(r[0]) < 0.01, "成本仍是 1 手口径（被放大到离群值）"
 
 
 def test_flat_prices_give_zero_return_before_costs(tmp_db):
@@ -182,28 +189,32 @@ def test_cost_leg_uses_d1_prices_and_limits(tmp_db):
     - A：从 10 涨到 20（供 sell-at-d1 用）
     - d0 池 = ["A"]，d1 池 = []（清仓）
     - 期望：gross = A 从 [d0,d1] 的 +100%；成本 = 在 d1 卖 A（p1=20）
-      fee_ratio = fee(sell, 20, 100) / (20 * 100) / 1
-    - 旧代码：fee 用 p0=10 → 结果不同。
+      fee_ratio = `fees(sell, 20, qty) / (20 × qty) / 1`，qty = `int(名义仓位/20)`
+      （ADR-017 D-13：按名义仓位，**不是** 1 手），另加 1 条腿的滑点（D-14）
+    - 旧代码：fee 用 p0=10 → 结果不同；且用 `total()` → 滑点被丢掉。
 
     ## 可证伪性
     把成本循环里的 `p1.get(c)` 改回 `p0.get(c)`，本测试即变红。
     """
     from stocklab.config.costs import CostModel as CM
+    from stocklab.config.replay import POSITION_NOTIONAL
     dates = _dates(6)
     c = _db_with_bars(tmp_db, {"000A00": [10.0, 12.0, 14.0, 16.0, 18.0, 20.0]},
                       dates)
     costs = CM()  # 非零费率，可以体现价格差异
     p1 = 20.0
-    fill = costs.fill_price("sell", p1)
-    expected_fee = costs.fees("sell", fill, 100)
-    expected = 1.0 - expected_fee / (p1 * 100)
+    qty = int(POSITION_NOTIONAL / p1)
+    expected_fee = costs.fees("sell", p1, qty)
+    expected = (1.0 - expected_fee / (p1 * qty)
+                - costs.slippage_bps / 10_000.0)
     r = replay.period_returns(
         c, asof_dates=[dates[0], dates[5]], pool="short", costs=costs,
         _pools_for_test={dates[0]: ["000A00"], dates[5]: []})
     assert len(r) == 1
     assert r[0] == pytest.approx(expected), (
-        f"期望调仓 fee 用 d1 价格 {p1}，实际 {r[0]} vs {expected}——"
-        "若接近旧值，说明 fee 仍在用 p0 价格")
+        f"期望调仓 fee 用 d1 价格 {p1} 且按名义仓位，实际 {r[0]} vs {expected}——"
+        "若接近旧值，说明 fee 仍在用 p0 价格或 1 手口径")
+    assert r[0] < expected + 1e-9
 
 
 def test_benchmark_excess_skips_missing_bench_periods(tmp_db):
@@ -282,6 +293,173 @@ def test_split_keeps_order():
 
 def test_split_ratio_is_constant():
     assert replay.SPLIT_TRAIN_RATIO == 0.7
+
+
+# ---------------------------------------------------------------------------
+# 回放成本口径（ADR-017 D-13 名义仓位 / D-14 滑点如实计入）
+# ---------------------------------------------------------------------------
+
+def _zero_model(**kw) -> CostModel:
+    """只留指定项的成本模型：其余全 0（隔离被测项）。"""
+    base = dict(commission_rate=0.0, min_commission=0.0, transfer_fee_rate=0.0,
+                stamp_tax_rate=0.0, slippage_bps=0.0)
+    base.update(kw)
+    return CostModel(**base)
+
+
+def test_qty_truncates_to_whole_shares():
+    """`qty = max(1, int(N / px))` —— **整股截断**（不是四舍五入）。
+
+    代价：实际名义额 `px × qty` 可能略小于 `POSITION_NOTIONAL`，
+    所以「最低佣金不生效」的充分条件落在 `px × qty ≥ 20000` 上。
+    """
+    from stocklab.config.replay import POSITION_NOTIONAL
+    assert replay._qty_for(17.3) == int(POSITION_NOTIONAL / 17.3) == 5780
+    assert 17.3 * 5780 < POSITION_NOTIONAL        # 截断 → 略小于名义仓位
+    assert replay._qty_for(1e9) == 1              # 买不起 1 股 → 仍按 1 股（不静默变 0）
+
+
+def test_min_commission_boundary_is_20k_notional():
+    """最低佣金只在名义额 < 2 万元时生效（20000 × 0.025% 恰 = 5 元）。
+
+    这是「≥ 2 万是常数区间、不存在可调的 N」这条推导的算术基础。
+    隔离佣金：把印花税/过户费置 0。
+    """
+    costs = _zero_model(commission_rate=0.00025, min_commission=5.0)
+    assert costs.fees("buy", 10.0, 1000) == 5.0     # 名义 10000 → 2.5 < 5 → 最低佣金生效
+    assert costs.fees("buy", 10.0, 2000) == 5.0     # 名义 20000 → 恰相等（临界点）
+    assert costs.fees("buy", 10.0, 3000) == 7.5     # 名义 30000 → 比例佣金生效
+
+
+def test_cost_is_insensitive_to_notional_above_20k(tmp_db, monkeypatch):
+    """正向采信条件（设计 §5.1）：N ∈ {2万,5万,10万,50万} 两两等价。
+
+    夹具：4 只价格 17.3（**非整数**，故意触发整股截断）的标的，
+    四个调仓日每期只换 1 只（1 卖 + 1 买）→ 3 个周期。
+
+    容差不是「逐位相同」：`fees()` 末尾有 `round(…, 2)`，不同 N 的四舍五入
+    落到不同的分位上 → 只差一个极小的量。
+    """
+    dates = _dates(6)
+    px = 17.3
+    c = _db_with_bars(tmp_db, {code: [px] * 6
+                               for code in ("000A00", "000B00", "000C00", "000D00")},
+                      dates)
+    pools = {dates[0]: ["000A00"], dates[1]: ["000B00"],
+             dates[2]: ["000C00"], dates[3]: ["000D00"]}
+    marks = [dates[0], dates[1], dates[2], dates[3]]
+
+    series: list[list[float]] = []
+    for notional in (20_000.0, 50_000.0, 100_000.0, 500_000.0):
+        monkeypatch.setattr(replay, "POSITION_NOTIONAL", notional)
+        r = replay.period_returns(c, asof_dates=marks, pool="short",
+                                  costs=CostModel(), _pools_for_test=pools)
+        assert len(r) == 3
+        series.append(r)
+
+    for i in range(len(series)):
+        for j in range(i + 1, len(series)):
+            for k in range(3):
+                assert abs(series[i][k] - series[j][k]) < 1e-7, (
+                    f"N 档间逐期收益不同：{series[i][k]} vs {series[j][k]}"
+                    "—— 说明最低佣金仍在生效")
+            assert abs(sum(series[i]) / 3 - sum(series[j]) / 3) < 1e-6
+
+
+def test_notional_below_20k_is_different_and_costlier(tmp_db, monkeypatch):
+    """反向证伪（设计 §5.2）：N = 1 万必须与 10 万**不同**，且 1 万档成本更高。
+
+    1 万 × 0.025% = 2.5 < 5 → 最低佣金必生效。
+    **若这一条也相同 → 推导错了 → 停下来重查**（不得挑一个好看的 N）。
+    """
+    dates = _dates(6)
+    c = _db_with_bars(tmp_db, {"000A00": [10.0] * 6, "000B00": [10.0] * 6},
+                      dates)
+    pools = {dates[0]: ["000A00"], dates[5]: ["000B00"]}
+    marks = [dates[0], dates[5]]
+
+    monkeypatch.setattr(replay, "POSITION_NOTIONAL", 10_000.0)
+    r_small = replay.period_returns(c, asof_dates=marks, pool="short",
+                                    costs=CostModel(), _pools_for_test=pools)
+    monkeypatch.setattr(replay, "POSITION_NOTIONAL", 100_000.0)
+    r_big = replay.period_returns(c, asof_dates=marks, pool="short",
+                                  costs=CostModel(), _pools_for_test=pools)
+
+    assert r_small[0] != pytest.approx(r_big[0], abs=1e-7), (
+        "1 万档与 10 万档结果相同——最低佣金没生效，推导错了")
+    assert r_small[0] < r_big[0], "1 万档成本应**更高**（净收益更低）"
+
+
+def test_fee_uses_reference_price_not_slippage_price(tmp_db):
+    """决策 C3：费用用 `fees()`（**参考价**），不用 `total()`（滑点价）。
+
+    否则同一笔滑点会被算两遍。这里把滑点调到 100bps（1%）放大差异：
+    用参考价 hand-calc，若实现改成滑点价则断言变红。
+    """
+    dates = _dates(6)
+    c = _db_with_bars(tmp_db, {"000A00": [10.0] * 6}, dates)
+    costs = _zero_model(commission_rate=0.00025, stamp_tax_rate=0.0005,
+                        slippage_bps=100.0)
+    px = 10.0
+    qty = int(replay.POSITION_NOTIONAL / px)
+    expected_fee_ratio = costs.fees("sell", px, qty) / (px * qty)
+    expected_slippage = costs.slippage_bps / 10_000.0
+
+    r = replay.period_returns(
+        c, asof_dates=[dates[0], dates[5]], pool="short", costs=costs,
+        _pools_for_test={dates[0]: ["000A00"], dates[5]: []})
+    assert r[0] == pytest.approx(-(expected_fee_ratio + expected_slippage))
+    # 若费用改用滑点价（9.9 而非 10.0），费率会低 1% → 断言变红
+    assert r[0] != pytest.approx(-(expected_fee_ratio * 0.99 + expected_slippage))
+
+
+def test_slippage_only_charged_on_filled_legs(tmp_db):
+    """决策 C4：滑点**只对成交的腿**收（持仓不动不收）。
+
+    - (a) 零换手 `hold == nxt` → 滑点恰为 0（不是「整仓收一遍」）
+    - (b) 全换手且 n_hold = 1 → 滑点 = `2 × bps / 10000`
+    - (c) n_hold = 2 且换 1 只（1 卖 + 1 买）→ 滑点 = `2 × bps / 10000 / 2`
+    """
+    flat = _zero_model(slippage_bps=5.0)
+    dates = _dates(6)
+    marks = [dates[0], dates[5]]
+    c = _db_with_bars(tmp_db, {code: [10.0] * 6
+                               for code in ("000A00", "000B00", "000C00")}, dates)
+
+    def _run(pools):
+        # 价格全平 → gross = 0 → 返回值就是「负的成本」，滑点可直接读出
+        return replay.period_returns(c, asof_dates=marks, pool="short",
+                                     costs=flat, _pools_for_test=pools)[0]
+
+    # (a) 零换手：d0 池 == d1 池
+    assert _run({dates[0]: ["000A00"], dates[5]: ["000A00"]}) == 0.0, \
+        "零换手不该产生滑点"
+
+    # (b) 全换手、n_hold = 1（1 卖 + 1 买 = 2 条腿）
+    assert _run({dates[0]: ["000A00"], dates[5]: ["000B00"]}) == pytest.approx(
+        -(2 * 5.0 / 10_000.0))
+
+    # (c) n_hold = 2，只换 1 只（1 卖 + 1 买 = 2 条腿，每腿占 1/2 仓）
+    assert _run({dates[0]: ["000A00", "000B00"],
+                 dates[5]: ["000B00", "000C00"]}) == pytest.approx(
+        -(2 * 5.0 / 10_000.0 / 2))
+
+
+def test_slippage_lowers_net_return(tmp_db):
+    """方向：同一序列，含滑点的净收益必须**低于**不含滑点的。"""
+    dates = _dates(6)
+    pools = {dates[0]: ["000A00"], dates[5]: ["000B00"]}
+    marks = [dates[0], dates[5]]
+
+    c = _db_with_bars(tmp_db, {"000A00": [10.0] * 6, "000B00": [10.0] * 6},
+                      dates)
+    without = replay.period_returns(c, asof_dates=marks, pool="short",
+                                    costs=_zero_model(), _pools_for_test=pools)
+    with_slip = replay.period_returns(c, asof_dates=marks, pool="short",
+                                      costs=_zero_model(slippage_bps=5.0),
+                                      _pools_for_test=pools)
+    assert with_slip[0] < without[0]
+    assert without[0] == 0.0, "零成本模型下应有换手也等于 0"
 
 
 def _insert_script(conn, plugin_id="plug_x", version="1"):
