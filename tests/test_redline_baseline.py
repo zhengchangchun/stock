@@ -25,6 +25,7 @@ from stocklab.quality.redline import (
     leaves,
     leaves_sha256,
     load_baseline,
+    merge_regen_targets,
     repo_root,
     run_synthetic_predict_report,
 )
@@ -221,3 +222,82 @@ def test_synthetic_baseline_leaves_match_live_report_leaf_for_leaf(tmp_path):
         "predict_synthetic(叶子)", expected_sha=entry["sha256"], actual_sha="(见上)",
         leaf_diff=diff, regen_cmd=".venv/bin/python scripts/check_redlines.py --regen",
         baseline_file=str(BASELINE_RELPATH))
+
+
+# --------------------------------------------------------------------------
+# 6. `--regen --only X`：部分重基不能把没重基的条目弄丢/弄脏（2026-09-21）
+# --------------------------------------------------------------------------
+
+def test_merge_regen_targets_only_overrides_fresh_entries():
+    """`--only predict --regen` 只换 predict 的条目，其余**逐字节保留**（含自己的 taken_at）。"""
+    existing = {"predict_real_2026-09-14": {"sha256": "old", "taken_at": "2026-09-16"},
+                "backfill_real_2013-12-23_2026-09-14": {"sha256": "keep",
+                                                        "taken_at": "2026-09-16"}}
+    fresh = {"predict_real_2026-09-14": {"sha256": "new", "taken_at": "2026-09-21"}}
+    merged = merge_regen_targets(existing, fresh)
+    assert merged["predict_real_2026-09-14"] == {"sha256": "new", "taken_at": "2026-09-21"}
+    assert merged["backfill_real_2013-12-23_2026-09-14"] == existing[
+        "backfill_real_2013-12-23_2026-09-14"]
+    assert existing["predict_real_2026-09-14"]["sha256"] == "old"      # 不改原对象
+
+
+def _load_check_script():
+    import importlib.util
+    path = repo_root() / "scripts" / "check_redlines.py"
+    spec = importlib.util.spec_from_file_location("check_redlines_under_test", path)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+def test_regen_only_synthetic_keeps_real_entries(tmp_path):
+    """真实库不在时 `--only synthetic --regen` **不能**把真实库条目从基线里抹掉。
+
+    （改前的行为：重基路径重建整个 `targets`，库缺失时真实库条目会消失 —— 数据丢失。）
+    """
+    import contextlib
+    import io
+
+    mod = _load_check_script()
+    baseline = tmp_path / "redlines.json"
+    real_entry = {"kind": "real_db", "non_hermetic": True, "taken_at": "2026-09-16",
+                  "sha256": "o" * 64, "n_leaves": 1, "leaves_sha256": "x" * 64,
+                  "leaves": {".x": "1"}, "command": "c", "model_version": "m",
+                  "rebaseline_when": "w", "depends_on": "data/stocklab.db"}
+    baseline.write_text(json.dumps({
+        "schema": "stocklab-redline-v1", "rebaseline_when": "w",
+        "targets": {"predict_real_2026-09-14": real_entry,
+                    "predict_synthetic": {"sha256": "stale", "leaves": {}, "n_leaves": 0,
+                                         "leaves_sha256": "y" * 64}},
+    }, ensure_ascii=False), encoding="utf-8")
+
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        rc = mod.main(["--only", "synthetic", "--regen", "--baseline", str(baseline),
+                       "--db", str(tmp_path / "no-such-db.sqlite")])
+    assert rc == 0
+    out = buf.getvalue()
+
+    written = json.loads(baseline.read_text(encoding="utf-8"))["targets"]
+    assert written["predict_real_2026-09-14"] == real_entry        # 原样保留
+    assert written["predict_synthetic"]["sha256"] != "stale"       # 本次重基
+    assert written["predict_synthetic"]["sha256"] == \
+        load_baseline()["targets"]["predict_synthetic"]["sha256"]
+    assert "本次重基" in out and "保留旧值" in out                  # 输出要区分两者
+    assert "本次未动" in out
+
+
+def test_regen_with_no_prior_baseline_still_writes_only_the_synthetic_entry(tmp_path):
+    """首次生成基线（库不在）时行为不变：只写合成目标。"""
+    import contextlib
+    import io
+
+    mod = _load_check_script()
+    baseline = tmp_path / "fresh.json"
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        rc = mod.main(["--only", "synthetic", "--regen", "--baseline", str(baseline),
+                       "--db", str(tmp_path / "no-such-db.sqlite")])
+    assert rc == 0
+    written = json.loads(baseline.read_text(encoding="utf-8"))["targets"]
+    assert list(written) == ["predict_synthetic"]

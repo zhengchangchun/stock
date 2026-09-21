@@ -9,8 +9,9 @@
 用法:
     .venv/bin/python scripts/check_redlines.py                 # 跑全部（默认）
     .venv/bin/python scripts/check_redlines.py --only predict  # 只跑 predict 红线
-    .venv/bin/python scripts/check_redlines.py --regen         # **有意**重新基线
+    .venv/bin/python scripts/check_redlines.py --regen         # **有意**重新基线（一并写库指纹）
     .venv/bin/python scripts/check_redlines.py --cli-backfill  # backfill 走 CLI 原命令（3m35s）
+    .venv/bin/python scripts/check_redlines.py --fingerprint    # 只打印当前库指纹（归因用）
 
 三条红线目标（见 `docs/baselines/redlines.json`）:
     predict_real_2026-09-14              真实库；`predict run --asof 2026-09-14`
@@ -21,6 +22,13 @@
     ① **字节级** sha256 逐位相等 —— 抓「字段集被改动」（#34 的翻车类型：
        `MODEL_VERSION` 没变、预测没变，但加一个 `evidence.inputs` 回显字段就改了 sha）；
     ② **数字叶子级** 递归键路径比对 —— 抓「数值漂移」，**容忍纯文字新增/改写**。
+
+**库指纹（2026-09-21 用户拍板「做」）**：两条真实库目标额外存一份库指纹
+（标的清单 / 各标的 K 线起止与行数 / 预测验证行数 / 复权链规模 / 关键表内容摘要）。
+判红时脚本把「基线时刻的库」与「现在的库」**并排打出来**，
+于是「库变了」与「代码回归」不再需要每次手工做单变量实验
+（2026-09-21 那次花了约 40 分钟）。指纹**不参与判红**（`bars_daily` 每天都在涨）。
+`--fingerprint` 可单独打印当前库指纹（手工归因用）。
 
 失败时按 #34 的三步走：先归因实验 → 确认有意 → 才 `--regen`，并把新值 **append-only**
 写进 plan 与台账（不删旧值）。
@@ -45,6 +53,12 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
+from stocklab.quality.dbfingerprint import (  # noqa: E402
+    attach_db_fingerprint,
+    fingerprint,
+    format_fingerprint_diff,
+    format_fingerprint_json,
+)
 from stocklab.quality.redline import (  # noqa: E402
     BASELINE_RELPATH,
     REBASELINE_WHEN,
@@ -55,6 +69,7 @@ from stocklab.quality.redline import (  # noqa: E402
     leaves,
     leaves_sha256,
     load_baseline,
+    merge_regen_targets,
     repo_root,
     run_synthetic_predict_report,
     sha256_text,
@@ -145,50 +160,65 @@ def _real_entry(name: str, command: str, sha: str, payload: dict, **extra) -> di
     return entry
 
 
-def collect(db: Path, workdir: Path, cli_backfill: bool) -> dict:
+def collect(db: Path, workdir: Path, cli_backfill: bool,
+            db_label: str = DEFAULT_DB,
+            want: set[str] | None = None) -> dict:
+    """采集基线条目。`want` ⊆ {`predict`,`backfill`,`synthetic`}，默认全采。
+
+    （2026-09-21 新增 `want`：`--regen --only predict` 要能**只重基一条** ——
+    真实库那两条的失效原因不同，"把两条一起重基"会把「已知将要失效」的值也冻进基线。）
+    """
+    want = set(want) if want else {"predict", "backfill", "synthetic"}
     targets: dict[str, dict] = {}
 
-    rep = _predict_real(db, workdir)
-    raw = canonical_json(rep)
-    targets["predict_real_2026-09-14"] = _real_entry(
-        "predict_real_2026-09-14",
-        f".venv/bin/python -m stocklab.cli.main predict run --asof {PREDICT_ASOF} "
-        f"--db <{DEFAULT_DB} 的临时副本> --report <tmp>",
-        sha256_text(raw), rep,
-        note="跑在库副本上，真实库零写入；报告本身不含时间戳，同 asof 可逐字节复现。",
-    )
+    if "predict" in want:
+        rep = _predict_real(db, workdir)
+        raw = canonical_json(rep)
+        targets["predict_real_2026-09-14"] = _real_entry(
+            "predict_real_2026-09-14",
+            f".venv/bin/python -m stocklab.cli.main predict run --asof {PREDICT_ASOF} "
+            f"--db <{DEFAULT_DB} 的临时副本> --report <tmp>",
+            sha256_text(raw), rep,
+            note="跑在库副本上，真实库零写入；报告本身不含时间戳，同 asof 可逐字节复现。",
+        )
 
-    md, summary = (_backfill_cli(db, workdir) if cli_backfill
-                   else _backfill_readonly(db))
-    targets["backfill_real_2013-12-23_2026-09-14"] = _real_entry(
-        "backfill_real_2013-12-23_2026-09-14",
-        f".venv/bin/python -m stocklab.cli.main verify backfill --from {BACKFILL_FROM} "
-        f"--to {BACKFILL_TO} --db <{DEFAULT_DB} 的临时副本> --report <tmp>/acc.md",
-        sha256_text(md), summary,
-        summary_sha256=sha256_text(canonical_json(summary)),
-        note=("默认走**只读重算**（load_verification_rows+summarize+render_markdown，0.7s，不写库），"
-              "已实测与 CLI 原命令（3m35s，幂等）产出**逐字节相同**；"
-              "用 `--cli-backfill` 可原样复验该等价性。数字叶子取自 summary JSON。"),
-    )
+    if "backfill" in want:
+        md, summary = (_backfill_cli(db, workdir) if cli_backfill
+                       else _backfill_readonly(db))
+        targets["backfill_real_2013-12-23_2026-09-14"] = _real_entry(
+            "backfill_real_2013-12-23_2026-09-14",
+            f".venv/bin/python -m stocklab.cli.main verify backfill --from {BACKFILL_FROM} "
+            f"--to {BACKFILL_TO} --db <{DEFAULT_DB} 的临时副本> --report <tmp>/acc.md",
+            sha256_text(md), summary,
+            summary_sha256=sha256_text(canonical_json(summary)),
+            note=("默认走**只读重算**（load_verification_rows+summarize+render_markdown，"
+                  "0.7s，不写库），已实测与 CLI 原命令（3m35s，幂等）产出**逐字节相同**；"
+                  "用 `--cli-backfill` 可原样复验该等价性。数字叶子取自 summary JSON。"),
+        )
 
-    syn = run_synthetic_predict_report(workdir / "synthetic")
-    raw_syn = canonical_json(syn)
-    lv = leaves(syn)
-    targets["predict_synthetic"] = {
-        "kind": "hermetic",
-        "non_hermetic": False,
-        "depends_on": "(无 —— 合成夹具，见 stocklab/quality/redline.py::build_synthetic_db)",
-        "taken_at": TODAY,
-        "command": f"predict run --asof {synthetic_asof()} --db <合成库> --report <tmp>"
-                   "（由 tests/test_redline_baseline.py 与 --regen 共同驱动）",
-        "model_version": MODEL_VERSION,
-        "sha256": sha256_text(raw_syn),
-        "n_leaves": len(lv),
-        "leaves_sha256": leaves_sha256(lv),
-        "leaves": lv,
-        "rebaseline_when": REBASELINE_WHEN,
-        "note": "合成夹具用纯算术价格（无 RNG/无网络），所以这条基线是 hermetic 的。",
-    }
+    if "synthetic" in want:
+        syn = run_synthetic_predict_report(workdir / "synthetic")
+        raw_syn = canonical_json(syn)
+        lv = leaves(syn)
+        targets["predict_synthetic"] = {
+            "kind": "hermetic",
+            "non_hermetic": False,
+            "depends_on": "(无 —— 合成夹具，见 stocklab/quality/redline.py::build_synthetic_db)",
+            "taken_at": TODAY,
+            "command": f"predict run --asof {synthetic_asof()} --db <合成库> --report <tmp>"
+                       "（由 tests/test_redline_baseline.py 与 --regen 共同驱动）",
+            "model_version": MODEL_VERSION,
+            "sha256": sha256_text(raw_syn),
+            "n_leaves": len(lv),
+            "leaves_sha256": leaves_sha256(lv),
+            "leaves": lv,
+            "rebaseline_when": REBASELINE_WHEN,
+            "note": "合成夹具用纯算术价格（无 RNG/无网络），所以这条基线是 hermetic 的。",
+        }
+    # 非 hermetic 的条目挂上**库指纹**：红线红时能一眼分清「库变了」还是「代码回归」
+    # （2026-09-21 用户拍板；见 stocklab/quality/dbfingerprint.py 的模块 docstring）。
+    if targets:
+        attach_db_fingerprint(targets, fingerprint(db, label=db_label))
     return targets
 
 
@@ -218,8 +248,13 @@ def write_baseline(path: Path, targets: dict) -> None:
 # --------------------------------------------------------------------------
 
 def check_one(name: str, entry: dict, *, sha: str, payload: dict,
-              baseline_file: str = str(BASELINE_RELPATH)) -> bool:
-    """跑两档判据。任一红 → 返回 False 并打印可操作失败文案。"""
+              baseline_file: str = str(BASELINE_RELPATH),
+              db_fingerprint: tuple[dict | None, dict | None] | None = None) -> bool:
+    """跑两档判据。任一红 → 返回 False 并打印可操作失败文案。
+
+    `db_fingerprint` = `(基线里的指纹, 现在的指纹)`：**只在判红时**打印并排差异
+    —— 指纹本身不判红（`bars_daily` 每天都在涨，判红等于天天红）。
+    """
     lv = leaves(payload)
     diff = compare_leaves(entry["leaves"], lv)
     ok = True
@@ -235,6 +270,9 @@ def check_one(name: str, entry: dict, *, sha: str, payload: dict,
     print(format_failure(name, expected_sha=entry["sha256"], actual_sha=sha,
                          leaf_diff=diff, regen_cmd=REGEN_CMD,
                          baseline_file=baseline_file))
+    if db_fingerprint is not None:
+        print(format_fingerprint_diff(db_fingerprint[0], db_fingerprint[1],
+                                      taken_at=entry.get("taken_at")))
     if not is_red(diff):
         print("  ⚠️  数值叶子**全部一致**，只有字节变了 —— 这是「字段集/格式被改动」的特征"
               "（#34 的翻车类型：加了口径回显字段）。\n")
@@ -252,6 +290,8 @@ def main(argv: list[str] | None = None) -> int:
                     help="**有意**重新基线（先做归因实验！见 #34）")
     ap.add_argument("--cli-backfill", action="store_true",
                     help="backfill 走 CLI 原命令（3m35s）而非只读重算")
+    ap.add_argument("--fingerprint", action="store_true",
+                    help="只打印当前库指纹（JSON）后退出 —— 手工归因用，不跑任何目标")
     ap.add_argument("--require-db", action="store_true",
                     help="真实库缺失时**失败**而不是跳过（CI/交付用）")
     args = ap.parse_args(argv)
@@ -259,6 +299,13 @@ def main(argv: list[str] | None = None) -> int:
     root = repo_root()
     db = root / args.db
     baseline_file = root / args.baseline
+
+    if args.fingerprint:
+        if not db.exists():
+            print(f"  ❌ 库不存在：{db}")
+            return 1
+        print(format_fingerprint_json(fingerprint(db, label=args.db)))
+        return 0
     want = set()
     if args.only == "all":
         want = {"predict", "backfill", "synthetic"}
@@ -284,11 +331,12 @@ def main(argv: list[str] | None = None) -> int:
                 print("  ❌ --require-db：真实库缺失，失败。")
                 return 1
         with tempfile.TemporaryDirectory(prefix="p25-regen-") as td:
-            targets = collect(db, Path(td), args.cli_backfill) if db_ready else {}
-        if not db_ready:
+            fresh = (collect(db, Path(td), args.cli_backfill, db_label=args.db, want=want)
+                     if db_ready else {})
+        if not db_ready and "synthetic" in want:
             syn = run_synthetic_predict_report(Path(tempfile.mkdtemp(prefix="p25-syn-")))
             lv = leaves(syn)
-            targets["predict_synthetic"] = {
+            fresh["predict_synthetic"] = {
                 "kind": "hermetic", "non_hermetic": False,
                 "depends_on": "(无 —— 合成夹具)",
                 "taken_at": TODAY,
@@ -298,10 +346,23 @@ def main(argv: list[str] | None = None) -> int:
                 "n_leaves": len(lv), "leaves_sha256": leaves_sha256(lv), "leaves": lv,
                 "rebaseline_when": REBASELINE_WHEN,
             }
+
+        # `--only X` 只覆盖 X 的条目，其余**原样保留**（基线里每个条目自带 `taken_at`，
+        # 不同目标在不同日子重基是自洽的）——见 `merge_regen_targets` 的理由。
+        kept: dict = {}
+        if baseline_file.exists():
+            kept = load_baseline(baseline_file).get("targets", {})
+        targets = merge_regen_targets(kept, fresh) if kept else fresh
+
         write_baseline(baseline_file, targets)
         print(f"  ✍️  已写入基线：{args.baseline}（{len(targets)} 个目标）")
         for name, e in sorted(targets.items()):
-            print(f"       {name:42s} sha256={e['sha256'][:16]}… leaves={e['n_leaves']}")
+            mark = "（本次重基）" if name in fresh else "（保留旧值）"
+            print(f"       {name:42s} sha256={e['sha256'][:16]}… leaves={e['n_leaves']}"
+                  f"  taken_at={e.get('taken_at')} {mark}")
+        if kept and set(kept) - set(fresh):
+            print(f"       ⚠️  {args.only} 之外的条目**本次未动** —— 它们各自的红/绿与"
+                  "`taken_at` 无关，不能拿本次结果去推断。")
         print()
         print("  ⚠️  别忘了第 ③ 步：把新值 + 日期 + 原因 **append-only** 追加进")
         print("     `docs/plans/2026-09-15-p8-实验流水线.md` 与 `docs/experiments/README.md`。")
@@ -332,21 +393,25 @@ def main(argv: list[str] | None = None) -> int:
                         baseline_file=args.baseline)
 
     if db_ready and want & {"predict", "backfill"}:
+        # 指纹只采一次，两条真实库目标共用（只读、确定性）。
+        fp_now = fingerprint(db, label=args.db)
         with tempfile.TemporaryDirectory(prefix="p25-check-") as td:
             td = Path(td)
             if "predict" in want:
                 rep = _predict_real(db, td)
-                ok &= check_one("predict_real_2026-09-14",
-                                targets["predict_real_2026-09-14"],
+                entry = targets["predict_real_2026-09-14"]
+                ok &= check_one("predict_real_2026-09-14", entry,
                                 sha=sha256_text(canonical_json(rep)), payload=rep,
-                                baseline_file=args.baseline)
+                                baseline_file=args.baseline,
+                                db_fingerprint=(entry.get("db_fingerprint"), fp_now))
             if "backfill" in want:
                 md, summary = (_backfill_cli(db, td) if args.cli_backfill
                                else _backfill_readonly(db))
                 entry = targets["backfill_real_2013-12-23_2026-09-14"]
                 ok &= check_one("backfill_real_2013-12-23_2026-09-14", entry,
                                 sha=sha256_text(md), payload=summary,
-                                baseline_file=args.baseline)
+                                baseline_file=args.baseline,
+                                db_fingerprint=(entry.get("db_fingerprint"), fp_now))
                 exp = entry.get("summary_sha256")
                 act = sha256_text(canonical_json(summary))
                 if exp and exp != act:

@@ -34,6 +34,7 @@ __all__ = [
     "leaves",
     "leaves_sha256",
     "load_baseline",
+    "merge_regen_targets",
     "repo_root",
     "run_synthetic_predict_report",
     "synthetic_asof",
@@ -70,6 +71,21 @@ def baseline_path() -> Path:
 def load_baseline(path: Path | str | None = None) -> dict:
     p = Path(path) if path is not None else baseline_path()
     return json.loads(Path(p).read_text(encoding="utf-8"))
+
+
+def merge_regen_targets(existing: dict, fresh: dict) -> dict:
+    """`--regen --only X` 的**部分重基**：`fresh` 里有的目标覆盖旧值，其余**原样保留**。
+
+    为什么需要它（2026-09-21）：基线里两条真实库目标的失效**原因不同** ——
+    `predict_real` 红是「复权链从空到 80461 行」（已归因、可以重基），
+    `backfill_real` 的输入是 `verifications` 表里**尚未重放**的回放行（已知将要失效）。
+    一起重基 = 把一份已知将要失效的值冻进基线，下次还得再重基一次并再写一条台账。
+
+    基线条目**自带 `taken_at`**，所以「不同目标在不同日子重基」在文件里是自洽的。
+    """
+    out = dict(existing)
+    out.update(fresh)
+    return out
 
 
 def canonical_json(obj: Any) -> str:
