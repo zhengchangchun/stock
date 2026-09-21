@@ -113,3 +113,25 @@ def no_network(monkeypatch):
     monkeypatch.setattr(socket, "socket", _BlockedSocket)
     monkeypatch.setattr(socket, "create_connection", _blocked_create_connection)
     monkeypatch.setattr(socket, "getaddrinfo", _blocked_getaddrinfo)
+
+
+@pytest.fixture(autouse=True)
+def report_dir_is_tmp(tmp_path, monkeypatch):
+    """报告目录**永不落进仓库**（ERROR_DIARY #51）。
+
+    以前 `tests/` 里有几处直接调 `main([...])` 却不给 `--report-dir` / `--out`，
+    默认路径就是仓库的 `reports/`，而且**文件名取当天**：每跑一次全量测试就多一份
+    `<今天>-exp-rw-mu0.{md,json}` 与 `<今天>-predict-2024-07-14.json`
+    （实测 09-18/19/20/21 各一份，内容是退化 fixture 的读数：方向 100%、Brier 0）。
+    真报告与测试产物混在一个目录里，比「没有报告」更糟 —— 而且它长得像真的。
+
+    这里把 `paths.REPORT_DIR` 统一指到每个用例自己的 `tmp_path/reports`：
+    显式传 `--report-dir` 的用例不受影响，**忘了传**的用例再也写不进仓库。
+    所有写报告的代码都是 `from stocklab.config import paths` 再读
+    `paths.REPORT_DIR`（调用时才取属性），所以 attribute 打补丁有效。
+    """
+    from stocklab.config import paths
+
+    d = tmp_path / "reports"
+    monkeypatch.setattr(paths, "REPORT_DIR", d)
+    return d

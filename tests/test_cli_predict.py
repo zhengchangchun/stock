@@ -144,7 +144,8 @@ def test_predict_run_exits_nonzero_on_conflict_without_overwriting(env, capsys):
     assert insert_prediction(conn, bad, now=NOW, origin="replay")[0] == "inserted"
     conn.close()
 
-    assert main(["predict", "run", "--asof", ASOF, "--db", str(env["db"])]) == 1
+    assert main(["predict", "run", "--asof", ASOF, "--db", str(env["db"]),
+                 "--report-dir", str(env["reports"])]) == 1
     assert "冲突" in capsys.readouterr().err
 
     conn = connect(env["db"])

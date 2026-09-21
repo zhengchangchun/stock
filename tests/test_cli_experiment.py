@@ -160,6 +160,7 @@ def test_keep_test_sealed_flag_is_accepted_and_forwarded(tmp_path, capsys):
         rc = main(["experiment", "run", "--variant", "rw-mu0",
                    "--from", days[FIRST_TARGET], "--to", days[-1],
                    "--db", str(tmp_path / "a.db"), "--code", CODE,
+                   "--report-dir", str(tmp_path / "reports"),
                    "--keep-test-sealed"])
     finally:
         runner_mod.run_experiment = runner_mod_orig

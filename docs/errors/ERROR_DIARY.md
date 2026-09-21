@@ -2541,3 +2541,74 @@ return self.action in ("buy", "sell")     # 卖 0 股也算「成交」
 - [ ] 这条纪律的判据能被「删掉实现」判红吗？做过反向自检没有？
 - [ ] 拼进 `glance` / `rich()` 的字符串里有 HTML 标签吗？有就走 `glance_html` 并自己 `esc()`。
 - [ ] 只在数据边界出现的那几个分支，渲染出来看过吗？
+
+---
+
+## #51 2026-09-21：测试把 fixture 报告写进仓库 `reports/`，文件名还带当天日期
+
+### 现象
+
+`reports/` 里每天多出一批文件，名字完全合规、数字却是坏的：
+
+```
+reports/2026-09-18-exp-rw-mu0.md   20166 B
+reports/2026-09-18-exp-rw-mu0.json 29518 B     ← 09-19 / 09-20 / 09-21 各一份，逐字节相同
+reports/2026-09-18-predict-2024-07-14.json 7511 B  ← 同样每天一份
+```
+
+打开看：`train` 段 **行级准确率 100.00%、Brier 0.0000、`always_flat` 也是 100.00%**。
+任何真模型都不可能给出这种读数。
+
+### 根因
+
+两处测试直接调 CLI，但**不给** `--report-dir` / `--out`：
+
+- `tests/test_cli_experiment.py::test_keep_test_sealed_flag_is_accepted_and_forwarded`
+  （它只关心 `--keep-test-sealed` 有没有传到执行器）
+- `tests/test_cli_predict.py::test_predict_run_exits_nonzero_on_conflict_without_overwriting`
+
+CLI 的默认落盘目录是 `paths.REPORT_DIR = PROJECT_ROOT/reports`，文件名取 `_today()`
+⇒ 每次跑测试都往仓库里写一份、日期取当天。
+
+读数为什么是退化的：fixture 是「每天涨 1 分钱」的合成 K 线 + 固定日历 ⇒
+`sigma → 0`、60 日窗口内每个样本都落在 ±0.5% 的 flat 带内 ⇒ 三分类恒 flat、
+`p_flat = 1` ⇒ 「命中 100% / Brier 0」。这不是模型强，是输入退化。
+
+为什么一直没人发现：`/reports/` 在 `.gitignore` 第 25 行 ⇒ `git status` 永远干净；
+文件名 `<日期>-<类型>-<参数>` 与真报告**同构**。本次是在回答「有没有 AI 模型参与优化」
+时去数 `reports/` 里有哪些实验结果，读到 `exp-rw-mu0` 的「train 100%」才撞上。
+
+### 修法（三层，缺一层就还会复发）
+
+1. **默认值隔离**（根治）：`tests/conftest.py` 新增 autouse 夹具 `report_dir_is_tmp`，
+   把 `paths.REPORT_DIR` 指到每个用例的 `tmp_path/reports`。所有写报告的代码都是
+   `from stocklab.config import paths` 后读属性（调用时才取）⇒ 打补丁有效；
+   **忘了传参数的用例再也写不进仓库**。
+2. **局部显式**：给上面两处补上 `--report-dir`（读代码时看得见意图，不依赖全局夹具）。
+3. **护栏**：新增 `tests/test_reports_dir_hermetic.py`（3 条）—— 夹具真的改了指向；
+   `experiment run` / `predict run` **不给 `--report-dir`** 时文件落在重定向目录、
+   且不在仓库目录下。
+4. 清掉 12 个已污染产物：`rm reports/*-exp-rw-mu0.* reports/*-predict-2024-07-14.json`。
+
+### 验证
+
+`pytest` 全量通过，**且跑完之后 `ls -lt reports/` 与跑之前逐项相同**（无新增文件）——
+这条比任何断言都硬：它直接证明「护栏生效后，产物目录不再被测试改变」。
+`verify.sh` 1–4c 全 ✅（红线目标未动）。
+
+### 教训
+
+1. **产物目录不能靠「每个调用点都记得传参数」**。默认值必须指向隔离区（tmp），
+   把纪律做进默认路径里，而不是做进每个用例的自觉里。
+2. **`.gitignore` 会让污染隐形**：`git status` 干净 ≠ 目录干净。
+   判断「有没有意外产物」要 `ls -lt`，不要 `git status`。
+3. **同构命名的假报告最危险**：`<日期>-<类型>-<参数>` 完全合规、还带当天日期，
+   但没有一行是真的。读报告前先问「这份是谁写的、连的哪个库」。
+4. **看到不可能的数字先怀疑输入管线，再怀疑模型**：`100% / Brier 0` 只有退化输入能给。
+
+### 检查清单（新增会落盘的命令 / 新增测试时）
+
+- [ ] 这条命令的**默认**落盘目录是仓库目录吗？测试里会被重定向吗？
+- [ ] 测试调用 CLI 时给了 `--report-dir` / `--out` 吗？（`grep -n "main(\[" tests/`）
+- [ ] 全量测试跑完后，`ls -lt reports/` 有没有新文件？
+- [ ] 报告里的数字是「不可能的好」吗？先查输入是否退化。
