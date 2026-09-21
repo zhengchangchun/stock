@@ -102,6 +102,20 @@ def write_snapshot(conn: sqlite3.Connection, *, asof: str, run_kind: str,
     return snapshot_id
 
 
+def list_snapshot_keys(conn: sqlite3.Connection) -> list[tuple[str, str]]:
+    """所有已有快照的 `(asof, run_kind)`，**最新在前**。
+
+    「最新」= `created_at` 降序 —— **不是** asof 降序：同一天的 `light` 与 `weekly`
+    是两条独立快照（各自的幂等键不同），按 asof 排它们谁在前是未定义的。
+    `created_at` 相同（同一秒内跑两次不同类型）时按 `(asof, run_kind)` 字典序，
+    保证页面每次刷新显示的**是同一个**「最新」，而不是随 SQLite 的返回顺序变。
+    """
+    rows = conn.execute(
+        f"SELECT asof, run_kind FROM {TABLE_SNAPSHOTS}"
+        " ORDER BY created_at DESC, asof DESC, run_kind").fetchall()
+    return [(str(r[0]), str(r[1])) for r in rows]
+
+
 def load_snapshot(conn: sqlite3.Connection, snapshot_id: int) -> dict:
     snap = conn.execute(
         f"SELECT * FROM {TABLE_SNAPSHOTS} WHERE snapshot_id = ?",

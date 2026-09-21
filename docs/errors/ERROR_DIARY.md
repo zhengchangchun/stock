@@ -2170,3 +2170,55 @@ Task 18 验收时，用 `ingest bars --code <code>` 批量采集 21 只种子股
 - [ ] 验收时，写入行数是否与输入列表逐一对账（不只看退出码）？
 - [ ] 「命令成功」是否已确认等价于「数据完整写入」？
 - [ ] 我的文案里有没有为了「说明禁止」而使用那个被禁的词？
+
+## #45 2026-09-21：候选池「跑一次」按钮在工作线程里必炸 —— 插桩沙盒的 `signal` 超时只能跑主线程
+
+### 现象
+
+候选池页面（模块1 展示层）的写路径原来按设计文档写成「请求线程里直接调
+`run_candidate`」。测试真起 `ThreadingHTTPServer` 打 POST 时，5 条写用例全红：
+
+```
+http.client.RemoteDisconnected: Remote end closed connection without response
+ValueError: signal only works in main thread of the main interpreter
+  stocklab/plugin/runtime.py:51 in _time_limit  →  signal.signal(SIGALRM, ...)
+```
+
+服务端 traceback 完整，客户端只看到「连接被断开」——**没有任何响应体**。
+
+### 根因
+
+插桩执行器的强制超时用 `signal.setitimer`（设计如此，见 `plugin/runtime.py`
+模块 docstring：「将来若有人想把插桩塞进线程池并行，必须先把执行器换成子进程方案」）。
+`signal.signal` 只允许主线程调用，而 `ThreadingHTTPServer` 每个请求都在**工作线程**里处理
+⇒ 第一个插桩调用就 `ValueError`，且这个异常发生在构造响应之前，
+`BaseHTTPRequestHandler` 只能关掉连接。
+
+也就是说：**这条约束早就写在代码里了，但设计稿沿用了「进程内直接调 `run_candidate`」
+的写法**（评审也只核对了签名与同源，没核对线程模型）。
+
+### 修法（本轮采用）
+
+写路径改为**起子进程跑 CLI**（`python -m stocklab.cli.main candidate run …`）：
+
+- 子进程的主线程让 `signal` 可用，**沙盒一行不改**（不去偷偷降级超时）；
+- 页面与命令行两条路径跑的是同一段生产代码，报告落同一处；
+- 附了超时（300s）、非零退出码、以及「退出码 0 却没落快照」三种失败分支，
+  都把子进程的原话渲染到页面上，不吞。
+
+### 教训
+
+1. **「同一段生产代码」不等于「同一个进程」**。设计里写「内部调 `X()`」时，
+   要顺带回答「在哪个线程调」——线程模型是接口的一部分，不是实现细节。
+2. **文档里已经写下的约束要当成硬约束读**：`plugin/runtime.py` 的 docstring
+   明确说了不能进线程池，本轮写代码时没读它，白跑了一轮。
+3. **失败模式要按「客户端看到什么」验，不按服务端栈验**：服务端有完整 traceback，
+   客户端只是 `RemoteDisconnected` —— 只跑 `handle()` 单测是发现不了的，
+   必须真起服务打 HTTP（这条纪律 P15 就立过，这次是它救的场）。
+
+### 检查清单（下次必查）
+
+- [ ] 这个写路径跑在**主线程**还是工作线程？它调用的东西对线程有要求吗？
+- [ ] 目标模块的 docstring 里有没有「只能主线程 / 不能并行 / 不能重入」这类硬约束？
+- [ ] 这条写路径的失败，客户端看到的是可读页面还是「连接被断开」？
+- [ ] 有没有把「跨进程」写成「同进程」的假设（路径、环境变量、cwd 都要重新确认）？

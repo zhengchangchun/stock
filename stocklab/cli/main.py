@@ -2061,6 +2061,7 @@ def cmd_lab_serve(args: argparse.Namespace) -> int:
     带表单写入（录入成交 / 冲正 / 录入本金），写路径全程走 P12 的账本函数。
     """
     from stocklab.labweb import app as labweb
+    from stocklab.labweb.cand_data import CandLab
 
     try:
         labweb.assert_loopback(args.host)
@@ -2077,6 +2078,7 @@ def cmd_lab_serve(args: argparse.Namespace) -> int:
         return 2
     ensure_schema(db)   # lab 应用写入口前滚（P33）
     ctx = labweb.Context(lab=labweb.Lab(db, asof=args.asof),
+                         cand=CandLab(db),
                          signer=labweb.TokenSigner(labweb.new_secret()),
                          base_path=base_path)
     try:
@@ -2095,6 +2097,7 @@ def cmd_lab_serve(args: argparse.Namespace) -> int:
     host, port = args.host, httpd.server_port
     print(f"✅ 持仓管理应用已启动：{host}:{port}（仅回环；可读可写）")
     print(f"   总览    http://{host}:{port}{base_path}/")
+    print(f"   候选池  http://{host}:{port}{base_path}/candidate")
     print(f"   成交    http://{host}:{port}{base_path}/trades")
     print(f"   健康    http://{host}:{port}{base_path}/health")
     print(f"   库      {db}")

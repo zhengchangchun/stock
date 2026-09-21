@@ -29,16 +29,21 @@ HTTP 400，**不写库、不吞错**。页面同时保留用户填过的值，�
 from __future__ import annotations
 
 import json
+import os
 import re
+import subprocess
 import sys
 from dataclasses import dataclass, field
+from datetime import date
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from urllib.parse import parse_qs, urlsplit
+from urllib.parse import parse_qs, quote, urlsplit
 
 from stocklab.dashboard.server import (LOOPBACK_HOSTS, NonLoopbackHost,
                                        assert_loopback)
 from stocklab.labweb import SERVICE, VERSION
+from stocklab.labweb import cand_data, cand_render
+from stocklab.labweb.cand_data import CandLab
 from stocklab.labweb.data import Lab, now_iso
 from stocklab.labweb.render import (CASH_FIELDS, CSS_PATH, JS_PATH,
                                     TRADE_FIELDS, cash_page, cash_pane,
@@ -47,6 +52,9 @@ from stocklab.labweb.render import (CASH_FIELDS, CSS_PATH, JS_PATH,
                                     trade_detail_page, trades_page,
                                     trades_pane)
 from stocklab.labweb.tokens import TokenSigner, new_form_id, new_secret
+from stocklab.candidate import snapshot as cand_snapshot
+from stocklab.candidate.run import RUN_KINDS
+from stocklab.config import paths
 from stocklab.portfolio.ledger import (CASH_KINDS, CashFlowValidationError,
                                        DuplicateTradeError, LedgerError,
                                        TradeValidationError,
@@ -54,6 +62,7 @@ from stocklab.portfolio.ledger import (CASH_KINDS, CashFlowValidationError,
                                        find_identical_trade, record_cash_flow,
                                        record_trade, reverse_trade,
                                        validate_trade)
+from stocklab.store.migrate import ensure_schema
 
 DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 8791
@@ -61,6 +70,10 @@ DEFAULT_BASE_PATH = "/lab"
 
 #: POST body 上限。表单只有几个字段，超过一定不是正常用户在填。
 MAX_BODY = 64 * 1024
+
+#: 候选池「跑一次」的子进程超时（秒）。实测一次主流程 <1 秒（21 只种子），
+#: 给足余量：卡住的是子进程，不是 HTTP 连接。
+RUN_TIMEOUT_S = 300.0
 
 #: 写路径（方法, 路径正则）→ 处理函数名。
 _TRADE_ID = re.compile(r"^/trades/(\d+)$")
@@ -107,6 +120,11 @@ class Context:
     lab: Lab
     signer: TokenSigner
     base_path: str = DEFAULT_BASE_PATH
+    #: 模块1（候选池）的取数门面。**末位 + 有默认值** —— 现有构造点全是关键字形式，
+    #: 插一个必填字段进去会把它们全部变成 `TypeError`（模块2 的测试不碰
+    #: `/candidate`，`None` 不影响它们）。生产路径（`make_server` /
+    #: `cmd_lab_serve`）显式注入。
+    cand: "CandLab | None" = None
 
 
 # ---------- 小工具 ----------
@@ -437,6 +455,131 @@ def _post_reverse(ctx: Context, fields: dict, trade_id: int) -> Response:
                     f"&state={res['state']}")
 
 
+# ---------- 模块1：候选池（只读页 + 一个写按钮） ----------
+
+def _cand_required(ctx: Context) -> Response | None:
+    """`ctx.cand` 未注入时的**显式**答复（`None` = 可以继续）。
+
+    正常路径（`make_server(db_path=…)` / `cmd_lab_serve`）都会注入；这条
+    分支只有手工构造 `Context` 才可达 —— 但它必须是一个可读页面，
+    而不是 `AttributeError` 导致的空白 500。
+    """
+    if ctx.cand is not None:
+        return None
+    return html_response(500, error_page(
+        base=ctx.base_path, status=500,
+        message=("候选池页需要 `ctx.cand`（模块1 取数门面），本进程没有注入。"
+                 "用 `lab serve` 起服务会自动注入。"),
+        asof=ctx.lab.asof, built_at=now_iso()))
+
+
+def _get_candidate(ctx: Context, query: dict, built_at: str) -> Response:
+    """`GET /candidate?asof=…&run_kind=…`（两个参数缺省 → 最新一条）。"""
+    missing = _cand_required(ctx)
+    if missing is not None:
+        return missing
+    asof = (query.get("asof") or [""])[0].strip() or None
+    run_kind = (query.get("run_kind") or [""])[0].strip() or None
+    ran = (query.get("ran") or [""])[0]
+    raw_sid = (query.get("sid") or [""])[0]
+    return html_response(200, cand_render.candidate_page(
+        ctx.cand.view(asof=asof, run_kind=run_kind),
+        base=ctx.base_path, built_at=built_at,
+        token=ctx.signer.mint(ctx.lab.asof), form_id=new_form_id(),
+        default_asof=ctx.lab.asof,
+        ran=ran if ran in ("new", "exists") else "",
+        sid=int(raw_sid) if raw_sid.isdigit() else None))
+
+
+def _candidate_param_error(asof: str, run_kind: str) -> str:
+    """表单参数校验（返回空串 = 通过）。**先于任何写库动作**。"""
+    if not asof:
+        return "asof 不能为空（YYYY-MM-DD）"
+    try:
+        date.fromisoformat(asof)
+    except ValueError:
+        return f"asof 必须是 YYYY-MM-DD 的合法日期，收到 {asof!r}"
+    if run_kind not in RUN_KINDS:
+        return f"run_kind 必须是 {list(RUN_KINDS)} 之一，收到 {run_kind!r}"
+    return ""
+
+
+def _post_candidate_run(ctx: Context, fields: dict) -> Response:
+    """跑一次候选池 → 303 回列表页（PRG，刷新不会重发）。
+
+    **token 先于一切**：校验失败 403 且库一个字节都不动（既有规矩，有测试钉住）。
+    token 用 `ctx.lab.asof`（页面口径的今天）签发与校验，**不是**表单里的 asof ——
+    那个 asof 是历史日期，用历史日期签的 token 在 `verify(today=今天)` 下恒 False
+    （设计文档 §3.1 实测，有反向测试钉住）。
+
+    ## 为什么是**子进程**跑 CLI，而不是在请求线程里直接 `run_candidate`
+
+    插桩执行器的超时用 `signal.setitimer`，它**只在主线程有效**
+    （`stocklab/plugin/runtime.py` 的模块 docstring 早写了这条约束）。
+    而 labweb 是 `ThreadingHTTPServer`：请求都跑在**工作线程**里 ——
+    实测在工作线程里直接调 `run_candidate`，第一个插桩调用就抛
+    `ValueError: signal only works in main thread`（不是超时，是执行器压根进不去），
+    连接直接断在客户端眼前（`RemoteDisconnected`，见 ERROR_DIARY 2026-09-21）。
+
+    所以这里起一个子进程跑 CLI：子进程的主线程满足 signal 的前提，沙盒一行不改，
+    两条路径的产出物也同源（有测试在两个独立库上比过成员逐行相同）。
+    """
+    if not _token_ok(ctx, fields):
+        return _forbidden(ctx, "/candidate")
+    missing = _cand_required(ctx)
+    if missing is not None:
+        return missing
+    asof = _f(fields, "asof")
+    run_kind = _f(fields, "run_kind") or "weekly"
+    bad = _candidate_param_error(asof, run_kind)
+    if bad:
+        return html_response(400, cand_render.candidate_page(
+            ctx.cand.view(), base=ctx.base_path, built_at=now_iso(),
+            token=ctx.signer.mint(ctx.lab.asof), form_id=new_form_id(),
+            default_asof=ctx.lab.asof, error=bad,
+            values={"asof": asof, "run_kind": run_kind}))
+
+    ensure_schema(ctx.cand.db_path)          # 写库入口统一前滚（P33）
+    key = cand_data.SnapshotKey(asof, run_kind)
+    with ctx.cand.conn() as conn:            # 跑之前先问一句：新跑还是已存在
+        existed = cand_snapshot.find_snapshot(conn, asof=asof,
+                                              run_kind=run_kind) is not None
+    out = ctx.cand.report_path(key)
+    cmd = [sys.executable, "-m", "stocklab.cli.main", "candidate", "run",
+           "--db", str(ctx.cand.db_path), "--asof", asof,
+           "--run-kind", run_kind, "--out", str(out)]
+    try:
+        proc = subprocess.run(
+            cmd, cwd=str(paths.PROJECT_ROOT), capture_output=True, text=True,
+            timeout=RUN_TIMEOUT_S,
+            env={**os.environ, "PYTHONPATH": str(paths.PROJECT_ROOT)})
+    except subprocess.TimeoutExpired:
+        return _run_failed(ctx, asof, run_kind,
+                           f"子进程超过 {RUN_TIMEOUT_S:.0f} 秒未结束，已终止")
+    if proc.returncode != 0:
+        detail = (proc.stderr or proc.stdout or "").strip()[-400:]
+        return _run_failed(ctx, asof, run_kind,
+                           f"candidate run 退出码 {proc.returncode}：{detail}")
+
+    with ctx.cand.conn() as conn:
+        sid = cand_snapshot.find_snapshot(conn, asof=asof, run_kind=run_kind)
+    if sid is None:                          # 退出码 0 却没写入 —— 必须说出来
+        return _run_failed(ctx, asof, run_kind,
+                           "candidate run 返回 0，但库里没有这条快照")
+    state = "exists" if existed else "new"
+    return redirect(f"{ctx.base_path}/candidate?asof={quote(asof)}"
+                    f"&run_kind={quote(run_kind)}&ran={state}&sid={sid}")
+
+
+def _run_failed(ctx: Context, asof: str, run_kind: str, message: str) -> Response:
+    """跑失败时的可读页面（把子进程的原话带出来，不吞）。"""
+    return html_response(500, cand_render.candidate_page(
+        ctx.cand.view(asof=asof, run_kind=run_kind), base=ctx.base_path,
+        built_at=now_iso(), token=ctx.signer.mint(ctx.lab.asof),
+        form_id=new_form_id(), default_asof=ctx.lab.asof, error=message,
+        values={"asof": asof, "run_kind": run_kind}))
+
+
 # ---------- 只读路径 ----------
 
 def _receipt_of(query: dict[str, list[str]], data: dict, kind: str,
@@ -474,7 +617,7 @@ def _not_found(ctx: Context, path: str) -> Response:
 def handle(method: str, target: str, *, body: bytes, ctx: Context,
            fragment: bool = False,
            if_none_match: str | None = None) -> Response:
-    """路由（纯函数式：只经 `ctx.lab` 读库；写路径见 `_post_*`）。
+    """路由（纯函数式：只经 `ctx.lab` / `ctx.cand` 读库；写路径见 `_post_*`）。
 
     `fragment=True`（请求头 `X-Lab-Fragment: 1`）时，写路径回 **JSON 片段**
     而不是 303 —— 页面自己把回执与流水表换掉，不整页刷新。
@@ -509,6 +652,8 @@ def handle(method: str, target: str, *, body: bytes, ctx: Context,
         return _post_trade(ctx, fields, fragment=fragment)
     if rel == "/cash":
         return _post_cash(ctx, fields, fragment=fragment)
+    if rel == "/candidate/run":
+        return _post_candidate_run(ctx, fields)
     m = _TRADE_REVERSE.match(rel)
     if m:
         return _post_reverse(ctx, fields, int(m.group(1)))
@@ -544,6 +689,8 @@ def _get(ctx: Context, rel: str, query: dict, built_at: str) -> Response:
     if rel == "/risk":
         return html_response(200, risk_page(ctx.lab.risk(), base=base,
                                             built_at=built_at))
+    if rel == "/candidate":
+        return _get_candidate(ctx, query, built_at)
     if rel == "/data":
         return html_response(200, data_page(ctx.lab.data(), base=base,
                                             built_at=built_at))
@@ -623,7 +770,8 @@ def make_server(host: str = DEFAULT_HOST, port: int = DEFAULT_PORT, *,
             raise ValueError("必须给 ctx 或 db_path")
         ctx = Context(lab=Lab(db_path, asof=asof),
                       signer=signer or TokenSigner(secret or new_secret()),
-                      base_path=normalize_base_path(base_path))
+                      base_path=normalize_base_path(base_path),
+                      cand=CandLab(db_path))
     httpd = ThreadingHTTPServer((host, port), make_handler())
     httpd.daemon_threads = True
     httpd.ctx = ctx          # type: ignore[attr-defined]

@@ -19,8 +19,13 @@ Task 12 更新后的实情——① ST 判据非 PIT；② 财务因子已接入
 from __future__ import annotations
 
 import json
+from pathlib import Path
+from typing import TYPE_CHECKING
 
 from stocklab.candidate.pools import ALL_POOLS, POOL_TOPN
+
+if TYPE_CHECKING:                                   # 避免 run → report → run 循环
+    from stocklab.candidate.run import RunResult
 
 POOL_TITLES: dict[str, str] = {
     "short": "短期池", "mid": "中期池", "long": "长期池",
@@ -51,6 +56,25 @@ def _pool_section(pool: str, members: list[dict]) -> list[str]:
             f"| {m['status']} | {m['reason']} | {_risks(m['risk_json'])} |")
     lines.append("")
     return lines
+
+
+def report_path(out_dir: Path | str, asof: str, run_kind: str) -> Path:
+    """报告文件名规则**只有这一处**（CLI 与页面共用）。"""
+    return Path(out_dir) / f"{asof}-{run_kind}.md"
+
+
+def write_report_file(result: "RunResult", out_dir: Path | str) -> Path:
+    """把 `RunResult.report_md` 落盘，返回路径。
+
+    CLI（`candidate run`）与页面（`POST /candidate/run`）**都必须调这里**：
+    以前只有 CLI 落报告，于是「页面上跑过的 asof」在 `reports/candidate/` 里找不到 ——
+    同一件事两套产出物，正是设计文档 §4.2 要消掉的分叉。
+    `skipped=True`（幂等命中）时**照样落**：报告内容是既有快照的渲染，落一次才可复现。
+    """
+    out = report_path(out_dir, result.asof, result.run_kind)
+    out.parent.mkdir(parents=True, exist_ok=True)
+    out.write_text(result.report_md, encoding="utf-8")
+    return out
 
 
 def render_report(*, asof: str, run_kind: str, loaded: dict,

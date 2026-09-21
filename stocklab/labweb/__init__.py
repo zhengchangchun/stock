@@ -20,9 +20,14 @@
 | 模块 | 职责 |
 |---|---|
 | `tokens.py` | 表单 `_token`（HMAC，防 CSRF） |
-| `data.py`   | 取数：把既有函数拼成各页面要的 dict（**不产生新口径**） |
-| `render.py` | 服务端渲染 HTML（内嵌 CSS + inline SVG；无 CDN / 无外部字体 / 无 JS 框架） |
+| `data.py`   | 模块2 取数：把既有函数拼成各页面要的 dict（**不产生新口径**） |
+| `render.py` | 模块2 渲染 HTML（内嵌 CSS + inline SVG；无 CDN / 无外部字体 / 无 JS 框架） |
+| `cand_data.py` | **模块1** 取数：候选池三表 + `instruments` 取名（只读） |
+| `cand_render.py` | **模块1** 渲染（复用模块2 的壳、CSS、折叠块） |
 | `app.py`    | HTTP 路由表 + 写路径（PRG）+ 回环守卫 |
+
+模块1 与模块2 共用一个服务器、一个壳、一套 token，但取数与渲染分成两组文件：
+`render.py` 已 66KB，再把候选池塞进去就是什么都装的杂物间（边界按**职责**切）。
 """
 
 from __future__ import annotations

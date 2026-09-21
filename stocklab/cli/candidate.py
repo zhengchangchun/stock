@@ -6,6 +6,7 @@ import sys
 from datetime import datetime, timezone
 from pathlib import Path
 
+from stocklab.candidate.report import write_report_file
 from stocklab.candidate.run import recommend_optimization, run_candidate
 from stocklab.config import paths
 from stocklab.store.db import connect
@@ -23,10 +24,14 @@ def cmd_candidate_run(args) -> int:
         if result.skipped:
             print(f"⏭ 快照已存在（snapshot_id={result.snapshot_id}），跳过重跑")
 
-        out = Path(args.out) if args.out else (
-            paths.REPORT_DIR / "candidate" / f"{args.asof}-{args.run_kind}.md")
-        out.parent.mkdir(parents=True, exist_ok=True)
-        out.write_text(result.report_md, encoding="utf-8")
+        if args.out:
+            # `--out` 是**显式文件路径**（可覆盖文件名），不走命名规则
+            out = Path(args.out)
+            out.parent.mkdir(parents=True, exist_ok=True)
+            out.write_text(result.report_md, encoding="utf-8")
+        else:
+            # 默认路径与文件名规则走共享函数（页面也调它，两处产出物同源）
+            out = write_report_file(result, paths.REPORT_DIR / "candidate")
 
         counts = {}
         for m in result.members:
