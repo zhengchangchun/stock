@@ -1,4 +1,5 @@
-"""变体注册表（P8）：相对基线 `pit-rw-v1.0.1` **只改一个变量**的命名配置。
+"""变体注册表（P8）：相对**当前基线**（`MODEL_VERSION`，2026-09-21 起为 `pit-rw-v1.0.2`）
+**只改一个变量**的命名配置。
 
 ## 三条结构性保证（靠代码，不靠自觉）
 
@@ -28,6 +29,7 @@ from typing import Sequence
 from stocklab.data.models import Bar
 from stocklab.features.pit_regime import rv_percentile
 from stocklab.predict.model import FLAT_BAND, ForecastSpec
+from stocklab.predict.version import MODEL_VERSION
 
 #: 指数基准的代码（与 `backtest.benchmark` 同一口径：指数走不复权点位）。
 from stocklab.backtest.benchmark import INDEX_300_SYMBOL
@@ -61,8 +63,13 @@ class Variant:
 
     @property
     def model_tag(self) -> str:
-        """报告分组用的标签。带 `+` 前缀，一眼看出**不是**已发布的 model_version。"""
-        return f"pit-rw-v1.0.1+{self.name}"
+        """报告分组用的标签。带 `+` 前缀，一眼看出**不是**已发布的 model_version。
+
+        基线版本号从 `MODEL_VERSION` **取**，不写死：2026-09-21 升 v1.0.2 时发现
+        这里写着 `pit-rw-v1.0.1+…` —— 变体报告会声称自己相对旧基线，属于
+        「文件在说谎」（同一个毛病在 `scripts/check_redlines.py` 里也有一处）。
+        """
+        return f"{MODEL_VERSION}+{self.name}"
 
 
 def assert_single_variable(variant: Variant) -> None:

@@ -54,6 +54,12 @@ stocklab.verify.store.VerificationConflict: pred_id=1831 已有一条内容不�
 > ⚠️ 顺带修一处「文件在说谎」：`scripts/check_redlines.py` 原来自己写死
 > `MODEL_VERSION = "pit-rw-v1.0.1"`，升版后基线条目上的 `model_version` 会与报告不符。
 > 已改为从 `stocklab.predict.version` 导入。
+>
+> ⚠️ 同一类毛病还有一处：`stocklab/experiments/variants.py` 的 `model_tag` 也把
+> `pit-rw-v1.0.1+` 写死在 f-string 里 —— 升版后变体报告会声称自己「相对旧基线」。
+> 已改为 f"{MODEL_VERSION}+{name}"，断言写死的测试同步改为取常量。
+> （已有报告 `reports/2026-09-1x-exp-*.md` 里的旧标签**属历史产物，不回改**；
+> `experiment_decisions` 的幂等键取 `variant.name`、不取这个标签，故台账不受影响。）
 
 ## 4. 执行结果
 
