@@ -45,7 +45,7 @@ for _ in $(seq 1 40); do
   sleep 0.25
 done
 if [ "$ready" -ne 1 ]; then
-  echo "❌ 服务没起来（端口 $PORT）—— 截图未跑。日志："
+  echo "❌ 服务没起来（端口 ${PORT}）—— 截图未跑。日志："
   cat "$LOG"
   exit 1
 fi
@@ -75,7 +75,7 @@ PAGES=(
 )
 VIEWPORTS=("1280,900|desktop" "390,844|mobile")
 
-echo "截图目标：http://127.0.0.1:$PORT$BASE/　库=$DB　asof=$ASOF　成交 id=$TID"
+echo "截图目标：http://127.0.0.1:${PORT}${BASE}/　库=${DB}　asof=${ASOF}　成交 id=${TID}"
 echo
 
 for vp in "${VIEWPORTS[@]}"; do
