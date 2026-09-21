@@ -252,6 +252,19 @@ def glance(lines: Sequence[str]) -> str:
             + "".join(f"<li>{rich(x)}</li>" for x in lines) + "</ul>")
 
 
+def glance_html(lines: Sequence[str]) -> str:
+    """与 `glance` 同形，但每行**已经是 HTML**（调用方自己 `esc()` 数据）。
+
+    为什么要第二个函数：`rich()` 先转义再替换，所以把 `<a>` / `<span class="s-warn">`
+    塞进 `glance` 会被**原样显示成文本**（页面上真的出现过 `<a href=…>` 字样）。
+    需要标记的行就走这里，代价是调用方必须自己转义所有从库里来的值。
+    """
+    if not lines:
+        return ""
+    return ('<ul class="glance">'
+            + "".join(f"<li>{x}</li>" for x in lines) + "</ul>")
+
+
 def coverage_table(cov: Mapping, *, base: str = "") -> str:
     """标的覆盖表：**现价 + 来源 + 来源日期**（P17 / T5）。
 

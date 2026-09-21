@@ -12,6 +12,10 @@
 | 认不出的账户名原样显示 | 猜成最像的那条臂 |
 | 记一笔真成交并 step 后「我」与「什么都不做」分开 | `mirror_equals_hold` 写死 True |
 | 某臂当天没净值 → 「当日无净值；最后一行 …」 | 空白 / 拿上一日冒充当日 |
+| 「AI 自己编排的东西」一段的每个计数 == 库里的行数 | 页面上写死「用了/没用」 |
+| 表外触发理由 → 「已经接了写死条文之外的东西」 | 永远只说「没用上」 |
+| 准确率数字 == `rolling_accuracy` 的同名数 | 页面自己算一套命中率 |
+| 页面里不出现 `&lt;a`/`&lt;span` 这类被转义的标签 | 把 HTML 喂给 `rich()` |
 
 数字一律**从被测模块取**，不手抄一份到测试里 —— 手抄的那份会与上游漂移。
 """
@@ -344,3 +348,138 @@ def test_chart_needs_two_sessions():
                                   "points": [0.01]}])
     assert "<svg" not in svg
     assert "不画线" in svg
+
+
+# ---------- 「AI 自己编排的东西，用上了没有」 ----------
+
+def _add_active_script(path, *, plugin_id="1", version="9.9.9") -> int:
+    """夹具里放一版 active 插桩脚本（走 submit → sandbox_pass → approve）。"""
+    from stocklab.plugin import store as plugin_store
+
+    c = connect(path)
+    try:
+        sid = plugin_store.insert_script(
+            c, plugin_id=plugin_id, version=version,
+            source_text="def score(ctx):\n    return 0.0\n", note="测试用", now=NOW)
+        for action in ("submit", "sandbox_pass", "approve"):
+            plugin_store.insert_audit(c, script_id=sid, action=action,
+                                      actor="test", reason=None, now=NOW)
+    finally:
+        c.close()
+    return sid
+
+
+def test_ai_evidence_counts_are_read_from_the_db(tmp_path):
+    """每个计数都是库里的行数；池 → plugin 的映射从打分内核**反查**。"""
+    from stocklab.candidate import score
+
+    path = _fixture_db(tmp_path)
+    sid = _add_active_script(path)
+    c = connect(path)
+    try:
+        ev = paper_data.ai_evidence(c, LAST)
+        n_pred = c.execute("SELECT COUNT(*) FROM predictions").fetchone()[0]
+    finally:
+        c.close()
+    assert ev["counts"]["predictions"] == n_pred
+    assert ev["counts"]["plugin_scripts"] == 1
+    assert ev["by_state"] == {"active": 1}
+    assert [s["script_id"] for s in ev["scripts"]] == [sid]
+    assert {r["plugin_id"] for r in ev["routing"]} == \
+        {score.INDUSTRY_SCREEN_PLUGIN, *score.POOL_PLUGIN.values()}
+    routed = [r["label"] for r in ev["routing"]
+              if r["active_script_id"] is not None]
+    assert routed == ["short 池打分"], "夹具只给 plugin 1 配了 active 版本"
+    assert next(r for r in ev["routing"] if r["label"] == "short 池打分")[
+        "active_script_id"] == sid
+
+
+def test_ai_evidence_reports_zero_consumption_when_it_consumes_nothing(db):
+    """成交理由全在写死条文里、参数里没有 model/plugin 键 ⇒ 消费计数为 0。"""
+    c = connect(db)
+    try:
+        ev = paper_data.ai_evidence(c, LAST)
+    finally:
+        c.close()
+    cons = ev["consumption"]
+    assert cons["n_accounts"] == len(ARMS)
+    assert cons["n_trades"] > 0, "夹具没产生成交 —— 下面全是空断言"
+    assert cons["unknown_rules"] == []
+    assert cons["param_refs"] == []
+    assert not [k for k in cons["param_keys"] if "plugin" in k or "model" in k]
+
+
+def test_ai_evidence_flags_a_citation_outside_the_rule_book(db):
+    """表外的触发理由必须被点名 —— 真接了模型/插桩，这一段会自己变非空。"""
+    from stocklab.paper.config import RULE_CITATIONS
+
+    novel = "模型臂：涨概率 > 0.55 → 买入"
+    c = connect(db)
+    try:
+        c.execute(
+            "INSERT INTO paper_trades (account_id, date, code, side, ref_price,"
+            " fill_price, qty, commission, stamp_tax, transfer_fee, slippage_cost,"
+            " fee_total, asset_class, rule_citation, reason, binding_json,"
+            " price_source, price_asof, created_at)"
+            " VALUES ('arm-now','2026-09-17','510300','buy',4.532,4.532,100,"
+            " 5.0,0.0,0.0,0.0,5.0,'etf',?,'测试','[]','bars','2026-09-17',?)",
+            (novel, NOW))
+        c.commit()
+        ev = paper_data.ai_evidence(c, LAST)
+    finally:
+        c.close()
+    assert novel not in "\n".join(RULE_CITATIONS.values()), "该条文得是真表外的"
+    assert ev["consumption"]["unknown_rules"] == [novel]
+    html = paper_render.ai_block(ev)
+    assert "已经接了写死条文之外的东西" in html
+    assert "模拟盘没用上" not in html
+
+
+def test_page_shows_the_ai_evidence_section(db):
+    html = _html(db)
+    assert "AI 自己编排的东西，用上了没有" in html
+    assert "AI 的准确率" in html
+    assert "模拟盘没用上" in html
+    assert "引用模型预测 0 条、引用插桩脚本 0 条" in html
+
+
+def test_page_reports_ai_accuracy_from_rolling_accuracy(db):
+    """页面上的准确率与 `rolling_accuracy` 同源（不重算、不手写）。"""
+    from stocklab.session.review import rolling_accuracy
+
+    c = connect(db)
+    try:
+        acc = rolling_accuracy(c, end_date=LAST)
+    finally:
+        c.close()
+    html = _html(db)
+    replay = acc["replay"]
+    if replay is None:                      # 夹具里没有验证行
+        assert "不是「准确率是 0」，是没有样本" in html
+    else:
+        assert f'{replay["direction_accuracy_daily"]:.4f}' in html
+        assert f'{replay["brier_daily"]:.4f}' in html
+    assert "LIVE 0 行" in html
+
+
+def test_page_never_shows_escaped_markup_as_text(db):
+    """`rich()` 先转义再替换 —— 页面里不得出现被转义成文本的标签（真踩过）。"""
+    html = _html(db)
+    for needle in ("&lt;a href", "&lt;span", "&lt;b&gt;", "&lt;code&gt;"):
+        assert needle not in html, f"页面出现了被转义成文本的标签：{needle}"
+
+
+def test_overlap_note_keeps_its_link_clickable(db):
+    """两支重合时那句解释里的链接必须**可点**（曾经整句被转义成文本）。"""
+    html = _html(db)
+    assert "完全重合" in html
+    assert 'href="/lab/trades"' in html
+    assert "<code>arm-now</code>" in html
+
+
+def test_index_warning_line_is_markup_not_text():
+    data = {"index": {"base_level_missing": True}, "date": LAST,
+            "now_account_id": "arm-now"}
+    html = paper_render.glance_html(paper_render._why(data))
+    assert '<span class="s-warn">' in html
+    assert "&lt;span" not in html

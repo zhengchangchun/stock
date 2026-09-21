@@ -19,14 +19,23 @@
 我 = accent 深蓝实线（最粗）；什么都不做 = 灰虚线；AI 三档 = 绿 / 琥珀 / 青
 （同一规则、不同参数，色相分开是为了在图上分得清，**不是**区分好坏）；
 大盘 = 深灰点线。颜色不是唯一信号：图下每条线都有色块 + 文字 + 最新值。
+
+## 「AI 自己编排的东西，用上了没有」这一节
+
+对比图回答「现在谁多少钱」，这一节回答「那条 AI 线到底跑的是什么」：模型准确率
+与插桩/候选池的产出去向都摆在同一页上，**全部用计数回答**。
+
+这一节的首屏几行走 `glance_html`（行里已经是拼好的 HTML），因为 `rich()` 会把
+`<a>`、`<span class="s-warn">` 转义成可见文本 —— 同一个坑在本页的
+`_overlap_note` / `_why` 上都踩过，已一并修好。
 """
 
 from __future__ import annotations
 
 from typing import Any, Mapping, Sequence
 
-from stocklab.labweb.render import (cell, esc, glance, layout, money, more,
-                                    num, ratio_pct, rich, section, sign_cls)
+from stocklab.labweb.render import (cell, esc, glance, glance_html, layout, money,
+                                    more, num, ratio_pct, rich, section, sign_cls)
 
 #: 账户 → 人话。**只换标签**，不改任何数字。
 _LABELS: dict[str, str] = {
@@ -314,32 +323,35 @@ def _overlap_note(data: Mapping, *, base: str = "") -> str:
         return ""
     n = data.get("real_trades_after_start") or 0
     extra = ("没有新成交" if not n else f"只有 {n} 笔新成交")
-    return ('<p class="note">' + rich(
-        f'**「我」与「什么都不做」目前完全重合** —— 实盘账本在起跑日 '
-        f'{esc(data["start_date"])} 之后{extra}，`arm-now` 重放出来的持仓因此与'
-        f'冻结快照逐点相同。这不是画错了：往账本里记一笔真成交'
-        f'（<a href="{esc(base + "/trades")}">成交流水</a>页或 '
-        f'`stocklab trade add`），两条线下一个交易日就分开。')
-        + '</p>')
+    # 注意：这里走 `glance_html` 的同一条规矩 —— 本字符串是**拼好的 HTML**，
+    # 所以数据值一律过 `esc()`，不交给 `rich()`（它会连 `<a>` 一起转义成文本）。
+    return ('<p class="note"><b>「我」与「什么都不做」目前完全重合</b> —— '
+            f'实盘账本在起跑日 {esc(data["start_date"])} 之后{esc(extra)}，'
+            '<code>arm-now</code> 重放出来的持仓因此与冻结快照逐点相同。'
+            '这不是画错了：往账本里记一笔真成交（'
+            f'<a href="{esc(base + "/trades")}">成交流水</a>页或 '
+            '<code>stocklab trade add</code>），两条线下一个交易日就分开。</p>')
 
 
 def _why(data: Mapping) -> list[str]:
+    """「三条线各是什么」——返回**拼好的 HTML** 行（调用方走 `glance_html`）。"""
     idx = data.get("index") or {}
     lines = [
-        f'「我」= `arm-now`：把 `real_trades` + `cash_flows` 逐笔重放到 '
-        f'{esc(str(data["date"]))}，就是实盘账本本身，不是另一个账户。',
-        '「AI 纪律臂」= `arm-discipline-05/10/15`：三条**同一套写死条文**的账户'
+        f'「我」= <code>arm-now</code>：把 <code>real_trades</code> + '
+        f'<code>cash_flows</code> 逐笔重放到 {esc(data["date"])}，就是实盘账本本身，'
+        f'不是另一个账户。',
+        '「AI 纪律臂」= <code>arm-discipline-05/10/15</code>：三条<b>同一套写死条文</b>的账户',
         '（止损 + 单票 ≤40% + ETF 分散），只差「ETF 目标占比」这一个数 —— '
-        '单变量对照，**不含任何模型方向预测**。',
-        f'「相对我」= 该线累计收益 − 我（`{esc(str(data.get("now_account_id")))}`）'
+        '单变量对照，<b>不含任何模型方向预测</b>。',
+        f'「相对我」= 该线累计收益 − 我（<code>{esc(data.get("now_account_id"))}</code>）'
         '的累计收益，一个减法，不是独立口径。',
     ]
     if idx.get("base_level_missing"):
         lines.append('<span class="s-warn">起跑日没有大盘收盘价 → 大盘那条线整条'
                      '不画</span>（不拿别日的点位顶替）。')
     elif idx.get("n_missing"):
-        lines.append(f'大盘在 {idx["n_missing"]} 个日期没有收盘价 → 那几个点断线，'
-                     f'不插值、不用前值滚动。')
+        lines.append(f'大盘在 {esc(idx["n_missing"])} 个日期没有收盘价 → '
+                     f'那几个点断线，不插值、不用前值滚动。')
     return lines
 
 
@@ -393,6 +405,197 @@ def _trades_detail(data: Mapping) -> str:
               '本页只读，不改库。</p>')
 
 
+# ---------- 「AI 自己编排的东西，用上了没有」 ----------
+
+#: 写死条文 → 人话。**只换标签**，不改条文本身。
+_RULE_LABELS: dict[str, str] = {"stop_loss": "止损", "single_max": "单票≤40%",
+                                "etf_first_build": "分散建仓"}
+
+
+def _rule_short(text: str) -> str:
+    """条文全文 → 短标签。`rule_citation` 里冒号前那段就是它自己的名字。"""
+    return esc(text.split("：", 1)[0]) or "（空条文）"
+
+
+def _scripts_table(ev: Mapping) -> str:
+    scripts = ev.get("scripts") or []
+    if not scripts:
+        return ('<p class="note">`plugin_scripts` 是空的 —— '
+                '自己编排的脚本一版都没有。</p>')
+    head = ("<tr><th>script_id</th><th>plugin</th><th>版本</th><th>状态</th>"
+            "<th>入库</th><th>备注</th></tr>")
+    rows = "".join(
+        f'<tr><td class="num">{int(s["script_id"])}</td>'
+        f'<td><code>{esc(str(s["plugin_id"]))}</code></td>'
+        f'<td>{esc(str(s["version"]))}</td>'
+        f'<td>{esc(str(s["state"]))}</td>'
+        f'<td>{esc(str(s["created_at"])[:19])}</td>'
+        f'<td class="l">{esc(str(s["note"]))}</td></tr>' for s in scripts)
+    return f'<div class="scroll-x"><table class="tbl">{head}{rows}</table></div>'
+
+
+def _backtests_table(ev: Mapping) -> str:
+    bts = ev.get("backtests") or []
+    if not bts:
+        return '<p class="note">`plugin_backtests` 里没有回测记录 —— 没跑过就没有。</p>'
+    head = ("<tr><th>#</th><th>候选脚本</th><th>基线</th><th>池</th><th>窗口</th>"
+            "<th>verdict</th><th>过拟合标记</th></tr>")
+    rows = "".join(
+        f'<tr><td class="num">{int(b["backtest_id"])}</td>'
+        f'<td class="num">{b["candidate_script_id"]}</td>'
+        f'<td class="num">{b["baseline_script_id"]}</td>'
+        f'<td>{esc(str(b["pool"]))}</td>'
+        f'<td>{esc(str(b["window_start"]))} ~ {esc(str(b["window_end"]))}</td>'
+        f'<td>{esc(str(b["verdict"]))}</td>'
+        f'<td>{esc(str(b["overfit_flag"]))}</td></tr>' for b in bts)
+    return f'<div class="scroll-x"><table class="tbl">{head}{rows}</table></div>'
+
+
+def _consumption_detail(ev: Mapping) -> str:
+    """消费明细。注意：本函数的输出进 `more()`，**不走 `rich()`**，
+
+    所以每一段文字自己过 `rich()`（纯文本 + `**`/反引号），从库里来的值过 `esc()`。
+    """
+    cons = ev.get("consumption") or {}
+    cited = [str(c) for c in (cons.get("cited_rules") or [])]
+    unknown = [str(c) for c in (cons.get("unknown_rules") or [])]
+    items = "".join(
+        f'<li><code>{_rule_short(c)}</code> —— '
+        + (rich('在写死条文**表外**') if c in unknown
+           else rich('落在 `paper/config.RULE_CITATIONS` 内'))
+        + '</li>' for c in cited)
+    keys = esc(", ".join(cons.get("param_keys") or [])) or "（无）"
+    refs = [str(x) for x in (cons.get("param_refs") or [])]
+    return (
+        '<p class="note">' + rich(
+            '判据：把 `paper_trades` 每一行的 `rule_citation` 与 '
+            '`paper.config.RULE_CITATIONS` 逐条对表。表外为空 ⇒ 没有任何一笔成交由'
+            '模型预测或插桩脚本触发（真接了模型/插桩会以新条文或新参数键出现，'
+            '所以这一段将来会自己变成非空）。') + '</p>'
+        + (f'<ul class="list">{items}</ul>' if items
+           else '<p class="note">`paper_trades` 里还没有任何成交行。</p>')
+        + f'<p class="note">账户参数键：<code>{keys}</code>　'
+        + '参数里出现的模型/插桩标记：'
+        + (f'<code>{esc(", ".join(refs))}</code>' if refs
+           else rich('**无**（一个都没有）'))
+        + '</p>')
+
+
+def _ai_next_steps() -> str:
+    """「要真的用上，得动什么」——同样进 `more()`，每行自己过 `rich()`。"""
+    return ('<ol class="list">'
+            '<li>' + rich(
+                '**加一条「模型臂」**：照 `predictions` 的信号机械调仓，与纪律臂并列 '
+                '—— 这是唯一能直接回答「AI 操盘 vs 人操盘」的做法，但它要动 '
+                '`paper/config.py` 的口径定义与那条源码扫描测试，'
+                '**属于口径变更，得先拍板**。') + '</li>'
+            '<li>' + rich(
+                '**把插桩接进选股**：候选池已经接了（见上表 routing）；'
+                '模拟盘当前只管纪律与分散，选股是另一条链路。') + '</li>'
+            '<li>' + rich(
+                '**保持现状**：模拟盘继续做「纪律 vs 人 vs 大盘」的对照，'
+                '本段只把准确率与去向摆出来。') + '</li>'
+            '</ol>')
+
+
+def ai_block(ev: Mapping) -> str:
+    """「AI 自己编排的东西，用上了没有」—— 全部用计数回答，不写形容词。
+
+    首屏几行是**拼好的 HTML**（走 `glance_html`）：所以每个从库里取的值都过
+    `esc()`，`num()` 的「未知」占位当 HTML 用（它本来就是 HTML），而
+    `**强调**` / 反引号这类标记在这里不管用 —— 这里直接写 `<b>` 和 `<code>`。
+    """
+    if not ev:
+        return ('<p class="note">这一段没取到数据（旧库 / 缺表）—— '
+                '本页不编数。</p>')
+    counts = ev.get("counts") or {}
+    cons = ev.get("consumption") or {}
+    acc = ev.get("accuracy") or {}
+    win = acc.get("window") or {}
+    replay = acc.get("replay")
+    lines: list[str] = []
+
+    if replay:
+        ci = replay.get("direction_ci95") or [None, None]
+        base = (replay.get("baselines_daily") or {}).get("always_down")
+        tail = f'；「永远猜跌」基线 {num(base, 4)}' if base is not None else ""
+        lines.append(
+            f'<b>AI 的准确率</b>（模型 <code>{esc(acc.get("model_version"))}</code>，'
+            f'回放口径，窗口 {esc(win.get("start"))} ~ {esc(win.get("end"))} 共 '
+            f'{esc(win.get("n_sessions"))} 个交易日）：方向命中（按日聚类）'
+            f'<b>{num(replay.get("direction_accuracy_daily"), 4)}</b>'
+            f'（CI95 {num(ci[0], 4)}–{num(ci[1], 4)}）、Brier '
+            f'<b>{num(replay.get("brier_daily"), 4)}</b>{tail}。')
+    else:
+        lines.append('<b>AI 的准确率</b>：窗口内没有任何验证行 —— '
+                     '不是「准确率是 0」，是没有样本。')
+
+    if acc.get("live") is None:
+        lines.append('<b>LIVE 0 行</b>：窗口内一条实盘预测都没有 ⇒ 上面那些数字全是'
+                     '历史回放，<b>不是实盘表现</b>。')
+    gate = (replay or {}).get("sample_gate") or {}
+    if gate and not gate.get("meets", True):
+        lines.append(f'样本门槛 {esc(gate.get("min_days"))} 个交易日未达'
+                     f'（{esc(gate.get("label"))}）—— 该窗口的排名与差值都还是'
+                     f'噪声，只能当读数、不能当结论。')
+    excluded = (acc.get("excluded") or {}).get("n_rows")
+    if excluded:
+        lines.append(rich((acc.get("excluded") or {}).get("note")))
+
+    by_state = ev.get("by_state") or {}
+    lines.append(
+        f'<b>自己编排的产出</b>：插桩脚本 {esc(counts.get("plugin_scripts", 0))} 版'
+        + '（' + "、".join(f'{esc(k)} {esc(v)}' for k, v in sorted(by_state.items()))
+        + f'）、插件回测 {esc(counts.get("plugin_backtests", 0))} 条、候选池快照 '
+        f'{esc(counts.get("candidate_snapshots", 0))} 个 / 席位 '
+        f'{esc(counts.get("candidate_members", 0))}；库里的模型预测 '
+        f'{esc(counts.get("predictions", 0))} 条、验证 '
+        f'{esc(counts.get("verifications", 0))} 条。')
+
+    routes = [r for r in (ev.get("routing") or [])
+              if r.get("active_script_id") is not None]
+    if routes:
+        lines.append('<b>候选池在用</b>：' + "；".join(
+            f'{esc(r["label"])} = plugin <code>{esc(r["plugin_id"])}</code> 的 active '
+            f'版本 script {esc(r["active_script_id"])}（v{esc(r["version"])}）'
+            for r in routes)
+            + '。打分内核每次通过 <code>lifecycle.active_script_id</code> 取版本，'
+              '换一版不用改代码。')
+    else:
+        lines.append('<span class="s-warn">候选池也<b>没有可用的 active 版本</b>'
+                     '—— 打分管线会直接报错，不兜底。</span>')
+
+    unknown = [str(c) for c in (cons.get("unknown_rules") or [])]
+    refs = [str(x) for x in (cons.get("param_refs") or [])]
+    cited = [str(c) for c in (cons.get("cited_rules") or [])]
+    if not unknown and not refs:
+        lines.append(
+            '<span class="s-warn">模拟盘没用上</span>：'
+            f'{esc(cons.get("n_accounts", 0))} 个账户的 '
+            f'{esc(cons.get("n_trades", 0))} 笔成交，'
+            f'触发理由全部落在 {len(cited)} 条写死条文里（'
+            + "、".join(_rule_short(c) for c in cited)
+            + '）；账户参数键 <code>'
+            + (esc(", ".join(cons.get("param_keys") or [])) or "（无）")
+            + '</code> 里没有 plugin / script_id / model_version 之一 ⇒ '
+              '<b>引用模型预测 0 条、引用插桩脚本 0 条</b>。')
+    else:
+        lines.append(
+            f'<b>模拟盘已经接了写死条文之外的东西</b>：{len(unknown)} 条表外触发理由'
+            + '（' + "、".join(_rule_short(u) for u in unknown) + '）'
+            + f'、参数标记 {esc(", ".join(refs))} —— 逐条见下。')
+
+    lines.append('这个「没用上」是<b>被钉住的</b>，不是漏接：'
+                 '<code>test_paper_never_imports_model_or_kelly</code> 用源码扫描'
+                 '禁止 <code>stocklab/paper/</code> 碰模型与凯利 —— 因为上面那条'
+                 '准确率。')
+
+    return glance_html(lines) + more(
+        _scripts_table(ev) + _backtests_table(ev) + _consumption_detail(ev)
+        + '<p class="note">要真的用上，三条路：</p>' + _ai_next_steps(),
+        label="查看详细：产出清单与消费明细")
+
+
 def _empty_body(data: Mapping) -> str:
     return section(
         "还没有模拟盘净值",
@@ -405,6 +608,8 @@ def _empty_body(data: Mapping) -> str:
             "已有这一步。",
         ]),
         note="没有净值行就是没有 —— 本页不拿成本价、也不拿 0 冒充一条曲线。")
+    + section("AI 自己编排的东西，用上了没有", ai_block(data.get("ai") or {}),
+              right="用计数回答")
 
 
 def paper_page(data: Mapping, *, base: str, built_at: str) -> str:
@@ -455,11 +660,14 @@ def paper_page(data: Mapping, *, base: str, built_at: str) -> str:
     body = [
         _headline_cells(data),
         section("三条线一起看",
-                glance(_why(data)) + _overlap_note(data, base=base) + fig + fig_zoom,
+                glance_html(_why(data)) + _overlap_note(data, base=base)
+                + fig + fig_zoom,
                 right="并行对照，不排名"),
         section("逐条对照", compare_table(data),
                 note="「相对大盘」「相对我」都是减法，不是新口径；指数不可交易，"
                      "所以它那两行没有成本与回撤 —— 与各臂比时口径偏乐观。"),
+        section("AI 自己编排的东西，用上了没有", ai_block(data.get("ai") or {}),
+                right="用计数回答"),
         section("这段时间发生了什么", summary,
                 detail=more(_trades_detail(data), label="查看详细：逐笔成交")),
         section("口径与限制", limits, right="模拟盘 ≠ 实盘",

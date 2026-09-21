@@ -2483,3 +2483,61 @@ return self.action in ("buy", "sell")     # 卖 0 股也算「成交」
 - [ ] 新加的守卫是写在**规则函数**里，还是能提到 `Decision.is_trade` 这类不变量上？
 - [ ] 写入层的错误信息能不能**点名是哪一层的问题**（而不是 sqlite 的 CHECK 名）？
 - [ ] 有没有一条**跨两天**的测试：今天清仓 → 明天同方向触发仍然返回 hold？
+
+## #50 2026-09-21：文档字符串里的「护栏」根本不存在 + 页面把 HTML 当文本显示
+
+### 现象
+
+两处，都在 `/lab/paper`（模拟盘对照页）上被用户一句「AI 模拟的准确率、自己编排的
+功能用上了么」问出来的：
+
+1. 三个模块的文档字符串都写着「`test_paper_never_imports_model_or_kelly` 用源码
+   扫描钉住这条纪律」（`paper/config.py`、`paper/rules.py`、`labweb/paper_data.py`），
+   但 `grep -rn "never_imports" --include=*.py .` 在 `tests/` 下**零命中** ——
+   这条测试**不存在**。「它不是注释里的君子协定」这句话，本身就在注释里。
+2. 页面正文里真的显示出了 `<a href=/trades>成交流水</a>页` 与
+   `<code>stocklab trade add</code>` 这种字样（`_overlap_note`，两支重合时必然出现），
+   链接点不动。
+
+### 根因
+
+1. 写实现时把「以后要加个源码扫描测试」当成了「已经有了」，而这条纪律的**唯一**
+   执行者就是那个不存在的测试。一个 `grep` 就能证伪，但没人去 grep。
+2. `rich()` 的契约是「纯文本 + `**` / 反引号」——它**先 `esc()` 再替换**；
+   `glance()` 又对每一行都调 `rich()`。于是往这些行里塞 `<span class="s-warn">` /
+   `<a href>` 就必然被转义成可见文本。同一个坑在 `_overlap_note`（页面上就在显示）
+   与 `_why`（指数基期缺价时）各踩一次，而这两个分支都只在数据边界上出现，
+   没人渲染出来看过。
+
+### 修法
+
+1. 补齐 `tests/test_paper_discipline_guard.py`：用 **AST** 扫描
+   `stocklab/paper/*.py` 的 import 边与标识符，禁止碰
+   `stocklab.predict/verify/risk/plugin/candidate/experiments` 与任何 `kelly` 标识符，
+   也不许引用 `MODEL_VERSION`；含一条**反向自检**（把违规样本喂给扫描函数，
+   必须判红）——否则「扫描零个文件」也会全绿。
+   *不用子串匹配*：文档字符串自己就写着 `kelly` / `model`，子串会把注释判红。
+2. 新增 `render.glance_html()`：「每行已经是 HTML」的并行入口，调用方负责 `esc()`。
+   本页需要标记的行全部改走它；`_overlap_note` 改成直接拼 HTML（链接恢复可点）；
+   `_why` 改为返回 HTML 行。
+3. 新增页面级护栏（`tests/test_labweb_paper.py`）：渲染结果里不得出现
+   `&lt;a href` / `&lt;span` / `&lt;b&gt;` / `&lt;code&gt;`；两支重合时
+   `href="/lab/trades"` 必须在。
+
+### 教训
+
+1. **「有测试钉住」这句话要么可执行，要么别说。** 文档里每一次点名测试名都是一条
+   可以 `grep` 验证的断言 —— 写完随手 grep 一次，成本 3 秒。
+2. **扫描「代码里有没有某个词」不能用子串匹配**：文档字符串会立刻把它判红。
+   扫代码用 AST（只看 import / Name / Attribute / keyword），扫文本才用子串。
+3. **往 `rich()` 里塞 HTML 等于把标签当正文**。光靠注释约定不够，
+   得让调用点一眼能选对函数（`glance` 文本 vs `glance_html` HTML）。
+4. **只在数据边界出现的分支，必须渲染出来看一次**（缺价、两线重合、空库）。
+   这类 bug 在库里、在单测断言里都不显形，只在浏览器里显形。
+
+### 检查清单（新增页面 / 新增纪律时）
+
+- [ ] 文档里点名的测试名，`tests/` 下真的存在吗？（`grep -rn "<test_name>" tests/`）
+- [ ] 这条纪律的判据能被「删掉实现」判红吗？做过反向自检没有？
+- [ ] 拼进 `glance` / `rich()` 的字符串里有 HTML 标签吗？有就走 `glance_html` 并自己 `esc()`。
+- [ ] 只在数据边界出现的那几个分支，渲染出来看过吗？

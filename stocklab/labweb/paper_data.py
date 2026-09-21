@@ -17,6 +17,21 @@
 被 `test_paper_never_imports_model_or_kelly` 源码扫描钉死。口径是
 「AI 纪律臂（规则执行，不含方向预测）」，不是「AI 操盘手」。
 
+## 「自己编排的东西用上了没有」（`ai_evidence`）
+
+对照页还要回答一个问题：**页面上那条「AI」线，究竟用没用上我们自己编排的东西**
+（插桩脚本、候选池、模型预测）。这三段全部**用计数回答**：
+
+| 段 | 来源 | 回答 |
+|---|---|---|
+| `accuracy` | `session.review.rolling_accuracy`（与「数据」页、`review` 报告同源） | AI 自己的准确率是多少 |
+| `scripts` / `backtests` / `candidate` / `routing` | `plugin_*`、`candidate_*` 表 + `candidate.score.POOL_PLUGIN` | 自己编排的产出有哪些、谁在调 |
+| `consumption` | `paper_trades.rule_citation` 对表 `paper.config.RULE_CITATIONS` + `paper_accounts.params_json` | 模拟盘**实际**消费了几条 |
+
+第三段是**实测**而不是描述：落在写死条文之外的触发理由会被逐条列出（空 = 没有
+任何一笔成交由模型或插桩脚本触发）。将来真接了模型臂，这里会自己变成非空 ——
+所以它同时是一块看板和一个钩子。
+
 ## 本模块不产生新口径
 
 - 各臂的净值 / 累计收益 / 最大回撤 / 累计成本 / 相对大盘超额 → **直接调
@@ -38,8 +53,11 @@ import json
 import sqlite3
 
 from stocklab.paper import store as paper_store
-from stocklab.paper.config import PAPER_START_DATE
+from stocklab.paper.config import PAPER_START_DATE, RULE_CITATIONS
 from stocklab.paper.engine import INDEX_300_SYMBOL, build_report
+from stocklab.plugin import lifecycle as plugin_lifecycle
+from stocklab.plugin import store as plugin_store
+from stocklab.session.review import rolling_accuracy
 
 #: 大盘显示名。指数**不可直接交易**，所以它没有成本 —— 对照时口径偏乐观，
 #: 这句话在报告（`build_report`）与页面上各出现一次，措辞同源。
@@ -94,12 +112,116 @@ def _paper_trades(conn: sqlite3.Connection, asof: str) -> list[dict]:
         (asof,))]
 
 
-def _empty(asof: str, start: str, *, db_missing: bool = False) -> dict:
+# ---------- 「自己编排的东西用上了没有」 ----------
+
+#: 「谁在消费自己编排的产出」这一段的判据：模拟盘账户参数里出现这些键，
+#: 就说明它接了模型 / 插桩。当前实测为空 —— 空就是空，不写「应该是空」。
+_CONSUMPTION_MARKERS: tuple[str, ...] = ("plugin", "plugin_id", "script_id",
+                                        "model_version", "model")
+
+
+def _plugin_routing(conn: sqlite3.Connection) -> list[dict]:
+    """哪个 plugin 管哪一池，以及它**当前生效**的是哪一版。
+
+    池 → plugin 的映射从 `candidate.score.POOL_PLUGIN` / `INDUSTRY_SCREEN_PLUGIN`
+    **反查**，不在这里再抄一份：抄出来的那份会和打分内核漂移，页面就会指错脚本。
+    生效版本走 `plugin.lifecycle.active_script_id`（与打分内核同一个函数）——
+    认不出 active 版本时返回 `None` 并原样显示，不猜。
+    """
+    from stocklab.candidate import score   # 懒 import：展示层不反向依赖打分内核
+    pairs = [("行业排雷", score.INDUSTRY_SCREEN_PLUGIN)]
+    pairs += [(f"{pool} 池打分", pid)
+              for pool, pid in sorted(score.POOL_PLUGIN.items())]
+    out = []
+    for label, pid in pairs:
+        sid = plugin_lifecycle.active_script_id(conn, str(pid))
+        version = None
+        if sid is not None:
+            row = plugin_store.get_script(conn, int(sid))
+            version = str(row["version"]) if row else None
+        out.append({"label": label, "plugin_id": str(pid),
+                    "active_script_id": (None if sid is None else int(sid)),
+                    "version": version})
+    return out
+
+
+def ai_evidence(conn: sqlite3.Connection, asof: str) -> dict:
+    """「AI 自己编排的东西，用上了没有」—— 三段，全部用计数回答。
+
+    `accuracy` 与「数据」页同源（`rolling_accuracy`），这里不重算；
+    `consumption` 是实测：各臂成交的 `rule_citation` 与本模块 import 的
+    `paper.config.RULE_CITATIONS` 逐条对表，表外的理由单独列出。
+    """
+    acc = rolling_accuracy(conn, end_date=asof)
+
+    scripts: list[dict] = []
+    for s in plugin_store.list_scripts(conn):
+        sid = int(s["script_id"])
+        scripts.append({
+            "script_id": sid, "plugin_id": str(s["plugin_id"]),
+            "version": str(s["version"]),
+            "state": plugin_lifecycle.script_state(conn, sid),
+            "created_at": str(s["created_at"]),
+            "note": str(s["note"] or ""),
+        })
+    by_state: dict[str, int] = {}
+    for s in scripts:
+        by_state[s["state"]] = by_state.get(s["state"], 0) + 1
+
+    def _count(table: str) -> int:
+        return int(conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0])
+
+    snaps = [dict(r) for r in conn.execute(
+        "SELECT snapshot_id, asof, run_kind, created_at FROM candidate_snapshots"
+        " ORDER BY asof")]
+
+    known = set(RULE_CITATIONS.values())
+    rows = conn.execute("SELECT rule_citation FROM paper_trades").fetchall()
+    cited = sorted({str(r["rule_citation"] or "") for r in rows})
+    unknown = [c for c in cited if c not in known]
+    blobs = [str(r["params_json"] or "") for r in conn.execute(
+        "SELECT params_json FROM paper_accounts")]
+    param_keys = sorted({k for blob in blobs for k in json.loads(blob or "{}")})
+    param_refs = sorted({m for m in _CONSUMPTION_MARKERS
+                         if any(m in blob for blob in blobs)})
+
+    return {
+        "accuracy": acc,
+        "counts": {
+            "predictions": _count("predictions"),
+            "verifications": _count("verifications"),
+            "plugin_scripts": len(scripts),
+            "plugin_backtests": _count("plugin_backtests"),
+            "candidate_snapshots": len(snaps),
+            "candidate_members": _count("candidate_members"),
+        },
+        "scripts": scripts,
+        "by_state": by_state,
+        "backtests": [dict(b) for b in plugin_store.load_backtests(conn)],
+        "routing": _plugin_routing(conn),
+        "candidate": [{"snapshot_id": int(r["snapshot_id"]),
+                       "asof": str(r["asof"]),
+                       "run_kind": str(r["run_kind"]),
+                       "created_at": str(r["created_at"])} for r in snaps],
+        "consumption": {
+            "n_accounts": _count("paper_accounts"),
+            "n_trades": len(rows),
+            "cited_rules": cited,
+            "unknown_rules": unknown,
+            "param_keys": param_keys,
+            "param_refs": param_refs,
+        },
+    }
+
+
+def _empty(asof: str, start: str, *, db_missing: bool = False,
+           ai: dict | None = None) -> dict:
     return {"asof": asof, "available": False, "db_missing": db_missing,
             "start_date": start, "date": None, "dates": [], "n_sessions": 0,
             "arms": [], "index": None, "now_account_id": None,
             "mirror_equals_hold": None, "real_trades": [],
             "real_trades_after_start": None, "paper_trades": [],
+            "ai": ai or {},
             "disclosure": [], "disclaimer": "", "sample_note": ""}
 
 
@@ -107,6 +229,7 @@ def track(conn: sqlite3.Connection, asof: str) -> dict:
     """对照页的全部取数。同一库 + 同一 asof → 同一结果（不含生成时刻）。"""
     accounts = paper_store.load_accounts(conn)
     start = str(accounts[0]["start_date"]) if accounts else PAPER_START_DATE
+    ai = ai_evidence(conn, asof)
 
     # `date <= asof`：**不取全表 MAX(date)** —— 那会让 `--asof` 的历史截图
     # 显示未来某天的净值（`data._paper` 同一条纪律）。
@@ -114,7 +237,7 @@ def track(conn: sqlite3.Connection, asof: str) -> dict:
         "SELECT DISTINCT date FROM paper_nav_daily WHERE date <= ? ORDER BY date",
         (asof,))]
     if not accounts or not session_dates:
-        return _empty(asof, start)
+        return _empty(asof, start, ai=ai)
 
     display_date = session_dates[-1]
     # 锚点（起跑日）永远在横轴上：没有它，「相对大盘」就没有公共起点。
@@ -206,6 +329,7 @@ def track(conn: sqlite3.Connection, asof: str) -> dict:
         "real_trades_after_start": sum(1 for t in real_trades
                                        if str(t["date"]) > start),
         "paper_trades": _paper_trades(conn, asof),
+        "ai": ai,
         "disclosure": list(report.get("disclosure") or []),
         "disclaimer": report.get("disclaimer", ""),
         "sample_note": report.get("sample_note", ""),
