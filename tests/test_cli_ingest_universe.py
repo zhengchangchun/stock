@@ -14,7 +14,9 @@ import json
 
 import pytest
 
-from stocklab.cli.main import _bars_universe, build_parser, cmd_ingest_bars
+from stocklab.cli.main import (_bars_universe, _stock_universe, build_parser,
+                              cmd_ingest_actions, cmd_ingest_bars,
+                              cmd_ingest_valuation)
 from stocklab.config import paths
 from stocklab.config.universe import ASSET_ETF, ASSET_STOCK, DEFAULT_UNIVERSE, Instrument
 from stocklab.data.models import Bar
@@ -103,3 +105,38 @@ def test_ingest_bars_cli_rejects_unknown_code(db, monkeypatch, capsys):
     err = capsys.readouterr().err
     assert "999999" in err and "拒绝静默跳过" in err
     assert db.execute("SELECT COUNT(*) FROM bars_daily").fetchone()[0] == 0
+
+
+def test_stock_universe_excludes_etf(db):
+    """复权链用的集合只要股票（ADR-008：ETF 不进复权链），库为空时退回默认里的股票。"""
+    repo.upsert_instruments(
+        db, (*OUTSIDE, Instrument("510300", "沪深300ETF", "sh", "main", ASSET_ETF)),
+        now=NOW)
+    assert [i.code for i in _stock_universe(db)] == ["000651", "600519"]
+    assert all(i.is_stock for i in _stock_universe(db))
+
+
+def test_ingest_actions_rejects_etf_code(db, monkeypatch, capsys):
+    """ETF 不在复权集合里 → 退出 1 点名（不能默默采一个不会建链的标的）。"""
+    repo.upsert_instruments(
+        db, (Instrument("510300", "沪深300ETF", "sh", "main", ASSET_ETF),),
+        now=NOW)
+    import stocklab.data.fetch as fetch_mod
+
+    def _boom(*a, **kw):
+        raise AssertionError("不该走到抓取")
+
+    monkeypatch.setattr(fetch_mod, "fetch_corp_actions", _boom)
+
+    args = build_parser().parse_args(["ingest", "actions", "--code", "510300"])
+    assert cmd_ingest_actions(args) == 1
+    err = capsys.readouterr().err
+    assert "510300" in err and "拒绝静默跳过" in err
+
+
+def test_ingest_valuation_rejects_unknown_code(db, capsys):
+    """估值/资金流系列采集同样不接受库外代码（同一道闸）。"""
+    repo.upsert_instruments(db, OUTSIDE, now=NOW)
+    args = build_parser().parse_args(["ingest", "valuation", "--code", "999999"])
+    assert cmd_ingest_valuation(args) == 1
+    assert "999999" in capsys.readouterr().err

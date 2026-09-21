@@ -164,6 +164,40 @@ def cmd_ingest_bars(args: argparse.Namespace) -> int:
     return 0 if report.ok_count else 1
 
 
+def _stock_universe(conn):
+    """**需要复权链**的采集（`ingest actions`）的标的集合：库里 active **股票**。
+
+    为什么不是 ETF：ADR-008 明确「ETF 不进复权链」（`assert_adjustable` 直接抛错），
+    所以复权事件采集必须排掉 ETF；库为空时退回 `DEFAULT_UNIVERSE` 里的股票。
+    与 `_bars_universe` 的差别：本函数只要股票，且库为空时不带 ETF。
+    """
+    from stocklab.config.universe import Instrument
+
+    try:
+        rows = conn.execute(
+            "SELECT code, name, market, board, type FROM instruments"
+            " WHERE active=1 AND type='stock' ORDER BY code").fetchall()
+    except sqlite3.Error:
+        rows = []
+    loaded = tuple(
+        Instrument(r["code"], r["name"], r["market"], r["board"], r["type"])
+        for r in rows)
+    return loaded or tuple(i for i in DEFAULT_UNIVERSE if i.is_stock)
+
+
+def _reject_unknown_codes(universe, codes, *, cmd: str):
+    """`--code` 里出现标的集合中没有的代码 → 打印并回 False（**不静默跳过**，#44）。"""
+    if not codes:
+        return True
+    known = {i.code for i in universe}
+    unknown = [c for c in dict.fromkeys(codes) if c not in known]
+    if unknown:
+        print(f"❌ {cmd} --code 里有不在标的集合里的代码，拒绝静默跳过: {unknown}",
+              file=sys.stderr)
+        return False
+    return True
+
+
 # ---------- ingest actions（除权事件 + 因子链） ----------
 
 def cmd_ingest_actions(args: argparse.Namespace) -> int:
@@ -185,17 +219,22 @@ def cmd_ingest_actions(args: argparse.Namespace) -> int:
     settings = load_settings()
     now = datetime.now(TZ).isoformat(timespec="seconds")
     end = _today()
-    universe = tuple(i for i in DEFAULT_UNIVERSE
-                     if not args.code or i.code in args.code)
-
-    cache = RawCache(paths.RAW_CACHE_DIR) if settings.cache_enabled else None
-    client = HttpClient(policy_from_settings(settings), cache=cache)
-    out: dict = {"end": end, "start": args.start, "codes": {}}
-    failed: list[str] = []
 
     ensure_schema(paths.DB_PATH)   # 写库入口前滚（P33）
     conn = connect(paths.DB_PATH)
     try:
+        universe = _stock_universe(conn)
+        if not _reject_unknown_codes(universe, args.code, cmd="ingest actions"):
+            return 1
+        if args.code:
+            wanted = set(args.code)
+            universe = tuple(i for i in universe if i.code in wanted)
+
+        cache = RawCache(paths.RAW_CACHE_DIR) if settings.cache_enabled else None
+        client = HttpClient(policy_from_settings(settings), cache=cache)
+        out: dict = {"end": end, "start": args.start, "codes": {}}
+        failed: list[str] = []
+
         repo.upsert_instruments(conn, universe, now=now)
         for inst in universe:
             code = inst.code
@@ -312,8 +351,6 @@ def _cmd_ingest_series(args: argparse.Namespace, *, kind: str) -> int:
     now = datetime.now(TZ).isoformat(timespec="seconds")
     start = args.start or (date.today() - timedelta(days=args.days)).isoformat()
     end = args.end or _today()
-    universe = tuple(i for i in DEFAULT_UNIVERSE
-                     if not args.code or i.code in args.code)
 
     ensure_schema(paths.DB_PATH)    # 前滚 schema（P33：写库入口统一走 ensure_schema）
 
@@ -324,6 +361,13 @@ def _cmd_ingest_series(args: argparse.Namespace, *, kind: str) -> int:
     out: dict = {"kind": kind, "start": start, "end": end, "codes": {}}
     failed: list[str] = []
     try:
+        universe = _bars_universe(conn)
+        if not _reject_unknown_codes(universe, args.code, cmd=f"ingest {kind}"):
+            return 1
+        if args.code:
+            wanted = set(args.code)
+            universe = tuple(i for i in universe if i.code in wanted)
+
         repo.upsert_instruments(conn, universe, now=now)
         run_id = repo.record_job(conn, f"ingest_{kind}", status="running",
                                  started_at=now)
