@@ -64,13 +64,25 @@ def load_accounts(conn: sqlite3.Connection) -> list[dict]:
 
 def insert_trade(conn: sqlite3.Connection, *, account_id: str, date: str,
                  decision: Decision, now: str, commit: bool = True) -> int:
-    """写一条模拟成交。只接受 `Decision.is_trade` 的决定（hold 不该走到这里）。
+    """写一条模拟成交。只接受**带方向且有股数**的决定（hold 不该走到这里）。
+
+    ## 两道校验为什么不依赖 `Decision.is_trade`
+
+    `is_trade` 现在是 `action in ("buy","sell") and qty > 0`，但**写入层自己判**
+    这两个字段而不是信那个布尔：把校验外包给一个随时可能被重定义的性质，
+    就等着某天守卫悄悄失效。两道都留，并且都报**点名规则层**的 `ValueError` ——
+    否则看到的是 `CHECK (qty > 0)` 的 `IntegrityError`，排查方向会跑到 schema 上
+    （ERROR_DIARY #49 就是这么来的：止损规则产出「卖 0 股」，整个 step 事务回滚）。
 
     `commit=False` 供 `engine.step` 把**整个 step** 放进一个事务
     （一次失败不得留下「前 4 个账户已写、第 5 个没写」的半截状态）。
     """
-    if not decision.is_trade:
+    if decision.action not in ("buy", "sell"):
         raise ValueError(f"hold 决定不能写成交：{decision.action!r} / {decision.reason!r}")
+    if decision.qty <= 0:
+        raise ValueError(
+            f"qty={decision.qty} 不是可执行的股数（规则层不该产出 0 股成交）："
+            f"{decision.action!r} / {decision.code!r} / {decision.reason!r}")
     f = decision.fees
     cur = conn.execute(
         f"INSERT INTO {TABLE_TRADES} (account_id, date, code, side, ref_price,"

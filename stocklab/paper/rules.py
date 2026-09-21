@@ -91,7 +91,15 @@ class Decision:
 
     @property
     def is_trade(self) -> bool:
-        return self.action in ("buy", "sell")
+        """**真的能执行**的成交（有方向**且有股数**）。
+
+        `qty > 0` 进这个判据不是修辞：只有方向没有股数的「卖 0 股」曾经一路
+        传到写入层，被 `paper_trades` 的 `CHECK (qty > 0)` 拦成一个
+        `IntegrityError` —— 而 `step` 是**一个事务**，于是一天的净值全部回滚。
+        触发路径很平常：持仓已在昨天止损清完，今天收盘仍在线下，
+        规则说「整清 0 股」。见 ERROR_DIARY #49。
+        """
+        return self.action in ("buy", "sell") and self.qty > 0
 
 
 def _hold(code: str | None, reason: str, *, rule: str = "",
@@ -154,6 +162,15 @@ def plan_stop_loss(*, code: str, close: float | None, qty: int,
     if check["status"] != "FAIL":
         return _hold(code, f"收盘 {close:.2f} 未触发止损线 {line:.2f}（跌破才动）",
                      rule=RULE_CITATIONS["stop_loss"], ref_price=close)
+    if qty <= 0:
+        # 规则失效了、但手里没货（典型：昨天已按这条线整清，今天收盘仍在线下）。
+        # 这里必须回 `hold` 而不是「卖 0 股」：后者 `is_trade` 会把它当成成交，
+        # 一路走到 `paper_trades` 的 `CHECK (qty > 0)` 上，把整个 `step` 事务拖垮。
+        return _hold(
+            code,
+            f"{code} 收盘 {close:.2f} **跌破**止损线 {line:.2f}，但持仓为 0 股"
+            f"→ 无可执行动作（不是忘了卖）",
+            rule=RULE_CITATIONS["stop_loss"], ref_price=close)
     costs = costs or CostModel()
     fill, fees = costs.total("sell", close, qty)
     fee_parts = _fee_parts(costs, "sell", fill, qty, ref=close)

@@ -10,6 +10,8 @@ import sqlite3
 import pytest
 
 from stocklab.paper import engine
+from stocklab.paper import store
+from stocklab.paper.rules import Decision
 from stocklab.paper.config import (
     ARM_HOLD,
     ARM_NOW,
@@ -46,6 +48,15 @@ BARS = {
 INSTRUMENTS = (("000333", "美的集团", "sz", "stock"), ("600690", "海尔智家", "sz", "stock"),
                ("510300", "沪深300ETF", "sh", "etf"), ("510880", "红利ETF", "sh", "etf"))
 SEED_FEE = 5.09
+
+#: #49 的跨天回归专用：两个**全部收在止损线 82.14 之下**的交易日。
+#: 单独一套而不是改 `CAL`/`BARS` —— 那两个被其他测试的逐日循环共用，
+#: 往里面加一天会静默改变它们的覆盖面。
+CAL_LOW = ("2026-09-18", "2026-09-21")
+BARS_LOW = {
+    "2026-09-18": {"000333": 80.00, "510300": 4.470, "510880": 3.360},
+    "2026-09-21": {"000333": 79.00, "510300": 4.460, "510880": 3.350},
+}
 
 
 @pytest.fixture
@@ -356,6 +367,29 @@ def test_append_only_triggers_block_update_and_delete(db, table):
     c.close()
 
 
+def test_store_refuses_zero_share_or_hold_decisions(db):
+    """写入层的两道校验都报**点名规则层**的 `ValueError`，不靠 `CHECK` 兜底。
+
+    直接构造 `Decision`：即便将来有人把 `is_trade` 重新定义回去，
+    写入层也不会把一个空操作写进去，更不会把整天的 step 事务拖垮（#49）。
+    """
+    _run_init(db)
+    c = _conn(db)
+    try:
+        with pytest.raises(ValueError, match="hold 决定不能写成交"):
+            store.insert_trade(
+                c, account_id=ARM_HOLD, date="2026-09-16", now=NOW,
+                decision=Decision(action="hold", code=HOLD_CODE, qty=100,
+                                  rule_citation="", reason="不动"))
+        with pytest.raises(ValueError, match="不是可执行的股数"):
+            store.insert_trade(
+                c, account_id=ARM_HOLD, date="2026-09-16", now=NOW,
+                decision=Decision(action="sell", code=HOLD_CODE, qty=0,
+                                  rule_citation="止损", reason="整清 0 股"))
+    finally:
+        c.close()
+
+
 def test_ledger_cash_formula_matches_ledger_module_when_unfiltered(db):
     """arm-now 的现金公式必须与 `ledger.cash_summary` 同源（两处算迟早会漂移）。"""
     from stocklab.portfolio.ledger import cash_summary
@@ -382,3 +416,41 @@ def test_report_has_three_arms_and_disclaimer(db, tmp_path):
     assert "样本 <120 交易日不算结论" in md
     assert "LIVE 仍为 0" in md
     assert "模拟盘 ≠ 实盘" in DISCLAIMER and "模拟盘 ≠ 实盘" in md
+
+
+def test_step_after_stop_loss_cleared_the_position_does_not_crash(db):
+    """跳天回归（ERROR_DIARY #49）：今天止损清仓 → 明天收盘仍在线下，step 仍要出净值。
+
+    曾经的失败形态：止损规则产出「卖 0 股」→ `is_trade` 为真 → 撞上
+    `paper_trades` 的 `CHECK (qty > 0)` → `step` 是一个事务
+    ⇒ **当天五个账户一条净值都没落**，而且**每天**都会重现。
+    """
+    _run_init(db)
+    c = _conn(db)
+    c.executemany("INSERT INTO trading_calendar (date, is_open, source, created_at)"
+                  " VALUES (?,1,'tencent',?)", [(d, NOW) for d in CAL_LOW])
+    c.executemany(
+        "INSERT INTO bars_daily (code, date, open, high, low, close, volume, adj_mode,"
+        " source, fetched_at) VALUES (?,?,?,?,?,?,100,'none','x',?)",
+        [(code, d, px, px, px, px, NOW)
+         for d, series in BARS_LOW.items() for code, px in series.items()])
+    c.commit()
+    c.close()
+
+    _run_step(db, "2026-09-16")
+    _run_step(db, CAL_LOW[0])            # 收盘 80.00 < 止损线 82.14 → 纪律臂整清
+    rep = _run_step(db, CAL_LOW[1])      # 仍在线下、已无持仓 → 不许炸
+    by_id = {a["account_id"]: a for a in rep["accounts"]}
+    assert len(rep["accounts"]) == 5, "整天的净值必须都落库（事务不许半截）"
+    for tranche in ETF_TRANCHES:
+        acc = by_id[f"arm-discipline-{int(tranche):02d}"]
+        assert HOLD_CODE not in acc["positions"]
+        assert all(d["code"] != HOLD_CODE for d in acc["decisions"]), \
+            "已清仓的止损不该再产出成交（#49）"
+    c = _conn(db)
+    try:
+        zero = c.execute("SELECT COUNT(*) n FROM paper_trades WHERE qty <= 0"
+                         ).fetchone()["n"]
+    finally:
+        c.close()
+    assert zero == 0

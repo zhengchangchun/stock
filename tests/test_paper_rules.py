@@ -15,6 +15,7 @@ from stocklab.paper.rules import (
     C_PER_STEP,
     C_SINGLE,
     C_WHITELIST,
+    Decision,
     LookaheadError,
     check_no_lookahead,
     etf_leg_targets,
@@ -80,6 +81,32 @@ def test_stop_loss_exactly_on_line_does_not_trigger():
     d = plan_stop_loss(code="000333", close=82.14, qty=100)
     assert d.action == "hold"
     assert "未触发" in d.reason
+
+
+def test_stop_loss_with_no_position_is_a_hold_not_a_zero_share_sell():
+    """跌破但手里没货（昨天已整清）→ `hold`，**不是**「卖 0 股」。
+
+    这条钉住 ERROR_DIARY #49：曾经返回 `action="sell", qty=0`，
+    `is_trade` 为真 → 一路走到 `paper_trades` 的 `CHECK (qty > 0)`，
+    而 `step` 是一个事务 ⇒ 当天**五个账户的净值全部回滚**，且第二天照旧。
+    """
+    d = plan_stop_loss(code="000333", close=82.00, qty=0)
+    assert d.action == "hold" and d.qty == 0
+    assert not d.is_trade
+    assert "跌破" in d.reason and "0 股" in d.reason
+    assert "无关" not in d.reason          # 不是「不判定」，是「判定过了、没动作」
+
+
+def test_is_trade_needs_a_direction_and_a_positive_qty():
+    """`is_trade` 是「**真的能执行**」，所以只带方向不算成交。"""
+    assert Decision(action="sell", code="000333", qty=0,
+                    rule_citation="", reason="").is_trade is False
+    assert Decision(action="buy", code="510300", qty=0,
+                    rule_citation="", reason="").is_trade is False
+    assert Decision(action="hold", code="000333", qty=100,
+                    rule_citation="", reason="").is_trade is False
+    assert Decision(action="sell", code="000333", qty=100,
+                    rule_citation="", reason="").is_trade is True
 
 
 # ---------- 单票 40% 上限（验收 ③） ----------
