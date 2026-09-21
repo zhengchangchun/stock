@@ -156,6 +156,97 @@ def test_empty_window_is_not_zero_accuracy(conn):
     assert "没有样本" in roll["note"]
 
 
+# ---------- 版本分列（2026-09-21 升 v1.0.2 时实测到的真缺陷） ----------
+
+OLD_VERSION = "pit-rw-v1.0.1"
+
+
+def _predict_as_version(conn, asof: str, *, now: str, origin: str,
+                        model_version: str) -> str:
+    """写一批**指定版本号**的预测（换版本号就相当于升版前的历史行）。"""
+    rep = build_predictions(conn, asof, [CODE])
+    for p in rep["predictions"]:
+        insert_prediction(conn, {**p, "model_version": model_version},
+                          now=now, origin=origin)
+    return rep["target_date"]
+
+
+def test_two_model_versions_are_not_mixed(conn):
+    """升版后同一 (目标日, 标的) 会有**两行**（各一版）—— 不许混算。
+
+    这是真事，不是预防性设计：2026-09-21 升 `pit-rw-v1.0.2` 后，30 个交易日的窗口里
+    REPLAY 桶实测 1020 行 = 510 + 510，**(日, 标的) 组合 510 个全部被重复计数**，
+    页面上那个「33.8%」既不是 v1.0.1 的也不是 v1.0.2 的。
+    """
+    from stocklab.predict.version import MODEL_VERSION
+
+    assert OLD_VERSION != MODEL_VERSION
+    t_old = _predict_as_version(conn, "2026-08-30", now=REPLAY_NOW,
+                                origin="replay", model_version=OLD_VERSION)
+    t_new = _predict_as_version(conn, "2026-08-30", now=REPLAY_NOW,
+                                origin="replay", model_version=MODEL_VERSION)
+    assert t_old == t_new
+    _verify(conn, t_new, now=REPLAY_NOW)      # 一次打分覆盖两版（pred_id 各自独立）
+
+    roll = rolling_accuracy(conn, end_date="2026-09-01", n_sessions=30)
+    # 两个桶只含当前版本：不再是被重复计数的 2 行
+    assert roll["model_version"] == MODEL_VERSION
+    assert roll["replay"]["n_rows"] == 1
+    assert roll["replay"]["effective_n_days"] == 1
+    assert roll["provenance"]["replay"]["model_version"] == MODEL_VERSION
+    # 逐版行数：两版各一行，都能看到
+    assert roll["provenance"]["by_model_version"] == {
+        OLD_VERSION: {"live": 0, "replay": 1},
+        MODEL_VERSION: {"live": 0, "replay": 1}}
+    assert roll["excluded"]["n_rows"] == 1
+    assert roll["excluded"]["by_model_version"][OLD_VERSION] == {
+        "live": 0, "replay": 1}
+    # 旧版本读数单列（没被丢掉，也没被混进去）
+    assert set(roll["model_versions"]) == {OLD_VERSION, MODEL_VERSION}
+    assert "excluded" in roll["note"] and "两重分列" in roll["note"]
+
+
+def test_current_version_only_when_old_version_absent(conn):
+    """没有旧版本行时 `excluded` 为 0 且不输出「另有 N 行」那种噪声。"""
+    t = _predict_as_version(conn, "2026-08-30", now=REPLAY_NOW,
+                            origin="replay", model_version=OLD_VERSION)
+    _verify(conn, t, now=REPLAY_NOW)
+    roll = rolling_accuracy(conn, end_date="2026-09-01", n_sessions=30)
+    assert roll["model_version"] != OLD_VERSION
+    assert roll["live"] is None and roll["replay"] is None   # 当前版本一行为 0
+    assert roll["excluded"]["n_rows"] == 1                    # 旧版本行在账上
+    assert roll["excluded"]["note"] and OLD_VERSION in roll["provenance"]["by_model_version"]
+
+
+def test_report_names_the_version_and_never_mixes_it(conn):
+    """报告里的版本分列：点名当前版本 + 旧版本明标「剔除/仅作历史参照」+ §3 逐版行数。"""
+    from stocklab.predict.version import MODEL_VERSION
+
+    # 同一 asof 写两版 → 同一目标日（2026-08-31）上每版各一行
+    t = _predict_as_version(conn, "2026-08-30", now=REPLAY_NOW,
+                            origin="replay", model_version=OLD_VERSION)
+    t2 = _predict_as_version(conn, "2026-08-30", now=REPLAY_NOW,
+                             origin="replay", model_version=MODEL_VERSION)
+    assert t == t2
+    _verify(conn, t2, now=REPLAY_NOW)
+
+    rep = build_review(conn, t2)
+    md = render_markdown(rep)
+    # §3：`n` 是两个版本相加，必须逐版拆开写，否则会被读成独立样本数
+    assert rep["day"]["verifications"]["n"] == 2
+    assert rep["day"]["verifications"]["by_model_version"][OLD_VERSION]["n"] == 1
+    assert "逐版行数（可评分）" in md and "**`n` 不是独立样本数**" in md
+    # §4：口径版本 + 旧版本剔除/参照
+    assert f"口径版本：当前 **`{MODEL_VERSION}`**" in md
+    assert f"`{OLD_VERSION}`" in md
+    assert "属于旧版本" in md and "不与当前版本混算" in md
+    assert "仅作历史参照" in md
+    assert OLD_VERSION in md.split("## 5.")[0]      # 出现在 §4，不是乱塞在别处
+    # 口径声明里也要点名版本
+    assert rep["disclosure"]["model_version"] == MODEL_VERSION
+    assert f"口径版本：**{MODEL_VERSION}**" in md
+
+
 # ---------- 报告其余部分 ----------
 
 def test_report_sections_and_gap_evidence(conn):

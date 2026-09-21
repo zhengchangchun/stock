@@ -28,6 +28,7 @@ from collections.abc import Mapping, Sequence
 from typing import Any
 
 from stocklab.experiments.metrics import daily_stats
+from stocklab.predict.version import MODEL_VERSION
 from stocklab.verify.report import MIN_DAYS
 
 #: 口径判据原文（进报告，供审计者逐字复核）。
@@ -136,7 +137,18 @@ def _bucket(rows: Sequence[Mapping], *, min_days: int = MIN_DAYS) -> dict:
 
 def rolling_accuracy(conn: sqlite3.Connection, *, end_date: str,
                      n_sessions: int = 30, min_days: int = MIN_DAYS) -> dict:
-    """截至 `end_date` 的滚动准确率，**按口径分列**。
+    """截至 `end_date` 的滚动准确率，**两重分列：来源 × 版本**。
+
+    ## 为什么版本也必须参与分桶（2026-09-21 实测，不是预防性设计）
+
+    分桶只看 `provenance`（live / replay）时，**同一份预测的两个版本会各自算一次**：
+    升 `pit-rw-v1.0.2` 后，窗口 30 个交易日的 REPLAY 桶实测 **1020 行 = 510 + 510**，
+    其中 **(日, 标的) 组合 510 个全部被重复计数** —— 页面上那个「33.8%」是
+    两版口径混算出来的第三个数字，既不是 v1.0.1 的也不是 v1.0.2 的。
+
+    分桶后：`live` / `replay` 两个桶**只含当前 `MODEL_VERSION`**；其它版本的读数
+    单列在 `model_versions`（每个版本各自的 live/replay 桶）与 `excluded`（行数审计）里，
+    **不可相加、不可平均、不可互相顶替**（与「v1.0.0 的错误预测不许混进 v1.0.1」同一条纪律）。
 
     窗口 = 库里 `target_date <= end_date` 的最近 `n_sessions` 个交易日
     （取交易日而不是自然日：A 股的样本单位是交易日）。
@@ -146,26 +158,67 @@ def rolling_accuracy(conn: sqlite3.Connection, *, end_date: str,
         " ORDER BY target_date DESC LIMIT ?", (end_date, n_sessions))]
     if not days:
         return {"window": {"end": end_date, "n_sessions": 0, "start": None},
+                "model_version": MODEL_VERSION,
                 "provenance": {"rule": PROVENANCE_RULE,
-                               "live": {"n_rows": 0}, "replay": {"n_rows": 0}},
-                "live": None, "replay": None,
+                               "live": {"n_rows": 0, "model_version": MODEL_VERSION},
+                               "replay": {"n_rows": 0, "model_version": MODEL_VERSION},
+                               "by_model_version": {}},
+                "live": None, "replay": None, "model_versions": {},
+                "excluded": {"n_rows": 0, "by_model_version": {}, "note": None},
                 "note": "窗口内没有任何验证行 —— 不是「准确率是 0」，是「没有样本」"}
     start = min(days)
     rows = load_rows(conn, start, end_date)
-    live = [r for r in rows if r["provenance"] == "live"]
-    replay = [r for r in rows if r["provenance"] == "replay"]
+    by_mv: dict[str, dict[str, list[dict]]] = {}
+    for r in rows:
+        by_mv.setdefault(r["model_version"], {}).setdefault(
+            r["provenance"], []).append(r)
+
+    cur = by_mv.get(MODEL_VERSION) or {}
+    live = cur.get("live") or []
+    replay = cur.get("replay") or []
+    versions = {
+        mv: {
+            "n_rows": sum(len(v) for v in groups.values()),
+            "live": (_bucket(groups["live"], min_days=min_days)
+                     if groups.get("live") else None),
+            "replay": (_bucket(groups["replay"], min_days=min_days)
+                       if groups.get("replay") else None),
+        }
+        for mv, groups in sorted(by_mv.items())
+    }
+    excluded = {mv: {"live": len(g.get("live") or []),
+                     "replay": len(g.get("replay") or [])}
+                for mv, g in sorted(by_mv.items()) if mv != MODEL_VERSION}
+    excluded_rows = sum(v["live"] + v["replay"] for v in excluded.values())
     return {
         "window": {"end": end_date, "start": start, "n_sessions": len(days)},
+        #: 下面 `live` / `replay` 两个桶的**口径版本**（写出来，读者不必去猜）。
+        "model_version": MODEL_VERSION,
         "provenance": {
             "rule": PROVENANCE_RULE,
-            "live": {"n_rows": len(live)},
-            "replay": {"n_rows": len(replay)},
+            "live": {"n_rows": len(live), "model_version": MODEL_VERSION},
+            "replay": {"n_rows": len(replay), "model_version": MODEL_VERSION},
+            "by_model_version": {mv: {"live": len(g.get("live") or []),
+                                      "replay": len(g.get("replay") or [])}
+                                 for mv, g in sorted(by_mv.items())},
         },
         "live": _bucket(live, min_days=min_days) if live else None,
         "replay": _bucket(replay, min_days=min_days) if replay else None,
+        #: 窗口内**每个**版本的读数（含当前版本）—— 给页面/报告逐版展示用。
+        "model_versions": versions,
+        "excluded": {
+            "n_rows": excluded_rows,
+            "by_model_version": excluded,
+            "note": (f"窗口内另有 {excluded_rows} 行属于**其它** model_version"
+                     "（口径不同）—— 不计入上面的两个桶；逐版读数见 model_versions。"
+                     if excluded_rows else None),
+        },
         "note": (
-            "**口径分列**：`live` 是实盘累计，`replay` 是 PIT 历史回放。"
-            "两者不可相加、不可互相顶替。LIVE 为 null 表示窗口内一条实盘记录都没有 —— "
+            "**两重分列**：`live`（实盘累计）/ `replay`（PIT 历史回放）不可相加、"
+            "不可互相顶替；且这两个桶**只含当前版本** `" + MODEL_VERSION + "`。"
+            "其它 `model_version` 的行单列在 `excluded`，逐版读数在 `model_versions`，"
+            "混算会得到一个既不属于这一版、也不属于那一版的数字。"
+            "LIVE 为 null 表示窗口内一条实盘记录都没有 —— "
             "此时报告里**不得**出现任何被称为「实盘表现」的数字。"
         ),
     }
@@ -292,6 +345,14 @@ def day_results(conn: sqlite3.Connection, date: str) -> dict:
         " p.model_version AS model_version, p.created_at AS pred_created_at"
         " FROM verifications v JOIN predictions p ON p.pred_id=v.pred_id"
         " WHERE v.target_date=? ORDER BY p.model_version, p.code", (date,)).fetchall()
+    # 逐版计数（升版后同一 (标的, 目标日) 会有两行，`n` 会把两版相加 ——
+    # 拆出来读者才能看出「这不是 1020 个独立样本，是 510 个各算了两版」）
+    by_mv: dict[str, dict[str, int]] = {}
+    for r in states:
+        slot = by_mv.setdefault(r["model_version"], {"n": 0, "scorable": 0})
+        slot["n"] += 1
+        if r["actual_close"] is not None:
+            slot["scorable"] += 1
     return {
         "target_date": date,
         "predictions": {"n": sum(r["n"] for r in preds),
@@ -301,6 +362,7 @@ def day_results(conn: sqlite3.Connection, date: str) -> dict:
             "n": vers["n"] or 0,
             "scorable": vers["scorable"] or 0,
             "unscorable": unscorable,
+            "by_model_version": by_mv,
             "rows": [{**dict(r),
                       "provenance": classify(r["asof_date"], r["pred_created_at"])}
                      for r in states],
@@ -357,6 +419,10 @@ def _disclosure(report: Mapping) -> dict:
             f"LIVE(实盘累计) {n_live} 行；REPLAY(PIT 历史回放) "
             f"{(replay or {}).get('n_rows', 0)} 行"
         ),
+        #: 上面两个桶的口径版本（升版后报告里必须点名，否则读者无法判断
+        #: 「这个数字是哪一版的」）。
+        "model_version": report["rolling"].get("model_version"),
+        "excluded_rows": (report["rolling"].get("excluded") or {}).get("n_rows", 0),
         "is_live_performance": n_live > 0,
         "note": (
             "报告里的准确率**默认按 PIT 历史回放口径标注**。当前 LIVE 桶为空时，"
@@ -390,6 +456,54 @@ def _window_line(name: str, bucket: dict | None) -> str:
             f"，95% CI [{_pct(lo)}, {_pct(hi)}]；Brier {_num(bucket['brier_daily'])}；"
             f"有效样本 {bucket['effective_n_days']} 个交易日"
             f"（{bucket['n_rows']} 行）→ **{gate['label']}**")
+
+
+def _day_version_line(by_mv: Mapping | None) -> list[str]:
+    """§3 的逐版行数：**只在真的存在多个版本时**才输出（不刷噪声）。
+
+    升版后同一 (标的, 目标日) 会有两行（各一版），``n`` 是两个版本相加的结果 ——
+    不写这一句，「验证：1020 条」会被读成 1020 个独立样本。
+    """
+    if not by_mv or len(by_mv) < 2:
+        return []
+    return ["- 逐版行数（可评分）：" + "；".join(
+        f"`{mv}` {c['n']}（{c['scorable']}）" for mv, c in by_mv.items())
+        + "　—— 同一 (标的, 目标日) 在每个版本各一行，**`n` 不是独立样本数**"]
+
+
+def _version_line(roll: Mapping) -> list[str]:
+    """§4 的版本分列：当前版本 + 窗口内其它版本（不混算）。
+
+    一个具体场景（2026-09-21 实测）：升 `MODEL_VERSION` 后 30 个交易日的窗口里，
+    同一批 (日, 标的) 会有两个各 510 行的版本。不写这段的话，读者只会看到
+    「REPLAY 1020 行」这一个数 —— 既看不出重复计数，也没有任何东西提示
+    「这两个版本的分数不可平均」。
+    """
+    cur = roll.get("model_version")
+    cur_label = f"`{cur}`" if cur else "（未标注）"
+    out = [f"- 口径版本：当前 **{cur_label}**（下面 LIVE / REPLAY 两桶**只含这一版**）"]
+    by_mv = (roll.get("provenance") or {}).get("by_model_version") or {}
+    if by_mv:
+        out.append("- 窗口内逐版行数（live/replay）：" + "；".join(
+            f"`{mv}` {c['live']}/{c['replay']}" for mv, c in by_mv.items()))
+    excluded = (roll.get("excluded") or {}).get("by_model_version") or {}
+    if excluded:
+        total = sum(c["live"] + c["replay"] for c in excluded.values())
+        out.append(f"- 另有 **{total} 行属于旧版本**（已从上面的两桶**剔除**，"
+                   f"不与当前版本混算）：" + "；".join(
+                       f"`{mv}` {c['live']}/{c['replay']}" for mv, c in excluded.items()))
+        for mv, info in (roll.get("model_versions") or {}).items():
+            if mv == cur:
+                continue
+            for name, b in (("LIVE", info.get("live")), ("REPLAY", info.get("replay"))):
+                if not b:
+                    continue
+                lo, hi = (b["direction_ci95"] or [None, None])
+                out.append(f"  - 旧版本 `{mv}` {name} 读数（**仅作历史参照**）："
+                           f"方向 {_pct(b['direction_accuracy_daily'])}"
+                           f"（CI [{_pct(lo)}, {_pct(hi)}]）、Brier {_num(b['brier_daily'])}、"
+                           f"有效样本 {b['effective_n_days']} 个交易日（{b['n_rows']} 行）")
+    return out
 
 
 def render_markdown(report: Mapping) -> str:
@@ -432,6 +546,7 @@ def render_markdown(report: Mapping) -> str:
         f"（{day['predictions']['by_model_version'] or '无'}）",
         f"- 验证：{day['verifications']['n']} 条，其中可评分 "
         f"{day['verifications']['scorable']}、不可评分 {day['verifications']['unscorable']}",
+        *_day_version_line(day["verifications"].get("by_model_version")),
         _pending_line(report.get("pending")),
         "",
         "## 4. 滚动准确率",
@@ -439,6 +554,7 @@ def render_markdown(report: Mapping) -> str:
         f"- 窗口：`{roll['window']['start']}` ~ `{roll['window']['end']}`"
         f"（{roll['window']['n_sessions']} 个交易日）",
         f"- 口径判据：{roll['provenance']['rule']}",
+        *_version_line(roll),
         _window_line("LIVE（实盘累计）", roll.get("live")),
         _window_line("REPLAY（PIT 历史回放）", roll.get("replay")),
         "",
@@ -466,6 +582,7 @@ def render_markdown(report: Mapping) -> str:
         "## 7. 口径声明",
         "",
         f"- 准确率口径：{disc['accuracy_provenance']}；"
+        f"口径版本：**{disc.get('model_version') or '（未标注）'}**；"
         f"本报告是否含实盘表现：**{disc['is_live_performance']}**",
         f"- 成本：{disc['costs']}",
         f"- 清理策略：{disc['no_rolling_deletion']}",

@@ -95,8 +95,17 @@ def is_trade_date_closed(trade_date: str, now: datetime | str) -> bool:
 
 
 def _compact_rolling(roll: dict) -> dict:
-    """把完整滚动报告压成摘要字段（tick 的 JSON 要能一眼读完）。"""
-    out: dict = {"window": roll["window"], "rule": PROVENANCE_RULE}
+    """把完整滚动报告压成摘要字段（tick 的 JSON 要能一眼读完）。
+
+    压也要把**口径版本**带上：`live` / `replay` 两个桶只含当前版本，
+    不写版本的话这个摘要会在升版后被读成「全部历史都在里面」。同时报出被
+    剔除的旧版本行数（`excluded_rows`），旧版本的读数不往摘要里塞。
+    """
+    out: dict = {"window": roll["window"], "rule": PROVENANCE_RULE,
+                 "model_version": roll.get("model_version"),
+                 "excluded_rows": (roll.get("excluded") or {}).get("n_rows", 0),
+                 "rows_by_model_version": (
+                     (roll.get("provenance") or {}).get("by_model_version") or {})}
     for name in ("live", "replay"):
         b = roll.get(name)
         if not b:

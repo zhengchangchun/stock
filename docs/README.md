@@ -90,7 +90,14 @@ stocklab portfolio show --asof 2026-09-15 --json     # P13 消费的稳定接口
   （9分21秒 / 42312+42312 行 / 退出码 0）、`predict run` 由 exit 1 变 exit 0、口径对比
   （0.37607 → **0.37883**，Brier 0.66209 → 0.66070，**结论不变**）、红线三目标第三次重基
   （数值叶子 0 差异 / 差异全来自版本字符串），以及落地时补的**能力缺口**
-  （`verify_target` 的 `model_version` 过滤 —— 没有它回放会撞 `VerificationConflict`）
+   （`verify_target` 的 `model_version` 过滤 —— 没有它回放会撞 `VerificationConflict`）
+- [`plans/2026-09-21-准确率分桶补版本维度.md`](plans/2026-09-21-准确率分桶补版本维度.md)
+  — 紧接上一条的**读路径**：升版后「按口径分列」的桶把两版混算了（真库窗口 30 个交易日
+  REPLAY 读到 1020 行 = 510 + 510，**(日, 标的) 重复计数 510 个**；页面上的 0.33824
+  既不是 v1.0.1 的 0.34314 也不是 v1.0.2 的 0.33333）。修正＝两个桶**只含当前版本**，
+  旧版本单列在 `model_versions` / `excluded` 且明写「不许相加/平均」；五个消费者
+  （报告 / labweb / dashboard / tick / CLI JSON）全部对齐，含页面截图与前后逐版数字
+  （见错误日记 #48）
 - [`plans/2026-09-15-p11-调度链.md`](plans/2026-09-15-p11-调度链.md) — P11 设计稿：
   快照幂等键、收盘回填、LIVE/REPLAY 口径分列
 - [`tasks/2026-09-15-p11-调度链-task45-52.md`](tasks/2026-09-15-p11-调度链-task45-52.md) —

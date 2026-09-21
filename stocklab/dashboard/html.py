@@ -296,6 +296,10 @@ def _accuracy_section(acc: Mapping) -> str:
     out.append(f'<p class="tag">窗口：{esc(w["start"])} ~ {esc(w["end"])}，'
                f'{num(w["n_sessions"])} 个交易日 · 判据：'
                f'{esc(acc["provenance"]["rule"])}</p>')
+    # 口径版本：两个桶**只含当前版本**；旧版本读数单列（2026-09-21 升 v1.0.2 后加的）
+    cur = acc.get("model_version")
+    out.append(f'<p class="tag">口径版本：<b>{esc(str(cur or "（未标注）"))}</b>'
+               f'　下面两个桶只含这一版</p>')
     out.append('<div class="grid">')
     out.append(_bucket_card("LIVE（实盘累计）", acc["live"],
                             empty_note="窗口内一条实盘记录都没有 —— 这不是「实盘表现 0%」"))
@@ -304,6 +308,21 @@ def _accuracy_section(acc: Mapping) -> str:
     out.append("</div>")
     if acc.get("note"):
         out.append(f'<p class="tag">{esc(acc["note"])}</p>')
+    old = {k: v for k, v in (acc.get("model_versions") or {}).items() if k != cur}
+    if old:
+        total = sum(v["n_rows"] for v in old.values())
+        out.append(f'<p class="tag"><b>旧版本读数（共 {total} 行，已从上面两桶剔除）'
+                   f'—— 不与当前版本混算</b></p>')
+        for mv, info in old.items():
+            for label, key in (("LIVE", "live"), ("REPLAY", "replay")):
+                b = info.get(key)
+                if not b:
+                    continue
+                out.append(f'<p class="tag">`{esc(str(mv))}` {label}'
+                           f'（{num(b["n_rows"])} 行）：方向 '
+                           f'{num(b["direction_accuracy_daily"], 4)} · '
+                           f'Brier {num(b["brier_daily"], 4)} · '
+                           f'有效样本 {num(b["effective_n_days"])} 交易日</p>')
     rows = []
     for label, key in (("LIVE", "live"), ("REPLAY", "replay")):
         b = acc.get(key)

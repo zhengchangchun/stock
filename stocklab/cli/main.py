@@ -1775,16 +1775,23 @@ def cmd_review_daily(args: argparse.Namespace) -> int:
         "target_verifications": {
             "n": rep["day"]["verifications"]["n"],
             "scorable": rep["day"]["verifications"]["scorable"],
-            "unscorable": rep["day"]["verifications"]["unscorable"]},
+            "unscorable": rep["day"]["verifications"]["unscorable"],
+            # 逐版行数：升版后 `n` 是两个版本相加，**不是独立样本数**
+            "by_model_version": rep["day"]["verifications"].get("by_model_version")},
         # 缺步检测（P27）：`null` = 判不了（**不是** 0，见 ERROR_DIARY #36）
         "pending_verifications": rep["pending"]["n"],
         "pending_verifications_detail": {
             k: v for k, v in rep["pending"].items() if k != "evidence"},
         "rolling_window": roll["window"],
+        # 口径版本：下面 live/replay 两桶**只含这一版**（2026-09-21 升 v1.0.2）
+        "model_version": roll.get("model_version"),
         "provenance": {
             "rule": roll["provenance"]["rule"],
             "live_rows": roll["provenance"]["live"]["n_rows"],
-            "replay_rows": roll["provenance"]["replay"]["n_rows"]},
+            "replay_rows": roll["provenance"]["replay"]["n_rows"],
+            "rows_by_model_version": roll["provenance"].get("by_model_version")},
+        # 旧版本读数（口径不同）：**不参与**上面的 live/replay 桶，也不得与它们相加/平均
+        "excluded": roll.get("excluded"),
         "live": live,
         "replay": ({"n_rows": replay["n_rows"],
                     "direction_accuracy_daily": replay["direction_accuracy_daily"],

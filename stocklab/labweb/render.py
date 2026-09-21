@@ -999,10 +999,19 @@ def _how_detail(view: Mapping, nav: Mapping, *, base: str) -> str:
 
 
 def _accuracy_block(acc: Mapping) -> str:
-    """验证统计：**LIVE 与 REPLAY 分开，且各自带样本门槛**。"""
+    """验证统计：**LIVE / REPLAY 分开，且各自带样本门槛**。
+
+    2026-09-21 补第三重分列：**口径版本**。升 `MODEL_VERSION` 后，只看来源分桶会把
+    窗口里两个版本的行一起算（实测 REPLAY 1020 行 = 510 + 510，(日, 标的) 重复计数），
+    页面上读到的 33.8% 既不属于 v1.0.1 也不属于 v1.0.2。因此：两个桶只含当前版本，
+    旧版本读数单列且明写「不与当前版本混算」。
+    """
+    cur = acc.get("model_version")
     out = [f'<p class="note">窗口 {esc(acc["window"]["start"])} ~ '
            f'{esc(acc["window"]["end"])}（{acc["window"]["n_sessions"]} 个交易日）　'
            f'口径：{rich(acc["provenance"]["rule"])}</p>']
+    out.append(f'<p class="note">口径版本：<b>{esc(str(cur or "（未标注）"))}</b>'
+               f'　下面 LIVE / REPLAY 两桶<b>只含这一版</b></p>')
     live_n = acc["provenance"]["live"]["n_rows"]
     out.append(f'<p><b>LIVE（实盘）</b> {live_n} 行'
                + ('' if live_n else '　<span class="s-fail">没有实盘样本 —— '
@@ -1026,6 +1035,27 @@ def _accuracy_block(acc: Mapping) -> str:
             out.append('<p class="note">常数基线：' + "　".join(
                 f'{esc(k)} {num(v, 4)}' for k, v in sorted(base_.items()))
                 + '　跑不赢基线就是没有技能</p>')
+    by_mv = (acc.get("provenance") or {}).get("by_model_version") or {}
+    if len(by_mv) > 1:
+        out.append('<p class="note">窗口内逐版行数（live/replay）：' + "　".join(
+            f'{esc(str(k))} {v["live"]}/{v["replay"]}' for k, v in by_mv.items())
+            + '</p>')
+    old = {k: v for k, v in (acc.get("model_versions") or {}).items() if k != cur}
+    if old:
+        rows = []
+        for mv, info in old.items():
+            for name, bucket in (("LIVE", info.get("live")), ("REPLAY", info.get("replay"))):
+                if not bucket:
+                    continue
+                rows.append(f'<p class="note">旧版本 {esc(str(mv))} {name}'
+                            f'（{bucket["n_rows"]} 行）：方向准确率 '
+                            f'{num(bucket["direction_accuracy_daily"], 4)}　'
+                            f'Brier {num(bucket["brier_daily"], 4)}　'
+                            f'有效样本 {bucket["effective_n_days"]} 交易日</p>')
+        total = sum(v["n_rows"] for v in old.values())
+        out.append(f'<p class="note"><b>旧版本读数（共 {total} 行，已从上面两桶剔除）'
+                   f'—— 不与当前版本混算</b>（口径不同，相加/平均会得到第三个数字）</p>')
+        out.extend(rows)
     return "".join(out)
 
 
