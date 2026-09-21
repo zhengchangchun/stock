@@ -105,7 +105,12 @@ def backfill(conn: sqlite3.Connection, from_date: str, to_date: str, *,
             storage[str(pred_id)] = f"{p['code']}@{asof}:{state}"
         try:
             v = verify_target(conn, target, costs=costs, capital=capital,
-                              codes=codes, cache=cache, now=now)
+                              codes=codes, cache=cache, now=now,
+                              # 只评**本次回放刚写下**的那一版：不带这个过滤，跨版本重放
+                              # 会把旧版本已评分的行按新口径重算 ⇒ 撞上 append-only 守卫
+                              # （2026-09-21 实测）。见 `verify_target` 的 `model_version`
+                              # 段与 `docs/plans/2026-09-21-MODEL_VERSION-v1.0.2-复权口径升版.md`。
+                              model_version=rep["model_version"])
         except NoPredictions as exc:
             skipped[target] = str(exc)
             continue

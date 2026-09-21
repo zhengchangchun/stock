@@ -18,6 +18,7 @@ from stocklab.data.models import Bar
 from stocklab.predict.service import build_predictions
 from stocklab.predict.store import payload_from_row
 from stocklab.predict.model import payload_hash
+from stocklab.predict.version import MODEL_VERSION
 from stocklab.store.db import connect
 from tests.test_predict_service import _to_date, _to_ord, bars, seed
 
@@ -146,6 +147,30 @@ def test_backfill_payloads_match_predict_run(tmp_path):
                 "SELECT * FROM predictions WHERE code=? AND asof_date=?",
                 (CODE, asof)).fetchone()
             assert payload_hash(payload_from_row(row)) == payload_hash(p), asof
+
+
+def test_backfill_scores_only_the_version_it_wrote(tmp_path, monkeypatch):
+    """回放**只评本次刚写下的那一版**（跨版本重放会篡改旧账本，见 `verify_target`）。
+
+    这里是**接线**测试：不钉住的话，`verify_target` 的过滤能力就只是「写在那里没人用」。
+    """
+    conn, hist = _env(tmp_path)
+    from stocklab.predict.service import PitCache
+    from stocklab.verify import replay as RP
+
+    seen: list[tuple[str, str | None]] = []
+
+    def fake(conn, target, **kw):
+        seen.append((target, kw.get("model_version")))
+        return {"target_date": target, "rows": [], "storage": {},
+                "by_model_version": {}, "unscorable": [], "notes": {}}
+
+    monkeypatch.setattr(RP, "verify_target", fake)
+    rng = (hist[5].date, hist[-1].date)
+    RP.backfill(conn, rng[0], rng[1], codes=[CODE], cache=PitCache(),
+                now="2026-09-15T19:00:00+08:00")
+    assert len(seen) >= 5, "回放应当逐日打分"
+    assert {mv for _, mv in seen} == {MODEL_VERSION}
 
 
 def test_backfill_writes_verifications_and_a_deterministic_report(tmp_path):

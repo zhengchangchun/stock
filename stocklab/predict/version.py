@@ -19,7 +19,18 @@ from __future__ import annotations
 #:   见 `docs/errors/ERROR_DIARY.md` 2026-09-15。**载荷因此改变，故必须升版本**：
 #:   v1.0.0 那两行预测原样留在库里，不被覆盖、不被重算 —— 这正是 append-only
 #:   与 `model_version` 唯一键存在的意义。
-MODEL_VERSION = "pit-rw-v1.0.1"
+#: - `pit-rw-v1.0.2`：**公式一字未改**，改的是**输入口径**。此前库里
+#:   `corp_actions`/`adj_factors` 各 0 行 ⇒ 因子恒 1 ⇒ `adjust.load_bars_adjusted()`
+#:   把「前复权价」返回成**不复权价逐位相同**的序列（静默失真：不报错，报告里
+#:   仍写 `adjusted_prices: true`）。复权链补上（411→**417 事件 / 80461 因子行**）后，
+#:   同一个 `asof` 算出的载荷必然不同，而 `(code, asof_date, model_version)` 唯一键
+#:   与 append-only 触发器**拒绝改写**旧行（错误文案就是「要出新预测请升 model_version」）。
+#:   故按项目纪律升版本，而**不是**删行重写：`v1.0.1` = 「复权链为空的时期」的
+#:   带版本历史，报告按 `model_version` 分组天然不混算（`verify.report`）。
+#:   决策与证据见 `docs/plans/2026-09-21-红线库指纹.md` §7.2/§7.3
+#:   （用户 2026-09-21 拍板「X」）；落地记录见
+#:   `docs/plans/2026-09-21-MODEL_VERSION-v1.0.2-复权口径升版.md`。
+MODEL_VERSION = "pit-rw-v1.0.2"
 
 #: 模型短名（报告/证据块用）。
 MODEL_ID = "pit_rw_v1"

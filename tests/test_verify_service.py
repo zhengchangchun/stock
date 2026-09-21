@@ -14,6 +14,7 @@ import pytest
 from stocklab.data.models import Bar
 from stocklab.predict.service import build_predictions
 from stocklab.predict.store import insert_prediction
+from stocklab.predict.version import MODEL_VERSION
 from stocklab.store.db import connect
 from stocklab.verify import service as VS
 from stocklab.verify.score import HUMAN_ONLY_ATTRIBUTIONS
@@ -130,9 +131,11 @@ def test_groups_by_model_version(tmp_db, tmp_path):
 
     out = VS.verify_target(conn, target)
     groups = out["by_model_version"]
-    assert set(groups) == {"pit-rw-v1.0.0", "pit-rw-v1.0.1"}
+    # 当前版本从常量取，不写死：版本号会升（2026-09-21 → `pit-rw-v1.0.2`），
+    # 而这条测试钉的是「按版本分组」这件事本身。
+    assert set(groups) == {"pit-rw-v1.0.0", MODEL_VERSION}
     assert groups["pit-rw-v1.0.0"]["n"] == 1
-    assert groups["pit-rw-v1.0.0"]["pred_ids"] != groups["pit-rw-v1.0.1"]["pred_ids"]
+    assert groups["pit-rw-v1.0.0"]["pred_ids"] != groups[MODEL_VERSION]["pred_ids"]
     # 每一行的版本必须能对上组（不许出现「行说 v1.0.1、组算到 v1.0.0」）
     for row in out["rows"]:
         assert row["pred_id"] in groups[row["model_version"]]["pred_ids"]
@@ -209,3 +212,60 @@ def test_rows_carry_code_and_model_version_for_grouping(tmp_db, tmp_path):
     assert row["code"] == CODE
     assert row["model_version"] == rep["model_version"]
     assert row["asof_date"] == asof
+
+
+# ---------- 5. `model_version` 过滤：跨版本重放不许篡改旧账本 ----------
+
+def _env_with_target_bar(tmp_path):
+    hist = bars(n=200)
+    asof, target = hist[-1].date, _to_date(_to_ord(hist[-1].date) + 1)
+    extra = [Bar(code=CODE, date=target, open=11.0, high=11.4, low=10.9,
+                 close=11.2, volume=1000, amount=1.0, turnover=1.0,
+                 source="test", adj_mode="none")]
+    return seed(tmp_path / "a.db", {CODE: hist + extra}), asof, target
+
+
+def test_model_version_filter_spares_the_previous_versions_ledger(tmp_db, tmp_path):
+    """跨版本重放的真实碰撞（2026-09-21 实测，`pred_id=1831`）。
+
+    库里本来就有上一版的预测 + 已评分的验证行。新版重放时**只评自己那一版**：
+    不带过滤会把旧版行按新口径重算 ⇒ append-only 守卫（正确地）报冲突；
+    带上过滤则旧行一个字节不碰 —— 旧口径的账本保留为历史，而不是被新口径改写。
+    """
+    from stocklab.verify.store import VerificationConflict
+
+    conn, asof, target = _env_with_target_bar(tmp_path)
+    rep = build_predictions(conn, asof, [CODE])
+    legacy = {**rep["predictions"][0], "model_version": "pit-rw-v0.9.9"}
+    _, old_pid = insert_prediction(conn, legacy, now=NOW, origin="replay")
+    VS.verify_target(conn, target)                       # 旧版的账本行（唯一一条）
+    before = dict(conn.execute("SELECT * FROM verifications WHERE pred_id=?",
+                               (old_pid,)).fetchone())
+
+    # 口径/数据变了：同一根 bar 算出不同结果（模拟「复权链从空到有」）
+    conn.execute("UPDATE bars_daily SET close=13.0, high=13.5 WHERE code=? AND date=?",
+                 (CODE, target))
+    conn.commit()
+    with pytest.raises(VerificationConflict):           # 守卫是真的：不带过滤就撞
+        VS.verify_target(conn, target)
+    assert conn.execute("SELECT COUNT(*) FROM verifications").fetchone()[0] == 1
+
+    # 新版预测落库 + **只评这一版**
+    _, new_pid = insert_prediction(conn, rep["predictions"][0], now=NOW,
+                                   origin="replay")
+    out = VS.verify_target(conn, target, model_version=MODEL_VERSION)
+    assert sorted(out["storage"]) == [str(new_pid)]
+    assert conn.execute("SELECT COUNT(*) FROM verifications").fetchone()[0] == 2
+    # 旧行逐字段未动（不是「重算成一样」，是**压根没重算**）
+    after = dict(conn.execute("SELECT * FROM verifications WHERE pred_id=?",
+                              (old_pid,)).fetchone())
+    assert after == before
+
+
+def test_model_version_filter_matching_nothing_is_an_explicit_error(tmp_db, tmp_path):
+    """过滤后一条都不剩 ⇒ `NoPredictions`（不是静默成功 —— 那会把缺口读成「已评完」）。"""
+    conn, asof, target = _env_with_target_bar(tmp_path)
+    _predict_all(conn, asof)
+    with pytest.raises(VS.NoPredictions):
+        VS.verify_target(conn, target, model_version="pit-rw-v9.9.9")
+    assert conn.execute("SELECT COUNT(*) FROM verifications").fetchone()[0] == 0

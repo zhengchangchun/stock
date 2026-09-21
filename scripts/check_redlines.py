@@ -75,12 +75,15 @@ from stocklab.quality.redline import (  # noqa: E402
     sha256_text,
     synthetic_asof,
 )
+from stocklab.predict.version import MODEL_VERSION  # noqa: E402
 
 DEFAULT_DB = "data/stocklab.db"
 PREDICT_ASOF = "2026-09-14"
 BACKFILL_FROM = "2013-12-23"
 BACKFILL_TO = "2026-09-14"
-MODEL_VERSION = "pit-rw-v1.0.1"
+#: `MODEL_VERSION` 从 `stocklab.predict.version` **导入**，自己不写死
+#: （2026-09-21：升 v1.0.2 时发现这里还写着 v1.0.1 —— 基线条目上的
+#: `model_version` 会与报告里真正的版本号不符，属于「文件在说谎」）。
 REGEN_CMD = ".venv/bin/python scripts/check_redlines.py --regen"
 #: 基线条目的 `taken_at`。**不是**常量：重新基线时应当记下「那一天」——
 #: 写成写死的日期会把下一次 regen 的日期也记错（2026-09-21 重新基线时发现的）。

@@ -117,12 +117,26 @@ def index_pct_for(conn: sqlite3.Connection, asof: str, target: str,
 
 def verify_target(conn: sqlite3.Connection, target_date: str, *,
                   costs: CostModel | None = None, capital: float = CAPITAL,
-                  codes: Sequence[str] | None = None, cache=None,
+                  codes: Sequence[str] | None = None,
+                  model_version: str | None = None, cache=None,
                   now: str | None = None) -> dict:
     """给 `target_date` 的**全部**预测打分并落库。
 
     返回 `{"target_date", "rows", "storage", "by_model_version", "unscorable", "notes"}`，
     **不含任何时间戳** —— 同一份输入重复运行必须逐字段一致（幂等判定的前提）。
+
+    ## `model_version`：只评**这一版**的预测（`None` = 全部版本）
+
+    存在的理由不是「多一个参数」，是有一次真实碰撞：**回放要跨版本重跑**。
+    换版本（`v1.0.1 → v1.0.2`）后重放整段历史，本意是「新版本写新行、旧版本原样留着」；
+    但不带版本过滤时，`verify_target` 会把**已经评过分的旧版本行**按**新口径**重算一遍，
+    而 `insert_verification` 的 append-only 守卫（正确）会当场报「同一份预测同一根 bar
+    算出不同结果」。2026-09-21 实测就是这样撞上的（`pred_id=1831`，差异字段
+    `actual_pct`/`benchmark_pct`/`sim_pnl`）。
+
+    两个选择都是错的、只有这个是对的：① 连带重算旧版本 = 用新口径**篡改历史账本**；
+    ② 只把冲突当噪声忽略 = 把守卫关掉。故：**回放只评自己那一批**，
+    旧版本的验证行保留为「旧口径时期」的历史（与 `predictions` 的 append-only 语义一致）。
     """
     costs = costs or CostModel()
     sql = "SELECT * FROM predictions WHERE target_date=? AND status='ok'"
@@ -130,6 +144,9 @@ def verify_target(conn: sqlite3.Connection, target_date: str, *,
     if codes:
         sql += f" AND code IN ({','.join('?' * len(codes))})"
         params.extend(codes)
+    if model_version is not None:
+        sql += " AND model_version=?"
+        params.append(model_version)
     sql += " ORDER BY model_version, code"
     prows = conn.execute(sql, tuple(params)).fetchall()
     if not prows:
