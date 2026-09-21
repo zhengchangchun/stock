@@ -203,6 +203,7 @@ def test_call_active_explicit_script_id_of_wrong_plugin_is_rejected(conn):
 
 
 def test_call_active_explicit_missing_script_is_lookup_error(conn):
+    """指定的 script_id 不存在 → LookupError，**不静默回退到 active 版本**。"""
     with pytest.raises(LookupError):
         lifecycle.call_active(conn, "3", {}, script_id=99999)
 

@@ -385,18 +385,17 @@ def _seed_pipeline_db(tmp_db):
     形态同 test_candidate_run.py::_seed_db，保证生产路径可通。
 
     对插桩 "1"（短线打分插桩）发布两个行为不同的版本：
-    - v1（sid，score=80，pass_flag=True，archived — 不是 active）
-    - v2（sid2，score=100，pass_flag=True，active）
+    - v1（sid_v1，score=80，pass_flag=True，archived — 不是 active）
+    - v2（sid_v2，score=0，pass_flag=False，active — 主动拒绝全部标的）
 
-    两个版本分数不同（80 vs 100），但因为 topn=6 而 SEED_UNIVERSE 只有 2 只
-    标的，两者都能全部入池——分数差异在「选谁入池」上无法体现。
+    判别两个版本靠的是 **pass_flag**，不是分数：topn=6 而 SEED_UNIVERSE 只有
+    2 只标的，若两版都放行，两版都会全部入池，分数差异在「选谁入池」上体现不出来。
 
-    为了让两个版本产生可辨别的收益差，K 线使用单调递增序列（每天 +0.01）；
-    同时 v1 设 pass_flag=False（阻断全部标的），v2 设 pass_flag=True（放行）。
-    这样：
-    - v1 路径：所有标的被 score_pool 拒绝 → pool 为空 → 周期收益 = 0
-    - v2 路径：所有标的进池 → 有正收益（价格上涨）→ 周期收益 > 0
-    → Δ(cand=v1, base=v2) = 0 - positive < 0，断言 Δ≠0 成立。
+    所以让 v1 放行、v2 拒绝，使两版在「有无持仓」上分叉；配合单调递增的 K 线
+    （起点 10.0，每天 +0.01）：
+    - v1 路径：所有标的进 pool → 有正收益（价格上涨）→ 周期收益 > 0
+    - v2 路径：所有标的被 score_pool 拒绝 → pool 为空 → 周期收益 = 0
+    → Δ(cand=v1, base=v2) = positive - 0 > 0，断言 Δ≠0 成立。
 
     可证伪性：若 eff_pid 被改回 None（短路），两侧都解析 active（v2），
     两次 score_pipeline 相同，Δ=0，下方「Δ≠0」断言立即变红。
