@@ -332,7 +332,13 @@ def test_min_commission_boundary_is_20k_notional():
 
 
 def test_cost_is_insensitive_to_notional_above_20k(tmp_db, monkeypatch):
-    """正向采信条件（设计 §5.1）：N ∈ {2万,5万,10万,50万} 两两等价。
+    """正向采信条件（设计 §5.1；**v2 档位集**）：N ∈ {5万,10万,50万} 两两等价。
+
+    ⚠️ v1 的档位集是 `{2万, 5万, 10万, 50万}` —— **2 万档已在 2026-09-21 按 §5.1 的新注册移出**：
+    它恰在最低佣金门槛（20000）上，真实横截面里有 3140 处实际名义额被整股截断压到门槛以下，
+    逐期收益层实测 `4.797e-06 > 1e-7`（偏保守一侧）。证据：`docs/plans/2026-09-21-回放成本口径-验收记录.md` §2。
+    本用例的夹具是「单只换仓 + px=17.3」的合成场景（不触发那 3140 处截断），所以 2 万档在这里
+    **也能过** —— 移出是为了让测试的档位集与采信条件一致，**不是**因为这里会红。
 
     夹具：4 只价格 17.3（**非整数**，故意触发整股截断）的标的，
     四个调仓日每期只换 1 只（1 卖 + 1 买）→ 3 个周期。
@@ -350,7 +356,8 @@ def test_cost_is_insensitive_to_notional_above_20k(tmp_db, monkeypatch):
     marks = [dates[0], dates[1], dates[2], dates[3]]
 
     series: list[list[float]] = []
-    for notional in (20_000.0, 50_000.0, 100_000.0, 500_000.0):
+    # v1 档位集（保留备查，勿删）：(20_000.0, 50_000.0, 100_000.0, 500_000.0)
+    for notional in (50_000.0, 100_000.0, 500_000.0):
         monkeypatch.setattr(replay, "POSITION_NOTIONAL", notional)
         r = replay.period_returns(c, asof_dates=marks, pool="short",
                                   costs=CostModel(), _pools_for_test=pools)
