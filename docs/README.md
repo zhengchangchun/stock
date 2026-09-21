@@ -110,6 +110,12 @@ stocklab portfolio show --asof 2026-09-15 --json     # P13 消费的稳定接口
   模拟盘 11 笔成交的 `rule_citation` **全部落在 2 条写死条文内** ⇒ 模型/插桩一条都没进模拟盘）。
   顺带补上两处**只写在文档里、实际不存在**的护栏：`test_paper_discipline_guard.py`（AST 扫描，
   含反向自检）与页面 HTML 转义（`glance_html`，见错误日记 #50）
+- [`plans/2026-09-21-智能体动态编排对照臂.md`](plans/2026-09-21-智能体动态编排对照臂.md)
+  — **动态编排臂 `arm-agent`**（用户需求）：智能体在每个决策点调参数/提示词/工作流，与静态纪律臂、
+  以及**同预算随机改**的 `arm-agent-random` 三线对照；含变更白名单（禁方向信号/杠杆/白名单外标的）、
+  `paper_agent_decisions` append-only 台账（`n_trials`/`prompt_sha256`/`context_sha256` 全留痕）、
+  PIT 门禁与可复现判据、`改函数`走既有插桩状态机（人工 approve 是硬门槛）、
+  预注册结论判据（`Δ(agent−random)` CI 下界>0）与「什么结果不算证据」清单，澄清点 D-16–D-22
 - [`plans/2026-09-15-p11-调度链.md`](plans/2026-09-15-p11-调度链.md) — P11 设计稿：
   快照幂等键、收盘回填、LIVE/REPLAY 口径分列
 - [`tasks/2026-09-15-p11-调度链-task45-52.md`](tasks/2026-09-15-p11-调度链-task45-52.md) —
