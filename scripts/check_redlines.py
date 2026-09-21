@@ -40,6 +40,7 @@ import json
 import shutil
 import sys
 import tempfile
+from datetime import date
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
@@ -66,7 +67,9 @@ BACKFILL_FROM = "2013-12-23"
 BACKFILL_TO = "2026-09-14"
 MODEL_VERSION = "pit-rw-v1.0.1"
 REGEN_CMD = ".venv/bin/python scripts/check_redlines.py --regen"
-TODAY = "2026-09-16"
+#: 基线条目的 `taken_at`。**不是**常量：重新基线时应当记下「那一天」——
+#: 写成写死的日期会把下一次 regen 的日期也记错（2026-09-21 重新基线时发现的）。
+TODAY = date.today().isoformat()
 
 
 # --------------------------------------------------------------------------
