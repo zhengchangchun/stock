@@ -2093,60 +2093,17 @@ def cmd_dashboard_build(args: argparse.Namespace) -> int:
     return 0
 
 
-def cmd_dashboard_serve(args: argparse.Namespace) -> int:
-    """起**只读**看板服务。**只绑回环**；非回环 host 直接报错退出。
-
-    `0.0.0.0` 在**代码层**被拒绝（`assert_loopback`，先于 bind）。对外访问走 nginx。
-    """
-    from stocklab.dashboard import server as dash
-
-    try:
-        dash.assert_loopback(args.host)
-    except dash.NonLoopbackHost as exc:
-        print(json.dumps({"error": str(exc), "kind": "NonLoopbackHost"},
-                         ensure_ascii=False), file=sys.stderr)
-        return 2
-
-    db, provider = _dashboard_provider(args)
-    if not db.exists():
-        print(json.dumps({"error": "db not found; run `stocklab db init`"},
-                         ensure_ascii=False), file=sys.stderr)
-        return 2
-    try:
-        summary = provider()          # 起服务前先算一次：算不出来就别占端口
-    except Exception as exc:          # noqa: BLE001（错误必须变成可读的退出码）
-        print(json.dumps({"error": f"{type(exc).__name__}: {exc}"},
-                         ensure_ascii=False), file=sys.stderr)
-        return 2
-
-    ctx = dash.Context(summary_provider=provider,
-                       health_provider=dash.summary_health(provider, db),
-                       db_path=db)
-    try:
-        httpd = dash.make_server(args.host, args.port, ctx)
-    except OSError as exc:
-        print(json.dumps({"error": f"绑定 {args.host}:{args.port} 失败：{exc}"},
-                         ensure_ascii=False), file=sys.stderr)
-        return 1
-    host, port = args.host, httpd.server_port
-    print(f"✅ 看板服务已启动：{host}:{port}（只读；仅回环）")
-    print(f"   页面    http://{host}:{port}/lab/")
-    print(f"   健康    http://{host}:{port}/health")
-    print(f"   JSON    http://{host}:{port}/api/summary")
-    print(f"   asof {summary['asof']} · bars 最新 "
-          f"{summary['freshness']['bars_latest_date']} · 告警 {len(summary['alarms'])} 条")
-    print("   停止：Ctrl-C。本项目**不常驻**服务（ADR-001 D-05），常驻由 nanobot 调度侧负责。")
-    dash.serve_forever(httpd)
-    return 0
-
-
-# ---------- 持仓管理 Web 应用（P15） ----------
-
 def cmd_lab_serve(args: argparse.Namespace) -> int:
-    """起**持仓管理 Web 应用**（可查看 + 可管理真实持仓）。**只绑回环**。
+    """起**唯一的 Web 服务**（查看 + 管理真实持仓）。**只绑回环**。
 
-    与 `dashboard serve` 的区别：那个是**只读快照服务**，这个是**应用**——
-    带表单写入（录入成交 / 冲正 / 录入本金），写路径全程走 P12 的账本函数。
+    2026-09-21 服务合并：这里曾经有两个网页服务（`dashboard serve` 只读快照 /
+    `lab serve` 应用），默认端口都是 8791 —— 撞端口、且只能靠记忆区分。
+    现在只留这一个：看板变成**离线单文件产物**（`dashboard build`），
+    所有网页入口统一在 `/lab/*`（总览 / 模拟盘对照 / 候选池 / 成交流水 /
+    现金流 / 风险 / 数据 / 健康检查）。
+
+    写路径（录入成交 / 冲正 / 录入本金 / 候选池「跑一次」）全程走既有账本函数，
+    带 CSRF token 与幂等键。
     """
     from stocklab.labweb import app as labweb
     from stocklab.labweb.cand_data import CandLab
@@ -2720,7 +2677,9 @@ def build_parser() -> argparse.ArgumentParser:
     _add_risk_common(rs, entry=True)
     rs.set_defaults(func=cmd_risk_size)
 
-    dash = sub.add_parser("dashboard", help="单文件看板 + 本地只读服务（P14）")
+    dash = sub.add_parser(
+        "dashboard",
+        help="单文件看板（离线产物；网页服务统一走 `lab serve`）")
     dash_sub = dash.add_subparsers(dest="dashboard_action")
     dash_build = dash_sub.add_parser(
         "build", help="生成单文件 HTML 看板（零外部依赖，离线可双击）")
@@ -2732,19 +2691,8 @@ def build_parser() -> argparse.ArgumentParser:
     dash_build.add_argument("--json", action="store_true", help="输出机器可读结果")
     dash_build.set_defaults(func=cmd_dashboard_build)
 
-    dash_serve = dash_sub.add_parser(
-        "serve", help="起只读看板服务（**只绑回环**；0.0.0.0 直接报错退出）")
-    dash_serve.add_argument("--host", default="127.0.0.1",
-                            help="绑定地址（只允许回环；默认 127.0.0.1）")
-    dash_serve.add_argument("--port", type=int, default=8791,
-                            help="端口（默认 8791；0 = 由内核分配）")
-    dash_serve.add_argument("--asof", help="固定 asof 日期（默认每次请求取今天）")
-    dash_serve.add_argument("--db", help="数据库路径（默认 data/stocklab.db）")
-    dash_serve.add_argument("--now", help="保留参数（服务按请求真实时间渲染）")
-    dash_serve.set_defaults(func=cmd_dashboard_serve)
-
     lab = sub.add_parser(
-        "lab", help="持仓管理 Web 应用（P15）：浏览器里查看 + 管理真实持仓")
+        "lab", help="Web 服务（P15，本机**唯一**的网页服务）：查看 + 管理持仓")
     lab_sub = lab.add_subparsers(dest="lab_action")
     lab_serve = lab_sub.add_parser(
         "serve", help="起 Web 应用（**只绑回环**；0.0.0.0 直接报错退出）")

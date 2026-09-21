@@ -23,6 +23,9 @@
 ## 后果
 带来的好处、代价、后续需要注意的地方。
 ```
+
+## 索引
+
 - [ADR-004 复权落点](2026-09-15-ADR-004-复权落点.md) — 读取层复权 + 自建乘性因子链（探针实测腾讯 qfq 减法式出负价）
 - [ADR-005 实验决策的幂等键取语义不取呈现](2026-09-15-ADR-005-幂等键取语义不取呈现.md) — 改一个标点不得多判一条决策；20 行历史台账保留不迁移
 - [ADR-008 ETF 复权口径](2026-09-15-ADR-008-etf-复权口径.md) — 腾讯通道拿不到 ETF 除息事件（显式限制）→ 读取层硬拒绝，白名单判据；禁止未复权冒充复权
@@ -32,3 +35,4 @@
 - [ADR-013 已公告休市表与「未来已知事实」的 PIT 纪律](2026-09-17-ADR-013-休市表与PIT纪律.md) — 交易所**提前公告**的休市安排属「预测时点已公开的未来已知事实」→ **不构成前视**；另起 `market_holidays`（前瞻）而非塞进 `trading_calendar`（回看，塞进去会静默污染 `Calendar.load` 与 `session_check`）；主键 `(date, source_url)` + 改期靠多行 `published_at` 最新者胜出、**不覆盖旧行**；覆盖判据只认 `doc_kind='annual'`，覆盖不到如实退回 `weekday_fallback`；`target_date` **不参与任何收益/因子计算**（结构性保证：算错了也够不到价格）；四条风险边界（临时休市不可预知 / 改期 / 只覆盖已公告年份 / 只采上交所）
 - [ADR-014 `predictions.origin` 来源列与「断言 vs 推断」分段](2026-09-17-ADR-014-origin列与断言分段.md) — 回放/实时分段从「按 `created_at` 推断」改为「写入路径断言」：`origin TEXT CHECK(origin IN ('live','replay'))`，`insert_prediction` 的 `origin` 为**必填**关键字参数（`predict run`→`live`、`verify backfill`→`replay`），漏传即 TypeError；迁移只 `ALTER TABLE ADD COLUMN`、**老行一律 NULL 不回填**（回填等于用猜测冒充事实），`origin IS NULL` 在 `chain accuracy` 退回推断并**分列计数** `asserted/inferred`；`session/review.py` 一字不改（保 P11 复盘逐字节不变）
 - [ADR-015 写库入口统一走 `ensure_schema` 自动前滚 schema](2026-09-17-ADR-015-写库入口自动前滚schema.md) — 迁移只挂在 `db init` 导致真库没前滚、收盘链 `predict run` 撞 `OperationalError`；修法：`migrate.ensure_schema`（幂等前滚 + 只在确有结构变更时备份一次 + 真失败要炸），**写库入口统一接它**（`ingest bars/actions/index`、`predict/verify run|backfill|pending`、`review daily`、`session tick/backfill-close`、`paper init|step`、`features build`、lab 应用）；`init_db` 与 `ensure_schema` 并存分工（前者每次都备份、后者只在变更时备份）；`doctor` 只读报告 schema marker 在位与否、**不擅自迁移**
+- [ADR-018 单一 Web 服务](2026-09-21-ADR-018-单一Web服务.md) — `dashboard serve` 合并进 `lab serve`（两者默认端口都是 8791 ⇒ 本机跑着哪个只能靠记忆回答）；看板只留离线单文件产物（`dashboard build`），回环白名单只留一份；两条护栏钉住不回退（`dashboard.server` 公开面只剩三个名字 / `dashboard serve` 必须 `invalid choice`）

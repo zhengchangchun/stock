@@ -1,7 +1,7 @@
-"""P14：CLI —— `dashboard build` / `dashboard serve`。
+"""P14：CLI —— `dashboard build`（`serve` 已于 2026-09-21 合并下线）。
 
-`serve` 的**唯一**不可协商行为：非回环 host 报错退出（退出码 2），且**不 bind**。
-本文件里那条测试就是这条红线的机器版本。
+看板现在只剩**离线单文件产物**；网页服务统一走 `lab serve`（本机唯一的服务）。
+本文件保留 `build` 的全部测试，并用一条用例钉住「第二个服务不会回来」。
 """
 
 from __future__ import annotations
@@ -91,23 +91,24 @@ def test_build_fails_cleanly_without_a_db(tmp_path, capsys):
     assert "db not found" in err
 
 
-# ---------- serve：只能绑回环 ----------
+# ---------- serve 已下线（2026-09-21 服务合并） ----------
 
-@pytest.mark.parametrize("host", ["0.0.0.0", "192.168.1.7", "::"])
-def test_serve_refuses_non_loopback_host(db, host, capsys):
-    """`--host 0.0.0.0` 必须**报错退出 2**，不是警告、不是静默改成回环。"""
-    code, out, err = run("dashboard", "serve", "--host", host, "--port", "0",
-                         "--db", str(db), capsys=capsys)
+def test_dashboard_serve_is_gone(capsys):
+    """第二个网页服务已合并进 `lab serve` —— 子命令**不存在**。
+
+    为什么钉的是「不存在」而不是「报错信息好看」：缺陷不是「serve 参数不好」,
+    而是**两个默认端口都是 8791 的服务** —— 本机此刻跑着哪一个只能靠记忆回答，
+    而这两个一个只读、一个带写路径。只要 `serve` 还能跑，这个缺陷就还在。
+    """
+    code, out, err = run("dashboard", "serve", "--port", "0", capsys=capsys)
     assert code == 2
-    assert "NonLoopbackHost" in err
-    assert "回环" in err
-    assert out == ""            # 什么都没起：连「已启动」都不该打印
+    assert "invalid choice: 'serve'" in err
+    assert "(choose from build)" in err      # 只剩 build，没有别的服务入口
+    assert out == ""                    # 什么都没起，也没打印「已启动」
 
 
-def test_serve_default_host_is_loopback_and_prints_url(db, monkeypatch, capsys):
-    """默认参数下必须绑到 127.0.0.1，并把**实际端口**报出来。"""
-    from stocklab.dashboard import server as dash
-
+def test_lab_serve_is_the_only_web_entry(db, capsys):
+    """`lab serve` 是唯一的网页入口，且它仍然存在（守回环、报端口）。"""
     seen = {}
 
     def _fake_serve(httpd):
@@ -115,21 +116,14 @@ def test_serve_default_host_is_loopback_and_prints_url(db, monkeypatch, capsys):
         seen["port"] = httpd.server_address[1]
         httpd.server_close()
 
-    monkeypatch.setattr(dash, "serve_forever", _fake_serve)
-    code, out, err = run("dashboard", "serve", "--port", "0", "--db", str(db),
-                         "--asof", "2026-09-14", capsys=capsys)
+    import stocklab.labweb.app as labweb
+    original = labweb.serve_forever
+    labweb.serve_forever = _fake_serve
+    try:
+        code, out, err = run("lab", "serve", "--port", "0", "--db", str(db),
+                             capsys=capsys)
+    finally:
+        labweb.serve_forever = original
     assert code == 0, err
-    assert seen["host"] == "127.0.0.1"
-    assert seen["port"] > 0
-    assert f"127.0.0.1:{seen['port']}" in out
-    assert f"/lab/" in out and "/health" in out and "/api/summary" in out
-    assert "只读" in out
-
-
-def test_serve_validates_the_db_before_binding(db, capsys):
-    """库不存在 → 退出 2；不占端口、不进入 serve_forever。"""
-    code, out, err = run("dashboard", "serve", "--port", "0",
-                         "--db", str(db.parent / "missing.db"), capsys=capsys)
-    assert code == 2
-    assert "db not found" in err
-    assert "已启动" not in out
+    assert seen["host"] == "127.0.0.1" and seen["port"] > 0
+    assert f"127.0.0.1:{seen['port']}/lab/" in out
