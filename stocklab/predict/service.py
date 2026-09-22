@@ -210,6 +210,7 @@ class PitCache:
         self._holidays: HolidayTable | None = None
         self._money_flow: dict[str, dict[str, float | None]] = {}
         self._valuation: dict[str, list[tuple[str, float | None]]] = {}
+        self._fin_quality: dict[str, dict[str, float | None]] = {}
 
     def chain(self, conn: sqlite3.Connection, code: str) -> tuple:
         if code not in self._chains:
@@ -254,6 +255,21 @@ class PitCache:
         if code not in self._valuation:
             self._valuation[code] = _read_valuation(conn, code)
         return self._valuation[code]
+
+    def fin_quality(self, conn: sqlite3.Connection, asof: str,
+                    codes: Sequence[str]) -> dict[str, float | None]:
+        """P40 V1 的**横截面**质量分位（`asof` → `{code: q}`，读一次）。
+
+        **缓存键只含 `asof`**：分位是同一时点整批标的一起算的派生量，
+        与「哪些标的被请求」无关的重复计算必须挡掉（同一天 17 只各查一次 = O(N²)）。
+        计算放在 `experiments.variants`（变体层），这里只做记忆化 ——
+        `predict` 层不依赖变体层的口径。懒导入避免 `service ↔ variants` 成环。
+        """
+        if asof not in self._fin_quality:
+            from stocklab.experiments.variants import _compute_fin_quality_scores
+
+            self._fin_quality[asof] = _compute_fin_quality_scores(conn, asof, codes)
+        return self._fin_quality[asof]
 
 
 def _read_raw(conn: sqlite3.Connection, code: str) -> tuple[list[Bar], set[str]]:

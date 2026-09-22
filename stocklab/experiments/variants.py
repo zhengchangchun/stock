@@ -195,6 +195,37 @@ VARIANTS: dict[str, Variant] = {
         ),
         prereg_doc="docs/experiments/2026-09-15-residual-quantile-interval.md",
     ),
+    # ---- P40：财报质量先验。两条**独立**的轴（不合并、不取最好）----
+    # V1 是本项目**第一条横截面轴**：`q` 由同一 `asof` 当日可见的整批标的算出，
+    # 而不是个股自身的时间序列。V2 是时序轴但变量独立（自身 ROE 同比）。
+    # 两者的 `hypothesis` **逐字**取自预注册 §1，不许改写。
+    "fin-quality-pct": Variant(
+        name="fin-quality-pct",
+        changed_axis="mu_mode",
+        spec=ForecastSpec(mu_mode="fin_quality_pct"),
+        hypothesis=(
+            "**V1 `fin-quality-pct`（横截面轴，本项目的**第一条**横截面轴）**：\n"
+            "`asof` 时点按 PIT 取每只标的**最新已公告期**的财报 → `indicators.factors()` "
+            "→ 取可用因子在\n**横截面**上的分位（`cross_section.py` 的极性规则，"
+            "统一「越大越好」）→ 合成质量分\n`q_raw = mean(可用因子分位)`"
+            "（要求**至少 3 个因子可用**，否则该标的当日剔除）；\n"
+            "再对 `q_raw` 取横截面分位得 `q ∈ [0,1]`；令\n"
+            "`q ≥ 0.70 → mu = +|mu_sample|`、`q ≤ 0.30 → mu = −|mu_sample|`、"
+            "其余 → 符号 0（`mu = 0`）。"
+        ),
+        prereg_doc="docs/experiments/2026-09-22-financials-quality-prior.md",
+    ),
+    "fin-roe-yoy": Variant(
+        name="fin-roe-yoy",
+        changed_axis="mu_mode",
+        spec=ForecastSpec(mu_mode="fin_roe_yoy"),
+        hypothesis=(
+            "**V2 `fin-roe-yoy`（时序轴）**：自身 `roe(TTM)` 相对**去年同期**的变化：\n"
+            "`Δ = roe(TTM, 本期) − roe(TTM, 去年同期)`；`Δ > +0.01` → `+1`、"
+            "`Δ < −0.01` → `−1`、其余 `0`。"
+        ),
+        prereg_doc="docs/experiments/2026-09-22-financials-quality-prior.md",
+    ),
 }
 
 
@@ -368,5 +399,138 @@ def load_val_pe_pct_sign(conn: sqlite3.Connection, code: str, asof: str, *,
     if q <= lo:
         return 1
     if q >= hi:
+        return -1
+    return 0
+
+
+# ---------- PIT 财报质量 / ROE 同比（P40）----------
+#
+# 与资金流/估值一样是**按 (code, asof)** 的当日事实，但 V1 是**横截面**：
+# 分位只有把同一 `asof` 的整批标的放在一起才有意义，逐只调用 = O(N²) 重复读库。
+# 所以 V1 按 `asof` 缓存**一批**（缓存键只含 `asof`，不含未来信息）；V2 是纯时序，逐只算。
+
+#: V1 合成分要求**至少这么多个**因子可用（预注册 §1 写死，不是旋钮）。
+MIN_FIN_FACTORS = 3
+
+#: V1 横截面分位要求**至少这么多只**标的（预注册 §1 写死）。低于此 → 分位无意义 → `None`。
+MIN_FIN_CROSS_SECTION = 5
+
+#: V1 质量分位 → 符号的阈值（预注册 §1 写死）。
+FIN_Q_HI = 0.70
+FIN_Q_LO = 0.30
+
+#: V2 的 ROE 同比阈值（预注册 §1 写死）。
+ROE_YOY_DELTA = 0.01
+
+
+def _sign_of_quality(q: float | None) -> int | None:
+    """`q ∈ [0,1]` → `+1` / `0` / `-1`；`q is None`（被剔除）→ `None`。
+
+    阈值 `FIN_Q_HI` / `FIN_Q_LO` 是**预注册写死**的常量，形参化会让「口径漂移」
+    变成一次安静的调用点修改 —— 这里不给那个口子。
+    """
+    if q is None:
+        return None
+    if q >= FIN_Q_HI:
+        return 1
+    if q <= FIN_Q_LO:
+        return -1
+    return 0
+
+
+def _compute_fin_quality_scores(conn: sqlite3.Connection, asof: str,
+                                codes: Sequence[str]) -> dict[str, float | None]:
+    """V1 的核心：同一 `asof` 的**整批**横截面质量分位 `q ∈ [0,1]`（不可算给 `None`）。
+
+    **PIT 边界只有一句**：`load_financials` 的 `notice_date <= asof`（预注册 §2）。
+    极性**取自真源** `candidate.cross_section.POLARITY`（`inv_days` 越小越好，其余越大越好），
+    本函数**不另写极性表** —— 两份必然走样（ERROR_DIARY #50 同款）。
+    第二级分位复用同一模块的 `_pct_of`（平均排名法），避免两处口径各写一遍。
+    """
+    from stocklab.candidate import cross_section, indicators
+    from stocklab.candidate.score import load_financials
+
+    rows: dict[str, dict] = {}
+    for code in codes:
+        rows[code] = indicators.factors(load_financials(conn, code, asof=asof))
+    xsec = cross_section.build(rows, asof=asof)
+
+    q_raw: dict[str, float | None] = {}
+    for code in codes:
+        pcts = [xsec[code][f"{f}_pct"] for f in cross_section.POLARITY
+                if xsec[code].get(f"{f}_pct") is not None]
+        q_raw[code] = (sum(pcts) / len(pcts)
+                       if len(pcts) >= MIN_FIN_FACTORS else None)
+
+    usable = [code for code in codes if q_raw[code] is not None]
+    out: dict[str, float | None] = {code: None for code in codes}
+    if len(usable) < MIN_FIN_CROSS_SECTION:      # 横截面太小 → 分位无意义
+        return out
+    vals = [q_raw[code] for code in usable]
+    for code in usable:
+        out[code] = cross_section._pct_of(vals, q_raw[code], higher_better=True)
+    return out
+
+
+def fin_quality_scores(conn: sqlite3.Connection, asof: str, *,
+                       codes: Sequence[str], cache=None) -> dict[str, float | None]:
+    """V1 的横截面质量分位（`None` = 该标的当日被剔除 / 横截面太小）。
+
+    走 `cache` 时按 `asof` 缓存**整批**（同一天 17 只各查一次 = O(N²)，必须批算）。
+    """
+    if cache is not None:
+        return cache.fin_quality(conn, asof, codes)
+    return _compute_fin_quality_scores(conn, asof, codes)
+
+
+def load_fin_quality_sign(conn: sqlite3.Connection, code: str, asof: str, *,
+                          codes: Sequence[str], cache=None) -> int | None:
+    """V1 `fin-quality-pct` 的符号：`+1` / `-1` / `0`；被剔除或横截面太小 → `None`。
+
+    **PIT 硬约束**（预注册 §2）：只允许读 `notice_date <= asof` 的行，且取**最新已公告期**
+    （不是「取最近一根」）。`asof` 当日无可用财报 / 可用因子 < 3 → `None`，
+    由调用方拒绝（`compute_forecast` 抛 `DegenerateInput`），**绝不**静默回落基线。
+    """
+    return _sign_of_quality(
+        fin_quality_scores(conn, asof, codes=codes, cache=cache).get(code))
+
+
+def load_fin_roe_yoy_sign(conn: sqlite3.Connection, code: str, asof: str, *,
+                          cache=None) -> int | None:
+    """V2 `fin-roe-yoy` 的符号：自身 `roe(TTM)` 同比变化的符号。
+
+    `Δ = roe(TTM, 最新已公告期) − roe(TTM, 去年同期)`；`Δ > +0.01` → `+1`、
+    `Δ < −0.01` → `−1`、其余 `0`。任一侧不可算 → `None`（由调用方拒绝）。
+
+    **复用 `indicators.factors()` 的 TTM 口径**（不另写 TTM）：去年同期那一期由
+    「把可见报告裁到 `(year−1, quarter)` 及以前」后**再跑一次 `factors()`** 得到，
+    并**校验它确实落在去年同期**（否则返回 `None`，不拿更早的期顶替）。
+    """
+    from stocklab.candidate import indicators
+    from stocklab.candidate.score import load_financials
+
+    reports = load_financials(conn, code, asof=asof)
+    period = indicators.latest_period(reports)
+    if period is None:
+        return None
+    year, quarter = period
+    roe_now = indicators.factors(reports)["roe"]
+    if roe_now is None:
+        return None
+    prev = (year - 1, quarter)
+    subset = [r for r in reports
+              if indicators.quarter_of(r.report_date) <= prev]
+    if not subset:
+        return None
+    f_prev = indicators.factors(subset)
+    if f_prev["period"] != f"{prev[0]}Q{prev[1]}":
+        return None                    # 去年同期那一期本身不可用 → 拒绝，不顶替
+    roe_prev = f_prev["roe"]
+    if roe_prev is None:
+        return None
+    d = roe_now - roe_prev
+    if d > ROE_YOY_DELTA:
+        return 1
+    if d < -ROE_YOY_DELTA:
         return -1
     return 0

@@ -81,7 +81,14 @@ CONTRACT_FIELDS: tuple[str, ...] = (
 #: - `val_pe_pct`（P34 / P29 V2）：`mu = |mu_sample| × s`，`s` = `PE_TTM` 在 `asof`
 #:   之前（含）最近 756 行分位 `q` 的映射（`q≤0.30→+1`、`q≥0.70→-1`、其余 `0`）。
 #:   数据参数 `val_sign`。
-MU_MODES: tuple[str, ...] = ("sample_mean", "zero", "index_sign", "mf_sign", "val_pe_pct")
+#: - `fin_quality_pct`（P40 V1）：`mu = |mu_sample| × s`，`s` = 财报**横截面**质量分位
+#:   `q` 的映射（`q≥0.70→+1`、`q≤0.30→-1`、其余 `0`）。数据参数 `fin_sign`。
+#:   本项目**第一条横截面轴**：`q` 由同一 `asof` 当日可见的整批标的算出（见
+#:   `experiments.variants.fin_quality_scores`），不是个股自身的时间序列。
+#: - `fin_roe_yoy`（P40 V2）：同上，`s` = 自身 `roe(TTM)` 同比变化 `Δ` 的符号
+#:   （`Δ>+0.01→+1`、`Δ<-0.01→-1`、其余 `0`）。数据参数同样走 `fin_sign`。
+MU_MODES: tuple[str, ...] = ("sample_mean", "zero", "index_sign", "mf_sign",
+                             "val_pe_pct", "fin_quality_pct", "fin_roe_yoy")
 
 #: `sigma_mode` 的合法取值。**P9-a 新增的第二条轴**：条件化波动率。
 #:
@@ -263,6 +270,7 @@ def compute_forecast(*, code: str, asof: str, bars: Sequence[Bar], target_date: 
                      index_dir: int | None = None,
                      mf_sign: int | None = None,
                      val_sign: int | None = None,
+                     fin_sign: int | None = None,
                      features: PitFeatures | None = None,
                      residuals: ResidualDistribution | None = None) -> dict:
     """算出 `code` 在 `asof` 收盘后应给出的次日预测载荷。
@@ -280,6 +288,11 @@ def compute_forecast(*, code: str, asof: str, bars: Sequence[Bar], target_date: 
     `mf_sign` / `val_sign` 同理（P34 / P29）：只在 `mu_mode == "mf_sign"` /
     `"val_pe_pct"` 时被读取，是**按 (code, asof)** 的当日事实（资金流主力净额符号 /
     估值 PE 分位符号），不是配置。**缺失或非法即拒绝** —— 不许静默退化成 mu=0 或基线。
+
+    `fin_sign`（P40）同理，且**两个新变体共用同一个数据参数**：`mu_mode` 为
+    `"fin_quality_pct"` / `"fin_roe_yoy"` 时被读取，符号由 loader 层算好
+    （横截面质量分位 / 自身 ROE 同比，见 `experiments.variants`）。
+    **缺失或非法即拒绝**。
 
     `features`（P9-a）同理：只有 `spec.sigma_mode != "const"` 时被读取，是**数据**，
     承载量能 z / 自身 RV 分位 / 指数 RV 分位三个 PIT 量（见 `features.pit_regime`）。
@@ -358,6 +371,19 @@ def compute_forecast(*, code: str, asof: str, bars: Sequence[Bar], target_date: 
                 f"val_sign={val_sign!r} 非法（只接受 -1 / 0 / +1）—— 拒绝猜"
             )
         mu = abs(mu_sample) * val_sign
+    elif mode in ("fin_quality_pct", "fin_roe_yoy"):
+        if fin_sign is None:
+            raise DegenerateInput(
+                f"{code} 在 {asof} 缺财报质量符号（fin_sign=None）—— "
+                f"`{mode}` 变体**拒绝静默退化成 mu=0 或基线**：那是把「不知道」写成「没有」，"
+                "会让报告里的样本量悄悄变少而没人知道"
+            )
+        if fin_sign not in (-1, 0, 1):
+            raise DegenerateInput(
+                f"fin_sign={fin_sign!r} 非法（只接受 -1 / 0 / +1）—— 拒绝猜"
+            )
+        # 只换**方向的来源**（财报质量 / ROE 同比），幅度仍是基线那个 |mu_sample|。
+        mu = abs(mu_sample) * fin_sign
     else:                                        # pragma: no cover - 构造期已挡
         raise DegenerateInput(f"未知 mu_mode={mode!r}")
     sigma_base = statistics.stdev(rets)
@@ -488,6 +514,8 @@ def compute_forecast(*, code: str, asof: str, bars: Sequence[Bar], target_date: 
             evidence_inputs["mf_sign"] = mf_sign
         elif mode == "val_pe_pct":
             evidence_inputs["val_sign"] = val_sign
+        elif mode in ("fin_quality_pct", "fin_roe_yoy"):
+            evidence_inputs["fin_sign"] = fin_sign
     if spec.sigma_mode != "const":
         # 只改 sigma 的那三个变体在这里留痕；`mu_mode` 那两条变体的 evidence
         # 因此**逐字节不变**（既有报告 sha256 仍是红线）。

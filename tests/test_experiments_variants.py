@@ -178,9 +178,11 @@ def test_val_pe_pct_variant_changes_exactly_one_field():
     assert v.prereg_doc.endswith("2026-09-17-valuation-moneyflow-oos.md")
 
 
-def test_mu_modes_are_exactly_the_documented_five():
+def test_mu_modes_are_exactly_the_documented_set():
     # P34 / P29 新增 `mf_sign`（V1 资金流符号）与 `val_pe_pct`（V2 估值分位符号）。
-    assert MU_MODES == ("sample_mean", "zero", "index_sign", "mf_sign", "val_pe_pct")
+    # P40 新增 `fin_quality_pct`（V1 财报横截面质量分位）与 `fin_roe_yoy`（V2 ROE 同比）。
+    assert MU_MODES == ("sample_mean", "zero", "index_sign", "mf_sign",
+                        "val_pe_pct", "fin_quality_pct", "fin_roe_yoy")
 
 
 # ---------- 2. 口径冻结：没有那些旋钮 ----------

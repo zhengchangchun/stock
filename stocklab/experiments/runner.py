@@ -40,6 +40,8 @@ from stocklab.experiments.metrics import METRIC_VERSION, MIN_DAYS
 from stocklab.experiments.split import (SPLIT_NAMES, SplitConfig, boundaries,
                                         split_days)
 from stocklab.experiments.variants import (Variant, get_variant,
+                                           load_fin_quality_sign,
+                                           load_fin_roe_yoy_sign,
                                            load_index_direction,
                                            load_index_rv_percentile,
                                            load_mf_sign,
@@ -119,6 +121,10 @@ def _replay(conn: sqlite3.Connection, days: Sequence[str], sessions: Sequence[st
     # P34 / P29：资金流/估值符号是**按 (code, asof)** 的当日事实，与按天的指数方向不同
     need_mf = variant.spec.mu_mode == "mf_sign"
     need_val = variant.spec.mu_mode == "val_pe_pct"
+    # P40：财报质量符号。V1 是**横截面**（同一 asof 整批一起算，loader 内部按 asof 缓存），
+    # V2 是纯时序。两者共用 `fin_sign` 这一个数据参数。
+    need_fin_quality = variant.spec.mu_mode == "fin_quality_pct"
+    need_fin_roe = variant.spec.mu_mode == "fin_roe_yoy"
     # 这个变体需要哪些 PIT 特征（`const` → 空集，连算都不算）
     need_feats = PitFeatures.required_for(variant.spec.sigma_mode)
 
@@ -163,10 +169,18 @@ def _replay(conn: sqlite3.Connection, days: Sequence[str], sessions: Sequence[st
                     if need_mf else None)
             val_s = (load_val_pe_pct_sign(conn, code, asof, cache=cache)
                      if need_val else None)
+            # P40：财报质量符号（V1 横截面 / V2 时序）。缺数据 → `None` →
+            # `compute_forecast` 抛 `DegenerateInput`（**不许**静默回落基线）。
+            fin_s = None
+            if need_fin_quality:
+                fin_s = load_fin_quality_sign(conn, code, asof, codes=codes,
+                                              cache=cache)
+            elif need_fin_roe:
+                fin_s = load_fin_roe_yoy_sign(conn, code, asof, cache=cache)
 
-            sides = (("baseline", None, None, None, None),
-                     ("variant", variant.spec, idx_dir, mf_s, val_s))
-            for side, spec, idir, mf_sign, val_sign in sides:
+            sides = (("baseline", None, None, None, None, None),
+                     ("variant", variant.spec, idx_dir, mf_s, val_s, fin_s))
+            for side, spec, idir, mf_sign, val_sign, fin_sign in sides:
                 # 特征层**硬拒绝**了这天的输入（volume NULL / 价格非正）。
                 # 基线侧 `required_for("const")` 是空集 → 不受影响；
                 # 需要它的变体侧拒绝该行并**计数**，不许静默当成 0。
@@ -178,7 +192,8 @@ def _replay(conn: sqlite3.Connection, days: Sequence[str], sessions: Sequence[st
                     p = compute_forecast(code=code, asof=asof, bars=hist,
                                          target_date=target, strategy_mix=strategy_mix,
                                          spec=spec, index_dir=idir, mf_sign=mf_sign,
-                                         val_sign=val_sign, features=feats,
+                                         val_sign=val_sign, fin_sign=fin_sign,
+                                         features=feats,
                                          residuals=residuals)
                 except DegenerateInput as exc:
                     skipped[side][f"{target}/{code}"] = f"DegenerateInput: {exc}"
