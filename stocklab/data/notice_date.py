@@ -61,18 +61,37 @@ def statutory_deadline(report_date: str) -> str:
     return _dt.date(year, month, day).isoformat()
 
 
-def resolve(original: str | None, *, report_date: str) -> tuple[str, str, bool]:
-    """返回 `(notice_date, source, suspect)`。
+def resolve(original: str | None, *, report_date: str) -> tuple[str, str, str | None]:
+    """返回 `(notice_date, source, fallback_kind)`。
 
-    `suspect=True` 表示原始值不可信、已回退到法定截止日。
+    `fallback_kind` 只在走了回退时非 None，且**区分回退原因**：
+
+    - `'missing'`：源站本来就没给这个字段（如美的 2004–2007 的 17 期）。
+      这是评审 A3 说的「该期公告日为推定」，**不是**数据可疑 —— 不发 warn。
+    - `'implausible'`：**有值但不合理**（早于报告期 / 滞后超过 120 天）。
+      这才是真的可疑（A1 那个 bug 的表现），调用方应发
+      `warn: notice_date_suspect`。
+
+    分开这两类是因为 120 天上界**不能套到回退值上**：年报法定截止日 4-30 与
+    12-31 的间隔在闰年是 **121** 天（实测真库 41 行如此）。回退值本身定义在
+    法定期限上、不可能越界，对它做合理性检查只会年年误报。
     """
     fallback = statutory_deadline(report_date)
     if not original:
-        return fallback, "statutory", True
+        return fallback, "statutory", "missing"
 
+    if not plausible(report_date, original):
+        return fallback, "statutory", "implausible"
+    return original, "f10", None
+
+
+def plausible(report_date: str, notice_date: str) -> bool:
+    """公告日合理性：`report_date < notice_date <= report_date + 120 天`。
+
+    上界 120 天用来抓 A1 那个 bug —— DMSK 的历史行会把公告日指向**次年同类
+    报告的公告日**（美的 6 行里有 5 行会被它抓出来）。**只对源站原始值用**，
+    不要拿去检查 `statutory` 回退值（闰年合法值为 121 天，见 `resolve`）。
+    """
     start = _dt.date.fromisoformat(report_date)
-    got = _dt.date.fromisoformat(original)
-    lag = (got - start).days
-    if 0 < lag <= MAX_NOTICE_LAG_DAYS:
-        return original, "f10", False
-    return fallback, "statutory", True
+    got = _dt.date.fromisoformat(notice_date)
+    return 0 < (got - start).days <= MAX_NOTICE_LAG_DAYS

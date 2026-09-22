@@ -1,6 +1,7 @@
 """Task 15：主流程端到端（设计文档 §7 的 12 步）。"""
 
 from datetime import date, timedelta
+import json
 
 import pytest
 
@@ -304,6 +305,30 @@ def test_score_pipeline_overrides_plugin_version(tmp_db):
     short_over = {m.code: m.raw_score for m in over.members if m.pool == "short"}
     assert short_over and all(v == 100.0 for v in short_over.values())
     assert short_over != short_base
+
+
+def test_industry_risk_note_reaches_report_even_when_screen_passes(tmp_db):
+    """插桩0 的行业注记**通过排雷时也必须进报告**（P53 T5）。
+
+    原来 `risk_note` 只在 `pass_flag=False` 的拒绝分支里用 —— 于是银行/保险
+    在报告里看不到「金融业…毛利率与存货周转无意义」「行业非 PIT」，正是
+    「静默排除」要避免的不可见。
+    """
+    conn = _seed_db(tmp_db)
+    sid = store.insert_script(
+        conn, plugin_id="0", version="9.9.9",
+        source_text="def run(ctx):\n"
+                    "    return {'pass_flag': True,"
+                    " 'risk_note': ['金融业（银行Ⅱ）：毛利率与存货周转无意义',"
+                    " '行业非 PIT，仅为近似']}\n",
+        note=None, now=NOW)
+    pipe = score_pipeline(conn, asof=ASOF, plugin_overrides={"0": sid})
+    rows = [m for m in pipe.members if m.pool == "mid"]
+    assert rows, "夹具应至少产出一个中期池成员"
+    for m in rows:
+        risks = json.loads(m.risk_json)
+        assert "金融业（银行Ⅱ）：毛利率与存货周转无意义" in risks
+        assert "行业非 PIT，仅为近似" in risks
 
 
 def test_score_pipeline_unoverridden_plugin_uses_active(tmp_db):

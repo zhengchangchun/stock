@@ -3306,3 +3306,64 @@ E   assert 1 == 0
 是 22:36 写的，而最后一条用例 22:41 才落盘 —— 记录比它声称的结论**晚不到 5 分钟就失真了**。
 **记录里的实测数字必须在最后一次改动之后重跑**；不确定就在记录里写明「本节数字取自 xx:xx，
 其后仍有改动」。审计侧同理：不采信任何自报的绿，按退出码在自己手上重跑一次。
+
+---
+
+## #65 2026-09-22：公告日合理性判据的 120 天上界会**年年误报** —— 「法定期限」与「实测滞后」不是同一套边界（P53）
+
+### 现象
+
+任务书 P53 T1 与评审 §A1 都要求加一条质检：
+
+```
+report_date < notice_date <= report_date + 120 天，越界 → warn: notice_date_suspect
+```
+
+照着实现之前先拿真库（只读）跑了一遍这条式子，**它误报 41 行合法数据**：
+
+```
+$ （真库只读）select code, report_date, notice_date, notice_date_source,
+     julianday(notice_date)-julianday(report_date) lag
+   from financial_reports
+   where not (report_date < notice_date and notice_date <= date(report_date,'+120 day'))
+('000333','2019-12-31','2020-04-30','statutory',121.0)
+('600519','2007-12-31','2008-04-30','statutory',121.0)
+... 41 行，**全部** notice_date_source='statutory'，滞后**全部** 121 天
+```
+
+### 根本原因
+
+这 41 行都是「源站没给公告日 → 回退到法定披露截止日 4-30」的**年报**期。
+12-31 到次年 4-30 的间隔在**平年 120 天、闰年 121 天**（闰年跨过 2 月 29 日）：
+
+- `2019-12-31 → 2020-04-30` = 121 天（2020 闰年）
+- `2020-12-31 → 2021-04-30` = 120 天（2021 平年）
+
+即 **120 这个常数只对源站实测值成立，对「法定期限」本身不成立**。而回退值
+**定义上就等于**法定期限，对它做「滞后 ≤ 120」的合理性检查，等价于用一个
+比法定期限更严的常数去否决法定期限 —— 于是每个闰年的每一份年报都报一次假警。
+
+更隐蔽的是：这条式子**写在两处权威位置**（评审 §A1「配套质检」+ 任务书判据），
+照抄实现是默认动作。而它错得不显眼 —— 只在闰年、只在走回退的期上出现，
+且表现为「warn 有点多」而不是失败。
+
+### 教训
+
+① **判据要在真数据上先跑一遍再实现**。这条例子的成本是「一条只读 SQL」，
+   省下的是「实现完才发现要回退、且要解释 41 行为什么不是 bug」。
+   同 #34/#37/#38/#64：**别处给的数字与判据都可能过期或想当然**。
+② **别把「源站实测值」的界套到「口径推定值」上**。两套边界性质不同：
+   实测值需要合理性检查（它可能错，A1 那个 DMSK bug 就是），
+   推定值由定义约束（它只该校验「是否等于法定期限」）。共用一个常数必然一边出错。
+③ 由此引出**回退原因要分型**：`missing`（源站没有该字段，纯推定）与
+   `implausible`（有值但不合理，真可疑）是两件事。原来两者共用一个 `suspect=True`，
+   一旦想发 warn 就没法只发该发的那些。
+
+### 已加判据
+
+- `notice_date.plausible()` 只用于**源站原始值**；`statutory` 回退值只校验
+  「等于 `statutory_deadline(report_date)`」（`stocklab/data/notice_date.py`）。
+- `resolve()` 第三返回值由布尔 `suspect` 改为 `fallback_kind ∈ {None,'missing','implausible'}`，
+  只有 `implausible` 才发 `warn: notice_date_suspect`（`stocklab/data/ingest.py`）。
+- 用例钉死闰年：`tests/test_notice_date.py::test_statutory_leap_year_is_121_days_and_that_is_legitimate`、
+  `tests/test_ingest_financials.py::test_leap_year_statutory_121_days_is_not_a_suspect`。

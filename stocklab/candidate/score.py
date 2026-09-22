@@ -54,11 +54,24 @@ _FIN_COLS = ("code", "report_date", "notice_date", "notice_date_source",
 
 
 def load_financials(conn, code: str, *, asof: str) -> list:
-    """按 PIT 读该标的**已公告**的财报期（`notice_date <= asof`），按报告期升序。"""
+    """按 PIT 读该标的**已公告**的财报期（`notice_date <= asof`），按报告期升序。
+
+    同一 `report_date` 若有多条（财报被更正/重述会产生新公告日 = 新主键行），
+    只保留 `notice_date` **最晚**的那条 —— 这是 `schema.sql` 早已写下的读侧约定
+    （P53 T7）。少了这步，同一报告期会返回两行，`indicators` 里 `_value_at`
+    取到哪条就**不确定**，因子会静默算错。
+
+    `ORDER BY notice_date` 让「取最晚」在 SQL 侧一次完成（`report_date` 升序由
+    外层再排一次保证）。
+    """
     rows = conn.execute(
         "SELECT * FROM financial_reports WHERE code = ? AND notice_date <= ?"
-        " ORDER BY report_date", (code, asof)).fetchall()
-    return [FinancialReport(**{k: r[k] for k in _FIN_COLS}) for r in rows]
+        " ORDER BY report_date, notice_date", (code, asof)).fetchall()
+    latest: dict[str, object] = {}
+    for r in rows:                       # 后出现的同报告期行公告日更晚 → 覆盖
+        latest[r["report_date"]] = r
+    return [FinancialReport(**{k: latest[rd][k] for k in _FIN_COLS})
+            for rd in sorted(latest)]
 
 
 def build_ctx(conn, inst: Instrument, pool: str, bars: list[Bar], *,

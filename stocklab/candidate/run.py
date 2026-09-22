@@ -159,11 +159,16 @@ def score_pipeline(conn: sqlite3.Connection, *, asof: str,
                 continue
             final, risks = risk_adjust.adjust(conn, outcome, pool_ctx,
                                               plugin_overrides=plugin_overrides)
+            # 插桩0 的行业注记**无论排雷是否通过**都要进报告（P53 T5）。
+            # 原来只在 `pass_flag=False` 的拒绝分支里用 `risk_note`，导致通过排雷的
+            # 银行/保险在报告里看不到「金融业（银行Ⅱ）：…毛利率与存货周转无意义」
+            # 与「行业非 PIT，仅为近似」——正是「静默排除」要避免的那种不可见。
             scored[pool].append({
                 "code": inst.code, "pool": pool,
                 "raw_score": outcome.raw_score, "adj_score": final,
                 "reason": outcome.reason,
-                "risk_json": json.dumps(risks, ensure_ascii=False)})
+                "risk_json": json.dumps(
+                    [*industry["risk_note"], *risks], ensure_ascii=False)})
 
     for pool in pools.ALL_POOLS:
         for row in pools.select_top(scored[pool], pool):

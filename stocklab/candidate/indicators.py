@@ -9,6 +9,8 @@
     TTM     = 最近 4 个单季之和
 
 存量类（总资产、权益、存货）用期末值；需要均值的用期初期末均值。
+**`roe` 与 `dupont` 用同一套均值口径**（P53 T2）——口径混用会让杜邦恒等式
+静默不成立（分子归母、分母合计那类错，算得出数、也不报错）。
 
 ## 缺一期就给 None，不补 0
 
@@ -113,8 +115,12 @@ def factors(reports: list[FinancialReport]) -> dict:
     """算出六个因子。**不落库**。
 
     返回的 dict **键永远齐全**：不可算的因子给 `None`，并在 `na_reasons`
-    写明原因（设计 §6.3）。`dupont` 用**期末**口径，`roe` 用**均值**口径
-    —— 两者不构成恒等，见设计 §7.1.1。
+    写明原因（设计 §6.3）。
+
+    `dupont` 与 `roe` **同口径**（都用期初期末均值），因此恒等式
+    `净利率 × 总资产周转率 × 权益乘数 == roe` 精确成立（P53 T2）。三分项一律
+    用**归母**权益（`parent_equity`），不是含少数股东的 `total_equity` ——
+    换回合计权益会让恒等式不成立（有负例测试钉死）。
     """
     na: list[str] = []
     period = latest_period(reports)
@@ -140,8 +146,7 @@ def factors(reports: list[FinancialReport]) -> dict:
 
     parent_eq_avg = _avg(reports, "parent_equity", year, quarter)
     inv_avg = _avg(reports, "inventory", year, quarter)
-    assets_now = _value_at(reports, "total_assets", year, quarter)
-    parent_eq_now = _value_at(reports, "parent_equity", year, quarter)
+    assets_avg = _avg(reports, "total_assets", year, quarter)
 
     roe = None
     if profit is not None and parent_eq_avg not in (None, 0):
@@ -183,24 +188,24 @@ def factors(reports: list[FinancialReport]) -> dict:
         na.append("fcf_margin: 现金流或营收缺失")
 
     dupont = None
-    if (profit is not None and income not in (None, 0) and assets_now
-            and parent_eq_now not in (None, 0)):
+    if (profit is not None and income not in (None, 0)
+            and assets_avg not in (None, 0) and parent_eq_avg not in (None, 0)):
         dupont = {
             "net_margin": profit / income,
-            "asset_turnover": income / assets_now,
-            "equity_multiplier": assets_now / parent_eq_now,
+            "asset_turnover": income / assets_avg,
+            "equity_multiplier": assets_avg / parent_eq_avg,
         }
     else:
         # Only append a dupont-specific entry when the missing piece belongs to
-        # dupont's own stock inputs (total_assets / parent_equity_now).  Flow
-        # fields (profit / income) are already reported by the _need() calls
-        # above, so adding a second entry here would be a duplicate root cause.
+        # dupont's own stock inputs (平均总资产 / 平均归母权益).  Flow fields
+        # (profit / income) are already reported by the _need() calls above, so
+        # adding a second entry here would be a duplicate root cause.
         _dupont_own_missing = (
             profit is not None and income not in (None, 0)
-            and (not assets_now or parent_eq_now in (None, 0))
+            and (assets_avg in (None, 0) or parent_eq_avg in (None, 0))
         )
         if _dupont_own_missing:
-            na.append("dupont: 期末总资产或期末归母权益缺失")
+            na.append("dupont: 平均总资产或平均归母权益缺失")
 
     return {"period": period_str, "roe": roe, "gross_margin": gm,
             "gm_yoy_pp": gm_yoy, "inv_days": inv_days,

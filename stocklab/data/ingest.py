@@ -22,6 +22,7 @@ from dataclasses import dataclass, field
 from typing import Callable, Sequence
 
 from stocklab.config.universe import Instrument
+from stocklab.data import notice_date
 from stocklab.data.models import Bar
 from stocklab.quality.checks import Issue, check_bars
 from stocklab.store import repo
@@ -142,8 +143,35 @@ class IngestResultF:
     error: str = ""
 
 
+def _notice_date_issue(r) -> str | None:
+    """公告日质检：`notice_date_source` 与 `notice_date` 取值必须自洽。
+
+    三种不合的情形（任一命中即 warn `notice_date_suspect`）：
+
+    1. 源站给过公告日但被判不合理（`notice_date_suspect`）—— 这是 A1 那个 bug
+       的表现（DMSK 历史行把公告日指向次年同类报告的公告日）。
+    2. 标 `f10` 却算不出 `0 < 滞后 <= 120 天`：源站值越界却没被回退。
+    3. 标 `statutory` 却不等于法定披露截止日：回退值被改过。
+
+    ②③ 是**回归护栏**：当前的 `notice_date.resolve` 不会产出这样的行，但 ingest
+    是系统边界（数据来自外部），将来任何新的写入方（迁移、手工补数）走这条路
+    都会被拦住并留痕。**只记不拒**，与会计恒等式检查同款。
+    """
+    src, got = r.notice_date_source, r.notice_date
+    if getattr(r, "notice_date_suspect", False):
+        return ("notice_date_suspect: 源站公告日不合理（要求 report_date < "
+                f"notice_date ≤ report_date+120 天），已回退法定截止日 {got}")
+    if src == "f10" and not notice_date.plausible(r.report_date, got):
+        return (f"notice_date_suspect: 标 f10 但 {r.report_date} → {got} 不满足 "
+                "report_date < notice_date ≤ report_date+120 天")
+    if src == "statutory" and got != notice_date.statutory_deadline(r.report_date):
+        return (f"notice_date_suspect: 标 statutory 但 {got} 不等于法定披露截止日 "
+                f"{notice_date.statutory_deadline(r.report_date)}")
+    return None
+
+
 def _sanitize(r) -> list[str]:
-    """会计恒等式勾稽 + 量级检查。返回 issue 文案列表（可能为空）。
+    """会计恒等式勾稽 + 量级检查 + 公告日质检。返回 issue 文案列表（可能为空）。
 
     **只记不拒**：财报是公开数据，异常值可能是真实的（巨额商誉减值之类），
     丢掉它等于静默篡改历史。留痕，让下游自己判。
@@ -160,6 +188,9 @@ def _sanitize(r) -> list[str]:
                 f"会计恒等式不成立：|资产−负债−权益|/资产 = "
                 f"{diff / abs(r.total_assets):.2e}（口径探针：若此处长期不过，"
                 "检查 TOTAL_EQUITY 是不是被当成了归母权益）")
+    issue = _notice_date_issue(r)
+    if issue is not None:
+        out.append(issue)
     return out
 
 

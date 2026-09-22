@@ -469,12 +469,13 @@ def fetch_financial_reports(client, *, code: str, org_type: str,
 
     out: list[FinancialReport] = []
     for rd, slot in acc.items():
-        notice, source, _suspect = notice_date.resolve(
+        notice, source, fallback_kind = notice_date.resolve(
             f10_notice.get(rd), report_date=rd)
         out.append(FinancialReport(
             code=code, report_date=rd, notice_date=notice,
             notice_date_source=source,
             report_type=notice_date.report_type_of(rd),
-            parent_equity=f10_parent.get(rd), **slot))
+            parent_equity=f10_parent.get(rd),
+            notice_date_suspect=(fallback_kind == "implausible"), **slot))
     out.sort(key=lambda r: r.report_date)
     return out, refs

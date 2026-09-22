@@ -343,6 +343,102 @@ def migrate_p52_agent_decisions_portfolio(conn) -> list[str]:
     return changed
 
 
+# ---------------------------------------------------------------------------
+# P53：把东财 `INDUSTRY_NAME` 回填进 `instruments.sector`。
+#
+# 背景：`build_ctx` 早已把 `instruments.sector` 喂给插桩0（评审 A7），但这一列
+# **从来没人写过** —— 实测真库 21/21 全为 NULL，于是 `ctx["sector"]` 恒为 None，
+# 行业判定永远退化成「按标的名称猜关键词」。采到的行业数据躺在
+# `financial_reports.industry_name` 里没用上。
+#
+# 这是**数据回填**，不是结构迁移：`instruments` 没有 append-only 触发器
+# （评审 A7 已确认），但改的是会进 `ctx`、进而进分数的列，所以必须**留痕** ——
+# 每次回填写一条 `system_events`，记下改了哪些 code、从什么值改成什么值，
+# 以便将来回答「这个 sector 是什么时候写进去的」。
+#
+# ⚠️ **不注册进 `_KNOWN_MARKERS`**：那份清单是「既有表缺列」的结构 marker，
+# 由 `_pending_column_migrations`（只读探测）驱动。这里是补数据，不是补列，
+# 塞进去会让 doctor 把「已回填」误报成结构迁移状态。
+# ---------------------------------------------------------------------------
+_SECTOR_BACKFILL_SQL = """
+SELECT f.code, f.industry_name
+FROM financial_reports f
+JOIN (
+    SELECT code, MAX(report_date) AS rd
+    FROM financial_reports
+    WHERE industry_name IS NOT NULL AND industry_name <> ''
+    GROUP BY code
+) latest ON latest.code = f.code AND latest.rd = f.report_date
+WHERE f.industry_name IS NOT NULL AND f.industry_name <> ''
+"""
+
+
+def instruments_need_sector_backfill(conn) -> list[str]:
+    """只读探测：哪些 `instruments.sector` 为空且库里有行业名可回填。
+
+    供 doctor / 迁移前预检用，**不写任何东西**。
+    """
+    if not (_table_exists(conn, "instruments")
+            and _table_exists(conn, "financial_reports")):
+        return []
+    known = {code: name for code, name in conn.execute(_SECTOR_BACKFILL_SQL)}
+    rows = conn.execute("SELECT code, sector FROM instruments")
+    return sorted(code for code, sector in rows
+                  if code in known and not (sector or "").strip())
+
+
+def migrate_instruments_sector(conn, *, now: str | None = None) -> list[str]:
+    """按 `financial_reports.industry_name`（每 code 取最新报告期）**补空**的
+    `instruments.sector`。返回 `["<code>: None -> '<new>', ...]`。
+
+    - **只补空**：已有非空值的行**一律不动**（人工值、或上一轮回填的值）。
+      回填的语义是「填缺口」，不是「刷新」—— 静默覆盖既有值等于用今天的
+      口径改写当时的事实（与 `predictions.origin` 不许回填同一条纪律）。
+    - **幂等**：补过一次后再调用返回 `[]`。
+    - **留痕**：有变更时写一条 `system_events`（`module='migrate'`），
+      含全部变更明细 —— 这一列会进 `ctx`、进插桩0 的判据，必须可追溯。
+    - 同一 `report_date` 若命中多个行业名 → 取字典序最小者，保证**可复现**。
+    """
+    if not (_table_exists(conn, "instruments")
+            and _table_exists(conn, "financial_reports")):
+        return []
+    latest: dict[str, str] = {}
+    for code, name in conn.execute(_SECTOR_BACKFILL_SQL):
+        cur = latest.get(code)
+        if cur is None or name < cur:
+            latest[code] = name
+
+    changed: list[str] = []
+    for code, sector in conn.execute("SELECT code, sector FROM instruments"):
+        if (sector or "").strip():
+            continue                      # 只补空，不动既有值
+        want = latest.get(code)
+        if want is None:
+            continue                      # 没有行业名可补（如 ETF）
+        changed.append(f"{code}: None -> {want!r}")
+    if not changed:
+        return []
+
+    conn.execute("BEGIN")
+    try:
+        for item in changed:
+            code = item.split(":", 1)[0]
+            conn.execute("UPDATE instruments SET sector = ? WHERE code = ?",
+                         (latest[code], code))
+        conn.commit()
+    except BaseException:
+        conn.rollback()
+        raise
+
+    from stocklab.store import repo
+    repo.log_event(
+        conn, "migrate", "info",
+        f"p53: 回填 instruments.sector {len(changed)} 行"
+        "（来源 financial_reports.industry_name，东财二级行业名；只补空）",
+        context={"changes": changed}, now=now)
+    return changed
+
+
 
 #: 已知迁移 marker 清单：doctor 逐个报告在位与否（只读，不迁移）。#: (name, table, 判据)。判据是列名（str）或一个只读探测函数。
 #: 新增迁移时必须在这里登记，否则 doctor 看不出来。

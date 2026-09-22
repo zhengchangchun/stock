@@ -134,3 +134,83 @@ def test_insert_bind_tuple_order_matches_f_cols(conn):
     assert row[idx_te] == rep.total_equity, (
         f"total_equity 列值错位：期望 {rep.total_equity}, 得到 {row[idx_te]}"
     )
+
+
+# ---------- P53 T1：公告日质检 notice_date_suspect ----------
+
+def test_implausible_source_notice_date_raises_warn(conn):
+    """源站给过公告日但不合理（已回退）→ 记 `notice_date_suspect`。"""
+    r = ingest_financial_reports(
+        conn, [_rep(notice_date="2026-04-30", notice_date_source="statutory",
+                    notice_date_suspect=True, report_type="中报")],
+        _refs(), now=NOW)
+    assert r.rows_written == 1, "只记不拒：可疑也要留痕落库"
+    assert any("notice_date_suspect" in i for i in r.issues)
+
+
+def test_statutory_from_missing_is_not_a_suspect(conn):
+    """源站**没给**值 → `missing` 推定，不是可疑，不许发 warn。
+
+    真库 175 行 statutory 里绝大多数是这一类（美的 2004–2007 那 17 期），
+    把它们全报成 suspect 等于噪声淹没信号。
+    """
+    r = ingest_financial_reports(
+        conn, [_rep(notice_date="2026-08-31", notice_date_source="statutory")],
+        _refs(), now=NOW)
+    assert r.rows_written == 1
+    assert not any("notice_date_suspect" in i for i in r.issues)
+
+
+def test_leap_year_statutory_121_days_is_not_a_suspect(conn):
+    """真库 41 行：年报 12-31 → 次年 4-30 在闰年是 **121** 天，合法。
+
+    120 天上界只约束源站原始值，**不套 statutory 回退值** —— 否则年年误报。
+    """
+    r = ingest_financial_reports(
+        conn, [_rep(report_date="2019-12-31", report_type="年报",
+                    notice_date="2020-04-30", notice_date_source="statutory")],
+        _refs(), now=NOW)
+    assert r.rows_written == 1
+    assert not any("notice_date_suspect" in i for i in r.issues), r.issues
+
+
+def test_f10_row_violating_range_is_caught(conn):
+    """标 f10 却越过 120 天上界 → 回归护栏命中（当前 resolve 不会产出这种行）。"""
+    r = ingest_financial_reports(
+        conn, [_rep(notice_date="2027-06-30", notice_date_source="f10")],
+        _refs(), now=NOW)
+    assert r.rows_written == 1
+    assert any("notice_date_suspect" in i for i in r.issues)
+
+
+def test_statutory_row_off_the_deadline_is_caught(conn):
+    """标 statutory 却不等法定披露截止日 → 回归护栏命中。"""
+    r = ingest_financial_reports(
+        conn, [_rep(notice_date="2026-08-30", notice_date_source="statutory")],
+        _refs(), now=NOW)
+    assert any("notice_date_suspect" in i for i in r.issues)
+
+
+# ---------- P53 T3：早期期数 NOTICE_DATE 为 NULL 也能入库 ----------
+
+def test_pre_2007_period_with_empty_notice_date_is_storable(conn):
+    """真库 244 行 `report_date < 2007`；其中美的 17 期源站公告日为 NULL。
+
+    主键 `notice_date` 是 `NOT NULL` —— 若没有回退，这批历史期根本进不去。
+    本用例钉死：回退到法定截止日后**插入成功**，且来源如实标 `statutory`。
+    """
+    from stocklab.data import notice_date as nd
+
+    got, src, kind = nd.resolve(None, report_date="2004-12-31")
+    assert (got, src, kind) == ("2005-04-30", "statutory", "missing")
+
+    rep = _rep(report_date="2004-12-31", report_type="年报",
+               notice_date=got, notice_date_source=src,
+               total_assets=2.0e10, parent_equity=1.0e10,
+               total_equity=1.2e10, total_liabilities=8.0e9)
+    r = ingest_financial_reports(conn, [rep], _refs(), now=NOW)
+    assert r.ok and r.rows_written == 1
+    row = conn.execute(
+        "SELECT report_date, notice_date, notice_date_source FROM financial_reports"
+    ).fetchone()
+    assert tuple(row) == ("2004-12-31", "2005-04-30", "statutory")

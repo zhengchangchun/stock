@@ -148,3 +148,7 @@ class FinancialReport:
     construct_long_asset: float | None = None
     industry_name: str | None = None
     source: str = "eastmoney-datacenter"
+    #: 源站**给过**公告日但不合理（早于报告期或滞后 > 120 天），已回退法定截止日。
+    #: 瞬态字段，**不落库** —— 它只负责把 fetch 的判定传给 ingest 去发 warn。
+    #: 从库里读回来的行一律为 False（那时判定已成历史，重算等于改口径）。
+    notice_date_suspect: bool = False

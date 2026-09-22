@@ -183,3 +183,39 @@ def test_cache_key_carries_fetch_date():
     for _url, key in client.calls:
         assert key.startswith("financial:000333:2026-09-20:")
         assert key.split(":")[2] == "2026-09-20", "第 3 段必须是 ISO 日期（ADR-009）"
+
+
+# ---------- P53 T4：分页取全（正向） ----------
+
+_QUARTER_DAY = {3: "31", 6: "30", 9: "30", 12: "31"}
+
+
+def _quarter_ends(n: int) -> list[str]:
+    """从 2026-06-30 往回生成 n 个季末日期（升序不要求，覆盖足够即可）。"""
+    out, y, m = [], 2026, 6
+    for _ in range(n):
+        out.append(f"{y}-{m:02d}-{_QUARTER_DAY[m]}")
+        m -= 3
+        if m < 3:
+            y, m = y - 1, 12
+    return out
+
+
+def test_multi_page_response_is_fully_collected():
+    """>pageSize 的响应必须**翻全**，不许只拿第一页（P53 T4 判据）。
+
+    造 700 行（pageSize=500 → 2 页：500 + 200）。若分页缺失，只会入库 500 行，
+    且「半截当完整」——正是 valuation_daily 踩过的坑。
+    """
+    dates = _quarter_ends(700)
+    assert len(dates) == 700
+    rows = {1: [{"REPORT_DATE": f"{d} 00:00:00"} for d in dates[:PAGE_SIZE]],
+            2: [{"REPORT_DATE": f"{d} 00:00:00"} for d in dates[PAGE_SIZE:]]}
+    reports, refs = fetch.fetch_financial_reports(
+        _FakeClient({"RPT_DMSK_FN_BALANCE": rows}), code="000333",
+        org_type="通用", fetched_date="2026-09-20")
+
+    assert len(reports) == 700, f"只收到 {len(reports)} 行 —— 分页没翻全"
+    assert {r.report_date for r in reports} == set(dates)
+    pages = [r["page"] for r in refs if r["endpoint"] == "RPT_DMSK_FN_BALANCE"]
+    assert pages == [1, 2], f"溯源必须记录两页，实际 {pages}"

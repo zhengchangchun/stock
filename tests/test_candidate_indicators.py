@@ -150,22 +150,52 @@ def test_fcf_margin():
     assert f["fcf_margin"] == pytest.approx(68.0 / 440.0)
 
 
-def test_dupont_components_present_and_weekly_consistent():
+def test_dupont_components_present_and_internally_consistent():
+    """三分项与 `roe` 同口径：都用期初期末均值。"""
     f = ind.factors(_two_years())
     d = f["dupont"]
+    # 平均总资产 = (1000 + 1100) / 2 = 1050；平均归母权益 = (400 + 460) / 2 = 430
     assert d["net_margin"] == pytest.approx(48.0 / 440.0)
-    assert d["asset_turnover"] == pytest.approx(440.0 / 1100.0)
-    assert d["equity_multiplier"] == pytest.approx(1100.0 / 460.0)
+    assert d["asset_turnover"] == pytest.approx(440.0 / 1050.0)
+    assert d["equity_multiplier"] == pytest.approx(1050.0 / 430.0)
 
 
-def test_dupont_identity_holds_within_one_basis():
-    """三分项相乘 == 归母净利 / 期末归母权益（**期末口径**，不含均值）。"""
+def test_dupont_identity_holds_against_roe():
+    """恒等式：净利率 × 总资产周转率 × 权益乘数 == roe（P53 T2 判据）。"""
     f = ind.factors(_two_years())
     d = f["dupont"]
     product = d["net_margin"] * d["asset_turnover"] * d["equity_multiplier"]
-    assert product == pytest.approx(48.0 / 460.0, rel=1e-12)
-    # 而 roe 用均值口径 —— 两者**不相等**，是有意为之（设计 §7.1.1）
-    assert f["roe"] != pytest.approx(product)
+    assert abs(product - f["roe"]) < 1e-9
+    assert product == pytest.approx(48.0 / 430.0)
+
+
+def test_dupont_identity_negative_case_total_equity_breaks_it():
+    """负例：**分子归母、分母合计**（P53 之前的历史 bug）→ 恒等式必须不成立。
+
+    口径混用才是错：只把乘数的分母换成 `total_equity`（含少数股东），
+    `roe` 仍按归母算，右边的乘积就变成一个**我们不上报的 ROE**。
+    这条负例证明恒等式测试对口径敏感，不是恒真的橡皮图章。
+    """
+    f = ind.factors(_two_years())
+    d = f["dupont"]
+    # 夹具：平均总资产 1050、平均归母权益 430、平均合计权益 (450+510)/2 = 510
+    mixed = d["net_margin"] * d["asset_turnover"] * (1050.0 / 510.0)
+    assert abs(mixed - f["roe"]) >= 1e-9
+    # 方向恒为**低估**（分母变大），幅度 = 1 − 平均归母/平均合计
+    assert mixed < f["roe"]
+    assert abs(mixed - f["roe"]) / f["roe"] == pytest.approx(1.0 - 430.0 / 510.0)
+
+
+def test_swapping_parent_for_total_consistently_keeps_identity():
+    """反面对照：**两边都**换成合计权益时恒等式仍成立 —— 错的是混用，不是取值。"""
+    import dataclasses
+
+    swapped = [dataclasses.replace(r, parent_equity=r.total_equity)
+               for r in _two_years()]
+    f = ind.factors(swapped)
+    d = f["dupont"]
+    product = d["net_margin"] * d["asset_turnover"] * d["equity_multiplier"]
+    assert abs(product - f["roe"]) < 1e-9
 
 
 def test_missing_operate_cost_marks_na_not_zero():

@@ -163,6 +163,66 @@ def test_pit_excludes_unannounced_periods(fin_db):
     assert late["features"]["period"] == "2026Q2"
 
 
+def _insert_report(conn, *, report_date, notice_date, income, cost, profit):
+    conn.execute(
+        "INSERT INTO financial_reports (code, report_date, notice_date,"
+        " notice_date_source, report_type, total_assets, parent_equity,"
+        " total_equity, total_liabilities, inventory, total_operate_income,"
+        " operate_cost, parent_netprofit, source, fetched_at, created_at,"
+        " raw_refs_json) VALUES ('000333',?,?,'f10',?, 1e11, 4e10, 4.4e10,"
+        " 5.6e10, 2e10, ?, ?, ?, 'x', ?, ?, '[]')",
+        (report_date, notice_date,
+         {3: "一季报", 6: "中报", 9: "三季报", 12: "年报"}[int(report_date[5:7])],
+         income, cost, profit, NOW, NOW))
+    conn.commit()
+
+
+def test_missing_quarter_yields_none_not_zero(fin_db):
+    """缺一季 ⇒ 因子是 `None`（**不是 `0.0`**），且 `na_reasons` 给出原因（P53 T6）。
+
+    `0.0` 是「最差」的合法分数，把「不知道」填成 `0.0` 等于伪装成最差 ——
+    正是设计 §6.3 要避免的。
+    """
+    # 只给一季（Q2）→ 单季拆不出（缺 Q1 累计）→ TTM 四季不齐
+    _insert_report(fin_db, report_date="2026-06-30", notice_date="2026-08-29",
+                   income=5e10, cost=3.5e10, profit=5e9)
+    f = score.build_ctx(fin_db, STOCK, "mid", BARS,
+                        asof="2026-09-17")["features"]
+
+    assert f["period"] == "2026Q2", "报告期本身是可见的"
+    for key in ("roe", "gross_margin", "gm_yoy_pp", "inv_days", "fcf_margin"):
+        assert f[key] is None, f"{key} 缺数据时必须 None，不许给 {f[key]!r}"
+        assert f[key + "_pct"] is None, f"{key}_pct 分位不可算时必须是 None"
+    assert f["dupont"] is None
+    assert f["na_reasons"], "每个 None 都必须有 na_reasons 解释"
+    # 「不知道」不许被伪装成「最差」：因子位置上不得出现 0.0
+    for key in ("roe", "gross_margin", "gm_yoy_pp", "inv_days", "fcf_margin",
+                "dupont"):
+        assert f[key] != 0.0, f"{key} 是 0.0 —— NA 被伪装成了「最差」"
+
+
+def test_read_side_keeps_latest_notice_date_per_report_date(fin_db):
+    """同一报告期的多个公告版本（更正/重述）→ 只读**最晚**那条（P53 T7）。
+
+    `schema.sql` 承诺「读取侧取 `notice_date <= asof` 中最晚的那个」，但原来
+    `load_financials` 全取 → 同一报告期返回两行 → 因子静默取到不确定的那条。
+    """
+    _insert_report(fin_db, report_date="2026-06-30", notice_date="2026-08-29",
+                   income=5e10, cost=3.5e10, profit=5e9)
+    # 更正版：同报告期、更晚公告日（净利润被下修）
+    _insert_report(fin_db, report_date="2026-06-30", notice_date="2026-09-10",
+                   income=5e10, cost=3.5e10, profit=4e9)
+
+    rows = score.load_financials(fin_db, "000333", asof="2026-09-17")
+    assert len(rows) == 1, f"同一报告期只该读到一行，实际 {len(rows)}"
+    assert rows[0].notice_date == "2026-09-10", "应取最晚公告的那一版"
+    assert rows[0].parent_netprofit == 4e9, "读到的必须是更正后的值"
+
+    # 更正公告日尚未到 → 只看得到老版本
+    early = score.load_financials(fin_db, "000333", asof="2026-09-05")
+    assert len(early) == 1 and early[0].parent_netprofit == 5e9
+
+
 def test_features_keys_complete_when_factors_omits_dupont(fin_db, monkeypatch):
     """indicators.factors() 不含 dupont 时，build_ctx 本地保证该键仍在 features 中。
 
