@@ -510,17 +510,29 @@ def _trigger_keys(cal: tuple[dict[str, int], ...]) -> set[tuple[int, int, int]]:
     return out
 
 
-def test_patrol_plist_covers_0900_to_1500_and_never_1530(tmp_path):
-    """T1：`patrol` 的 **65 条**触发点 = 工作日 09:00–15:00 每 30 分钟，且不含 15:30。
+def test_patrol_plist_covers_0900_to_1430_and_no_slot_reaches_the_close(tmp_path):
+    """T1：`patrol` 的 **60 条**触发点 = 工作日 09:00–14:30 每 30 分钟。
 
-    15:30 那槽与 `close` 撞在同一分钟（P42 §0）：`patrol --fix` 会真起子进程补步，
-    与收盘链并发写同一个库 → `database is locked` → 收盘链断链。
+    两条边界各自钉一件事：
+
+    - **不含 15:30**：那一槽与 `close` 撞在同一分钟（P42 §0），`patrol --fix` 会真起
+      子进程补步，与收盘链并发写同一个库 → `database is locked` → 收盘链断链；
+    - **不含 15:00**（P46 §T1）：15:00 那一刻 `is_trade_date_closed(今天, now)` 已经为真
+      ⇒ `latest_closed_session` 变成**今天** ⇒ patrol 会补 `predict run --asof 今天`，
+      而那时当天的 K 线还是**盘中值**（`ingest bars` 是 15:30 收盘链的事）。实测
+      2026-09-22 15:00 槽就这么写出了 17 条基于半截 bar 的 LIVE 预测，15:30 收盘链
+      重算后全部撞 append-only → 收盘链 exit 1。所以「任一槽严格早于 15:00」不是
+      排版偏好，而是这条缺陷的结构性断言。
     """
     cal = _generated_calendars(tmp_path)["patrol"]
-    assert len(cal) == 65
-    assert {(e["Hour"], e["Minute"]) for e in cal} == {
-        (h, m) for h in range(9, 15) for m in (0, 30)} | {(15, 0)}
-    assert (15, 30) not in {(e["Hour"], e["Minute"]) for e in cal}
+    assert len(cal) == 60
+    assert len(schedule.patrol_calendar()) == 60          # 生成器与 plist 同源
+    times = {(e["Hour"], e["Minute"]) for e in cal}
+    assert times == {(h, m) for h in range(9, 15) for m in (0, 30)}
+    assert (15, 30) not in times
+    # T1 的断言本体：patrol **永远不碰收盘时刻** —— 任一槽 (H, M) 严格早于 (15, 0)。
+    assert all(t < (15, 0) for t in times), sorted(t for t in times if t >= (15, 0))
+    assert all(e["Hour"] < 15 for e in cal)
     assert {e["Weekday"] for e in cal} == {1, 2, 3, 4, 5}
 
 

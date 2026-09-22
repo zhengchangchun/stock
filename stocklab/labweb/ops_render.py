@@ -112,6 +112,21 @@ def _anomalies_block(anomalies: Sequence[Mapping]) -> str:
     return f'<ul class="list">{items}</ul>'
 
 
+def _skipped_block(skipped: Sequence[Mapping]) -> str:
+    """**有意跳过**的步骤（P46 §T4）：非静默，且**不折进 `more()`** —— 一眼可见。
+
+    与「整轮跳过」（`skipped` 字符串）和「拒绝执行」（`refused`）是三件不同的事：
+    整轮跳过是今天不该跑，拒绝执行是这一轮结构上跑不了，这里是**计划里有这一步、
+    但 deliberately 没跑**。三者都要在页面上有各自的说法，否则「没跑」的各种原因
+    会被读成同一个（ERROR_DIARY #54）。
+    """
+    items = "".join(
+        f'<li><code>{esc(s.get("step"))}</code>　{rich(s.get("reason") or "")}</li>'
+        for s in skipped)
+    return ('<p class="note">本轮**有意跳过**这些步骤（不是漏跑，也不是失败）：</p>'
+            f'<ul class="list">{items}</ul>')
+
+
 def _job_section(job: Mapping) -> str:
     """一条任务 = 一段：窗口 / 命令 / 回执 / 最近一次 / 历史。"""
     latest = job.get("latest")
@@ -144,6 +159,8 @@ def _job_section(job: Mapping) -> str:
         if job.get("summary"):
             lines.append(f'<p class="note">摘要行（与 launchd 日志逐字相同）：'
                          f'<code>{esc(job["summary"])}</code></p>')
+        if job.get("plan_skipped"):
+            lines.append(_skipped_block(job["plan_skipped"]))
         lines.append(_steps_table(job["steps"]))
         lines.append(more(_anomalies_block(job["anomalies"]),
                           label=f'查看异常（{len(job["anomalies"])} 条）'))

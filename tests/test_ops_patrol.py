@@ -75,6 +75,15 @@ def _db(tmp_path, *, report_dir: Path | None = None, **kw) -> Path:
             " amount, adj_mode, source, fetched_at)"
             " VALUES (?,?,10.0,10.0,10.0,10.0,100,NULL,'none','x',?)",
             [(code, L, NOW) for code in CODES])
+    if kw.get("bars_today"):
+        # 今天也有 bar ⇒ 收盘后 `latest_closed_session` 会变成**今天**（T2 的触发条件：
+        # `predict run --asof` == 今天，而这一天归 close，不归 patrol）。
+        c.executemany(
+            "INSERT INTO bars_daily (code, date, open, high, low, close, volume,"
+            " amount, adj_mode, source, fetched_at)"
+            " VALUES (?,?,10.0,10.0,10.0,10.0,100,NULL,'none','x',?)",
+            [(code, TODAY, kw.get("bars_today_fetched_at", NOW))
+             for code in CODES])
     if kw.get("snapshots_today", True):
         _snap(c, TODAY, kw.get("today_ts", "20260922103000"))
     if kw.get("snapshots_for_L"):
@@ -287,6 +296,64 @@ def test_predictions_of_another_model_version_do_not_count(tmp_path):
     assert payload["checks"]["predictions"]["n"] == 0
     assert payload["checks"]["predictions"]["status"] == "missing"
     assert patrol.plan(payload)["steps"] == ["predict_run"]
+
+
+# ---------- T2：patrol 不碰「今天 asof」的 predict（那条归 15:30 的 close） ----------
+
+def test_today_asof_predict_is_skipped_and_the_receipt_says_why(tmp_path):
+    """T2：`latest_closed_session` == 今天时，**不补** `predict run --asof 今天`。
+
+    这是 2026-09-22 事故的形状（P46）：15:00 那一刻今天已「收盘」，而当天 K 线要到
+    15:30 收盘链才定型 —— patrol 此刻补出来的预测基于**半截 bar**，写进 append-only
+    的 `predictions` 后退不回来，15:30 收盘链重算必然全撞冲突（实测 17 条）。
+
+    「跳过」必须**非静默**：回执里要带着 `skipped_reason`，否则读者只会看到
+    「③ missing」而不知道有人故意没补（ERROR_DIARY #54 的教训：不新增绿码掩盖异常）。
+    """
+    payload = _check(_db(tmp_path, bars_today=True, predictions=False), now=CLOSED_NOW)
+    assert payload["latest_closed_session"]["date"] == TODAY
+    assert payload["checks"]["predictions"]["status"] == "missing"
+
+    p = patrol.plan(payload)
+    assert "predict_run" not in p["steps"]
+    assert [s["step"] for s in p["skipped"]] == ["predict_run"]
+    reason = p["skipped"][0]["reason"]
+    assert "今天" in reason and "close" in reason
+
+
+def test_yesterday_asof_predict_is_still_filled(tmp_path):
+    """T2 的反面对照：**昨天的**缺口照旧补 —— 不能把整个补步功能关掉。
+
+    盘中（10:30）`latest_closed_session` 是昨天，那时补 `predict run --asof 昨天`
+    用的是已经定型的 K 线，是正经活。
+    """
+    payload = _check(_db(tmp_path, predictions=False), now=NOW)
+    assert payload["latest_closed_session"]["date"] == L
+    p = patrol.plan(payload)
+    assert "predict_run" in p["steps"]
+    assert p["skipped"] == []
+
+
+def test_fix_never_runs_the_today_asof_predict(tmp_path):
+    """T2 的端到端断言：`--fix` 一次子进程都不许为 `predict run --asof 今天` 起。"""
+    path = _db(tmp_path, bars_today=True, predictions=False)
+    runner = FakeRunner()
+    payload = patrol.run_patrol(db_path=path, now=CLOSED_NOW, fix=True, runner=runner,
+                                report_dir=path.parent / "reports")
+    assert "predict_run" not in {c["step"] for c in runner.calls}
+    assert [s["step"] for s in payload["plan"]["skipped"]] == ["predict_run"]
+    assert payload["plan"]["skipped"][0]["reason"]
+
+
+def test_summary_line_reports_the_skip(tmp_path):
+    """摘要行（launchd 日志与 `/lab/ops` 逐字相同的那一行）也要看得见「跳过」。"""
+    path = _db(tmp_path, bars_today=True, predictions=False)
+    payload = patrol.run_patrol(db_path=path, now=CLOSED_NOW, fix=False,
+                                runner=FakeRunner(),
+                                report_dir=path.parent / "reports")
+    line = patrol.summary_line(payload)
+    assert "predict_run" not in line.split("fixed=")[1].split()[0]
+    assert "skip=" in line and "predict_run" in line.split("skip=")[1]
 
 
 def test_pending_verification_plans_verify_pending(tmp_path):

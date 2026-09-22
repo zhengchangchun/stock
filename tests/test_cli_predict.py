@@ -160,3 +160,99 @@ def test_predict_run_skips_a_code_with_no_bars_on_asof(env, capsys):
     assert run(env, "--code", "600690") == 2
     err = capsys.readouterr().err
     assert "600690" in err and "无 K 线" in err
+
+
+# ---------- T3：`--asof 今天` 的「当日数据未定型」闸门（P46） ----------
+#
+# 背景（实测，见 `docs/errors/ERROR_DIARY.md` #60）：patrol 的 15:00 槽在
+# 2026-09-22 补跑了 `predict run --asof 2026-09-22`，而当天的 K 线还是 12:06 那根
+# **盘中半截 bar**（`ingest bars` 是 15:30 收盘链的第一步）。17 条 LIVE 预测写进
+# append-only 的 `predictions` 后退不回来，15:30 收盘链重算必然全撞冲突。
+#
+# 闸门判据是 `bars_daily.fetched_at ≥ 当日 15:00`（`session.close.bars_finalized_on`）。
+# 它**不是**墙上的钟：`--asof` 是历史日时完全不判（回放不受影响）。
+
+def _today_is(monkeypatch, day: str) -> None:
+    """把 CLI 的「今天」注入成 `day`（时钟是参数不是环境，ERROR_DIARY #31）。"""
+    monkeypatch.setattr("stocklab.cli.main._today", lambda: day)
+
+
+def _set_today_fetched_at(env, fetched_at: str) -> None:
+    conn = connect(env["db"])
+    conn.execute("UPDATE bars_daily SET fetched_at=? WHERE date=?", (fetched_at, ASOF))
+    conn.commit()
+    conn.close()
+
+
+def _predictions_count(env) -> int:
+    conn = connect(env["db"])
+    n = conn.execute("SELECT COUNT(*) FROM predictions").fetchone()[0]
+    conn.close()
+    return n
+
+
+def test_asof_today_with_an_intraday_bar_is_refused_before_writing_anything(
+        env, monkeypatch, capsys):
+    """事故复现：今天的 K 线是盘中采的（`fetched_at` = 12:06）→ **exit 2、一行不写**。"""
+    _today_is(monkeypatch, ASOF)
+    _set_today_fetched_at(env, f"{ASOF}T12:06:00+08:00")
+
+    assert run(env) == 2
+    err = capsys.readouterr().err
+    assert "未定型" in err and "12:06" in err and "15:00" in err
+    assert _predictions_count(env) == 0          # fail-closed：一行都没写
+
+    report = env["reports"] / f"{ASOF}-predict-{ASOF}.json"
+    assert not report.exists()                   # 报告也不落盘（没有可复现的产物）
+
+
+def test_asof_today_with_a_final_bar_is_allowed(env, monkeypatch, capsys):
+    """收盘链的形状：`ingest bars` 已把当天 K 线刷成终值 → 照常出预测。"""
+    _today_is(monkeypatch, ASOF)
+    _set_today_fetched_at(env, f"{ASOF}T15:30:03+08:00")
+
+    assert run(env) == 0
+    assert _predictions_count(env) == 1
+    assert "payload_sha256" in capsys.readouterr().out
+
+
+def test_asof_today_without_any_bar_row_is_refused(env, monkeypatch, capsys):
+    """当天连一根 K 线都没有 → 证不出定型，同样拒绝（fail-closed）。"""
+    _today_is(monkeypatch, ASOF)
+    conn = connect(env["db"])
+    conn.execute("DELETE FROM bars_daily WHERE date=?", (ASOF,))
+    conn.commit()
+    conn.close()
+
+    assert run(env) == 2
+    assert "未定型" in capsys.readouterr().err
+    assert _predictions_count(env) == 0
+
+
+def test_a_historical_asof_is_never_gated(env, monkeypatch, capsys):
+    """回放不受影响：`--asof` 是历史日时闸门**完全不参与**，哪怕它当天 fetched_at 很旧。
+
+    这条是闸门的边界 —— 判据只回答「今天能不能出预测」，不该顺手把
+    「历史日复算」这条整个预测体系赖以存在的路也堵上。
+    """
+    _today_is(monkeypatch, "2026-09-22")
+    _set_today_fetched_at(env, f"{ASOF}T12:06:00+08:00")     # ASOF 是历史日
+
+    assert run(env) == 0
+    assert _predictions_count(env) == 1
+    capsys.readouterr()
+
+
+def test_the_finality_judgement_never_reads_a_clock(env):
+    """判据是**数据**（`bars_daily.fetched_at`）不是**时刻** —— 签名里就没有「现在几点」。
+
+    节假日 / 临时休市 / 机器睡醒补跑都会骗过「时间 ≥ 15:30」这类判据（P46 §T3 明令
+    不许拿它当唯一判据）。这条断言把「不读时钟」变成结构性的：想加时钟进来就得先改
+    签名，而改签名会当场红。
+    """
+    import inspect
+
+    from stocklab.session import close as close_mod
+
+    assert list(inspect.signature(close_mod.bars_finalized_on).parameters) == [
+        "conn", "trade_date"]

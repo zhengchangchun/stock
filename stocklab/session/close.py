@@ -1,5 +1,8 @@
 """收盘回填（P11）：把当日快照里的 `amount`/`turnover` 补进 `bars_daily` 对应行。
 
+另有一个同源判据 `bars_finalized_on()`（P46）：**当天的 K 线定型了没** ——
+它同样只认「收盘后采到的证据」，是 `predict run --asof 今天` 的闸门。
+
 ## 五条不许越过的线
 
 1. **只补当日**：`WHERE code=? AND date=?` —— 语句层面够不到别的日期。
@@ -37,8 +40,12 @@
 from __future__ import annotations
 
 import sqlite3
+from datetime import datetime
+from zoneinfo import ZoneInfo
 
 from stocklab.store import repo
+
+TZ = ZoneInfo("Asia/Shanghai")
 
 #: 收盘时刻（Asia/Shanghai，本地时钟口径）。在此**及之后**当日快照的最后一条即全天值。
 CLOSE_HOUR = 15
@@ -80,6 +87,74 @@ def is_closed_snapshot(ts: str) -> bool:
     if parts is None:
         return False
     return parts >= (CLOSE_HOUR, CLOSE_MINUTE, 0)
+
+
+def _fetched_time(fetched_at: str) -> tuple[int, int, int] | None:
+    """`fetched_at`（ISO8601）→ 上海本地 `(hh, mm, ss)`；读不出 → `None`（fail-closed）。
+
+    naive 值按 `Asia/Shanghai` 解释：本项目所有写入都用 `datetime.now(TZ)` 生成带
+    `+08:00` 的 ISO 串，naive 只可能来自手改/老数据，按本地读是这里的正确答案。
+    """
+    if not isinstance(fetched_at, str) or not fetched_at:
+        return None
+    try:
+        dt = datetime.fromisoformat(fetched_at)
+    except ValueError:
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=TZ)
+    dt = dt.astimezone(TZ)
+    return dt.hour, dt.minute, dt.second
+
+
+def bars_finalized_on(conn: sqlite3.Connection, trade_date: str) -> tuple[bool, str]:
+    """`trade_date` 当天的日 K 是否已是**收盘后采到**的终值。→ `(定型?, 人话原因)`。
+
+    ## 为什么需要它（P46 §T3）
+
+    `predict run --asof 今天` 若在任何一次「收盘后」判定为真时跑，就能拿到一根
+    **尚未定型**的 K 线：`is_trade_date_closed(今天, now)` 在 15:00 就为真，而当天
+    K 线要到 15:30 收盘链的 `ingest bars` 才被刷成终值。此时算出的预测基于**半截
+    bar**，而 `predictions` 是 append-only —— 15:30 收盘链重算必然条条冲突
+    （2026-09-22 实测 17 条，收盘链 exit 1，见 ERROR_DIARY #60）。
+
+    ## 判据：`bars_daily.fetched_at`（这一行**最后一次从源站采到的时刻**）
+
+    `repo.insert_bars` 的 `ON CONFLICT DO UPDATE` 会把 `fetched_at` 刷成本次采集
+    时刻，所以它天然就是「这根 K 线是什么时候拿到的」。早于收盘时刻 ⇒ 那时市场
+    还没收盘 ⇒ 这根 K 线的 `close` 只能是盘中值。
+
+    **不用**墙上时钟（节假日、临时休市、机器睡醒补跑都会骗过「现在几点」），
+    **也不用**另外两个更顺手的判据 —— 它们都度量「快照/回填跑没跑」，而本问题是
+    「**收盘价**是不是终值」：`backfill_close_amounts` 只补 `amount`/`turnover`，
+    **一行都不碰 `close`**。两个反例都实测过（ERROR_DIARY #60）：
+    `session backfill-close` 当天成功跑过、当天 `amount` 非 NULL，两者在事故当天
+    都为真，闸门会恒放行。
+
+    ## fail-closed（三条）
+
+    当天**一行 bar 都没有** / `fetched_at` 读不出时刻 / **任一行**早于收盘时刻
+    → 一律判「未定型」。最后一条是刻意的：整天只有一行旧数据，而它可能正是被预测
+    的那个标的，容不得「多数行都新」这种多数表决。
+    """
+    rows = conn.execute(
+        "SELECT code, fetched_at FROM bars_daily WHERE date=? AND adj_mode='none'"
+        " ORDER BY code", (trade_date,)).fetchall()
+    if not rows:
+        return False, (f"{trade_date} 在 bars_daily 里一行都没有 —— "
+                       "证不出当天的 K 线已定型")
+    close_hm = (CLOSE_HOUR, CLOSE_MINUTE, 0)
+    for row in rows:
+        t = _fetched_time(row["fetched_at"])
+        if t is None:
+            return False, (f"{row['code']} {trade_date} 的 fetched_at="
+                           f"{row['fetched_at']!r} 读不出时刻 → 按未定型处理")
+        if t < close_hm:
+            return False, (f"{row['code']} {trade_date} 的 K 线是 "
+                           f"{t[0]:02d}:{t[1]:02d} 采到的（早于 "
+                           f"{CLOSE_HOUR:02d}:{CLOSE_MINUTE:02d} 收盘时刻）"
+                           "→ 收盘价还没定型")
+    return True, ""
 
 
 def latest_snapshots(conn: sqlite3.Connection, trade_date: str) -> dict[str, dict]:

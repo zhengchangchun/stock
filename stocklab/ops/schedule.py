@@ -19,8 +19,8 @@
 
 launchd 没有 cron 表达式，`StartCalendarInterval` **一次只能描述一个（集）触发点**；
 给一个数组则是「命中任一条即触发」（缺的键 = 通配）。所以要表达
-「工作日 09:00–15:00 每 30 分钟」必须展开成 `13 槽 × 5 天 = 65` 条 ——
-数字大，但语义与 `*/30 9-15 * * 1-5` 去掉 15:30 那一格后逐点等价，且**没有 shell 参与**。
+「工作日 09:00–14:30 每 30 分钟」必须展开成 `12 槽 × 5 天 = 60` 条 —— 数字大，
+但语义与 `*/30 9-14 * * 1-5` 逐点等价，且**没有 shell 参与**。
 
 **为什么去掉 15:30**（P42）：15:30 那一槽与 `close` **撞在同一分钟**，而两个任务都会
 真起子进程写同一个 SQLite 库（`patrol --fix` 补步、`close` 跑整条 12 步链）→ 撞
@@ -28,6 +28,19 @@ launchd 没有 cron 表达式，`StartCalendarInterval` **一次只能描述一�
 状态。收盘后补缺口的职责本来就归 `close`（15:30 整条链），那一槽的巡逻是冗余的。
 `tests/test_ops_close.py::test_no_two_jobs_fire_at_the_same_moment` 把这条钉死成
 通用护栏：将来再加任务，撞点当场红。
+
+**为什么连 15:00 也去掉**（P46）：15:30 只是撞点，15:00 是**更贵的错**。15:00 那一刻
+`is_trade_date_closed(今天, now)` 已经为真 ⇒ `latest_closed_session` 变成**今天**
+⇒ `patrol` 会补 `predict run --asof 今天`，而当天的 K 线只能来自 `ingest bars`，
+那是 15:30 收盘链的第一步 —— 于是写出来的是**基于盘中半截 bar 的当日 LIVE 预测**。
+实测 2026-09-22 15:00 那一槽就这么落下 17 条预测（`created_at=15:05:22`），15:30 收盘链
+把当日 K 线覆盖成真收盘价后重算，17 条载荷全变 → append-only 全部拒绝 → 收盘链 exit 1，
+当天预测永久停在**收盘前口径**（`docs/errors/ERROR_DIARY.md` #60）。
+
+所以这里的边界不是「避开撞点」而是**职责边界**：**盘中归 patrol，收盘后归 close**。
+`patrol` 的任何一槽都必须**严格早于 15:00**，这条由
+`tests/test_ops_close.py::test_patrol_plist_covers_0900_to_1430_and_no_slot_reaches_the_close`
+逐槽断言（`all((H, M) < (15, 0))`），改时刻表时当场红。
 
 `Weekday` 的取值是 launchd 的约定：`0` 与 `7` 都是周日，`1` = 周一 … `5` = 周五。
 
@@ -59,10 +72,13 @@ LABEL_PREFIX = "com.stocklab"
 #: launchd 的星期约定：1 = 周一 … 5 = 周五。
 WEEKDAYS = (1, 2, 3, 4, 5)
 
-#: 巡检的触发时刻（`(Hour, Minute)`，共 13 槽）：09:00–15:00 每 30 分钟。
-#: **不含 15:30** —— 那一槽与 `close` 撞点（见模块 docstring），冗余且危险。
+#: 巡检的触发时刻（`(Hour, Minute)`，共 12 槽）：09:00–14:30 每 30 分钟。
+#: **任一槽严格早于 15:00** —— 15:00 之后 `latest_closed_session` 会变成「今天」，
+#: 而当天 K 线要到 15:30 收盘链才定型，那时补 `predict run --asof 今天` 写的是
+#: 半截 bar 的预测（见模块 docstring「为什么连 15:00 也去掉」）。
+#: 15:30 那一槽还与 `close` 撞点。两条都由测试逐槽断言。
 PATROL_TIMES: tuple[tuple[int, int], ...] = (
-    tuple((h, m) for h in range(9, 15) for m in (0, 30)) + ((15, 0),)
+    tuple((h, m) for h in range(9, 15) for m in (0, 30))
 )
 
 #: `launchctl` 的调用超时（它只跟本机 launchd 说话，不应超过几秒）。
@@ -78,7 +94,7 @@ def log_dir() -> Path:
 
 
 def patrol_calendar() -> tuple[dict[str, int], ...]:
-    """`PATROL_TIMES` × 工作日 = 13 × 5 = **65 条**（见模块 docstring）。"""
+    """`PATROL_TIMES` × 工作日 = 12 × 5 = **60 条**（见模块 docstring）。"""
     return tuple({"Hour": h, "Minute": m, "Weekday": d}
                  for h, m in PATROL_TIMES for d in WEEKDAYS)
 
@@ -114,9 +130,9 @@ JOBS: tuple[Job, ...] = (
     Job(
         name="patrol", label=f"{LABEL_PREFIX}.patrol",
         args=("ops", "patrol", "--fix"),
-        window="工作日 09:00–15:00 每 30 分钟",
-        why="巡检：7 项体检（只读）+ 缺哪步补哪步；盘中补快照与当日缺口"
-            "（收盘后那一轮不归它，归 close —— 错峰见模块 docstring）",
+        window="工作日 09:00–14:30 每 30 分钟",
+        why="巡检：7 项体检（只读）+ 缺哪步补哪步。只负责**盘中**（任一槽严格早于 "
+            "15:00）—— 收盘后那一轮归 close，理由见模块 docstring",
         calendar=patrol_calendar(),
     ),
     Job(

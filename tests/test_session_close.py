@@ -276,3 +276,80 @@ def test_no_rolling_cleanup_anywhere_in_the_module():
     src = inspect.getsource(close_mod).upper()
     assert "DELETE" not in src               # 没有任何删除路径
     assert "LIMIT" not in src                # 也没有「只取最近 N 天」的写法
+
+
+# ---------- 当日 K 线「定型」判据（P46 §T3） ----------
+#
+# 这是 `predict run --asof 今天` 的闸门判据：**当天的 K 线是不是收盘后采到的终值**。
+# 唯一可信的信号是 `bars_daily.fetched_at`（这一行最后一次从源站采到的时刻，
+# `repo.insert_bars` 的 `ON CONFLICT DO UPDATE` 会刷新它），**不是**墙上的钟。
+#
+# 为什么不用另外两个更顺手的判据（都有实测反例，见 `docs/errors/ERROR_DIARY.md` #60）：
+# - 「`session backfill-close` 当天跑过」：2026-09-22 patrol 15:05 跑过它且 exit 0，
+#   而预测照样基于半截 bar —— 闸门恒放行；
+# - 「当天 bar 的 amount 非 NULL」：`session tick` **自己就会回填**（`tick.py:229`），
+#   15:05:19 已把 17 只填好 —— 15:05:22 的 predict run 看到 amount 非 NULL，照样放行。
+# 两者度量的是「快照/回填跑没跑」，而定型问的是「**那根 K 线的收盘价**是不是终值」：
+# `backfill-close` 只补 amount/turnover，**一行都不碰 close**。
+
+def _fetched_at_of(conn, date: str, code: str = CODE):
+    return conn.execute("SELECT fetched_at FROM bars_daily WHERE code=? AND date=?",
+                        (code, date)).fetchone()[0]
+
+
+def test_bar_fetched_after_the_close_is_final(conn):
+    repo.insert_bars(conn, [_bar(TODAY)], now="2026-09-15T15:30:03+08:00")
+    ok, why = close_mod.bars_finalized_on(conn, TODAY)
+    assert ok is True and why == ""
+
+
+def test_bar_fetched_exactly_at_the_close_minute_is_final(conn):
+    """>= 15:00:00 即已收盘（与 `is_closed_snapshot` 同一把尺子）。"""
+    repo.insert_bars(conn, [_bar(TODAY)], now="2026-09-15T15:00:00+08:00")
+    assert close_mod.bars_finalized_on(conn, TODAY)[0] is True
+
+
+def test_bar_fetched_before_the_close_is_not_final(conn):
+    """事故的形状：12:06 采到的那根 K 线，收盘价还是盘中值。"""
+    repo.insert_bars(conn, [_bar(TODAY)], now="2026-09-15T12:06:00+08:00")
+    ok, why = close_mod.bars_finalized_on(conn, TODAY)
+    assert ok is False
+    assert "12:06" in why and "15:00" in why
+
+
+def test_no_bar_row_for_the_day_is_not_final(conn):
+    """fail-closed：当天一行 bar 都没有 ⇒ 证不出它定型 ⇒ 判**未**定型。
+
+    这一条不是吹毛求疵：没有当日 bar 时 `build_predictions` 会退到「最后一根是昨天」
+    的那条路（`NoBarOnAsof` 分支之外），算出来的「今天 asof 预测」用的是旧价。
+    """
+    ok, why = close_mod.bars_finalized_on(conn, TODAY)
+    assert ok is False and "一行" in why
+
+
+def test_one_stale_row_makes_the_whole_day_unfinal(conn):
+    """同一天只要**有一行**早于收盘，整天都不算定型 —— 那行可能正是被预测的标的。"""
+    repo.insert_bars(conn, [_bar(TODAY), _bar(TODAY, "600690")],
+                     now="2026-09-15T15:30:03+08:00")
+    assert close_mod.bars_finalized_on(conn, TODAY)[0] is True
+    conn.execute("UPDATE bars_daily SET fetched_at='2026-09-15T12:06:00+08:00'"
+                 " WHERE code='600690'")
+    conn.commit()
+    ok, why = close_mod.bars_finalized_on(conn, TODAY)
+    assert ok is False and "600690" in why
+
+
+def test_unparseable_fetched_at_is_not_final(conn):
+    """`fetched_at` 读不出时刻时**不许当成已定型**（fail-closed，同 `_ts_time`）。"""
+    repo.insert_bars(conn, [_bar(TODAY)], now=NOW)
+    conn.execute("UPDATE bars_daily SET fetched_at='not-a-timestamp' WHERE date=?",
+                 (TODAY,))
+    conn.commit()
+    ok, why = close_mod.bars_finalized_on(conn, TODAY)
+    assert ok is False and "not-a-timestamp" in why
+
+
+def test_a_historical_day_is_judged_by_its_own_fetched_at(conn):
+    """判据只看**该日自己**的 `fetched_at`，不看今天是几号 —— 历史日的复算不受影响。"""
+    repo.insert_bars(conn, [_bar(YESTERDAY)], now="2026-09-14T15:30:05+08:00")
+    assert close_mod.bars_finalized_on(conn, YESTERDAY)[0] is True

@@ -178,6 +178,11 @@ class OpsLab:
             "ok": (payload or {}).get("ok"),
             "summary": summary_fn(payload) if payload is not None else None,
             "steps": self._steps(payload),
+            # 计划里**有意没跑**的步骤（P46 §T4）：patrol 不补「今天 asof」的 predict，
+            # 理由写在 `plan.skipped[].reason`。页面必须能一眼看出「有人没补」，
+            # 而不是让 `③missing` 被读成「patrol 漏跑了」。
+            "plan_skipped": list(((payload or {}).get("plan") or {}).get("skipped")
+                                 or []),
             "anomalies": list((payload or {}).get("anomalies") or []),
             "last_run": runs[0] if runs else None,
             "history": runs,

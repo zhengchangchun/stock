@@ -923,10 +923,25 @@ def cmd_predict_run(args: argparse.Namespace) -> int:
         「当时该给的」预测 —— 这是日后测准确率的前提。
 
     退出码：0 全部落库（含幂等 `identical`）；1 有 `conflict`（同键不同载荷，**不覆盖**）；
-    2 非交易日 / 没有任何可出预测的标的。
+    2 非交易日 / 没有任何可出预测的标的 / **`--asof 今天` 但当天 K 线未定型**（见下）。
+
+    ## `--asof 今天` 的定型闸门（P46 §T3）
+
+    `asof` 就是今天时，先问一句「今天的 K 线定型了吗」—— 判据是
+    `session.close.bars_finalized_on`（`bars_daily.fetched_at ≥ 当日 15:00`，
+    **不看墙上时钟**）。没定型就 exit 2、**一行都不写**。
+
+    这道闸门拦的是 2026-09-22 那次事故：`is_trade_date_closed(今天, now)` 在 15:00
+    就为真，而当天 K 线要到 15:30 收盘链的 `ingest bars` 才刷新成终值 —— 于是
+    patrol 的 15:00 槽算出了一批**基于半截 bar** 的 LIVE 预测，写进 append-only 的
+    `predictions` 后退不回来，15:30 收盘链重算条条冲突（ERROR_DIARY #60）。
+
+    **只在 `asof == 今天` 时生效**：历史日复算（回放）是整套预测体系的立足点，
+    那时当天的 K 线早已定型，没有这个问题。
     """
     from stocklab.predict.service import NotASession, build_predictions
     from stocklab.predict.store import PredictionConflict, insert_prediction
+    from stocklab.session import close as close_mod
 
     db = Path(args.db) if args.db else paths.DB_PATH
     if not db.exists():
@@ -940,6 +955,15 @@ def cmd_predict_run(args: argparse.Namespace) -> int:
     ensure_schema(db)   # 写库入口前滚（P33）
     conn = connect(db)
     try:
+        # 定型闸门：必须在**任何写入之前**判掉（append-only 写错了退不回来）。
+        if args.asof == _today():
+            finalized, why = close_mod.bars_finalized_on(conn, args.asof)
+            if not finalized:
+                print(f"❌ 当日数据未定型，拒绝出预测（asof={args.asof}）：{why}"
+                      "；预测用的是收盘价，等收盘链把当天 K 线刷成终值再跑"
+                      "（`ops close` 15:30，或手工 `ingest bars` 之后重跑本命令）",
+                      file=sys.stderr)
+                return 2
         try:
             rep = build_predictions(conn, args.asof, args.code)
         except NotASession as exc:

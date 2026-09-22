@@ -320,3 +320,72 @@ def test_route_without_the_facade_is_a_readable_error(tmp_path, loopback_http):
         conn.close()
         server.shutdown()
         server.server_close()
+
+
+# ---------- T4：被跳过 / 被拒绝都要能一眼看出来（P46） ----------
+#
+# patrol 的「有意跳过」与 close 的「拒绝执行」是**两件不同的事**，但都属于
+# 「没跑」。页面上必须各有一条可读文案，而且都**不许折进 `more()`** ——
+# 折起来就等于用一个展开动作掩盖了异常（ERROR_DIARY #54 的教训）。
+
+def _patrol_receipt_with_a_skip(reason: str = "asof=2026-09-22 就是**今天**：…") -> dict:
+    return {
+        "job": "patrol", "now": NOW, "exit_code": 1, "ok": False,
+        "checks": {name: {"status": "ok"} for name in patrol.CHECK_ORDER},
+        "calendar": {"status": "ok"}, "latest_closed_session": {"date": "2026-09-22"},
+        "steps": [], "anomalies": [],
+        "plan": {"steps": [], "skipped": [{"step": "predict_run", "reason": reason}]},
+    }
+
+
+def test_view_exposes_the_planned_skips(tmp_path):
+    root = tmp_path / "reports"
+    payload = _patrol_receipt_with_a_skip()
+    _write_receipt(root, "patrol", payload)
+    job = _job(OpsLab(_db(tmp_path), report_dir=root).view(now=TZ_NOW), "patrol")
+    assert job["plan_skipped"] == [{"step": "predict_run", "reason": payload["plan"]["skipped"][0]["reason"]}]
+
+
+def test_a_receipt_without_a_plan_shows_no_skips(tmp_path):
+    """反面对照：没有 `plan.skipped` 的回执（close）不许凭空长出「跳过」块。"""
+    root = tmp_path / "reports"
+    _write_receipt(root, "close", _close_receipt())
+    job = _job(OpsLab(_db(tmp_path), report_dir=root).view(now=TZ_NOW), "close")
+    assert job["plan_skipped"] == []
+
+
+def test_page_shows_the_skip_reason_without_expanding_anything(tmp_path):
+    """跳过块**在折叠之外**：真实原因必须出现在 HTML 里，读者不用点开任何东西。"""
+    root = tmp_path / "reports"
+    _write_receipt(root, "patrol",
+                   _patrol_receipt_with_a_skip("asof=2026-09-22 就是**今天**"))
+    html = ops_render.ops_page(
+        OpsLab(_db(tmp_path), report_dir=root).view(now=TZ_NOW),
+        base="/lab", built_at=NOW)
+    assert "有意跳过" in html
+    assert "predict_run" in html
+    assert "就是**今天**" not in html and "<b>今天</b>" in html   # 走 rich()，不双转义
+
+
+def test_page_without_a_skip_does_not_claim_one(tmp_path):
+    """反向自检（ERROR_DIARY #43）：整页扫描的断言要有「不该出现时会红」的对照。"""
+    root = tmp_path / "reports"
+    _write_receipt(root, "close", _close_receipt())
+    html = ops_render.ops_page(
+        OpsLab(_db(tmp_path), report_dir=root).view(now=TZ_NOW),
+        base="/lab", built_at=NOW)
+    assert "有意跳过" not in html
+
+
+def test_page_shows_a_refused_round_as_refused(tmp_path):
+    """「拒绝执行」已有文案，这里把它钉住 —— 与「跳过」共享同一条可见性纪律。"""
+    root = tmp_path / "reports"
+    _write_receipt(root, "close", {
+        "job": "close", "now": NOW, "exit_code": 2, "ok": False, "steps": [],
+        "refused": "今天（2026-09-22 14:07）还没收盘 → 拒绝执行",
+        "anomalies": [{"kind": "before_close", "detail": "还没收盘"}],
+    })
+    html = ops_render.ops_page(
+        OpsLab(_db(tmp_path), report_dir=root).view(now=TZ_NOW),
+        base="/lab", built_at=NOW)
+    assert "<b>拒绝执行</b>" in html and "还没收盘" in html

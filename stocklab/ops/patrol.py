@@ -405,13 +405,29 @@ def plan(snap: dict) -> dict:
 
     刻意**不**写成「从第一步一路跑到最后」：那样每天都白跑七条命令，而白跑正是本
     仓库反复强调要避免的（07 §调度约束：幂等，但白跑）。
+
+    ## 一条**不许补**的缺口：`predict run --asof 今天`（P46 §T2）
+
+    ③ 缺预测时**不能无条件**排 `predict_run`。当 `latest_closed_session` 就是今天时，
+    当天的 K 线还没定型（`ingest bars` 是 15:30 收盘链的第一步），此刻补出来的预测
+    基于**半截 bar**，而 `predictions` 是 append-only —— 15:30 收盘链把当日 K 线覆盖成
+    真收盘价后重算，必然条条冲突（2026-09-22 实测 17 条，收盘链 exit 1，当天预测永久
+    停在收盘前口径，见 ERROR_DIARY #60）。
+
+    ⇒ **盘中归 patrol，收盘后归 close**。今天 asof 的这一步进 `skipped` 而不是
+    `steps`，并**写明原因**（非静默：读者要能从回执里看出「有人故意没补」，
+    而不是把 ③ missing 读成「patrol 忘了」）。
+
+    只跳过**这一步**：昨天的缺口照旧补（那时 K 线已定型），补步功能整体不受影响。
     """
     latest = (snap.get("latest_closed_session") or {}).get("date")
     if latest is None:
-        return {"steps": [], "exit_code": EXIT_BLOCKED,
+        return {"steps": [], "skipped": [], "exit_code": EXIT_BLOCKED,
                 "reasons": ["最新已收盘交易日判不出 → 不猜、不补"]}
+    today = snap.get("today")
     checks = snap["checks"]
     wanted: list[str] = []
+    skipped: list[dict] = []
     reasons: list[str] = []
 
     bars = checks["bars"]
@@ -437,8 +453,17 @@ def plan(snap: dict) -> dict:
         reasons.append(f"② {checks['snapshot'].get('reason') or checks['snapshot']['status']}")
 
     if checks["predictions"]["status"] == MISSING:
-        wanted.append("predict_run")
-        reasons.append(f"③ {checks['predictions'].get('reason')}")
+        if today is not None and latest == today:
+            skipped.append({
+                "step": "predict_run",
+                "reason": (f"asof={latest} 就是**今天**：当天的 K 线要到收盘链的 "
+                           "`ingest bars` 才定型，此刻补 `predict run` 会把半截 bar "
+                           "算出的预测写进 append-only 的 predictions —— 这条归 "
+                           "`close`（15:30），patrol 不碰（P46 §T2）"),
+            })
+        else:
+            wanted.append("predict_run")
+            reasons.append(f"③ {checks['predictions'].get('reason')}")
 
     if checks["verifications"]["status"] == MISSING:
         wanted.append("verify_pending")
@@ -453,7 +478,8 @@ def plan(snap: dict) -> dict:
         reasons.append(f"⑥ {checks['paper_nav'].get('reason')}")
 
     picked = [name for name in STEP_ORDER if name in set(wanted)]
-    return {"steps": picked, "exit_code": verdict(snap)["exit_code"], "reasons": reasons}
+    return {"steps": picked, "skipped": skipped,
+            "exit_code": verdict(snap)["exit_code"], "reasons": reasons}
 
 
 def _fix_refusal(db_path: Path, steps: list[str]) -> str | None:
@@ -557,7 +583,12 @@ def run_patrol(*, db_path: Path | str | None = None, now: str | None = None,
 
 
 def summary_line(payload: dict) -> str:
-    """**一行**给 cron 用（体检 7 项各自状态 + 补了哪几步 + 异常数）。"""
+    """**一行**给 cron 用（体检 7 项各自状态 + 补了哪几步 + 跳过了哪几步 + 异常数）。
+
+    `skip=` 是刻意露出来的：③ 缺预测而 patrol 故意不补时，摘要行必须让 launchd 日志
+    与 `/lab/ops` 同时看得见「有人没补」，否则读者只能看到 `③missing` 而误以为漏跑
+    （ERROR_DIARY #54：不许让「被跳过」在退出码/摘要上长得像「跑完了都成功」）。
+    """
     checks = payload.get("checks") or {}
     if not checks:
         return (f"patrol: exit={payload.get('exit_code')} 未体检（"
@@ -565,8 +596,11 @@ def summary_line(payload: dict) -> str:
     marks = " ".join(f"{CIRCLED[i]}{checks[name]['status']}"
                      for i, name in enumerate(CHECK_ORDER) if name in checks)
     fixed = ",".join(s["name"] for s in (payload.get("steps") or [])) or "-"
+    skip = ",".join(s["step"] for s in ((payload.get("plan") or {}).get("skipped")
+                                        or []))
     latest = (payload.get("latest_closed_session") or {}).get("date")
     return (f"patrol: exit={payload['exit_code']} latest_closed={latest}"
             f" calendar={(payload.get('calendar') or {}).get('status')}"
             f" {marks} fixed={fixed}"
-            f" anomalies={len(payload.get('anomalies') or [])}")
+            + (f" skip={skip}" if skip else "")
+            + f" anomalies={len(payload.get('anomalies') or [])}")
