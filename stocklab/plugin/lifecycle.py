@@ -16,6 +16,20 @@ UPDATE 的 status 列会把这信息抹掉。
 `PluginStateError`。「回滚」不是独立命令 —— 对 `archived` 版本执行
 `approve` 即可，这样回滚走的是与上线完全相同的已审计路径，不会成为
 绕过审核的后门。
+
+## 模块2 的两态（P44 / D-29）
+
+`validating`（验证中）与 `frozen`（策略冻结）由 4 个新事件折叠而来：
+`start_validation` / `finish_validation` / `freeze` / `unfreeze`。
+「已回滚」仍然**不设独立态** —— 回滚 = 对 `archived` 版本 `approve`。
+
+**未知事件一律拒绝**：折叠遇到白名单外的事件抛 `PluginStateError`，
+而不是跳过。跳过会让「状态」与「事件流」不一致，且没有任何一层会发现。
+
+**未定的口径（留给 P48 显式决策）**：`active_script_id` 只认 `active`，
+所以脚本进入 `validating` 后不再被解析为在役版本。P44 没有任何生产调用者
+触发这些事件（只有测试会），主干链因此不受影响；「验证期算不算在役」
+是 P48 的问题 —— 本轮用一条测试把**当前**行为钉住，改动必须是显式决策。
 """
 
 from __future__ import annotations
@@ -24,9 +38,12 @@ import sqlite3
 
 from stocklab.plugin import runtime, store
 
-#: 折叠 `plugin_audit` 得到的可能状态。
+#: 折叠 `plugin_audit` 得到的可能状态（P44 追加 `validating` / `frozen`）。
 STATES: tuple[str, ...] = ("draft", "pending_review", "rejected", "active",
-                           "archived")
+                           "archived", "validating", "frozen")
+
+#: 事件白名单的唯一真源在 `store.ALLOWED_ACTIONS`（写入侧也用它）。
+KNOWN_ACTIONS: frozenset[str] = store.ALLOWED_ACTIONS
 
 #: 事件 → 折叠后的状态（`submit` 不改状态：沙盒还没跑完）。
 _ACTION_TO_STATE: dict[str, str] = {
@@ -35,6 +52,10 @@ _ACTION_TO_STATE: dict[str, str] = {
     "approve": "active",
     "reject": "rejected",
     "archive": "archived",
+    "start_validation": "validating",
+    "finish_validation": "active",
+    "freeze": "frozen",
+    "unfreeze": "active",
 }
 
 
@@ -46,11 +67,25 @@ class NoActivePlugin(LookupError):
     """该 plugin_id 下没有 active 版本。**不兜底**：不返回默认脚本。"""
 
 
+def apply_event(action: str) -> str | None:
+    """单个事件对状态的迁移；**不改状态**的事件（如 `submit`）返回 `None`。
+
+    白名单外的 action 抛 `PluginStateError` —— **不静默忽略**：跳过一条事件
+    会让折叠出的状态与事件流不一致，而下游（报告、审计）看到的仍是一个
+    合法状态，没有任何一层会报警。同型教训见 `store.insert_audit`。
+    """
+    if action not in KNOWN_ACTIONS:
+        raise PluginStateError(
+            f"未知审计事件 {action!r} —— 拒绝折叠。事件类型必须先在 "
+            "store.ALLOWED_ACTIONS 与 schema.sql 的 CHECK 里登记")
+    return _ACTION_TO_STATE.get(action)
+
+
 def script_state(conn: sqlite3.Connection, script_id: int) -> str:
     """折叠该脚本的全部审计事件，得到当前状态。无事件 = `draft`。"""
     state = "draft"
     for row in store.list_audit(conn, script_id=script_id):
-        nxt = _ACTION_TO_STATE.get(row["action"])
+        nxt = apply_event(row["action"])
         if nxt:
             state = nxt
     return state
@@ -152,6 +187,61 @@ def reject(conn: sqlite3.Connection, script_id: int, *, actor: str,
             "（只允许 pending_review）")
     store.insert_audit(conn, script_id=script_id, action="reject", actor=actor,
                        reason=reason, now=now)
+
+
+# ---------- 模块2 状态事件（P44 / D-29）----------
+
+#: 新事件的合法**前置状态**。非法前置一律拒绝 —— 与 `approve` / `reject` 同纪律。
+_EVENT_PRE_STATES: dict[str, tuple[str, ...]] = {
+    "start_validation": ("active",),
+    "finish_validation": ("validating",),
+    "freeze": ("active", "validating"),
+    "unfreeze": ("frozen",),
+}
+
+
+def _record_event(conn: sqlite3.Connection, action: str, script_id: int, *,
+                  actor: str, reason: str, now: str) -> str:
+    """记一条状态事件并返回折叠后的新状态（共用前置状态与 reason 校验）。"""
+    if not reason:
+        raise ValueError(f"{action} 必须给 --reason —— 审计链要留下为什么")
+    state = script_state(conn, script_id)
+    allowed = _EVENT_PRE_STATES[action]
+    if state not in allowed:
+        raise PluginStateError(
+            f"脚本 {script_id} 当前状态是 {state!r}，不允许 {action}"
+            f"（只允许 {' 或 '.join(allowed)}）")
+    store.insert_audit(conn, script_id=script_id, action=action, actor=actor,
+                       reason=reason, now=now)
+    return script_state(conn, script_id)
+
+
+def start_validation(conn: sqlite3.Connection, script_id: int, *, actor: str,
+                     reason: str, now: str) -> str:
+    """`active` → `validating`（模块2 验证期开始）。"""
+    return _record_event(conn, "start_validation", script_id, actor=actor,
+                         reason=reason, now=now)
+
+
+def finish_validation(conn: sqlite3.Connection, script_id: int, *, actor: str,
+                      reason: str, now: str) -> str:
+    """`validating` → `active`（验证期结束，策略仍在役）。"""
+    return _record_event(conn, "finish_validation", script_id, actor=actor,
+                         reason=reason, now=now)
+
+
+def freeze(conn: sqlite3.Connection, script_id: int, *, actor: str,
+           reason: str, now: str) -> str:
+    """`active` / `validating` → `frozen`（策略冻结）。"""
+    return _record_event(conn, "freeze", script_id, actor=actor,
+                         reason=reason, now=now)
+
+
+def unfreeze(conn: sqlite3.Connection, script_id: int, *, actor: str,
+             reason: str, now: str) -> str:
+    """`frozen` → `active`（人工解冻）。"""
+    return _record_event(conn, "unfreeze", script_id, actor=actor,
+                         reason=reason, now=now)
 
 
 def call_active(conn: sqlite3.Connection, plugin_id: str, ctx: dict,

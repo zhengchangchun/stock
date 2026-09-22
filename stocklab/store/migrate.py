@@ -209,6 +209,88 @@ def migrate_p37_paper_accounts_agent_arms(conn) -> list[str]:
     return ["paper_accounts.arm"]
 
 
+# ---------------------------------------------------------------------------
+# P44：`plugin_audit.action` 的 CHECK 要放开到 10 个事件（模块2 状态机）。
+#
+# 与 P37 同款：SQLite 改不了 CHECK，只能重建表；而 `plugin_audit` 是 append-only
+# 的审计链，重建必须在一个事务里、逐行搬运并**校验行数**、把随 DROP 一起消失的
+# 两个触发器与索引重新建起来。DDL / 触发器文本与 schema.sql **同文**
+# （两处都改才算改完）。**只改允许集合，不动任何历史行的值。**
+# ---------------------------------------------------------------------------
+_MIGRATE_P44_MARKER = "start_validation"
+
+_MIGRATE_P44_DDL = """
+CREATE TABLE plugin_audit (
+    audit_id   INTEGER PRIMARY KEY AUTOINCREMENT,
+    script_id  INTEGER NOT NULL,
+    action     TEXT NOT NULL CHECK (action IN
+                 ('submit','sandbox_pass','sandbox_fail','approve','reject','archive',
+                  'start_validation','finish_validation','freeze','unfreeze')),
+    actor      TEXT NOT NULL,
+    reason     TEXT,
+    created_at TEXT NOT NULL
+)"""
+
+_MIGRATE_P44_TRIGGERS = (
+    "CREATE TRIGGER IF NOT EXISTS trg_plugin_audit_no_update"
+    " BEFORE UPDATE ON plugin_audit"
+    " BEGIN SELECT RAISE(ABORT, 'plugin_audit is append-only'); END;\n"
+    "CREATE TRIGGER IF NOT EXISTS trg_plugin_audit_no_delete"
+    " BEFORE DELETE ON plugin_audit"
+    " BEGIN SELECT RAISE(ABORT, 'plugin_audit is append-only'); END;\n"
+    "CREATE INDEX IF NOT EXISTS idx_plugin_audit_script"
+    " ON plugin_audit (script_id, audit_id);"
+)
+
+_MIGRATE_P44_COLUMNS = ("audit_id", "script_id", "action", "actor", "reason",
+                        "created_at")
+
+
+def plugin_audit_needs_module2_events(conn) -> bool:
+    """该表的 CHECK 还不能装模块2 的新事件吗？（只读探测，供 doctor 用）
+
+    表不存在时返回 False：`executescript` 会按 schema.sql 的新 shape 直接建出。
+    """
+    if not _table_exists(conn, "plugin_audit"):
+        return False
+    row = conn.execute(
+        "SELECT sql FROM sqlite_master WHERE type='table' AND name='plugin_audit'"
+    ).fetchone()
+    return row is not None and _MIGRATE_P44_MARKER not in (row[0] or "")
+
+
+def migrate_p44_plugin_audit_events(conn) -> list[str]:
+    """放开 `plugin_audit.action` 的 CHECK（P44），返回变更列表。
+
+    审计链重建是本项目里与 P37 并列的「重写 append-only 表」场景，纪律相同：
+    整段在一个事务里、搬完核对内容逐行相等、核对不过就回滚报错，**一行值都不改**。
+    """
+    if not plugin_audit_needs_module2_events(conn):
+        return []
+    cols = ", ".join(_MIGRATE_P44_COLUMNS)
+    rows = [tuple(r) for r in conn.execute(
+        f"SELECT {cols} FROM plugin_audit ORDER BY audit_id")]
+    conn.execute("BEGIN")
+    try:
+        conn.execute("DROP TABLE plugin_audit")
+        conn.execute(_MIGRATE_P44_DDL)
+        conn.executemany(
+            f"INSERT INTO plugin_audit ({cols})"
+            f" VALUES ({', '.join('?' * len(_MIGRATE_P44_COLUMNS))})", rows)
+        conn.executescript(_MIGRATE_P44_TRIGGERS)
+        after = [tuple(r) for r in conn.execute(
+            f"SELECT {cols} FROM plugin_audit ORDER BY audit_id")]
+        if after != rows:
+            raise RuntimeError(
+                f"plugin_audit 重建后内容不一致（{len(rows)} 行 → {len(after)} 行）"
+                "—— 已回滚，库未被改动")
+        conn.commit()
+    except BaseException:
+        conn.rollback()
+        raise
+    return ["plugin_audit.action"]
+
+
 #: 已知迁移 marker 清单：doctor 逐个报告在位与否（只读，不迁移）。
 #: (name, table, 判据)。判据是列名（str）或一个只读探测函数。
 #: 新增迁移时必须在这里登记，否则 doctor 看不出来。
@@ -216,6 +298,10 @@ _KNOWN_MARKERS: list[tuple[str, str, object]] = [
     ("p28_resp_sha256_valuation", "valuation_daily", "resp_sha256"),
     ("p28_resp_sha256_moneyflow", "money_flow_daily", "resp_sha256"),
     ("p32_predictions_origin", "predictions", "origin"),
+    ("p37_paper_accounts_agent_arms", "paper_accounts",
+     lambda conn: not paper_accounts_needs_agent_arms(conn)),
+    ("p44_plugin_audit_events", "plugin_audit",
+     lambda conn: not plugin_audit_needs_module2_events(conn)),
 ]
 
 
@@ -240,6 +326,10 @@ def _pending_column_migrations(conn) -> list[str]:
     if (_table_exists(conn, "predictions")
             and _MIGRATE_P32_MARKER not in _table_columns(conn, "predictions")):
         pending.append("p32:predictions.origin")
+    if paper_accounts_needs_agent_arms(conn):
+        pending.append("p37:paper_accounts.arm")
+    if plugin_audit_needs_module2_events(conn):
+        pending.append("p44:plugin_audit.action")
     return pending
 
 
@@ -269,6 +359,8 @@ def _apply_schema(conn, sql: str) -> list[str]:
     changes: list[str] = []
     changes += migrate_p28_valuation_moneyflow(conn)
     changes += migrate_p32_predictions_origin(conn)
+    changes += migrate_p37_paper_accounts_agent_arms(conn)
+    changes += migrate_p44_plugin_audit_events(conn)
     return changes
 
 

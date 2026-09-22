@@ -28,6 +28,14 @@ TABLE_SCRIPTS = "plugin_scripts"
 TABLE_AUDIT = "plugin_audit"
 TABLE_BACKTESTS = "plugin_backtests"
 
+#: `plugin_audit.action` 的白名单 —— 与 `schema.sql` 的 CHECK **必须逐字相同**
+#: （`tests/test_plugin_lifecycle_module2.py::test_action_whitelist_matches_schema_check`
+#: 钉住两者一致）。放在这里而不是状态机里：写入侧的校验不该依赖读取侧。
+ALLOWED_ACTIONS: frozenset[str] = frozenset({
+    "submit", "sandbox_pass", "sandbox_fail", "approve", "reject", "archive",
+    "start_validation", "finish_validation", "freeze", "unfreeze",
+})
+
 
 def source_sha256(source_text: str) -> str:
     return hashlib.sha256(source_text.encode("utf-8")).hexdigest()
@@ -70,6 +78,11 @@ def insert_audit(conn: sqlite3.Connection, *, script_id: int, action: str,
                  actor: str, reason: str | None, now: str) -> int:
     if not actor:
         raise ValueError("actor 不许为空 —— 审计链上「谁批的」不能是空的")
+    if action not in ALLOWED_ACTIONS:
+        raise ValueError(
+            f"未知审计事件 {action!r} —— 事件类型必须先在 "
+            f"store.ALLOWED_ACTIONS 与 schema.sql 的 CHECK 里登记"
+            "（不许静默忽略：状态与事件流一旦不一致，没有任何一层会发现）")
     cur = conn.execute(
         f"INSERT INTO {TABLE_AUDIT} (script_id, action, actor, reason,"
         " created_at) VALUES (?,?,?,?,?)",

@@ -720,6 +720,22 @@ CREATE TRIGGER IF NOT EXISTS trg_paper_nav_daily_no_delete
 BEFORE DELETE ON paper_nav_daily
 BEGIN SELECT RAISE(ABORT, 'paper_nav_daily is append-only'); END;
 
+-- ---------- 智能体动态编排臂的决定台账（P37，append-only） ----------
+-- 一次「复审」= 一行：改了什么（spec_before/after）、试了几版（n_trials）、
+-- 被拒了哪些（rejected_json）、喂进去的 PIT 快照指纹（context_sha256）、
+-- 用的什么模型与提示词（model_id / prompt_sha256 / seed）。
+--
+-- 为什么这些字段必须落地，而不是留在结果里：一个能反复改规则、又能看结果的
+-- 智能体，天然会把历史噪声调成「策略」。试错次数、变更前后的原文、输入快照，
+-- 是事后区分「编排带来了信息」与「多试几次的好运」的唯一依据。
+-- 所以 `agent_kind='manual'`（人手写的 spec）也必须走同一张表。
+--
+-- 幂等键 `UNIQUE(arm, asof)`：同一天同一臂只允许一版。**它不是用来静默覆盖的**
+-- —— 写入前先按这个键精确查一行，内容一致就当作已存在返回，不一致就报错让人处理
+-- （ERROR_DIARY #25：先写再让唯一键兜底，会把自己刚写的行当成重复）。
+--
+-- `arm` 列在这里存的是**账户 id**（如 'arm-agent'），与 `paper_accounts.arm`
+-- （存的是一类臂的 kind，如 'agent'）同名不同义 —— 台账的主语是「哪条臂在改」。
 CREATE TABLE IF NOT EXISTS paper_agent_decisions (
     decision_id      INTEGER PRIMARY KEY AUTOINCREMENT,
     arm              TEXT NOT NULL,        -- 账户 id：'arm-agent' | 'arm-agent-random'
@@ -791,7 +807,8 @@ CREATE TABLE IF NOT EXISTS plugin_audit (
     audit_id   INTEGER PRIMARY KEY AUTOINCREMENT,
     script_id  INTEGER NOT NULL,
     action     TEXT NOT NULL CHECK (action IN
-                 ('submit','sandbox_pass','sandbox_fail','approve','reject','archive')),
+                 ('submit','sandbox_pass','sandbox_fail','approve','reject','archive',
+                  'start_validation','finish_validation','freeze','unfreeze')),
     actor      TEXT NOT NULL,
     reason     TEXT,
     created_at TEXT NOT NULL
@@ -952,3 +969,69 @@ BEGIN SELECT RAISE(ABORT, 'financial_reports is append-only'); END;
 CREATE TRIGGER IF NOT EXISTS trg_financial_reports_no_delete
 BEFORE DELETE ON financial_reports
 BEGIN SELECT RAISE(ABORT, 'financial_reports is append-only'); END;
+
+-- ---------- 模块2 验证周期台账（P44，append-only）----------
+-- 口径：D-26（每策略版本一个隔离账户）/ D-27（熔断）/ D-28（自评估边界）。
+-- 三张表 + `plugin_audit` 共同回答：「这一轮用的是**哪个策略版本**、
+-- **哪组参数**、**判据原文**是什么」（任务书 T3）。
+-- 状态变化一律靠**追加事件**，不许 UPDATE 任何一列（触发器 RAISE(ABORT)）。
+CREATE TABLE IF NOT EXISTS validation_cycles (
+    cycle_id       INTEGER PRIMARY KEY AUTOINCREMENT,
+    script_id      INTEGER NOT NULL,          -- 策略版本（plugin_scripts.script_id）
+    account_id     TEXT NOT NULL,             -- 该版本对应的隔离模拟账户（D-26）
+    planned_rounds INTEGER NOT NULL,          -- AI 给的轮次（原值落库，越界在写入前已被拒）
+    planned_days   INTEGER NOT NULL,          -- 单轮天数（同上）
+    params_json    TEXT NOT NULL,             -- 该版本**生效的参数集**（口径可追溯）
+    criteria_text  TEXT NOT NULL,             -- 判据**原文**（D-31：不许事后换口径）
+    start_date     TEXT NOT NULL,
+    created_at     TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS validation_rounds (
+    round_id     INTEGER PRIMARY KEY AUTOINCREMENT,
+    cycle_id     INTEGER NOT NULL,
+    round_no     INTEGER NOT NULL CHECK (round_no >= 1),
+    window_start TEXT NOT NULL,
+    window_end   TEXT NOT NULL,
+    metrics_json TEXT NOT NULL,               -- 该轮观测指标（口径同 P41 指标集）
+    note         TEXT,
+    created_at   TEXT NOT NULL,
+    UNIQUE (cycle_id, round_no)               -- 同一周期内轮序唯一（补跑不许静默覆盖）
+);
+
+CREATE TABLE IF NOT EXISTS validation_events (
+    event_id      INTEGER PRIMARY KEY AUTOINCREMENT,
+    cycle_id      INTEGER NOT NULL,
+    script_id     INTEGER NOT NULL,
+    kind          TEXT NOT NULL CHECK (kind IN
+                    ('circuit_breaker','freeze','unfreeze','validation_end')),
+    at_value      REAL,                       -- 触发时的**实测数值**（如回撤 -0.137）
+    threshold     REAL,                       -- 判据阈值（如 0.10）——与 at_value 分开存
+    criteria_text TEXT NOT NULL,              -- 判据原文（同上，不许事后改写）
+    reason        TEXT NOT NULL,
+    created_at    TEXT NOT NULL
+);
+
+CREATE TRIGGER IF NOT EXISTS trg_validation_cycles_no_update
+BEFORE UPDATE ON validation_cycles
+BEGIN SELECT RAISE(ABORT, 'validation_cycles is append-only'); END;
+
+CREATE TRIGGER IF NOT EXISTS trg_validation_cycles_no_delete
+BEFORE DELETE ON validation_cycles
+BEGIN SELECT RAISE(ABORT, 'validation_cycles is append-only'); END;
+
+CREATE TRIGGER IF NOT EXISTS trg_validation_rounds_no_update
+BEFORE UPDATE ON validation_rounds
+BEGIN SELECT RAISE(ABORT, 'validation_rounds is append-only'); END;
+
+CREATE TRIGGER IF NOT EXISTS trg_validation_rounds_no_delete
+BEFORE DELETE ON validation_rounds
+BEGIN SELECT RAISE(ABORT, 'validation_rounds is append-only'); END;
+
+CREATE TRIGGER IF NOT EXISTS trg_validation_events_no_update
+BEFORE UPDATE ON validation_events
+BEGIN SELECT RAISE(ABORT, 'validation_events is append-only'); END;
+
+CREATE TRIGGER IF NOT EXISTS trg_validation_events_no_delete
+BEFORE DELETE ON validation_events
+BEGIN SELECT RAISE(ABORT, 'validation_events is append-only'); END;

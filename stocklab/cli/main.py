@@ -3215,7 +3215,8 @@ def build_parser() -> argparse.ArgumentParser:
     pl_submit = pl_sub.add_parser("submit", help="提交一版插桩脚本（预检 + 沙盒）")
     pl_submit.add_argument("file", help="脚本文件路径（.py）")
     pl_submit.add_argument("--plugin-id", required=True,
-                           help="插桩编号：0-5（本轮）")
+                           help="插桩编号：0-5（模块1）或 m2_a1/m2_a2/m2_a3/m2_b1"
+                                "（模块2，D-33 不占 0-5 编号）")
     pl_submit.add_argument("--version", required=True, help="版本号，如 1.0.0")
     pl_submit.add_argument("--actor", required=True, help="提交人（审计用）")
     pl_submit.add_argument("--note", help="备注")
