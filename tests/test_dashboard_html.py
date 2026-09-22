@@ -88,7 +88,10 @@ def test_risk_section_distinguishes_null_from_zero(summary):
 
 def test_html_declares_that_state_does_not_predict_direction(doc):
     assert "不预测方向" in doc
-    assert "38.14%" in doc
+    # 当前读数 = `pit-rw-v1.0.2` 行级 37.883%（区间 2013-12-23 → 2026-09-14）。
+    # ⚠️ 换读数时**必须**连同版本与区间一起换（D-38：光换数字，过两个月又是一句陈旧的）。
+    assert "37.883%" in doc
+    assert "pit-rw-v1.0.2" in doc
     assert "样本不足，仅供观察" in doc or "样本不足" in doc
 
 

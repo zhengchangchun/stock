@@ -14,7 +14,8 @@
 
 `arm-discipline-*` 里**没有模型方向预测**：它执行的是写死的纪律条文
 （`paper/config.RULE_CITATIONS`），选哪只 ETF 由白名单决定。生产模型的方向能力
-≈ 0（行级命中 38.14%、Brier 0.6581 对随机 0.667），所以「拿涨的概率当买入信号」
+≈ 0（`pit-rw-v1.0.2`，区间 2013-12-23 → 2026-09-14：行级命中 37.883%、Brier 0.66070
+对随机 0.667），所以「拿涨的概率当买入信号」
 被 `test_paper_never_imports_model_or_kelly` 源码扫描钉死。口径是
 「AI 纪律臂（规则执行，不含方向预测）」，不是「AI 操盘手」。
 
@@ -295,7 +296,7 @@ def _metrics(values: list[float], *, missing_reason: str | None = None) -> dict:
     `annualized_return` 走 `bt.annualize`，`win_rate` / `profit_loss_ratio`
     吃同一批日收益。`paper` 侧不另写公式（需求 02 §4 与任务书 T1 的共同要求）。
 
-    `values` 的第一项是**期初基准**（账户 = `paper_accounts.initial_nav`，
+    `values` 的第一项是**期初基准**（账户 = 净入金 `net_deposits`，
     基准 = 起跑日的指数收盘），所以 `values` 长度 = 日收益个数 + 1。
     """
     if missing_reason is not None or len(values) < 2:
@@ -353,9 +354,20 @@ def _sample_gate(n_sessions: int) -> dict:
 
 
 def _row_metrics(account: dict, rows: list[dict]) -> dict:
-    """一个账户的五个指标：期初 = `paper_accounts.initial_nav`（不是 0、不是现金）。"""
+    """一个账户的五个指标：期初 = **净入金**（不是 0、不是现金、也不是 `initial_nav`）。
+
+    与既有「累计收益」列（`paper_nav_daily.cum_return`）**同一个基**，所以新节的
+    「总收益」与那一列逐位一致 —— 见 `performance` 的「期初口径」与 ADR-023 修正段
+    （D-37）。取 `paper_accounts.initial_nav` 的话，起跑日那笔浮盈会被算进每一臂，
+    同一个页面上就会有两个差一个常数（真实库 0.2155%）的「总收益」。
+    """
     try:
-        initial = float(account["initial_nav"])
+        if rows:
+            initial = float(rows[0]["net_deposits"])
+        else:
+            # 窗口内一行净值都没有：五个指标全是「算不出」，但期初基还得有个来源 ——
+            # 净入金的定义就是账户参数里的 `initial_capital`（`engine` 同一次读取）。
+            initial = float(json.loads(account["params_json"])["initial_capital"])
     except (KeyError, TypeError, ValueError):
         return _metrics([])
     return _metrics([initial, *[float(r["nav"]) for r in rows]])
@@ -366,16 +378,17 @@ def performance(conn: sqlite3.Connection, asof: str) -> dict:
 
     ## 期初口径
 
-    每条线的期初 = 它**起跑日**的值：账户取 `paper_accounts.initial_nav`
-    （起跑日收盘 mark-to-market 的结果），基准取起跑日 `sh000300` 收盘。
-    五个指标全部由这一条序列推出，所以「总收益 == Π(1+日收益) − 1」恒成立 ——
-    指标集内部只有一套口径。
+    每条线的期初 = 它**起跑日**的值：账户取**净入金**（`paper_nav_daily.net_deposits`），
+    基准取起跑日 `sh000300` 收盘。五个指标全部由这一条序列推出，
+    所以「总收益 == Π(1+日收益) − 1」恒成立 —— 指标集内部只有一套口径。
 
-    ⚠️ **与既有「累计收益」列的已知差异**：`paper_nav_daily.cum_return` 的基是
-    **净入金**（`net_deposits` = `initial_capital`）。起跑日持仓已经浮盈时
-    （实测 2026-09-15：20043 ÷ 20000），两处的「总收益」相差一个**对全部臂相同**
-    的常数因子，排名不变、只有水平线整体平移。任务书 §1 明写期初取 `initial_nav`，
-    故本块从任务书；差异在报告与 ADR-023 里记账，**不靠改口径去对齐**。
+    账户的期初取净入金而**不是** `paper_accounts.initial_nav`：后者含起跑日种子买入的
+    浮动（实测 2026-09-15：20043 ÷ 20000），会让本节的「总收益」比既有「累计收益」列
+    低一个**对全部臂相同**的常数（0.2155%）—— 同一个页面上的两个「总收益」差一个常数，
+    读者只会读成「真差异」。ADR-023 的修正段（D-37）拍板改取净入金，两列逐位一致；
+    落地见 P51 T4，`test_the_new_section_matches_the_existing_cum_return_column`
+    钉住这条不许再漂。**未变**：`paper_nav_daily.nav` 与 `cum_return` 的基、
+    成本口径（ADR-008）、门禁 120 交易日。
 
     ## 基准
 

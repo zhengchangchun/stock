@@ -1758,7 +1758,8 @@ def cmd_session_backfill_close(args: argparse.Namespace) -> int:
 def cmd_review_daily(args: argparse.Namespace) -> int:
     """生成 `reports/YYYY-MM-DD-review.md` + `.json`（离线只读；不写任何数据表）。
 
-    ⚠️ 报告里的准确率**默认是 PIT 历史回放口径**（当前 38.14% / Brier 0.6581）。
+    ⚠️ 报告里的准确率**默认是 PIT 历史回放口径**（`pit-rw-v1.0.2`，
+    2013-12-23 → 2026-09-14 区间：行级 37.883% / Brier 0.66070）。
     口径由 `provenance` 判据按**实测行数**分列（LIVE / REPLAY），**不是**按
     「有没有实盘开关」—— 见 `session/review.py` 与 ERROR_DIARY #16。
     """
@@ -2459,12 +2460,13 @@ def cmd_paper_spec_set(args: argparse.Namespace) -> int:
     except agent_spec.DecisionConflict as exc:
         # 竞态路径（预检与落库之间被别人插了一行）撞的也是**冲突**，与预检分支
         # （`_spec_conflict`）同一个退出码 —— 2 的语义是「输入不合法」，用在这里是错的。
-        conn.close()
         return _paper_fail(exc, EXIT_CONFLICT)
     except agent_spec.SpecViolation as exc:
-        conn.close()
         return _paper_fail(exc)
-    conn.close()
+    finally:
+        # 一处收口：本函数有 5 条退出路径（2 个早退 + 2 个 except + 1 个成功），
+        # 逐条补 `close()` 的话，下次加早退的人多半会忘掉一条 —— 那就是 P51 T1。
+        conn.close()
     print(json.dumps({"arm": args.arm, "asof": args.asof,
                       "decision_id": decision_id, "status": "已写入",
                       "spec_before": before, "spec": after,

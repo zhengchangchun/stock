@@ -437,8 +437,16 @@ def plan(snap: dict) -> dict:
                        "（没有 bar 行时连 amount 是否 NULL 都查不出来，链序保证 bars 在前）")
     elif bars.get("amount_null_rows") and bars.get("snapshots_for_date"):
         wanted.append("session_backfill_close")
-        reasons.append(f"① {latest} 已有 {bars['snapshots_for_date']} 个标的的当日快照，"
-                       "但 amount/turnover 仍是 NULL → 回填")
+        # 措辞按**实测**（P46 §9.4 记下、P51 T2 修）：
+        # ① amount 为 NULL 的那几行是**当日没有快照**的标的（快照只覆盖了一部分标的），
+        #    不是「有快照却没取到量」；旧文案把这两件事说成了一件事。
+        # ② `snapshots_for_date` 是 `COUNT(*)`（**行**，一个标的一天可能多个时点），
+        #    实测真库 2026-09-22 = 68 行 / 17 个标的 —— 旧文案写成「N 个标的」也是错的。
+        # 判定逻辑不动：单变量原则 —— 这条是文案 bug，不是判据 bug（不新增查询）。
+        reasons.append(f"① {latest} 已有 {bars['snapshots_for_date']} 行当日快照"
+                       f"（时点见 ②），另有 {bars['amount_null_rows']} 行 amount/turnover"
+                       " 为 NULL —— 那几行正是**没有当日快照**的标的（快照只覆盖了部分"
+                       "标的）→ 回填补上")
 
     if snap.get("calendar", {}).get("status") == STALE:
         wanted.append("ingest_index")

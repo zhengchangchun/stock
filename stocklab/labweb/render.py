@@ -1281,6 +1281,50 @@ def risk_page(data: Mapping, *, base: str, built_at: str) -> str:
                   built_at=built_at, current="/risk")
 
 
+def _experiments_block(exp: Mapping) -> str:
+    """实验台账现状 —— 与 `reports/*-review.md` §5 **同一个取数函数**（P51 T6）。
+
+    页面只负责把已经取好的数字摆出来：行数、每个变体最近一次决定。
+    台账为空不是错误（`experiment_decisions` 一行都没有），页面显示「无」，
+    **不显示空表** —— 空表会被读成「有这一节但没能渲染」。
+    """
+    head = (f'<p class="note">`experiment_decisions` 行数：<b>{exp["rows"]}</b>'
+            f'（{rich(exp["note"])}）</p>')
+    rows = exp["latest_by_variant"]
+    if not rows:
+        return head + '<p>无 —— 台账一行都没有。</p>'
+    body = "".join(
+        f'<tr><td class="l">{esc(vid)}</td><td class="l">{esc(info["decision"])}</td>'
+        f'<td>{esc(info["gate_status"])}</td><td>{esc(info["split"])}</td>'
+        f'<td>{esc(info["metric"])}</td><td>{info["last_decision_id"]}</td></tr>'
+        for vid, info in rows.items())
+    return head + ('<div class="scroll-x"><table class="tbl">'
+                   '<tr><th>变体</th><th>决定</th><th>门禁</th><th>切分</th>'
+                   '<th>指标</th><th>decision_id</th></tr>'
+                   + body + '</table></div>')
+
+
+def _gaps_block(gaps: Mapping) -> str:
+    """数据缺口清单 —— 与报告 §6 **同一个取数函数**（P51 T6）。
+
+    `amount` / `turnover` 的历史 NULL 语义是「当日未采集」，不是 0 —— 这一句
+    随数字一起显示（`gaps["note"]` 与报告里那行逐字同源），否则读者会把它读成缺口。
+    从未有过值的字段（首日为 `None`）显示「无」，**不显示 `None`**。
+    """
+    snap = gaps["quote_snapshots"]
+    span = (f'{esc(snap["first_trade_date"])} → {esc(snap["last_trade_date"])}'
+            if snap["rows"] else "无")
+    return ('<table class="kv">'
+            f'<tr><th>bars_daily</th><td>{gaps["bars_daily_rows"]} 行；'
+            f'`amount` 非 NULL <b>{gaps["amount_non_null"]}</b> 行'
+            f'（首日 {esc(gaps["amount_first_date"]) or "无"}）；'
+            f'`turnover` 非 NULL <b>{gaps["turnover_non_null"]}</b> 行'
+            f'（首日 {esc(gaps["turnover_first_date"]) or "无"}）</td></tr>'
+            f'<tr><th>quote_snapshots</th><td>{snap["rows"]} 行（{span}）</td></tr>'
+            '</table>'
+            f'<p class="note">{rich(gaps["note"])}</p>')
+
+
 def data_page(data: Mapping, *, base: str, built_at: str) -> str:
     c, b, s = data["calendar"], data["bars"], data["snapshots"]
     fresh = data["freshness"]
@@ -1306,6 +1350,10 @@ def data_page(data: Mapping, *, base: str, built_at: str) -> str:
                    f'{esc("、".join(fresh["codes_without_bars"]))}</p>'
                    if fresh["codes_without_bars"] else "")),
         section("验证统计（LIVE / REPLAY 分开）", _accuracy_block(data["accuracy"])),
+        # 报告 §5 / §6 搬上页面（P51 T6）：数字来自报告同一对取数函数，
+        # 报告本身**保留**这两节（它仍是离线交付物）。
+        section("实验台账现状（报告 §5）", _experiments_block(data["experiments"])),
+        section("数据缺口清单（报告 §6）", _gaps_block(data["gaps"])),
         section(f'最近事件（{len(data["events"])} 条）',
                 '<div class="scroll-x"><table class="tbl">'
                 '<tr><th>时刻</th><th>模块</th><th>级别</th><th>消息</th></tr>'

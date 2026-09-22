@@ -220,6 +220,24 @@ def test_amount_null_with_snapshot_plans_backfill_only(tmp_path):
     assert patrol.plan(payload)["steps"] == ["session_backfill_close"]
 
 
+def test_backfill_reason_says_the_null_rows_have_no_snapshot(tmp_path):
+    """① 的 reason 必须与实测一致（P51 T2，判定逻辑不动、只改文案）。
+
+    实测（真库 2026-09-22）：`amount IS NULL` 的那几行**恰恰**是当日没有快照的标的
+    —— 快照只覆盖了一部分标的，所以回填补的是「没采到量」而不是「采了但没量」。
+    旧文案写成「已有 N 个标的的当日快照，但 amount 仍是 NULL」，把它读成
+    「同一批标的既有快照又没量」是误导（P46 §9.4 记下、本轮只改措辞）。
+    """
+    payload = _check(_db(tmp_path, snapshots_for_L=True))
+    reason = next(r for r in patrol.plan(payload)["reasons"] if r.startswith("①"))
+    assert "没有当日快照" in reason
+    assert "但 amount" not in reason          # 旧措辞把两件事混成了一件
+    # `snapshots_for_date` 是 COUNT(*) = **行数**（一个标的一天可能多个时点）。
+    # 真库 2026-09-22 实测 68 行 / 17 个标的 —— 旧文案写「N 个标的」也是错的。
+    assert "行当日快照" in reason
+    assert "个标的的当日快照" not in reason
+
+
 def test_amount_null_without_snapshot_plans_nothing_extra(tmp_path):
     """没有快照就没有 amount 的来源 —— 不排回填（白跑），也不算异常。"""
     payload = _check(_db(tmp_path))

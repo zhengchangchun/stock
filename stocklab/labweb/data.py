@@ -9,6 +9,7 @@
 | 风险面板 | `risk.panel.build_risk_block`（并已接进 `build_summary` 的 `risk` 段） |
 | 验证统计 | `dashboard.summary` 的 `accuracy`（LIVE / REPLAY 分列 + 样本门槛） |
 | 数据新鲜度 | `session.review.freshness`（经 `build_summary`） |
+| 实验台账 / 数据缺口 | `session.review.experiments_state` / `gap_manifest`（与报告 §5/§6 同一个函数） |
 | 事件 | `system_events`（只读最近 N 条） |
 
 ## 每次请求重新读库
@@ -30,7 +31,7 @@ from stocklab.portfolio.decision import position_decision
 from stocklab.portfolio.prices import resolve_prices
 from stocklab.portfolio.view import build_portfolio, daily_close, nav_series
 from stocklab.risk.panel import build_risk_block, risk_subject
-from stocklab.session.review import freshness
+from stocklab.session.review import experiments_state, freshness, gap_manifest
 from stocklab.store.db import connect
 
 TZ = ZoneInfo("Asia/Shanghai")
@@ -229,6 +230,13 @@ class Lab:
                 "portfolio": view, "summary": summary}
 
     def data(self) -> dict:
+        """`/data` 页取数。
+
+        「实验台账」与「数据缺口」两节**直接调报告用的那两个函数**
+        （`session.review.experiments_state` / `gap_manifest`）：
+        报告 §5 / §6 与页面从这里读的是**同一次取数**，不存在第二套数字
+        （P51 T6）。本方法不重算、不写库。
+        """
         with self.conn() as c:
             fresh = freshness(c, self.asof)
             summary = build_summary(c, self.asof)
@@ -242,6 +250,8 @@ class Lab:
                 "SELECT COUNT(*) AS n, MAX(date) AS d FROM bars_daily").fetchone()
             snaps = c.execute(
                 "SELECT COUNT(*) AS n, MAX(ts) AS t FROM quote_snapshots").fetchone()
+            experiments = experiments_state(c)
+            gaps = gap_manifest(c, self.asof)
         return {
             "asof": self.asof,
             "freshness": fresh,
@@ -251,6 +261,8 @@ class Lab:
             "calendar": {"latest_open": cal["d"], "n_open_days": cal["n"]},
             "bars": {"n_rows": bars["n"], "latest": bars["d"]},
             "snapshots": {"n_rows": snaps["n"], "latest_ts": snaps["t"]},
+            "experiments": experiments,
+            "gaps": gaps,
         }
 
     def coverage(self) -> dict:

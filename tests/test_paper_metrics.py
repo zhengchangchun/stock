@@ -47,12 +47,15 @@ def _dates(n: int, start: str = START) -> list[str]:
             for i in range(1, n + 1)]
 
 
-def _tiny_db(tmp_path, *, navs=NAVS, initial=INITIAL,
+def _tiny_db(tmp_path, *, navs=NAVS, initial=INITIAL, initial_nav=None,
              with_index=True) -> tuple:
     """一份最小的库：**一个账户** + 一条给定净值序列（不跑 `paper step`）。
 
     直接插净值行而不是推进流水线，是为了让「手算的五个数」不被引擎的成交逻辑
     搅进来 —— 这一组测的是指标公式，不是下单。
+
+    `initial_nav` 默认等于净入金；给它一个**不同**的值就复现真库起跑日浮盈的形态
+    （2026-09-15：`initial_nav=20043` ÷ 净入金 20000），T4 那条断言要的正是这个差。
     """
     tmp_path.mkdir(parents=True, exist_ok=True)
     path = tmp_path / "metrics.db"
@@ -75,11 +78,14 @@ def _tiny_db(tmp_path, *, navs=NAVS, initial=INITIAL,
     paper_store.insert_account(
         c, account_id=ACC, arm="discipline", etf_target_pct=10.0,
         start_date=START, initial_cash=initial, initial_positions=[],
-        initial_nav=initial, params={"initial_capital": initial}, now=NOW)
+        initial_nav=initial if initial_nav is None else initial_nav,
+        params={"initial_capital": initial}, now=NOW)
     for d, nav in zip(days, navs):
         paper_store.insert_nav(
             c, account_id=ACC, date=d, cash=nav, positions=[], market_value=0.0,
-            nav=nav, drawdown=0.0, cum_cost=0.0, cum_return=nav / initial - 1.0,
+            nav=nav, drawdown=0.0, cum_cost=0.0,
+            # 与 `paper.engine` 落库时同一个写法（round 到 6 位），不是测试自己发明的
+            cum_return=round(nav / initial - 1.0, 6),
             net_deposits=initial, index_300_level=None, index_300_asof=None, now=NOW,
             commit=False)
     c.commit()
@@ -129,6 +135,37 @@ def test_total_return_is_the_compounded_product_of_the_daily_returns(tmp_path):
     for r in RETURNS:
         prod *= 1.0 + r
     assert row["total_return"] == pytest.approx(prod - 1.0)
+
+
+def test_the_new_section_matches_the_existing_cum_return_column(tmp_path):
+    """T4（ADR-023 修正段 D-37）：新节的「总收益」与既有「累计收益」列**逐位一致**。
+
+    真库的形态是起跑日持仓已有浮盈：`initial_nav`（20043）≠ 净入金（20000）。
+    期初若取 `initial_nav`，新节的「总收益」会比既有列低一个**对全部臂相同**的
+    常数（实测 0.2155%）—— 同一个页面上两个「总收益」差一个常数，
+    读者只会读成「真差异」。所以期初取**净入金**（`paper_nav_daily.net_deposits`）。
+
+    这条断言是防漂的钉子：以后谁把期初改回 `initial_nav`（或另算一个基），
+    两列立刻不等，这里当场变红。
+    """
+    path, days = _tiny_db(tmp_path, initial=1000.0, initial_nav=1005.0)
+    c = connect(path)
+    try:
+        tracked = paper_data.track(c, days[-1])
+    finally:
+        c.close()
+    perf = _row(tracked["performance"])
+    arm = next(a for a in tracked["arms"] if a["account_id"] == ACC)
+
+    # 1) 期初确实是净入金：18.62775% 而不是以 initial_nav 为基的 8.08731%
+    assert perf["total_return"] == pytest.approx(1086.2775 / 1000.0 - 1.0)
+    assert perf["total_return"] != pytest.approx(1086.2775 / 1005.0 - 1.0)
+
+    # 2) 与既有「累计收益」列逐位一致（那边落库时 round 到 6 位，所以这里也对齐它）
+    assert round(perf["total_return"], 6) == arm["cum_return"]
+    # 3) 页面上**渲染出来的字符串**也必须一模一样 —— 「逐位」是对读者而言的
+    assert (paper_render.ratio_pct(perf["total_return"])
+            == paper_render.ratio_pct(arm["cum_return"]))
 
 
 def test_monotonic_benchmark_has_no_profit_loss_ratio_and_says_why(tmp_path):
