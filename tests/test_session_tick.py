@@ -116,8 +116,16 @@ def test_verify_is_idempotent(env):
     _predict(conn, "2026-08-30")
     run_tick(conn, now=NOW, fetch=_fetch(), universe=())
     n = _verif_count(conn)
+
+    # 第二次：该日已**全部**验证过 → 选日收窄后它根本不被选中（P39）。
+    # 注意这里断言的是 `identical == 0` 而不是 1 —— 修前那个 1 是**选日过宽**的
+    # 产物（每天重扫已评分日期，靠打分器算/比一遍再报 identical）。打分器自身的
+    # 幂等（第二次报 identical、不写新行）由 `test_verify_service.py` 与
+    # `test_cli_verify.py::test_verify_run_report_is_byte_identical_on_rerun` 钉住。
     s2 = run_tick(conn, now=NOW, fetch=_fetch(), universe=())
-    assert s2["verify"]["identical"] == 1 and s2["verify"]["inserted"] == 0
+    assert s2["verify"]["due_dates"] == 0
+    assert s2["verify"]["verified_dates"] == []
+    assert s2["verify"]["identical"] == 0 and s2["verify"]["inserted"] == 0
     assert _verif_count(conn) == n                        # 不重复打分
 
 

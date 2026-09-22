@@ -231,30 +231,57 @@ def run_tick(conn: sqlite3.Connection, *, now: str,
                                         conn, td, now=now)})
 
     # ---------- ③ 验证到期预测 ----------
+    # 选日**复用** `pending_predictions`（与 CLI `verify pending` **同一份**实现）：
+    # 只挑「存在**没有验证行**的到期预测」的 `target_date`，并只把该日**未验证的
+    # `codes`** 交给打分器。**绝不在这里另写一条平行 SQL** —— 两处走样正是 P39
+    # 这类缺陷的来源。
+    #
+    # 为什么必须收窄（实测 2026-09-22）：原来的选日是
+    # `SELECT DISTINCT target_date FROM predictions WHERE target_date <= cutoff`，
+    # 完全不看「该日是否还有未验证的预测」。于是**已经全部验证过**的历史日期每天
+    # 都被重扫一遍，用**今天的复权口径**去重算**昨天口径下写的账本** → append-only
+    # 守卫（**正确地**）报 `verification_conflict` → 每轮 tick exit 1、`ops patrol`
+    # 每天记 `step_anomaly`，真异常被这条永久噪声淹没。
+    #
+    # **「有验证行但不可评分」的行本步不管**：它们是 `NO_BAR_TARGET` 这类
+    # （停牌 / 目标日无 bar）的永久缺口，**已经有验证行**，所以不在
+    # `pending_predictions` 的选取集里。这类行要补分需**人工**跑
+    # `stocklab verify run --target-date <d>`（该命令保留「评该日**全部**预测」的
+    # 全量语义，是唯一的有意出口）——自动纳入它会在 `reason_code` 一变时
+    # 制造新的假冲突。
+    #
     # cutoff 取 `trading_calendar ∪ bars_daily`（P27）。**不能只用日历**：日历行由
     # `ingest index` 在 15:30+ 才写，而当天最后一次 tick 跑在 15:23 —— 只用日历的话
     # 「今天到期」的预测**永远轮不到验证**（实测 2026-09-16：tick 15:23:35 /
     # 日历行 15:32:56 → verify_inserted+0）。日 K 只在收盘后入库，「有 bar」本身就是
     # 收盘已完成的正面证据。判据实现在 `stocklab/verify/pending.py`（本处 import 是
     # 函数内的：pending 依赖本模块的 `closed_through` / `is_trade_date_closed`）。
-    from stocklab.verify.pending import latest_closed_session
+    from stocklab.verify.pending import pending_predictions
 
-    cutoff, cutoff_evidence = latest_closed_session(conn, now)
-    if cutoff is None:
+    pend = pending_predictions(conn, now)
+    if pend["n"] is None:
+        # 判不了就说判不了：**不能**退化成「没有缺口」（ERROR_DIARY #36 / #37），
+        # 所以 `due_dates` 写 `None` 而不是 0。沿用既有 skip 分支的形状。
         summary["verify"] = {"skipped": "no_closed_session_in_calendar",
                              "calendar_range": summary["calendar"]["range"],
-                             "cutoff_evidence": cutoff_evidence}
+                             "cutoff": None,
+                             "cutoff_evidence": pend["evidence"],
+                             "reason": pend["reason"],
+                             "due_dates": None,
+                             "note": pend["note"]}
     else:
-        due = [r["target_date"] for r in conn.execute(
-            "SELECT DISTINCT target_date FROM predictions"
-            " WHERE status='ok' AND target_date <= ?"
-            " ORDER BY target_date DESC", (cutoff,))]
+        cutoff = pend["latest_closed_session"]
+        pending_codes: dict[str, set[str]] = {}
+        for r in pend["rows"]:
+            pending_codes.setdefault(r["target_date"], set()).add(r["code"])
+        due = sorted(pending_codes, reverse=True)
         selected = due[:window]
         agg = {"inserted": 0, "identical": 0, "rescored_after_data_gap": 0}
         unscorable: list[dict] = []
         for d in selected:
+            codes = sorted(pending_codes[d])          # 只评该日未验证的那些
             try:
-                rep = verify_target(conn, d, now=now)
+                rep = verify_target(conn, d, codes=codes, now=now)
             except NoPredictions as exc:               # 理论上选不到，留个兜底
                 anomalies.append({"kind": "verify_no_predictions",
                                   "target_date": d, "detail": str(exc)})
@@ -275,12 +302,12 @@ def run_tick(conn: sqlite3.Connection, *, now: str,
                 unscorable.append({"target_date": d, **u})
         summary["verify"] = {
             "cutoff": cutoff,
-            "cutoff_evidence": cutoff_evidence,
+            "cutoff_evidence": pend["evidence"],
             "due_dates": len(due),
             "verified_dates": selected,
             "backlog_skipped": max(0, len(due) - len(selected)),
-            "backlog_note": ("只验证最近 window 个到期日；更早的未验证日计入 "
-                             "backlog_skipped（显式报出，不静默丢）"),
+            "backlog_note": ("只验证最近 window 个**含未验证预测**的到期日；更早的"
+                             "未验证日计入 backlog_skipped（显式报出，不静默丢）"),
             **agg,
             "unscorable": unscorable,
         }
