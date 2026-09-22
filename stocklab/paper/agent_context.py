@@ -137,6 +137,77 @@ def context_sha256(context: Mapping[str, object]) -> str:
     return hashlib.sha256(blob.encode("utf-8")).hexdigest()
 
 
+# ---------- P52：操盘决策的上下文（D-34） ----------
+
+#: 操盘上下文里有、spec 上下文里没有的东西：**可投集合**与**护栏清单**。
+#: 变更空间（5 字段白名单）不在里面 —— P52 的决策空间是「方向 ＋ 仓位 ＋ 池内选标的」，
+#: 白名单不再约束它（D-34 覆盖 D-18）。
+DECISION_HASHED_KEYS: tuple[str, ...] = (
+    "arm", "asof", "account", "marks", "index_300", "pool", "guardrails",
+    "disclosure", "non_goals", "counter_arm",
+)
+
+#: 不许做的（写进上下文，让「越权」在**输入侧**就不可表达）。
+GUARDRAILS: tuple[str, ...] = (
+    "不许杠杆、不许负权重：Σ target_weight_pct + cash_pct 必须 = 100",
+    "不许池外标的：code 必须在当日候选池（短/中/长并集）里",
+    "不许做空：A 股无融券。「看空」只能表达为降低总仓位 / 清仓",
+    "不许接券商下单：本项目只记账、不发单",
+    "不许用 > asof 的数据：上下文与价格全是 PIT",
+    "不许参数搜索：这一条决策就是这一条，试错次数必须与读数同时报",
+    "不许改主干常量：熔断阈值 / 自评估边界 / approve 闸门都不在决策空间里",
+)
+
+
+def build_decision_context(conn: sqlite3.Connection, *, arm: str, asof: str,
+                           pool: Mapping[str, object], cash: float,
+                           positions: Mapping[str, int],
+                           marks: Mapping[str, object],
+                           total_assets: float) -> dict:
+    """喂给 AI 操盘手的 **PIT 上下文**（与 `build_context` 并列，键集不同）。
+
+    只含 `<= asof` 的行（净值 / 持仓 / 收盘价 / 候选池快照）；候选池快照本身也按
+    `asof <= 决策日` 取（`agent_pool.pool_snapshot`）。
+    """
+    check_no_lookahead(asof, marks)
+    idx = marks.get(INDEX_300_SYMBOL) or pit_close(conn, INDEX_300_SYMBOL, asof)
+    if idx is not None:
+        check_no_lookahead(asof, {INDEX_300_SYMBOL: idx})
+    return {
+        "arm": arm,
+        "asof": asof,
+        "account": {"cash": round(float(cash), 4),
+                    "positions": {str(k): int(v) for k, v in sorted(positions.items())},
+                    "market_value": round(total_assets - float(cash), 4),
+                    "total_assets": round(float(total_assets), 4)},
+        "marks": {c: {"price": float(p.price), "price_asof": str(p.price_asof),
+                      "source": str(p.source)} for c, p in sorted(marks.items())},
+        "index_300": (None if idx is None else
+                      {"level": float(idx.price), "price_asof": str(idx.price_asof),
+                       "tradable": False,
+                       "note": "指数不可直接交易 —— 与各臂对照时口径偏乐观"}),
+        "pool": {"asof": pool.get("asof"), "codes": list(pool.get("codes") or []),
+                 "pools": pool.get("pools") or {},
+                 "missing_pools": list(pool.get("missing_pools") or []),
+                 "available": bool(pool.get("available"))},
+        "guardrails": list(GUARDRAILS),
+        "disclosure": list(DISCLOSURE_ITEMS),
+        "non_goals": list(NON_GOALS),
+        "counter_arm": ARM_AGENT_RANDOM,
+    }
+
+
+def decision_context_sha256(context: Mapping[str, object]) -> str:
+    """操盘上下文的指纹（与 `context_sha256` 同一条纪律：同输入 ⇒ 同指纹）。"""
+    missing = [k for k in DECISION_HASHED_KEYS if k not in context]
+    if missing:
+        raise KeyError(f"上下文缺字段 {missing} —— 指纹会漏掉它们，故直接报错")
+    payload = {k: context[k] for k in DECISION_HASHED_KEYS}
+    blob = json.dumps(payload, sort_keys=True, ensure_ascii=False,
+                      separators=(",", ":"))
+    return hashlib.sha256(blob.encode("utf-8")).hexdigest()
+
+
 def context_summary(context: Mapping[str, object]) -> dict:
     """给报告/页面用的一行摘要（**不重算**任何上层数字）。"""
     account = context["account"] or {}

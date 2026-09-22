@@ -13,7 +13,8 @@
 | `show` 的 JSON 与库内容同源 | 页面/CLI 各算一套 spec |
 | 只在 `arm-agent` / `arm-agent-random` 上写 | 往静态臂上写出一张没人读的台账 |
 | 越界 / 未知字段 → exit 2 且**一行都不写** | 先写后校验（半截状态） |
-| `step` 之后成交的 `rule_citation` 落在 `RULE_CITATIONS_AGENT` | 参数化了却还在引用写死条文 |
+| `paper spec set` **不再**给 `arm-agent` 下单（D-34） | 退役了的执行路径被悄悄复活 |
+| 两张 agent 条文表（spec / 操盘决策）互不相交 | 数不清成交由哪套条文触发 |
 """
 
 import json
@@ -22,7 +23,9 @@ import pytest
 
 from stocklab.cli.main import main
 from stocklab.paper import agent_spec
-from stocklab.paper.config import ARM_AGENT, ARM_AGENT_RANDOM, RULE_CITATIONS_AGENT
+from stocklab.paper.config import (ARM_AGENT, ARM_AGENT_RANDOM,
+                                   RULE_CITATIONS_AGENT,
+                                   RULE_CITATIONS_AGENT_DECISION)
 from stocklab.store.db import connect
 from stocklab.store.migrate import init_db
 
@@ -316,8 +319,14 @@ def test_rejected_must_be_a_json_array(db, capsys, bad):
 
 # ---------- spec 真的接进了执行内核 ----------
 
-def test_step_after_a_spec_set_trades_on_the_agent_rule_book(db, capsys, tmp_path):
-    """写一版 spec 之后 `paper step`：成交理由来自 `RULE_CITATIONS_AGENT`。"""
+def test_a_spec_no_longer_drives_the_agent_arm(db, capsys, tmp_path):
+    """D-34 之后：`paper spec set` 只往台账写一版策略规格，**不再给 `arm-agent` 下单**。
+
+    原判据是「写完 spec → `arm-agent` 起跑日建仓、条文落在 `RULE_CITATIONS_AGENT`」。
+    P52 把这条臂从「改纪律数字」重构成「每交易日一条决策的操盘手」：下不下单只看
+    `paper_agent_decisions` 里**当日那一条操盘决策**。spec 台账保留（不改写历史），
+    但它对成交的作用已经退役 —— 这条测试钉的正是「退役」，免得哪天悄悄复活。
+    """
     _init(db, capsys)
     code, _, err = run(db, "paper", "spec", "set", "--arm", ARM_AGENT,
                        "--asof", "2026-09-15", "--spec", '{"etf_target_pct": 12}',
@@ -329,23 +338,23 @@ def test_step_after_a_spec_set_trades_on_the_agent_rule_book(db, capsys, tmp_pat
 
     c = connect(db)
     try:
-        rows = [dict(r) for r in c.execute(
-            "SELECT account_id, qty, rule_citation, reason, binding_json"
-            " FROM paper_trades WHERE account_id = ?", (ARM_AGENT,))]
+        agent = [dict(r) for r in c.execute(
+            "SELECT qty, rule_citation, reason FROM paper_trades WHERE account_id = ?",
+            (ARM_AGENT,))]
         static = {dict(r)["rule_citation"] for r in c.execute(
             "SELECT rule_citation FROM paper_trades WHERE account_id = ?",
             ("arm-discipline-10",))}
+        kinds = [dict(r)["decision_kind"] for r in c.execute(
+            "SELECT decision_kind FROM paper_agent_decisions WHERE arm = ?",
+            (ARM_AGENT,))]
     finally:
         c.close()
-    assert rows, "arm-agent 起跑日应当建仓（默认 spec = arm-discipline-10 口径）"
-    agent_book = set(RULE_CITATIONS_AGENT.values())
-    for row in rows:
-        assert row["rule_citation"] in agent_book
-        # 溯源标签写进 reason：光有台账，读单笔成交的人还得自己 JOIN
-        assert f"spec {agent_spec.spec_sha256({'etf_target_pct': 12})[:12]}" \
-            in row["reason"]
-    assert static and static.isdisjoint(agent_book), \
-        "两条臂的条文表必须分得开，否则数不清几笔由 spec 触发"
+    assert agent == [],         "spec 不该再给 arm-agent 下单（D-34：决策空间已换成操盘决策）"
+    assert static, "静态臂照旧要建仓 —— 退的只是这一条臂的决策来源"
+    assert kinds == ["spec"], "spec 那一行必须还在（append-only，不改写历史）"
+    # 两张条文表必须分得开，否则数不清「几笔照 spec 下的 / 几笔照当日决策下的」
+    assert set(RULE_CITATIONS_AGENT.values()).isdisjoint(
+        set(RULE_CITATIONS_AGENT_DECISION.values()))
 
 
 def test_show_reports_the_ledger_counts(db, capsys):
@@ -372,6 +381,7 @@ def test_report_lists_the_agent_arm_with_its_own_label(db, capsys, tmp_path):
     assert code == 0, err
     md = out_path.read_text(encoding="utf-8")
     assert "arm-agent" in md and "arm-agent-random" in md
-    assert "智能体动态编排（spec 台账）" in md
-    assert "智能体随机改（阶段 3 才下单）" in md
+    assert "AI 操盘手（每交易日一条决策，台账在 paper_agent_decisions）" in md
+    assert "AI 操盘手·随机对照（同护栏同成本，标的与权重随机抽）" in md
+    assert "阶段 3" not in md, "阶段 3 的说法已作废（P52 起随机臂真的下单）"
     assert "口径未登记" not in md

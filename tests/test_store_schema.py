@@ -26,7 +26,8 @@ EXPECTED_TABLES = {
     "candidate_members",               # P插桩：候选池成员（append-only）
     "candidate_rejects",               # P插桩：候选池淘汰记录（append-only）
     "financial_reports",               # 财报采集层（PIT 公告日锚，append-only）
-    "paper_agent_decisions",           # P37：智能体臂 spec 台账（append-only，UNIQUE(arm,asof)）
+    "paper_agent_decisions",           # P37/P52：决策台账（append-only，UNIQUE(arm,asof)）
+    "fund_nav_daily",                  # P52：基金日净值（append-only，(code,date) 主键）
     "validation_cycles",               # P44：模块2 验证周期台账（append-only）
     "validation_rounds",               # P44：逐轮观测（append-only，UNIQUE(cycle_id,round_no)）
     "validation_events",               # P44：熔断/冻结/解冻事件（append-only）

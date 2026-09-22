@@ -1,24 +1,29 @@
 """模拟盘引擎（P19）：`init` / `step` / `show` 的编排层。
 
-## 四条臂（口径见 `paper/config.py` 与 ADR-010）
+## 臂分三类（口径见 `paper/config.py`、ADR-010 与 ADR-024）
 
-| 账户 | 状态来源 | 交易 | 条文数字从哪来 |
+| 账户 | 状态来源 | 交易 | 决策从哪来 |
 |---|---|---|---|
 | `arm-hold` | `init` 时**冻结**的快照 | 永不 | —— |
 | `arm-now` | 每步从 `real_trades`+`cash_flows` **重放**（实盘账本的镜像） | 永不 | —— |
 | `arm-discipline-{05,10,15}` | 自身 `paper_trades` | 只在触发纪律时 | 写死常量 |
-| `arm-agent` | 自身 `paper_trades` | 只在触发纪律时 | 台账里当前有效的 spec |
-| `arm-agent-random` | 自身 `paper_trades` | 阶段 3 才有 | 同（随机抽） |
+| `arm-agent` | 自身 `paper_trades` | 只在当日有决策时 | 台账里当日那一条**操盘决策**（P52/D-34） |
+| `arm-agent-random` | 自身 `paper_trades` | 同上（随机抽） | 台账里的随机对照决策 |
 
 起跑日 `arm-hold` 与 `arm-now` 数值**必然相同**（描述同一份状态），
 区别在之后：用户录一笔真成交，`arm-now` 跟着变、`arm-hold` 不变。
 
-## 「写死的条文」与「spec 参数化的同一批条文」共用一条执行路径
+## 「写死的条文」与「台账里的决策」共用一条**成交**路径，但决策来源不同
 
-`arm-agent` 不是第二套规则实现：它走的是**同一个** `_plan_steps` / `evaluate`，
-只是条文参数从 `RuleParams`（`STATIC_PARAMS` 或 spec 推出的那一组）来。
-设计 §4.3 「不复制规则代码」就靠这一点 —— 复制一份再两边各自维护，
-两条臂的差异就分不清是「编排的功劳」还是「抄错了」。
+`arm-discipline-*` 走 `_plan_steps`（条文 → 订单），`arm-agent*` 走
+`agent_decide.execute_decision`（台账里的目标权重 → 订单）。两条路**共用**
+`paper/rules.py` 的成本与整手口径：费用只由 `_fee_parts` 算一次，
+所以「同一笔 `(side, price, qty, 口径)`」在两条路上的成交字段逐字段相同
+（`tests/test_paper_agent_decide.py` 钉住这一条）。
+
+P52 之前 `arm-agent` 走的是 `_plan_steps` + spec 参数（P37 阶段 1）；D-34 把这条臂
+重构成「每交易日一条决策的操盘手」之后，条文参数化那条路只服务静态臂。
+`paper spec set` 与它的台账**保留**（历史不删），但不再决定这条臂下不下单。
 
 ## 输出是**数据库状态的函数**
 
@@ -41,7 +46,7 @@ import sqlite3
 from dataclasses import replace
 
 from stocklab.config.costs import ASSET_ETF, ASSET_STOCK, CostModel
-from stocklab.paper import agent_spec, store
+from stocklab.paper import agent_decide, agent_spec, store
 from stocklab.paper.config import (
     ARM_AGENT,
     ARM_AGENT_RANDOM,
@@ -51,7 +56,7 @@ from stocklab.paper.config import (
     ARM_KIND_DISCIPLINE,
     ARM_KIND_HOLD,
     ARM_KIND_NOW,
-    ARM_KINDS_WITH_RULES,
+    ARM_KINDS_SELF_DRIVEN,
     ARM_NOW,
     DISCLAIMER,
     DISCLOSURE_ITEMS,
@@ -62,6 +67,7 @@ from stocklab.paper.config import (
     HOLD_QTY,
     INITIAL_CAPITAL,
     LOT,
+    NOT_COMPARABLE,
     PAPER_START_DATE,
     PER_STEP_CASH_PCT,
     RULE_CITATIONS,
@@ -168,13 +174,25 @@ def ledger_state(conn: sqlite3.Connection, asof: str) -> dict:
 # ---------- 臂的分派 ----------
 
 def has_rules(account: dict) -> bool:
-    """这条臂跑不跑条文（= 会不会下单）。其余臂只记净值。
+    """这条臂跑不跑**写死的纪律条文**（`_plan_steps` 那条路径）。
 
-    `arm-agent-random` 阶段 1–2 不在这个集合里：它现在只做 mark-to-market，
-    阶段 3 接了随机 spec 才开交易。占位臂与「随机无信息」是两件事，
-    不能让一个还没接线的臂看起来像是已经跑出了一个结果。
+    P52 起 `arm-agent*` 不在这个集合里：它们的决策来自**决策台账**
+    （D-34：AI 当操盘手，方向 ＋ 仓位 ＋ 池内选标的），纪律条文不再给它们下单。
+    注意这与「会不会下单」不是同一个问题 —— 它们照旧下单，只是走
+    `_execute_agent_decision`。判断「会不会下单」用 `trades_by_decision`。
     """
-    return account["arm"] in ARM_KINDS_WITH_RULES
+    return account["arm"] == ARM_KIND_DISCIPLINE
+
+
+def trades_by_decision(account: dict) -> bool:
+    """这条臂的成交来自**决策台账里的目标权重**（P52 的 AI 操盘手与它的随机对照）。"""
+    return account["arm"] in (ARM_KIND_AGENT, ARM_KIND_AGENT_RANDOM)
+
+
+def replays_own_trades(account: dict) -> bool:
+    """现金/持仓从**自己的成交**推出来（与 `arm-hold` 的冻结快照、`arm-now` 的
+    实盘账本重放相对）。"""
+    return account["arm"] in ARM_KINDS_SELF_DRIVEN
 
 
 def _position_snapshot(account: dict) -> dict[str, int]:
@@ -186,16 +204,11 @@ def params_for_account(conn: sqlite3.Connection, account: dict, asof: str) -> Ru
     """这条臂本次决策的参数组。
 
     - `arm-discipline-*` ⇒ `STATIC_PARAMS` 换一个 `etf_target_pct`（账户列里的档位）；
-    - `arm-agent` ⇒ 台账里当前有效 spec 推出来的一组（四项来自 spec，成本/整手/白名单
-      只能是默认值）；
-    - `arm-hold` / `arm-now` / `arm-agent-random` ⇒ `STATIC_PARAMS`（它们不下单；
-      参数只用于 `evaluate` 里的「不动的理由」，`etf_target_pct=None` ⇒ 不建仓）。
+    - `arm-agent*` ⇒ `STATIC_PARAMS`（P52 起它们不下纪律条文的单 —— 决策走
+      `paper_agent_decisions` 里的目标权重，见 `agent_decide.plan_orders`）；
+    - `arm-hold` / `arm-now` ⇒ 同上（它们不下单；参数只用于 `evaluate` 里的
+      「不动的理由」，`etf_target_pct=None` ⇒ 不建仓）。
     """
-    if account["arm"] == ARM_KIND_AGENT:
-        spec = agent_spec.current_spec(conn, account["account_id"], asof)
-        det = agent_spec.latest_decision(conn, account["account_id"], asof)
-        return agent_spec.params_for(
-            spec, source_asof=None if det is None else str(det["asof"]))
     target = account["etf_target_pct"]
     return replace(STATIC_PARAMS,
                    etf_target_pct=None if target is None else float(target))
@@ -221,15 +234,15 @@ def _apply(positions: dict[str, int], code: str, side: str, qty: int) -> None:
 
 
 def _ledger_arm_state(conn: sqlite3.Connection, account: dict, asof: str) -> dict:
-    """`arm-hold`（冻结）与「自身成交」那些臂（纪律 / 智能体）的状态。
+    """`arm-hold`（冻结）与「自身成交」那些臂（纪律 / 智能体 / 随机对照）的状态。
 
-    `has_rules(account)` 决定要不要重放自己的成交 —— `arm-agent` 与
+    `replays_own_trades(account)` 决定要不要重放自己的成交 —— `arm-agent*` 与
     `arm-discipline-*` 共用同一条重放路径（都不读 `real_trades`）。
     """
     cash = float(account["initial_cash"])
     positions = _position_snapshot(account)
     cum_cost = float(json.loads(account["params_json"]).get("seed_fee", 0.0))
-    if has_rules(account):
+    if replays_own_trades(account):
         for t in store.load_trades(conn, account_id=account["account_id"], asof=asof):
             _apply(positions, t["code"], t["side"], int(t["qty"]))
             gross = float(t["fill_price"]) * int(t["qty"])
@@ -316,15 +329,20 @@ def init_accounts(conn: sqlite3.Connection, *, start_date: str = PAPER_START_DAT
              (ARM_NOW, ARM_KIND_NOW, None, params)]
     specs += [(f"{DISCIPLINE_PREFIX}{int(t):02d}", ARM_KIND_DISCIPLINE, t, params)
               for t in ETF_TRANCHES]
-    # 智能体臂：台账为空 ⇒ 跑 `AGENT_DEFAULT_SPEC`（= arm-discipline-10 口径），
-    # 所以它在起跑日与静态臂对齐，差别只看之后的编排。
+    # 智能体臂：P52 起它**不跑纪律条文** —— 决策来自 `paper_agent_decisions` 里
+    # 当日那一条（D-34：方向 ＋ 仓位 ＋ 池内选标的）。台账为空 ⇒ 那天不下单，
+    # 于是它在起跑日与 `arm-hold` 同值（同一起点、还没决定任何事），
+    # 差别从第一条决策开始。**不给它编一个默认条文**：那会把「还没决定」
+    # 显示成「决定按默认纪律办」，两者在读数上是两回事。
     specs += [(ARM_AGENT, ARM_KIND_AGENT, None,
-               {**params, "spec_source": agent_spec.TABLE_DECISIONS,
-                "agent_default_spec": dict(agent_spec.AGENT_DEFAULT_SPEC)}),
+               {**params, "decision_source": agent_decide.TABLE_DECISIONS,
+                "decision_kind": "portfolio",
+                "wired_from": "P52：每交易日一条操盘决策（写入口 paper agent decide）"}),
               (ARM_AGENT_RANDOM, ARM_KIND_AGENT_RANDOM, None,
-               {**params, "spec_source": agent_spec.TABLE_DECISIONS,
+               {**params, "decision_source": agent_decide.TABLE_DECISIONS,
+                "decision_kind": "portfolio",
                 "counter_arm": ARM_AGENT,
-                "wired_from": "阶段 3：随机改 spec（现在只记净值，不下单）"})]
+                "wired_from": "P52：随机抽标的与权重，同护栏同成本（归因必需）"})]
     created = []
     for account_id, arm, target, acct_params in specs:
         if store.account_exists(conn, account_id):
@@ -573,19 +591,38 @@ def _step_all(conn: sqlite3.Connection, asof: str, *, accounts: list[dict],
             continue
         state = _arm_state(conn, account, asof)
         params = params_for_account(conn, account, asof)
+        # AI 操盘手（与它的随机对照）只认**当日那一条**决策（`== asof`，不是「最近一版」）：
+        # 「每交易日一条决策」是口径的一部分，用「最近一版」会把昨天那条悄悄执行两次。
+        decision = (agent_decide.portfolio_decision_on(
+            conn, account["account_id"], asof)
+            if trades_by_decision(account) else None)
+        payload = (decision or {}).get("payload") or {}
+        decision_codes = {str(d["code"]) for d in payload.get("decisions", [])}
         codes = set(state["positions"])
         if has_rules(account):
             codes |= {HOLD_CODE} | set(params.whitelist)
+        codes |= decision_codes
         marks = dict(prices) if prices is not None else resolve_marks(conn, codes, asof)
         check_no_lookahead(asof, marks)
-        missing = sorted(c for c in state["positions"] if c not in marks)
+        missing = sorted(c for c in (set(state["positions"]) | decision_codes)
+                         if c not in marks)
         if missing:
-            raise MissingPriceError(f"持仓缺少 {asof} 及之前的收盘价：{missing}")
+            raise MissingPriceError(f"持仓/决策标的缺少 {asof} 及之前的收盘价：{missing}")
         cash, positions = state["cash"], dict(state["positions"])
         mv, _ = _mark_to_market(positions, marks)
         total = round(cash + mv, 4)
         orders: list[Decision] = []
-        if has_rules(account):
+        if decision is not None and decision_codes:
+            # 目标市值按**执行时**的总资产重算：写载荷时与执行时看的是同一批
+            # `<= asof` 的行，所以两者同口径；重算是为了不把「报告里的权重」
+            # 变成写载荷那一刻的快照（那会让 ¥ 与 % 对不上）。
+            payload = agent_decide.rebase_payload(payload, total_assets=total,
+                                                  marks=marks, positions=positions)
+            cash, positions, orders, _evals = agent_decide.execute_decision(
+                conn, arm=account["account_id"], asof=asof, decision=payload,
+                cash=cash, positions=positions, marks=marks,
+                total_assets=total)
+        elif has_rules(account):
             cash, positions, total, _evals, orders = _plan_steps(
                 conn, account, asof=asof, cash=cash, positions=positions,
                 marks=marks, total=total, params=params)
@@ -596,7 +633,7 @@ def _step_all(conn: sqlite3.Connection, asof: str, *, accounts: list[dict],
         nav = round(cash + mv, 4)
         history = [r["nav"] for r in store.load_nav(conn, account["account_id"],
                                                     asof=asof)]
-        if has_rules(account):
+        if has_rules(account) or decision is not None:
             cum_cost = state["cum_cost"] + sum(d.fees.get("total", 0.0) for d in orders)
         else:
             cum_cost = state["cum_cost"]
@@ -625,6 +662,11 @@ def _account_entry(conn: sqlite3.Connection, account: dict, asof: str,
     codes = set(positions) | ({HOLD_CODE} if has_rules(account) else set())
     if params.etf_target_pct:
         codes |= set(params.whitelist)
+    decision = (agent_decide.portfolio_decision_on(
+        conn, account["account_id"], asof)
+        if trades_by_decision(account) else None)
+    payload = (decision or {}).get("payload") or {}
+    codes |= {str(d["code"]) for d in payload.get("decisions", [])}
     marks = dict(prices) if prices is not None else resolve_marks(conn, codes, asof)
     check_no_lookahead(asof, marks)
     total = nav_row["nav"]
@@ -640,15 +682,45 @@ def _account_entry(conn: sqlite3.Connection, account: dict, asof: str,
                   if c in positions},
         "discipline": discipline_checks(cash=nav_row["cash"], positions=positions,
                                         total=total, marks=marks),
-        "evaluation": [json.loads(json.dumps(_decision_json(d)))
-                       for d in evaluate(conn, account, asof=asof,
-                                         cash=nav_row["cash"], positions=positions,
-                                         marks=marks, total_assets=total,
-                                         params=params)],
+        # AI 操盘手不跑纪律条文 ⇒ 它的 `evaluation` 为空是**真话**，
+        # 不是「没有理由」：理由在 `agent_decision` 里（台账那一条）。
+        "evaluation": ([] if trades_by_decision(account) else
+                       [json.loads(json.dumps(_decision_json(d)))
+                        for d in evaluate(conn, account, asof=asof,
+                                          cash=nav_row["cash"], positions=positions,
+                                          marks=marks, total_assets=total,
+                                          params=params)]),
+        "agent_decision": (_decision_entry(decision, payload, positions, marks, asof)
+                           if trades_by_decision(account) else None),
         "decisions": [_trade_json(t) for t in
                       store.trades_on(conn, account["account_id"], asof)],
         "nav_history_points": len(store.load_nav(conn, account["account_id"],
                                                  asof=asof)),
+    }
+
+
+def _decision_entry(decision: dict | None, payload: dict, positions: dict[str, int],
+                    marks: dict[str, Price], asof: str) -> dict:
+    """账户条目里的「当日决策」块（台账里那一条的**只读**投影）。"""
+    if decision is None:
+        return {"asof": asof, "present": False,
+                "note": (f"{asof} 没有决策行 ⇒ 本日**不下单**。"
+                         f"非交易日不出决策；交易日缺决策也是「没决定」，不补造")}
+    total = float(payload.get("total_assets") or 0.0)
+    return {
+        "asof": asof, "present": True,
+        "decision_id": int(decision["decision_id"]),
+        "decision_kind": str(decision.get("decision_kind") or ""),
+        "agent_kind": str(decision["agent_kind"]),
+        "model_id": str(decision["model_id"]),
+        "seed": int(decision["seed"]),
+        "context_sha256": str(decision["context_sha256"]),
+        "payload_sha256": agent_decide.payload_sha256(payload),
+        "cash_pct": float(payload.get("cash_pct") or 0.0),
+        "rationale": str(payload.get("rationale") or ""),
+        "weights": agent_decide.weight_table(payload, positions, marks),
+        "pool": dict(decision.get("pool") or {}),
+        "total_assets": total or None,
     }
 
 
@@ -689,6 +761,36 @@ def accounts_state(conn: sqlite3.Connection, asof: str | None = None) -> list[di
     return out
 
 
+def comparison_block(conn: sqlite3.Connection, asof: str) -> dict:
+    """对照臂同轴表（懒 import：`comparison` 模块级 import 本模块，反向 import 会成环）。"""
+    from stocklab.paper import comparison
+    return comparison.build(conn, asof)
+
+
+def arm_state_for(conn: sqlite3.Connection, arm: str, asof: str) -> dict | None:
+    """一条臂在 `asof` 收盘后的状态（现金 / 持仓 / 市值 / 总资产 / 收盘价）。
+
+    写决策时要用它算出「目标市值」与「现市值」的方向（`side` 的一致性判据）。
+    只看 `<= asof` 的行 —— 与执行期同一个口径，因此写载荷与执行不会各算一套。
+    账户不存在 → `None`（**不抛错**：调用方要能自己决定说什么）。
+    """
+    account = next((a for a in store.load_accounts(conn)
+                    if a["account_id"] == arm), None)
+    if account is None:
+        return None
+    state = _arm_state(conn, account, asof)
+    marks = resolve_marks(conn, set(state["positions"]), asof)
+    mv, _ = _mark_to_market(state["positions"], marks)
+    return {
+        "account_id": arm, "arm": account["arm"],
+        "cash": state["cash"], "positions": dict(state["positions"]),
+        "marks": marks, "market_value": mv,
+        "total_assets": round(state["cash"] + mv, 4),
+        "net_deposits": state["net_deposits"],
+        "has_nav_on_asof": store.nav_exists(conn, arm, asof),
+    }
+
+
 def state_payload(conn: sqlite3.Connection, asof: str) -> dict:
     """`asof` 的载荷 —— **只由库里的行 + PIT 价格决定**，故重跑逐字节一致。"""
     idx = pit_close(conn, INDEX_300_SYMBOL, asof)
@@ -699,14 +801,16 @@ def state_payload(conn: sqlite3.Connection, asof: str) -> dict:
         "index_300": ({"level": idx.price, "price_asof": idx.price_asof}
                       if idx else None),
         "agent": agent_block(conn, asof),
+        "comparison": comparison_block(conn, asof),
         "disclosure": list(DISCLOSURE_ITEMS),
     }
 
 
 # ---------- 智能体臂的报告块 ----------
 
-NO_RANDOM_FMT = ("`{arm}` 还没有任何一版 spec（阶段 3 才接线）⇒ 差分**不存在**，"
-                 "不是 0。拿一个没接线的臂当基准，算出来的差是噪音。")
+NO_RANDOM_FMT = ("`{arm}` 还没有任何一条决策 ⇒ 差分**不存在**，不是 0。"
+                 "拿一条没出过决策的臂当基准，算出来的差是噪音。缺它的时候"
+                 "「AI 选对了」与「多试了几次」分不开（D-19）。")
 
 
 def arm_target_label(arm_kind: str, etf_target_pct: float | None) -> str:
@@ -716,9 +820,9 @@ def arm_target_label(arm_kind: str, etf_target_pct: float | None) -> str:
     if arm_kind == ARM_KIND_NOW:
         return "实盘账本镜像"
     if arm_kind == ARM_KIND_AGENT:
-        return "智能体动态编排（spec 台账）"
+        return "AI 操盘手（每交易日一条决策，台账在 paper_agent_decisions）"
     if arm_kind == ARM_KIND_AGENT_RANDOM:
-        return "智能体随机改（阶段 3 才下单）"
+        return "AI 操盘手·随机对照（同护栏同成本，标的与权重随机抽）"
     if arm_kind == ARM_KIND_DISCIPLINE and etf_target_pct is not None:
         return f"ETF 目标 {etf_target_pct:.0f}%"
     return f"{arm_kind}（口径未登记）"
@@ -735,21 +839,38 @@ def _cum_return_at(conn: sqlite3.Connection, account_id: str,
 def agent_block(conn: sqlite3.Connection, asof: str) -> dict:
     """`arm-agent` 的报告块（`paper show` 与 `/lab/paper` **同源**，不重算）。
 
-    `delta_vs_random` 在阶段 3 之前恒为 `null`，但**字段必须出现**：省略字段会让
-    「还没接线」和「两臂一样」在 JSON 上长得一模一样。
+    `delta_vs_random` 在随机臂还没有决策时恒为 `null`，但**字段必须出现**：省略字段
+    会让「还没有对照」和「两条臂一样」在 JSON 上长得一模一样。
+
+    P52 起这一段同时要读**两段历史**：P37 的 spec 复审（`decision_kind='spec'`）与
+    P52 的操盘决策（`'portfolio'`）。混在一起报 `n_reviews` 会让读者以为
+    「改了 N 次纪律数字」，而那已经不发生 —— 故两个计数分开给。
     """
     spec = agent_spec.current_spec(conn, ARM_AGENT, asof)
     ledger = agent_spec.ledger_summary(conn, ARM_AGENT, asof)
     random_ledger = agent_spec.ledger_summary(conn, ARM_AGENT_RANDOM, asof)
+    rows = agent_decide.load_decisions(conn, ARM_AGENT)
+    portfolio = agent_decide.portfolio_decisions_only(rows)
     history = []
-    for d in agent_spec.load_decisions(conn, ARM_AGENT)[-HISTORY_KEEP:]:
+    for d in rows[-HISTORY_KEEP:]:
+        payload = d.get("payload") or {}
         history.append({
             "decision_id": int(d["decision_id"]), "asof": str(d["asof"]),
-            "agent_kind": str(d["agent_kind"]), "model_id": str(d["model_id"]),
+            "agent_kind": str(d["agent_kind"]),
+            "decision_kind": str(d.get("decision_kind") or ""),
+            "model_id": str(d["model_id"]),
             "n_trials": int(d["n_trials"]), "n_rejected": len(d["rejected"]),
             "spec_sha256": agent_spec.spec_sha256(d["spec_after"]),
             "spec_after": d["spec_after"], "rationale": str(d["rationale"]),
             "context_sha256": str(d["context_sha256"]),
+            "payload_sha256": (agent_decide.payload_sha256(payload)
+                               if payload else None),
+            "cash_pct": (None if not payload else float(payload.get("cash_pct") or 0.0)),
+            "weights": [
+                {"code": str(x["code"]), "side": str(x["side"]),
+                 "target_weight_pct": float(x["target_weight_pct"]),
+                 "reason": str(x["reason"])}
+                for x in (payload.get("decisions") or [])],
         })
     delta, available = None, random_ledger["n_reviews"] > 0
     if available:
@@ -767,6 +888,18 @@ def agent_block(conn: sqlite3.Connection, asof: str) -> dict:
         "stop_loss_line": agent_spec.stop_loss_line(spec),
         "change_space": {name: f.range_text()
                          for name, f in agent_spec.SPEC_SCHEMA.items()},
+        # P52：操盘决策的计数（这才是决定下不下单的那个数）。
+        "n_decisions": len(portfolio),
+        "n_spec_versions": len(rows) - len(portfolio),
+        "last_decision_asof": (str(portfolio[-1]["asof"]) if portfolio else None),
+        "last_decision": (None if not portfolio else {
+            "asof": str(portfolio[-1]["asof"]),
+            "model_id": str(portfolio[-1]["model_id"]),
+            "seed": int(portfolio[-1]["seed"]),
+            "payload_sha256": agent_decide.payload_sha256(
+                portfolio[-1].get("payload") or {}),
+            "cash_pct": float((portfolio[-1].get("payload") or {}).get("cash_pct") or 0.0),
+        }),
         "n_reviews": ledger["n_reviews"],
         "n_trials_total": ledger["n_trials_total"],
         "n_rejected": ledger["n_rejected"],
@@ -775,7 +908,6 @@ def agent_block(conn: sqlite3.Connection, asof: str) -> dict:
         "first_asof": ledger["first_asof"],
         "last_asof": ledger["last_asof"],
         "history": history,
-        # 阶段 3 之前恒为 null（字段必须出现，见 docstring）。
         "delta_vs_random": delta,
         "delta_vs_random_available": available,
         "delta_vs_random_note": (
@@ -878,6 +1010,7 @@ def build_report(conn: sqlite3.Connection, asof: str) -> dict:
                        "note": "指数不可直接交易，故不含成本 —— 与三臂对照时口径偏乐观"}
                       if idx else None),
         "accounts": per_account,
+        "comparison": comparison_block(conn, asof),
         "disclosure": list(DISCLOSURE_ITEMS),
         "disclaimer": DISCLAIMER,
         "sample_note": (f"起跑日 {start} → {asof} 共 "
@@ -925,7 +1058,39 @@ def render_report(rep: dict) -> str:
             L.append(f"| `{a['account_id']}` | {a['cum_return'] * 100:+.2f}% | "
                      f"{'—' if ex is None else f'{ex * 100:+.2f}%'} |")
     L.append("")
-    L.append("## 三、持仓与纪律判定")
+    L.append("## 三、对照臂同轴（5 条 + 随机臂；缺数据的写「不可比」，不填 0）")
+    L.append("")
+    cmp = rep.get("comparison") or {}
+    if not cmp:
+        L.append("- 对照块取不到（旧库）—— 不编数。")
+    else:
+        L.append(f"- 样本：{cmp['n_sessions']} 个交易日，门槛 "
+                 f"{cmp['sample_gate']['threshold']} 日 → "
+                 f"**{cmp['sample_gate']['status']}**"
+                 f"{'' if cmp['sample_gate']['note'] is None else '（' + cmp['sample_gate']['note'] + '）'}")
+        L.append("")
+        L.append("| 臂 | 口径 | 累计收益 | 可交易 | 成本 | 备注 |")
+        L.append("|---|---|---|---|---|---|")
+        for a in cmp["arms"]:
+            ret = (f"{a['latest'] * 100:+.2f}%" if a["latest"] is not None
+                   else f"**{NOT_COMPARABLE}**")
+            L.append(f"| {a['label']} | {a['kind']} | {ret} | "
+                     f"{'是' if a['tradable'] else '否'} | "
+                     f"{'有' if a['has_cost'] else '无'} | "
+                     f"{a['note'] or ''} |")
+        L.append("")
+        d = cmp["delta_vs_random"]
+        if cmp["delta_vs_random_available"] and d is not None:
+            L.append(f"- Δ(AI 操盘手 − 随机对照) = {d * 100:+.2f}%"
+                     f"（n_decision={cmp['n_decisions_agent']} / "
+                     f"n_random={cmp['n_decisions_random']}）—— **这是归因用的差分**，"
+                     f"没有它，AI 的领先分不清是选对了还是碰巧。")
+        else:
+            L.append(f"- Δ(AI 操盘手 − 随机对照) = **{NOT_COMPARABLE}**，"
+                     f"不是 0：{cmp['delta_vs_random_note']}")
+        L.append(f"- {cmp['not_comparable_note']}")
+    L.append("")
+    L.append("## 四、持仓与纪律判定")
     L.append("")
     for a in rep["accounts"]:
         pos = "、".join(f"{c}×{q}" for c, q in sorted(a["positions"].items())) or "空仓"
@@ -941,7 +1106,7 @@ def render_report(rep: dict) -> str:
                      f"{a['etf_target_pct'] - a['etf_actual_pct']:.2f} 个百分点；"
                      f"差额若来自现金下限 45%，见下节口径说明）")
         L.append("")
-    L.append("## 四、起跑日至今的调仓流水（append-only）")
+    L.append("## 五、起跑日至今的调仓流水（append-only）")
     L.append("")
     L.append("| 日期 | 账户 | 动作 | 标的 | 股数 | 收盘 | 成交价 | 佣金 | 印花税 | "
              "过户费 | 滑点 | 触发条文 |")
@@ -954,7 +1119,7 @@ def render_report(rep: dict) -> str:
                      f"{t['transfer_fee']:.2f} | {t['slippage_cost']:.2f} | "
                      f"{t['rule_citation']} |")
     L.append("")
-    L.append("## 五、口径说明（不许改）")
+    L.append("## 六、口径说明（不许改）")
     L.append("")
     for item in rep["disclosure"]:
         L.append(f"- {item}")

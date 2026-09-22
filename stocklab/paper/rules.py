@@ -34,6 +34,7 @@ from stocklab.paper.config import (
     ORDER_TARGET_AMOUNT,
     PER_STEP_CASH_PCT,
     RULE_CITATIONS,
+    RULE_CITATIONS_AGENT_DECISION,
 )
 from stocklab.portfolio.discipline import (
     DISCIPLINE,
@@ -54,6 +55,8 @@ C_WHITELIST = "diversifier_whitelist"    # 分散工具白名单
 C_NO_PRICE = "missing_price"             # 取不到价格 → 不判定
 C_NO_LINES = "no_discipline_lines"       # 该标的没配纪律线 → 不拿别人的线量它
 C_STOP_OFF = "stop_loss_off_by_spec"      # 止损按 spec 关闭（只可能出现在 arm-agent*）
+C_TARGET = "target_weight_from_ledger"    # 目标权重来自决策台账（P52 的 AI 操盘手）
+C_CASH_AVAILABLE = "cash_available"       # 现金不够 → 买不到目标权重（如实标出）
 
 _EPS = 1e-9
 
@@ -137,6 +140,12 @@ class RuleParams:
 
 #: 「写死条文」的那一组参数，也是 `plan_*` 的默认值。
 STATIC_PARAMS = RuleParams()
+
+#: 操盘手（P52）那条路默认用的条文表。**不是** `RULE_CITATIONS` ——
+#: 「按当日决策的目标权重调仓」这条规则在写死条文里不存在，让 `plan_target_weight`
+#: 用静态表兜底会 `KeyError`（它只服务于台账那条路）。
+AGENT_DECISION_PARAMS = RuleParams(
+    citations=tuple(RULE_CITATIONS_AGENT_DECISION.items()))
 
 
 def _params(p: RuleParams | None) -> RuleParams:
@@ -453,6 +462,107 @@ def plan_etf_buy(*, code: str, price: float, cash: float, total_assets: float,
 
 def _binding_text(cands: Mapping[str, float], p: RuleParams) -> str:
     return "、".join(f"{p.amount_text(k)} ¥{v:,.2f}" for k, v in cands.items())
+
+
+# ---------- 目标权重 → 订单（P52 的 AI 操盘手） ----------
+
+def plan_target_weight(*, code: str, side: str, target_value: float, price: float,
+                       qty_held: int, cash: float, total_assets: float,
+                       asset_class: str, costs: CostModel | None = None,
+                       params: RuleParams | None = None) -> Decision:
+    """把「目标市值」翻译成一笔**可执行**的订单（纯函数）。
+
+    ## 为什么这条要走 `_fee_parts` 而不是自己算一遍
+
+    成交语义必须与既有引擎**逐字段相同**（任务书 T4）：同 `(side, price, qty,
+    asset_class)` 下 `fill_price` / `fee_total` / `slippage_cost` / 各项明细只能
+    有一个算法。本函数因此复用 `CostModel.fill_price` 与 `_fee_parts`，
+    一行费用公式都不另写 —— 复制一份就等于把「ETF 免印花税」这条口径拄成两份。
+
+    ## 目标权重是「市值占比」，不是「现金流向」
+
+    差额按**市值**算（目标市值 − 现市值），再按含滑点的成交价折算股数。
+    整手**向下**取整（宁可差一点，也不越过分派给它的权重）。差额不足 1 手
+    → **不动**，并把「目标未达成」如实写在 `reason` 里 —— 不假装已达标。
+
+    ## 卖出封顶 = 当前持仓
+
+    目标权重 ≥0 本身就排除了做空，但滑点会让 `差额 ÷ 卖价` 略微超过持仓手数，
+    故显式封顶到 `qty_held`。买入则受**可用现金**封顶（`cash_available`），
+    并用 `violation_remaining=True` 标出「没买到目标」——
+    夹紧的是**执行**，不是 AI 的意图（意图的越界在写入口就被拒了）。
+    """
+    p = params or AGENT_DECISION_PARAMS
+    costs = costs or CostModel(asset_class=asset_class)
+    if costs.asset_class != asset_class:
+        raise ValueError(
+            f"{code} 的口径是 {asset_class!r}，成本模型给的是 "
+            f"{costs.asset_class!r} —— 口径错会让成本算错，且错的方向对策略有利")
+    lot = p.lot
+    current_value = round(price * qty_held, 4)
+    delta = target_value - current_value
+    if abs(delta) < _EPS:
+        return _hold(code, f"目标市值 ¥{target_value:,.2f} 与现市值 "
+                           f"¥{current_value:,.2f} 相同 → 不动",
+                     rule=p.cite("target_weight"), ref_price=price)
+    fill = costs.fill_price(side, price)
+    qty = floor_lot(abs(delta) / fill, lot)
+    binding: tuple[str, ...] = (C_TARGET,)
+    if qty <= 0:
+        one_lot = fill * lot
+        return _hold(
+            code,
+            f"目标 ¥{target_value:,.2f} 与现市值 ¥{current_value:,.2f} 差 "
+            f"¥{abs(delta):,.2f} < 1 手（¥{one_lot:,.2f}）→ **不动**；"
+            f"目标**未达成**，如实上报（不四舍五入凑一手）",
+            rule=p.cite("target_weight"), constraints=(*binding, C_LOT),
+            raw=abs(delta) / fill, remaining=True, ref_price=price)
+    unmet = False
+    if side == "sell":
+        if qty > qty_held:
+            qty = qty_held
+        out = round(fill * qty - _fee_parts(costs, "sell", fill, qty, ref=price)["total"], 2)
+        cash_after = round(cash + out, 2)
+    else:
+        affordable = cash - costs.fees("buy", fill, qty)
+        if affordable < 0:
+            # 现金不够：降到买得起的整手数（执行层面的夹紧，意图未被改）
+            qty = min(qty, floor_lot(cash / (fill * (1.0 + costs.commission_rate)), lot))
+            binding = (*binding, C_CASH_AVAILABLE)
+            unmet = True
+        if qty <= 0:
+            return _hold(code, f"目标 ¥{target_value:,.2f} 买不起（可用现金 "
+                               f"¥{cash:,.2f}，1 手需 ¥{fill * lot:,.2f}）→ 不动；"
+                               f"目标**未达成**，如实上报",
+                         rule=p.cite("target_weight"),
+                         constraints=(*binding, C_LOT, C_CASH_AVAILABLE),
+                         remaining=True, ref_price=price)
+        fees_total = _fee_parts(costs, "buy", fill, qty, ref=price)["total"]
+        out = round(fill * qty + fees_total, 2)
+        cash_after = round(cash - out, 2)
+    fees = _fee_parts(costs, "sell" if side == "sell" else "buy", fill, qty, ref=price)
+    achieved_value = round(fill * qty, 4)
+    hit = (abs((current_value + achieved_value * (1 if side == "buy" else -1))
+               - target_value) < fill * lot)
+    verb = "买入" if side == "buy" else "卖出"
+    return Decision(
+        action=side, code=code, qty=qty,
+        rule_citation=p.cite("target_weight"),
+        reason=(f"{verb} {qty} 股 {code} @{fill:.4f}（含滑点），"
+                f"成交额 ¥{achieved_value:,.2f}：目标市值 ¥{target_value:,.2f}"
+                f"（占总资产 {target_value / total_assets * 100.0:.2f}%），"
+                f"现市值 ¥{current_value:,.2f}；差额整手向下取整")
+               + ("；⚠️ 受可用现金封顶，**未达目标**" if unmet
+                  else ("" if hit else "；⚠️ 整手取整后**未达目标**，如实上报")),
+        binding_constraints=tuple(sorted(set(binding))),
+        planned_shares_raw=round(abs(delta) / fill, 4), violation_remaining=(unmet or not hit),
+        ref_price=price, fill_price=round(fill, 4), fees=fees,
+        amount=out, cash_after=cash_after,
+        weight_after_pct=_clip((current_value + achieved_value
+                                * (1 if side == "buy" else -1))
+                               / total_assets * 100.0 if total_assets > 0 else None),
+        asset_class=asset_class,
+    )
 
 
 def _fee_parts(costs: CostModel, side: str, price: float, qty: int, *,

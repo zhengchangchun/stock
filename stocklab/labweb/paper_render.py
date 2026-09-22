@@ -18,20 +18,21 @@
 
 我 = accent 深蓝实线（最粗）；什么都不做 = 灰虚线；AI 三档 = 绿 / 琥珀 / 青
 （同一规则、不同参数，色相分开是为了在图上分得清，**不是**区分好坏）；
-智能体臂 = 紫（`arm-agent` 实线、`arm-agent-random` 同色虚线 —— 同一家族的对照臂，
-线型分开是因为它**还没接线**：定稿阶段 3 前它只记净值、不下单）；
+智能体臂 = 紫（`arm-agent` 实线、`arm-agent-random` 同色虚线 —— **同护栏、同成本、
+同候选池**的对照臂，线型分开只是为了让两条叠在一起的线还认得出）；
 大盘 = 深灰点线。颜色不是唯一信号：图下每条线都有色块 + 文字 + 最新值。
 
 ## 「智能体臂」这一节
 
-它回答的不是「AI 准不准」，而是「**条文里的数字可以改**这件事本身带来什么」：
-当前 spec 是哪五个数、改了几次、试错预算用掉多少、与随机对照臂差多少。
+P52 起它回答的是「**AI 当操盘手**这段时间做了什么」：每交易日一条决策（方向 ＋ 仓位
+＋ 池内选标的），台账里存着载荷、模型指纹、候选池与上下文指纹；P37 的 spec 复审
+同表保留（`decision_kind='spec'`），但**不再给这条臂下单**（D-34）。
 所以本节每个数都从 `paper.engine.agent_block` 拿（与 `paper show` 同源），
 连 `delta_vs_random` 的 `null` 也是上游写好的 `null` —— 见下。
 
 ## `null` 与 `0` 在页面上必须长得不一样
 
-`delta_vs_random` 在阶段 3 前恒为 `null`（对照臂没接线 ⇒ 差分**不存在**，
+`delta_vs_random` 在随机对照臂还没有决策时恒为 `null`（差分**不存在**，
 不是 0）。页面上它显示为「无法判定」+ 原因，绝不显示 `+0.00%`。
 同理，复现性还没被真正检验过时写「无法判定」而不是「可复现」。
 
@@ -54,14 +55,14 @@ from stocklab.labweb.render import (cell, esc, glance, glance_html, layout, mone
                                     more, num, ratio_pct, rich, section,
                                     sign_cls)
 from stocklab.paper.config import (ARM_KIND_AGENT, ARM_KIND_AGENT_RANDOM,
-                                   RULE_CITATIONS_AGENT)
+                                   NOT_COMPARABLE, RULE_CITATIONS_AGENT)
 
 #: 账户 → 人话。**只换标签**，不改任何数字。
 _LABELS: dict[str, str] = {
     "arm-now": "我 · 实盘账本镜像",
     "arm-hold": "什么都不做 · 起跑日冻结快照",
-    "arm-agent": "AI 智能体臂 · spec 台账",
-    "arm-agent-random": "AI 智能体臂 · 随机对照（阶段 3 才下单）",
+    "arm-agent": "AI 操盘手 · 每交易日一条决策",
+    "arm-agent-random": "AI 操盘手 · 随机对照（同护栏同成本）",
 }
 
 #: 账户 → (颜色, 虚线 dash, 线宽)。我 = accent 实线最粗；大盘单列在 `_INDEX_STYLE`。
@@ -71,8 +72,8 @@ _STYLES: dict[str, tuple[str, str, float]] = {
     "arm-discipline-05": ("#0f6b3b", "", 1.8),
     "arm-discipline-10": ("#8a5a00", "", 1.8),
     "arm-discipline-15": ("#2a6f8f", "", 1.8),
-    # 智能体臂：紫色家族。random 用**同色虚线** —— 它们是一对（同预算、同变更空间），
-    # 线型分开是因为它还没接线，不是因为它“更差”。
+    # 智能体臂：紫色家族。random 用**同色虚线** —— 它们是一对（同护栏、同成本、
+    # 同候选池），线型分开只是为了让两条线叠在一起时还认得出，不是因为它「更差」。
     "arm-agent": ("#6a3d9a", "", 2.0),
     "arm-agent-random": ("#6a3d9a", "6 3", 1.6),
 }
@@ -105,7 +106,7 @@ def arm_label(arm: Mapping) -> str:
     if kind == ARM_KIND_AGENT:
         return f"{aid} · 智能体 spec 编排"
     if kind == ARM_KIND_AGENT_RANDOM:
-        return f"{aid} · 随机对照（阶段 3 才下单）"
+        return f"{aid} · 随机对照（同护栏同成本）"
     if kind == "discipline" and arm.get("etf_target_pct") is not None:
         return f"AI 纪律臂 · ETF 目标 {float(arm['etf_target_pct']):.0f}%"
     return f"{aid}（口径未知）"
@@ -374,9 +375,11 @@ def _why(data: Mapping) -> list[str]:
         '「AI 纪律臂」= <code>arm-discipline-05/10/15</code>：三条<b>同一套写死条文</b>的账户',
         '（止损 + 单票 ≤40% + ETF 分散），只差「ETF 目标占比」这一个数 —— '
         '单变量对照，<b>不含任何模型方向预测</b>。',
-        '「AI 智能体臂」= <code>arm-agent</code>：条文<b>同一套，但 5 个数字放在台账里</b>'
-        '（<code>paper_agent_decisions</code>），可以改；<code>arm-agent-random</code> 是'
-        '它的随机对照 —— 阶段 3 之前只记净值、不下单。两条都<b>不用模型</b>。',
+        '「AI 操盘手」= <code>arm-agent</code>：<b>每交易日一条决策</b>'
+        '（方向 ＋ 仓位 ＋ 池内选标的），落在 <code>paper_agent_decisions</code>；'
+        '<code>arm-agent-random</code> 是它的随机对照 —— <b>同护栏、同成本、同候选池</b>，'
+        '只是标的与权重随机抽。两条都<b>不用模型做方向预测</b>：载荷在项目外产出，'
+        '本页只报「按台账执行了几笔」。',
         f'「相对我」= 该线累计收益 − 我（<code>{esc(data.get("now_account_id"))}</code>）'
         '的累计收益，一个减法，不是独立口径。',
     ]
@@ -515,6 +518,63 @@ def _agent_reproducibility(ev: Mapping) -> str:
     return head + (f'<ul class="list">{body}</ul>' if body else '')
 
 
+# ---------- 对照臂同轴（P52 / D-36） ----------
+
+def comparison_block(data: Mapping) -> str:
+    """5 条对照臂 ＋ 随机臂**同轴并列**（六条，不排名、不挑「推荐」）。
+
+    「不可比」是本节的**一等公民**：基金等权臂没有持仓与成本、指数不可直接交易、
+    缺数据时点断线。这些行在表里写 `不可比`，**不写 0、不留空**——
+    留空会被读成「没问题」，写 0 会被读成「那天没涨没跌」。
+    """
+    cmp = data.get("comparison") or {}
+    if not cmp:
+        return ('<p class="note">对照块取不到（旧库）—— 本页不编数。</p>')
+    gate = cmp.get("sample_gate") or {}
+    head = ("<tr><th>臂</th><th>口径</th><th>累计收益</th><th>可交易</th>"
+            "<th>成本</th><th>备注</th></tr>")
+    rows = []
+    for a in cmp.get("arms") or []:
+        latest = a.get("latest")
+        ret = (f'<b class="{sign_cls(latest)}">{ratio_pct(latest)}</b>'
+               if latest is not None
+               else f'<span class="s-warn">{esc(NOT_COMPARABLE)}</span>')
+        note = str(a.get("note") or "—")
+        rows.append(
+            f'<tr><td class="l">{rich(str(a.get("label")))}'
+            f'<div class="note"><code>{esc(str(a.get("id")))}</code></div></td>'
+            f'<td>{esc(str(a.get("kind")))}</td>'
+            f'<td class="num">{ret}</td>'
+            f'<td>{"是" if a.get("tradable") else "否"}</td>'
+            f'<td>{"有" if a.get("has_cost") else "无"}</td>'
+            f'<td class="l">{rich(note)}</td></tr>')
+    d = cmp.get("delta_vs_random")
+    if cmp.get("delta_vs_random_available") and d is not None:
+        delta_html = (f'Δ(AI 操盘手 − 随机对照) = '
+                      f'<b class="{sign_cls(d)}">{ratio_pct(d)}</b>'
+                      f'（AI {esc(cmp.get("n_decisions_agent"))} 条决策 / 随机 '
+                      f'{esc(cmp.get("n_decisions_random"))} 条）。'
+                      f'这是**归因**用的差分，不是成绩单。')
+    else:
+        delta_html = ('<span class="s-warn">Δ(AI 操盘手 − 随机对照) '
+                      '**不存在**</span>（不是 0）：'
+                      + rich(str(cmp.get("delta_vs_random_note") or "")))
+    lines = [
+        f'样本 {esc(cmp.get("n_sessions"))} 个交易日，门槛 '
+        f'{esc(gate.get("threshold"))} 日 → '
+        + (f'<b>ok</b>' if gate.get("status") == "ok"
+           else f'<span class="s-warn">{esc(gate.get("status"))}</span>'
+                f'（{rich(str(gate.get("note") or ""))}）'),
+        delta_html,
+        rich(str(cmp.get("not_comparable_note") or "")),
+        '基金等权臂的清单与判据见 <code>stocklab/fund/nav.py</code>；'
+        '它是**持仓未知的基金组合**，<b>不是指数</b>。',
+        rich(str(cmp.get("disclaimer_extra") or "")),
+    ]
+    return (glance_html(lines)
+            + f'<div class="scroll-x"><table class="tbl">{head}{"".join(rows)}</table></div>')
+
+
 def agent_arm_block(data: Mapping) -> str:
     """智能体臂一段：当前 spec / 台账 / 与随机臂的差分 / 复现性。
 
@@ -552,10 +612,11 @@ def agent_arm_block(data: Mapping) -> str:
                      + rich(ev.get("delta_vs_random_note") or ""))
 
     lines.append(
-        '这两条臂<b>都不用模型</b>：<code>arm-agent</code> 只是把同一条纪律的 5 个数字'
-        '搬到台账里（<code>paper_agent_decisions</code>），阶段 1–2 的 spec 由人手写'
-        '或由人复核后落库。它回答的是「条文数字可变之后会怎样」，'
-        '不是「AI 会操盘」。')
+        '这两条臂<b>都不用模型做方向预测</b>：AI 操盘手（<code>arm-agent</code>）'
+        '每交易日一条决策（方向 ＋ 仓位 ＋ 池内选标的），载荷由<b>项目外</b>产出、'
+        '经 <code>paper agent decide</code> 校验后落 <code>paper_agent_decisions</code>；'
+        '<code>arm-agent-random</code> 是它的随机对照 —— <b>同护栏、同成本、同候选池</b>。'
+        '本页只报「按台账执行了几笔」，不替它解释理由。')
 
     detail = (_agent_history_table(ev) + _agent_change_space(ev)
               + '<p class="note">复现性判据（同 context + 同 model + 同 prompt + 同 seed '
@@ -730,6 +791,7 @@ def ai_block(ev: Mapping) -> str:
     refs = [str(x) for x in (cons.get("param_refs") or [])]
     cited = [str(c) for c in (cons.get("cited_rules") or [])]
     n_spec = int(cons.get("n_trades_by_spec") or 0)
+    n_decision = int(cons.get("n_trades_by_decision") or 0)
     if not unknown and not refs:
         lines.append(
             '<span class="s-warn">模型与插桩没用上</span>：'
@@ -753,6 +815,14 @@ def ai_block(ev: Mapping) -> str:
             '<code>RULE_CITATIONS_AGENT</code> 里（条文来自 '
             '<code>paper_agent_decisions</code> 台账的当前 spec）。这是'
             '<b>同一条纪律的参数化</b>，不是模型信号 —— 两条 AI 线都不含方向预测。')
+
+    if n_decision:
+        lines.append(
+            f'<b>AI 操盘手用上了</b>：{n_decision} 笔成交的触发理由落在 '
+            '<code>RULE_CITATIONS_AGENT_DECISION</code> 里（条文来自 '
+            '<code>paper_agent_decisions</code> 当日那一条的 '
+            '<code>target_weight_pct</code>）。它<b>不是模型方向预测</b>：'
+            '载荷由项目外产出、写入口只校验，本页只报「按台账执行了几笔」。')
 
     lines.append('这个「没用上」是<b>被钉住的</b>，不是漏接：'
                  '<code>test_paper_never_imports_model_or_kelly</code> 用源码扫描'
@@ -905,8 +975,10 @@ def _empty_body(data: Mapping) -> str:
             "已有这一步。",
         ]),
         note="没有净值行就是没有 —— 本页不拿成本价、也不拿 0 冒充一条曲线。")
-    + section("智能体臂（P37）：条文的数字可改", agent_arm_block(data),
-              right="台账里的 spec，不是模型信号")
+    + section("对照臂同轴（D-36：5 条 + 随机臂）", comparison_block(data),
+              right="并列，不排名；缺数据写「不可比」")
+    + section("智能体臂（P52）：AI 操盘手", agent_arm_block(data),
+              right="台账里的决策，不是模型信号")
     + section("绩效对比（模块2 §4）", performance_block(data.get("performance") or {}),
               right="五个指标 + 样本量门禁")
     + section("AI 自己编排的东西，用上了没有", ai_block(data.get("ai") or {}),
@@ -967,8 +1039,10 @@ def paper_page(data: Mapping, *, base: str, built_at: str) -> str:
         section("逐条对照", compare_table(data),
                 note="「相对大盘」「相对我」都是减法，不是新口径；指数不可交易，"
                      "所以它那两行没有成本与回撤 —— 与各臂比时口径偏乐观。"),
-        section("智能体臂（P37）：条文的数字可改", agent_arm_block(data),
-                right="台账里的 spec，不是模型信号"),
+        section("对照臂同轴（D-36：5 条 + 随机臂）", comparison_block(data),
+                right="并列，不排名；缺数据写「不可比」"),
+        section("智能体臂（P52）：AI 操盘手", agent_arm_block(data),
+                right="台账里的决策，不是模型信号"),
         section("绩效对比（模块2 §4）",
                 performance_block(data.get("performance") or {}),
                 right="五个指标 + 样本量门禁"),

@@ -9,7 +9,7 @@ import sqlite3
 
 import pytest
 
-from stocklab.paper import agent_spec, engine
+from stocklab.paper import agent_decide, agent_spec, engine
 from stocklab.paper import store
 from stocklab.paper.rules import Decision
 from stocklab.paper.config import (
@@ -136,11 +136,16 @@ def test_init_creates_hold_now_discipline_and_agent_arms(db):
     assert rows[ARM_HOLD]["initial_nav"] != pytest.approx(20000)
 
 
-def test_init_wires_the_agent_arms_to_the_ledger_without_copying_the_spec(db):
-    """智能体臂的 `etf_target_pct` 写 `None` —— ETF 目标来自台账，不抄第二份真相。
+def test_init_wires_the_agent_arms_to_the_ledger_without_copying_a_decision(db):
+    """智能体臂的 `etf_target_pct` 写 `None` —— 目标来自**台账**，不抄第二份真相。
 
-    把当时的 spec 抄进账户行，等于在库里存下第二个真相，而它**不随 spec 变**：
-    `paper spec set` 改了台账之后，那一列会开始说谎。所以它必须是 `None`。
+    把某一天的决策抄进账户行，等于在库里存下第二个真相，而它**不随台账变**：
+    下一天写了新决策之后，那一列会开始说谎。所以它必须是 `None`。
+
+    P37 时这里的判据是「不抄 spec」（`spec_source` + `agent_default_spec`）。
+    D-34 之后这条臂的决策来源换成**操盘决策**（`paper agent decide` 落的那一条），
+    于是接线的判据也随之改名：`decision_source` / `decision_kind`。
+    账户行里同样**没有**任何「当前决策」的副本。
     """
     _run_init(db)
     c = _conn(db)
@@ -152,15 +157,25 @@ def test_init_wires_the_agent_arms_to_the_ledger_without_copying_the_spec(db):
     assert random_arm["arm"] == ARM_KIND_AGENT_RANDOM
     assert agent["etf_target_pct"] is None and random_arm["etf_target_pct"] is None
     # 两臂都指向同一张台账；random 还指名它对的是哪一条臂。
-    assert json.loads(agent["params_json"])["spec_source"] == \
-        agent_spec.TABLE_DECISIONS
+    assert json.loads(agent["params_json"])["decision_source"] == \
+        agent_decide.TABLE_DECISIONS
+    assert json.loads(agent["params_json"])["decision_kind"] == "portfolio"
     assert json.loads(random_arm["params_json"])["counter_arm"] == ARM_AGENT
-    # 账户行里**没有** spec 的当前值（避免第二份真相）；`agent_default_spec` 只是
-    # `init` 当时那一份默认值的快照，改配置不会回写已存账户，所以它必须与现推一致
-    # —— 不一致就说明「默认 spec 从配置推出来」这句话在 init 那一刻就不成立了。
+    # 账户行里**没有**任何一条决策的副本（避免第二份真相）。
     params = json.loads(agent["params_json"])
-    assert params["agent_default_spec"] == agent_spec.AGENT_DEFAULT_SPEC
-    assert "spec" not in params and "spec_sha256" not in params
+    for leaked in ("spec", "spec_sha256", "payload", "payload_json", "target_weight_pct"):
+        assert leaked not in params, f"账户行里存下了第二份真相：{leaked}"
+    # 起跑日它与「什么都不做」同值：同一起点、还没决定任何事。
+    # **不给它编一个默认条文** —— 那会把「还没决定」显示成「按默认纪律办」。
+    c = _conn(db)
+    engine.step(c, PAPER_START_DATE, now=NOW)
+    navs = {r["account_id"]: r["nav"] for r in c.execute(
+        "SELECT account_id, nav FROM paper_nav_daily WHERE date = ?", (PAPER_START_DATE,))}
+    trades = c.execute("SELECT COUNT(*) FROM paper_trades WHERE account_id = ?",
+                       (ARM_AGENT,)).fetchone()[0]
+    c.close()
+    assert trades == 0, "台账里还没有操盘决策 ⇒ 这天不该下单"
+    assert navs[ARM_AGENT] == navs["arm-hold"]
 
 
 def test_init_rejects_ledger_disagreeing_with_declared_tape(db):

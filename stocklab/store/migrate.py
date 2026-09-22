@@ -291,8 +291,60 @@ def migrate_p44_plugin_audit_events(conn) -> list[str]:
     return ["plugin_audit.action"]
 
 
-#: 已知迁移 marker 清单：doctor 逐个报告在位与否（只读，不迁移）。
-#: (name, table, 判据)。判据是列名（str）或一个只读探测函数。
+# ---------------------------------------------------------------------------
+# P52：`paper_agent_decisions` 加三列（操盘决策，D-34）。
+#
+# **只加列、不回填历史行** —— 与 P32 的 `predictions.origin` 同一手法。
+# 这里不重建表：CHECK 是**列级**的，`ALTER TABLE ADD COLUMN` 能带上它
+# （实测 SQLite 3.51 会把新列的 CHECK 一起建出来），因此历史行的一个字节都不用碰。
+# 新列的默认值让 P37 的历史行自解释：它们全都是 `decision_kind='spec'`。
+# ---------------------------------------------------------------------------
+_MIGRATE_P52_COLUMNS: tuple[tuple[str, str], ...] = (
+    ("decision_kind",
+     "ALTER TABLE paper_agent_decisions ADD COLUMN decision_kind TEXT NOT NULL"
+     " DEFAULT 'spec' CHECK (decision_kind IN ('spec','portfolio'))"),
+    ("payload_json",
+     "ALTER TABLE paper_agent_decisions ADD COLUMN payload_json TEXT NOT NULL"
+     " DEFAULT '{}'"),
+    ("pool_json",
+     "ALTER TABLE paper_agent_decisions ADD COLUMN pool_json TEXT NOT NULL"
+     " DEFAULT '{}'"),
+)
+
+
+def agent_decisions_need_portfolio_columns(conn) -> bool:
+    """台账表还缺 P52 的列吗？（只读探测，供 doctor 用）
+
+    表不存在时返回 False：`executescript` 会按 schema.sql 的新 shape 直接建出。
+    """
+    if not _table_exists(conn, "paper_agent_decisions"):
+        return False
+    cols = _table_columns(conn, "paper_agent_decisions")
+    return any(name not in cols for name, _ in _MIGRATE_P52_COLUMNS)
+
+
+def migrate_p52_agent_decisions_portfolio(conn) -> list[str]:
+    """给决策台账加操盘载荷三列（只加列，不改历史行）。返回变更列表。"""
+    if not agent_decisions_need_portfolio_columns(conn):
+        return []
+    cols = _table_columns(conn, "paper_agent_decisions")
+    changed: list[str] = []
+    conn.execute("BEGIN")
+    try:
+        for name, ddl in _MIGRATE_P52_COLUMNS:
+            if name in cols:
+                continue
+            conn.execute(ddl)
+            changed.append(f"paper_agent_decisions.{name}")
+        conn.commit()
+    except BaseException:
+        conn.rollback()
+        raise
+    return changed
+
+
+
+#: 已知迁移 marker 清单：doctor 逐个报告在位与否（只读，不迁移）。#: (name, table, 判据)。判据是列名（str）或一个只读探测函数。
 #: 新增迁移时必须在这里登记，否则 doctor 看不出来。
 _KNOWN_MARKERS: list[tuple[str, str, object]] = [
     ("p28_resp_sha256_valuation", "valuation_daily", "resp_sha256"),
@@ -302,6 +354,8 @@ _KNOWN_MARKERS: list[tuple[str, str, object]] = [
      lambda conn: not paper_accounts_needs_agent_arms(conn)),
     ("p44_plugin_audit_events", "plugin_audit",
      lambda conn: not plugin_audit_needs_module2_events(conn)),
+    ("p52_agent_decisions_portfolio", "paper_agent_decisions",
+     lambda conn: not agent_decisions_need_portfolio_columns(conn)),
 ]
 
 
@@ -330,6 +384,8 @@ def _pending_column_migrations(conn) -> list[str]:
         pending.append("p37:paper_accounts.arm")
     if plugin_audit_needs_module2_events(conn):
         pending.append("p44:plugin_audit.action")
+    if agent_decisions_need_portfolio_columns(conn):
+        pending.append("p52:paper_agent_decisions.portfolio")
     return pending
 
 
@@ -361,6 +417,7 @@ def _apply_schema(conn, sql: str) -> list[str]:
     changes += migrate_p32_predictions_origin(conn)
     changes += migrate_p37_paper_accounts_agent_arms(conn)
     changes += migrate_p44_plugin_audit_events(conn)
+    changes += migrate_p52_agent_decisions_portfolio(conn)
     return changes
 
 

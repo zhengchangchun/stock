@@ -42,6 +42,9 @@ def test_whitelist_is_exact():
             # P30 新增：休市安排公告源 = 上交所（www.sse.com.cn）——
             # **有意**扩白名单，不是偷偷加：本断言仍是精确相等，改它必须留下痕迹。
             "www.sse.com.cn",
+            # P52 新增：基金日净值源（fund.eastmoney.com/pingzhongdata，**非官方**接口）——
+            # 同样是**有意**扩白名单：D-36 的第三条对照臂要读它的净值序列。
+            "fund.eastmoney.com",
         }
     )
 

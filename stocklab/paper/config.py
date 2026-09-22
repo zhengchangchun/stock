@@ -82,8 +82,17 @@ ARM_KIND_DISCIPLINE: str = "discipline"
 ARM_KIND_AGENT: str = "agent"
 ARM_KIND_AGENT_RANDOM: str = "agent_random"
 
-#: 会**跑条文**（即可能下单）的臂。其余（hold / now / agent_random）只记净值。
-ARM_KINDS_WITH_RULES: tuple[str, ...] = (ARM_KIND_DISCIPLINE, ARM_KIND_AGENT)
+#: 会**跑条文**（即可能下单）的臂。其余（hold / now）只记净值。
+#: P52 起 `agent_random` 也在这个集合里 —— 它不再是占位臂，而是真的随机下单
+#: （D-19：没有它，`arm-agent` 的读数一律不可归因）。
+ARM_KINDS_WITH_RULES: tuple[str, ...] = (ARM_KIND_DISCIPLINE, ARM_KIND_AGENT,
+                                        ARM_KIND_AGENT_RANDOM)
+
+#: 自身成交驱动状态的那些臂（`arm-hold` 冻结、`arm-now` 从实盘账本重放）。
+#: 与 `ARM_KINDS_WITH_RULES` 是两个问题：这条问「现金/持仓从哪来」，
+#: 那条问「会不会下单」。将来若有「只记净值不下单」的臂，两者会分叉。
+ARM_KINDS_SELF_DRIVEN: tuple[str, ...] = (ARM_KIND_DISCIPLINE, ARM_KIND_AGENT,
+                                          ARM_KIND_AGENT_RANDOM)
 
 #: `arm-agent` 的默认 spec 对齐**这一条**静态臂，默认值一律从它反推
 #: （见 `paper/agent_spec.py`，不另抄一份数字）。
@@ -91,6 +100,81 @@ AGENT_DEFAULT_ARM: str = f"{DISCIPLINE_PREFIX}10"
 
 #: 每次复审最多试几版（D-17「每次 ≤3 版」）。超预算的记录会被 `record_decision` 拒绝。
 MAX_TRIALS_PER_REVIEW: int = 3
+
+# ---------- P52：AI 操盘手（决策台账，D-34） ----------
+
+#: 决策载荷的**唯一形状**（D-34）：每交易日一条。
+#: `code` 必须落在当日候选池；`Σ target_weight_pct + cash_pct = 100`；不许负数。
+DECISION_PAYLOAD_KEYS: tuple[str, ...] = (
+    "asof", "decisions", "cash_pct", "rationale")
+DECISION_ITEM_KEYS: tuple[str, ...] = (
+    "code", "side", "target_weight_pct", "reason")
+
+#: 权重和的容差。取 1e-6：这是**浮点写法的容差**，不是「允许差一点」的额度 ——
+#: 载荷里的数字是两位小数，写错一位就是 0.01 级别的差，远在容差之外。
+WEIGHT_SUM_TOLERANCE: float = 1e-6
+
+#: A 股**没有做空**。这条不是限制「看空」的表达，而是限制表达的方式：
+#: 「看空」只能靠**降低总仓位 / 清仓**来表达（把 target_weight_pct 调低、把
+#: `cash_pct` 调高），不能靠 `side="sell"` 一个没持有的标的 —— 那是融券。
+#: 这段文案要出现在**报错里**，否则「AI 想卖空」会被读成静默失败。
+NO_SHORT_SIDE_MSG: str = (
+    "A 股无做空：`side=\"sell\"` 只对**已持有**的标的成立。"
+    "看空只能表达为**降低总仓位 / 清仓**（调低 target_weight_pct、调高 cash_pct），"
+    "不能对未持有的标的卖出 —— 那是融券，本臂不做"
+)
+
+#: 决策台账里 `agent_kind` 的取值：外部编码 agent 产出的决策。
+#: 与 `agent_spec.AGENT_KIND_LLM` 同一个字面量（那边是 spec 路径，这边是操盘路径）。
+DECISION_AGENT_KIND: str = "llm"
+
+#: 随机对照臂的产出者标识。**不是占位符**：它如实说明这条臂的载荷不是任何模型
+#: 产出的，因此「同 prompt + 同 context ⇒ 同结果」这条复现性判据对它天然成立
+#: （随机由固定种子决定，见 `agent_decide.random_payload`）。
+RANDOM_MODEL_ID: str = "random-control"
+
+#: 随机对照臂**一次抽几只**（含端点）。固定这个区间是为了让「同预算」可比：
+#: 换区间 = 换口径，必须与净值一起读。
+RANDOM_N_CODES: tuple[int, int] = (1, 4)
+
+#: 决策账（`paper_agent_decisions`）里 `decision_kind` 的两个取值。
+#: `spec` = P37 的「改纪律数字」（历史行，保留不删）；`portfolio` = P52 的操盘决策。
+DECISION_KIND_SPEC: str = "spec"
+DECISION_KIND_PORTFOLIO: str = "portfolio"
+
+# ---------- P52：对照臂（D-36 五条 + 随机臂） ----------
+
+#: 对照臂的**展示顺序**（与 D-36 的编号一致）。这不是排名，是阅读顺序。
+COMPARISON_ARM_IDS: tuple[str, ...] = (
+    ARM_AGENT, ARM_NOW, "fund-equal-weight", ARM_HOLD, "sh000300")
+COMPARISON_RANDOM_ARM: str = ARM_AGENT_RANDOM
+
+#: 基金等权臂的**固定清单**（先验选定，见 `stocklab/fund/nav.py` 的模块说明）。
+#: ⚠️ 它是**持仓未知的基金组合**，不是指数 —— 页面与报告里都不许写成「指数」。
+FUND_EQUAL_WEIGHT_ID: str = "fund-equal-weight"
+FUND_EQUAL_WEIGHT_LABEL: str = "真实主动权益基金等权平均"
+
+#: 基金净值源（非官方）。`pingzhongdata/<code>.js` 里的 `Data_netWorthTrend`。
+#: 标注口径是**交付物的一部分**：这两个词必须出现在页面上。
+FUND_NAV_SOURCE_URL: str = "https://fund.eastmoney.com/pingzhongdata/<code>.js"
+
+#: 样本量门槛（交易日）。与 `verify.report.MIN_DAYS` **同源同值**，但**不 import 它**：
+#: `paper/` 的源码护栏禁止依赖验证链路（`tests/test_paper_discipline_guard.py`），
+#: 而「两边是同一个 120」由 `tests/test_paper_comparison.py` 直接对拍钉住 ——
+#: 靠对拍而不是靠 import，护栏才不用为这个数字开洞。
+SAMPLE_THRESHOLD: int = 120
+
+#: 「不可比」的**唯一**措辞：缺数据/不扣成本的行写它，而不是 0。
+#: 写 0 会把「没有数据」显示成「那天没涨没跌」，那是把「不知道」当结论。
+NOT_COMPARABLE: str = "不可比"
+#: ⚠️ 措辞里**只用 Markdown 反引号、不写 HTML 标签**：这段文字同时进
+#: Markdown 报告、CLI 的 JSON 与网页。网页上 `rich()` 会把反引号变成真的
+#: `<code>`；写成字面 `<code>` 的话，网页会显示「被转义成文本的标签」（踩过）。
+FUND_NAV_APPROX_NOTE: str = (
+    "近似 / 非官方：净值取自天天基金 `pingzhongdata/{code}.js` 的 "
+    "`Data_netWorthTrend`（非官方接口），等权平均；基金**持仓不公开**，"
+    "所以只能比净值曲线，不能比持仓、不能改写成指数"
+)
 
 #: `arm-agent*` 的条文表。与 `RULE_CITATIONS` **并列而不合并**：静态表是「写死的条文」，
 #: 这张表是「同一批被 spec 参数化的规则」，数字来源不同 —— 合成一张表之后，
@@ -105,6 +189,18 @@ RULE_CITATIONS_AGENT: dict[str, str] = {
                        "单次动用现金与现金下限同守",
 }
 
+#: `arm-agent*` 在 **P52 操盘口径**下的条文表（与上面那张并列，不合并）。
+#: 第三条表而不是往上面加一行，理由与 P37 一样：`ai_evidence` 要能分开数出
+#: 「有几笔成交照 spec 下的」与「有几笔成交照当日决策下的」——
+#: 合成一张，这两件事就再也分不开了。
+#: 数字一律不进条文（数字进 `reason`），这样它们能按规则类型被稳定计数。
+RULE_CITATIONS_AGENT_DECISION: dict[str, str] = {
+    "target_weight": "AI 操盘手·目标权重：按决策台账里当日那一条的 target_weight_pct "
+                     "调仓到目标市值（整手向下取整；池外/越界/负权重在**写入口**即拒）",
+    "random_target_weight": "随机对照臂·目标权重：标的与权重由固定种子随机抽取，"
+                            "护栏与成本口径与 AI 臂**完全相同**（不构成任何判断）",
+}
+
 # ---------- 免责声明（报告里逐字出现，测试钉住） ----------
 
 DISCLAIMER: str = (
@@ -117,7 +213,8 @@ DISCLAIMER: str = (
 #: 报告/JSON 里必须出现的口径提示（测试逐条断言）。
 DISCLOSURE_ITEMS: tuple[str, ...] = (
     "禁止方向择时：不使用模型预测作为买卖信号，不做参数搜索，不输出买卖建议",
-    "起点 2026-09-15 收盘 · 初始资金 20,000 元 · 三臂并行（纪律臂 3 档 ETF 占比并列）",
+    "起点 2026-09-15 收盘 · 初始资金 20,000 元 · 各臂并列（纪律臂 3 档 ETF 占比 + "
+    "AI 操盘手及其随机对照；对照另含基金等权与沪深300）",
     "扣成本：佣金（最低 5 元）+ 印花税（ETF 免征）+ 过户费 + 滑点；ETF 按 ADR-008 标的口径",
     "PIT：当日决策只用 ≤ 当日的收盘价，喂未来价直接报错（LookaheadError）",
     "append-only：paper_accounts / paper_trades / paper_nav_daily 只增不改不删",

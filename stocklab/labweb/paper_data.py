@@ -70,7 +70,8 @@ from stocklab.paper import agent_spec
 from stocklab.paper import store as paper_store
 from stocklab.paper.config import (ARM_AGENT, ARM_AGENT_RANDOM, ARM_KIND_AGENT,
                                    ARM_KIND_AGENT_RANDOM, PAPER_START_DATE,
-                                   RULE_CITATIONS, RULE_CITATIONS_AGENT)
+                                   RULE_CITATIONS, RULE_CITATIONS_AGENT,
+                                   RULE_CITATIONS_AGENT_DECISION)
 from stocklab.paper.engine import INDEX_300_SYMBOL, agent_block, build_report
 from stocklab.plugin import lifecycle as plugin_lifecycle
 from stocklab.plugin import store as plugin_store
@@ -208,11 +209,16 @@ def ai_evidence(conn: sqlite3.Connection, asof: str) -> dict:
 
     known = set(RULE_CITATIONS.values())
     agent_known = set(RULE_CITATIONS_AGENT.values())
+    decision_known = set(RULE_CITATIONS_AGENT_DECISION.values())
     rows = conn.execute("SELECT rule_citation FROM paper_trades").fetchall()
     cited = sorted({str(r["rule_citation"] or "") for r in rows})
-    unknown = [c for c in cited if c not in known and c not in agent_known]
+    registered = known | agent_known | decision_known
+    unknown = [c for c in cited if c not in registered]
     spec_cited = [c for c in cited if c in agent_known]
+    decision_cited = [c for c in cited if c in decision_known]
     n_by_spec = sum(1 for r in rows if str(r["rule_citation"] or "") in agent_known)
+    n_by_decision = sum(1 for r in rows
+                        if str(r["rule_citation"] or "") in decision_known)
     blobs = [str(r["params_json"] or "") for r in conn.execute(
         "SELECT params_json FROM paper_accounts")]
     param_keys = sorted({k for blob in blobs for k in json.loads(blob or "{}")})
@@ -246,6 +252,10 @@ def ai_evidence(conn: sqlite3.Connection, asof: str) -> dict:
             # 它不是「表外」—— 表外为空与这里有数，两件事必须能同时成立。
             "spec_rules": spec_cited,
             "n_trades_by_spec": n_by_spec,
+            # P52：条文来自**当日决策台账**的成交（AI 操盘手与它的随机对照）。
+            # 与 spec 单列是同一个理由：合成一列就再也分不开「改纪律数字」与「当操盘手」。
+            "decision_rules": decision_cited,
+            "n_trades_by_decision": n_by_decision,
             "param_keys": param_keys,
             "param_refs": param_refs,
         },
@@ -255,6 +265,9 @@ def ai_evidence(conn: sqlite3.Connection, asof: str) -> dict:
 def _empty(asof: str, start: str, *, db_missing: bool = False,
            ai: dict | None = None, agent: dict | None = None) -> dict:
     return {"asof": asof, "available": False, "db_missing": db_missing,
+            # 空库也要有这一个键：缺键与「没有对照臂」在页面上长得一样，
+            # 而它们不是一回事（前者是页面坏了，后者是真话）。
+            "comparison": {},
             "start_date": start, "date": None, "dates": [], "n_sessions": 0,
             "arms": [], "index": None, "now_account_id": None,
             "mirror_equals_hold": None, "real_trades": [],
@@ -621,6 +634,7 @@ def track(conn: sqlite3.Connection, asof: str) -> dict:
         # 这是**事实判断**，不是渲染细节 —— 页面据此决定要不要解释两条线重合。
         "mirror_equals_hold": (None if now is None or hold is None
                                else now["points"] == hold["points"]),
+        "comparison": report.get("comparison") or {},
         "real_trades": real_trades,
         "real_trades_after_start": sum(1 for t in real_trades
                                        if str(t["date"]) > start),

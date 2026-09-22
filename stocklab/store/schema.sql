@@ -751,6 +751,15 @@ CREATE TABLE IF NOT EXISTS paper_agent_decisions (
     n_trials         INTEGER NOT NULL DEFAULT 1,  -- 本次试了几版（预算 K=3）
     rejected_json    TEXT NOT NULL DEFAULT '[]',  -- 被拒的版本与理由
     rationale        TEXT NOT NULL DEFAULT '',    -- 智能体自述（只作展示，不作证据）
+    -- P52 新增（只加列，不回填历史行；`ALTER TABLE ADD COLUMN` 由 migrate 前滚）：
+    -- `decision_kind` 区分两类行，两类的**主语不同**：
+    --   'spec'      —— P37：改纪律数字（spec_before/after 有值）
+    --   'portfolio' —— P52：操盘决策（payload_json 有值，spec_* 写 '{}'）
+    -- 不删不改历史行的理由与其它 append-only 表一致：改了就读不出「当时是什么口径」。
+    decision_kind    TEXT NOT NULL DEFAULT 'spec'
+                     CHECK (decision_kind IN ('spec', 'portfolio')),
+    payload_json     TEXT NOT NULL DEFAULT '{}',  -- 操盘决策的原始载荷（canonical JSON）
+    pool_json        TEXT NOT NULL DEFAULT '{}',  -- 当时那份候选池（池外拒绝的审计依据）
     created_at       TEXT NOT NULL,
     UNIQUE (arm, asof)
 );
@@ -762,6 +771,34 @@ BEGIN SELECT RAISE(ABORT, 'paper_agent_decisions is append-only (改错请再审
 CREATE TRIGGER IF NOT EXISTS trg_paper_agent_decisions_no_delete
 BEFORE DELETE ON paper_agent_decisions
 BEGIN SELECT RAISE(ABORT, 'paper_agent_decisions is append-only'); END;
+
+-- ---------- 基金日净值（P52：D-36 的第三条对照臂） ----------
+-- 净值源＝天天基金 `https://fund.eastmoney.com/pingzhongdata/<code>.js` 的
+-- `Data_netWorthTrend`（**非官方接口**，页面与报告必须标注「近似 / 非官方」）。
+--
+-- 为什么落成一张独立的表、而不是塞进 `paper_nav_daily`：
+-- 基金**持仓不公开**，所以它与各臂的关系只是「两条净值曲线并列」——
+-- 没有持仓、没有成交、没有成本，塞进模拟盘净值表就会让人以为它是一条可交易的臂。
+--
+-- `nav` 是单位净值（Data_netWorthTrend 的 `y`）。`source` 记来源（'eastmoney-js'），
+-- 便于将来换源时区分行（换源 = 换口径，必须能分开读）。
+CREATE TABLE IF NOT EXISTS fund_nav_daily (
+    code       TEXT NOT NULL,
+    date       TEXT NOT NULL,
+    nav        REAL NOT NULL,
+    source     TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    PRIMARY KEY (code, date)
+);
+
+-- 原始净值 append-only：源站重算/更正不许覆盖历史行（与 valuation/money_flow 同一条纪律）。
+CREATE TRIGGER IF NOT EXISTS trg_fund_nav_daily_no_update
+BEFORE UPDATE ON fund_nav_daily
+BEGIN SELECT RAISE(ABORT, 'fund_nav_daily is append-only'); END;
+
+CREATE TRIGGER IF NOT EXISTS trg_fund_nav_daily_no_delete
+BEFORE DELETE ON fund_nav_daily
+BEGIN SELECT RAISE(ABORT, 'fund_nav_daily is append-only'); END;
 
 -- P28：估值 / 资金流原始表 append-only（历史行一次写入后永不改写；源站重算不覆盖）。
 CREATE TRIGGER IF NOT EXISTS trg_valuation_daily_no_update

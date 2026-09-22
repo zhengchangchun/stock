@@ -4,8 +4,9 @@
 `engine.agent_block`（与 `paper show` 同源）。所以这里的断言分两类：
 
 1. 页面的数字 == 上游的同名字段（页面自己算一套就红）；
-2. **`null` 与 `0` 在页面上长得不一样** —— 阶段 3 之前 `delta_vs_random` 是
-   「差分不存在」，不是「差分等于 0」。写成 `+0.00%` 就把「还没接线」读成了结论。
+2. **`null` 与 `0` 在页面上长得不一样** —— 随机对照臂还没有决策时
+   `delta_vs_random` 是「差分不存在」，不是「差分等于 0」。写成 `+0.00%`
+   就把「还没出决策」读成了结论。
 
 | 断言 | 被摘掉后会红的实现 |
 |---|---|
@@ -24,13 +25,14 @@ import threading
 import pytest
 
 from stocklab.labweb import paper_data, paper_render
-from stocklab.paper import agent_spec
+from stocklab.paper import agent_decide, agent_spec, engine as paper_engine
 from stocklab.paper.config import (ARM_AGENT, ARM_AGENT_RANDOM, ARM_KIND_AGENT,
-                                   ARM_KIND_AGENT_RANDOM, RULE_CITATIONS_AGENT)
+                                   ARM_KIND_AGENT_RANDOM,
+                                   RULE_CITATIONS_AGENT_DECISION)
 from stocklab.store.db import connect
-from tests.test_labweb_paper import LAST, NOW, _fixture_db
+from tests.test_labweb_paper import LAST, NEXT, NOW, _fixture_db
 
-SECTION = "智能体臂（P37）：条文的数字可改"
+SECTION = "智能体臂（P52）：AI 操盘手"
 
 
 @pytest.fixture
@@ -63,6 +65,42 @@ def _set_spec(path, *, asof="2026-09-18", patch=None, n_trials=1, rejected=None,
             prompt_sha256=agent_spec.MANUAL_PROMPT_SHA256, seed=0,
             context_sha256="c" * 64, now=NOW, n_trials=n_trials,
             rejected=rejected, rationale=rationale)
+    finally:
+        c.close()
+
+
+def _add_agent_decision(path, *, asof, payload):
+    """写一条操盘决策 + 推进该日（`arm-agent` 的成交现在只来自这里）。
+
+    P52 起 `arm-agent` 不跑纪律条文（D-34）：它的成交必须能追溯到
+    `paper_agent_decisions` 里当日那一条目标权重，否则一笔都不该有。
+    """
+    c = connect(path)
+    try:
+        c.execute("INSERT INTO candidate_snapshots (asof, run_kind, params_json,"
+                  " created_at) VALUES (?,'light','{}',?)", (asof, NOW))
+        sid = c.execute("SELECT MAX(snapshot_id) FROM candidate_snapshots").fetchone()[0]
+        for code in sorted(payload["decisions"], key=lambda d: d["code"]):
+            c.execute("INSERT INTO candidate_members (snapshot_id, code, pool,"
+                      " raw_score, adj_score, reason, risk_json, status, entered_at)"
+                      " VALUES (?,?, 'short', 1.0, 1.0, '夹具', '{}', '观察中', ?)",
+                      (sid, code["code"], NOW))
+        c.commit()
+        state = paper_engine.arm_state_for(c, ARM_AGENT, asof)
+        pool = {"codes": [d["code"] for d in payload["decisions"]]}
+        # 写入口要能定价**候选池里的**标的（不只是当前持仓）——
+        # 否则一笔「买入一只新标的」的决策会因为「没有它的价」而被拒。
+        marks = {**paper_engine.resolve_marks(c, set(pool["codes"]), asof),
+                 **state["marks"]}
+        validated = agent_decide.validate_payload(
+            asof=asof, payload=payload, pool_codes=set(pool["codes"]),
+            held_qty=state["positions"], marks=marks,
+            total_assets=state["total_assets"])
+        agent_decide.record_portfolio_decision(
+            c, arm=ARM_AGENT, asof=asof, payload=validated, pool=pool,
+            agent_kind=agent_spec.AGENT_KIND_LLM, model_id="test-model",
+            prompt_sha256="p" * 64, seed=0, context_sha256="c" * 64, now=NOW)
+        paper_engine.step(c, asof, now=NOW)
     finally:
         c.close()
 
@@ -211,31 +249,43 @@ def test_reproducibility_passes_once_the_same_input_gives_the_same_spec(db):
 
 # ---------- 消费明细：spec 条文 vs 表外条文 ----------
 
-def test_trades_by_the_agent_rule_book_are_counted_without_polluting_unknown(db):
-    c = connect(db)
+def test_trades_by_the_agent_decision_are_counted_without_polluting_unknown(tmp_path):
+    """`arm-agent` 的成交按**当日决策**的条文表单列，且不许落进「表外条文」。
+
+    原判据数的是 `n_trades_by_spec`（P37：条文来自 spec 台账）。D-34 之后这条臂
+    照着**当日那一条操盘决策**下单，于是计数该落在
+    `RULE_CITATIONS_AGENT_DECISION` 上 —— 换的是条文表的来源，不是判据的形状。
+    """
+    path = _fixture_db(tmp_path)
+    _add_agent_decision(path, asof=NEXT, payload={
+        "asof": NEXT, "cash_pct": 90.0, "rationale": "夹具：买 10% 的 510300",
+        "decisions": [{"code": "510300", "side": "buy", "target_weight_pct": 10.0,
+                       "reason": "夹具要造一笔可归因的成交"}]})
+    c = connect(path)
     try:
-        ev = paper_data.ai_evidence(c, LAST)
+        ev = paper_data.ai_evidence(c, NEXT)
+        last = paper_engine.arm_state_for(c, ARM_AGENT, NEXT)
     finally:
         c.close()
     cons = ev["consumption"]
-    assert cons["n_trades_by_spec"] > 0, "夹具里 arm-agent 起跑日应当建仓"
-    assert set(cons["spec_rules"]) <= set(RULE_CITATIONS_AGENT.values())
+    assert cons["n_trades_by_decision"] > 0, "夹具里 AI 臂应当按当日决策建仓"
+    assert set(cons["decision_rules"]) <= set(RULE_CITATIONS_AGENT_DECISION.values())
     assert cons["unknown_rules"] == [], \
-        "spec 条文是**已登记**的，不许当成「表外（模型/插桩）」"
+        "决策条文是**已登记**的，不许当成「表外（模型/插桩）」"
+    assert last["positions"].get("510300"), "决策要真的落到持仓上"
     html = paper_render.ai_block(ev)
-    assert "智能体 spec 臂用上了" in html
+    assert "AI 操盘手用上了" in html
     assert "引用模型预测 0 条、引用插桩脚本 0 条" in html
-    assert "落在 <code>paper/config.RULE_CITATIONS_AGENT</code> 内（智能体 spec）" \
-        in html
+    assert "RULE_CITATIONS_AGENT_DECISION" in html
 
-
-# ---------- 标签 / 线型 / 顺序 ----------
 
 def test_agent_arms_have_their_own_labels_and_styles(db):
     data = _track(db)
     labels = {a["account_id"]: paper_render.arm_label(a) for a in data["arms"]}
-    assert labels[ARM_AGENT] == "AI 智能体臂 · spec 台账"
+    assert labels[ARM_AGENT] == "AI 操盘手 · 每交易日一条决策"
     assert "随机对照" in labels[ARM_AGENT_RANDOM]
+    assert "阶段 3" not in labels[ARM_AGENT_RANDOM], \
+        "阶段 3 的说法已经作废（P52 起它真的下单）"
     styles = {a["account_id"]: paper_render.arm_style(a) for a in data["arms"]}
     assert styles[ARM_AGENT] != paper_render._UNKNOWN_STYLE
     assert styles[ARM_AGENT] != styles[ARM_AGENT_RANDOM], \
@@ -297,4 +347,4 @@ def test_agent_section_has_no_ranking_words(db):
         assert banned not in html
     seg = html.split(SECTION, 1)[1].split("</section>", 1)[0]
     assert re.search(r"不做排名|不排名|并列", html), "「不做排名」这句不能丢"
-    assert "不是「AI 会操盘」" in seg
+    assert "AI 操盘手" in seg

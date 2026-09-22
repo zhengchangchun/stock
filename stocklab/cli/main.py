@@ -36,7 +36,8 @@ from stocklab.store.db import connect
 from stocklab.store.migrate import ensure_schema, init_db
 # `paper/config.py` 是纯常量叶子模块（无 import），在模块级引用它不会成环 ——
 # 这样 `SPEC_ARMS` 不需要在自己内部再抄一遍臂名字面量。
-from stocklab.paper.config import ARM_AGENT, ARM_AGENT_RANDOM
+from stocklab.paper.config import (ARM_AGENT, ARM_AGENT_RANDOM,
+                                  RANDOM_MODEL_ID)
 from stocklab.cli.plugin import (cmd_plugin_approve, cmd_plugin_list,
                                  cmd_plugin_reject, cmd_plugin_sandbox,
                                  cmd_plugin_submit)
@@ -2380,8 +2381,11 @@ EXIT_CONFLICT = 1
 
 def _spec_conflict(arm: str, asof: str, existing: dict, mine: dict) -> int:
     print(json.dumps({
-        "error": f"{arm} 在 {asof} 已有一版 spec —— append-only，本命令不改写历史",
-        "hint": "要么把 --asof 改成一个还没复审过的交易日，要么先把两版的差异读清楚",
+        "error": (f"{arm} 在 {asof} 已经有一行决定了（{existing.get('decision_kind')}）"
+                  f" —— append-only，本命令不改写历史"),
+        "hint": ("要么把 --asof 改成一个还没写过决定的交易日，要么先把两版的差异"
+                 "读清楚。**一天一条**是幂等键本身（UNIQUE(arm, asof)）："
+                 "spec 复审与操盘决策共用这一格"),
         "existing": {"decision_id": existing["decision_id"],
                      "created_at": existing["created_at"],
                      "agent_kind": existing["agent_kind"],
@@ -2474,6 +2478,286 @@ def cmd_paper_spec_set(args: argparse.Namespace) -> int:
                       "n_trials": args.n_trials, "n_rejected": len(rejected),
                       "context_sha256": context_sha256},
                      ensure_ascii=False, sort_keys=True, indent=2))
+    return 0
+
+
+# ---------- AI 操盘手的决策（P52 / D-34） ----------
+
+def _agent_arms_check(conn, arm: str) -> None:
+    """只许在智能体臂上写决策（别的臂的决策文件没人读，写下去就是一张假台账）。"""
+    from stocklab.paper import agent_decide, store
+
+    if arm not in (ARM_AGENT, ARM_AGENT_RANDOM):
+        raise agent_decide.DecisionPayloadError(
+            "arm", arm, f"`paper agent` 只管 {[ARM_AGENT, ARM_AGENT_RANDOM]}"
+                        f"（决策由外部编码 agent 产出，落在这两条臂的台账上）")
+    accounts = {a["account_id"] for a in store.load_accounts(conn)}
+    if arm not in accounts:
+        raise agent_decide.DecisionPayloadError(
+            "arm", arm, f"账户不存在（现有 {sorted(accounts)}）—— 先跑 `paper init`")
+
+
+def _agent_decide_inputs(conn, arm: str, asof: str):
+    """写决策前要拿到的三样东西：账户状态、候选池、可定价的收盘价。"""
+    from stocklab.paper import agent_pool, engine
+
+    state = engine.arm_state_for(conn, arm, asof)
+    pool = agent_pool.pool_snapshot(conn, asof)
+    codes = set(state["positions"]) | set(pool["codes"])
+    marks = {**engine.resolve_marks(conn, codes, asof), **state["marks"]}
+    return state, pool, marks
+
+
+def cmd_paper_agent_decide(args: argparse.Namespace) -> int:
+    """写一条**操盘决策**（D-34）：校验 → 算 PIT 上下文指纹 → 落 append-only 台账。
+
+    幂等：同 `(arm, asof)` 且载荷**逐字节一致** → exit 0、台账仍 1 行；
+    不一致 → exit 1（append-only，本命令不改写历史）。
+    越界（权重和≠100 / 负权重 / 池外 / 缺 reason / 想卖空）→ exit 2，**一行都不写**。
+    """
+    from stocklab.paper import agent_context, agent_decide, agent_spec, store
+
+    conn, code = _paper_conn(args)
+    if conn is None:
+        return code
+    try:
+        _agent_arms_check(conn, args.arm)
+        try:
+            payload = json.loads(Path(args.file).read_text(encoding="utf-8"))
+        except OSError as exc:
+            raise agent_decide.DecisionPayloadError(
+                "--file", args.file, f"读不到决策文件（{exc.strerror}）") from None
+        except json.JSONDecodeError as exc:
+            raise agent_decide.DecisionPayloadError(
+                "--file", args.file, f"不是合法 JSON（{exc.msg}）") from None
+        state, pool, marks = _agent_decide_inputs(conn, args.arm, args.asof)
+        validated = agent_decide.validate_payload(
+            asof=args.asof, payload=payload, pool_codes=set(pool["codes"]),
+            held_qty=state["positions"], marks=marks,
+            total_assets=state["total_assets"])
+        ctx = agent_context.build_decision_context(
+            conn, arm=args.arm, asof=args.asof, pool=pool, cash=state["cash"],
+            positions=state["positions"], marks=marks,
+            total_assets=state["total_assets"])
+        context_sha256 = agent_context.decision_context_sha256(ctx)
+        existing = agent_decide.decision_on(conn, args.arm, args.asof)
+        if existing is not None:
+            same = (agent_decide.canonical_payload(existing["payload"])
+                    == agent_decide.canonical_payload(validated))
+            if not same:
+                return _spec_conflict(args.arm, args.asof, existing, validated)
+            print(json.dumps({"arm": args.arm, "asof": args.asof,
+                              "decision_id": existing["decision_id"],
+                              "status": "已存在且一致（未写入）",
+                              "payload_sha256": agent_decide.payload_sha256(validated),
+                              "context_sha256": existing["context_sha256"]},
+                             ensure_ascii=False, sort_keys=True, indent=2))
+            return 0
+        decision_id = agent_decide.record_portfolio_decision(
+            conn, arm=args.arm, asof=args.asof, payload=validated, pool=pool,
+            agent_kind=args.agent_kind, model_id=args.model_id,
+            prompt_sha256=args.prompt_sha256, seed=args.seed,
+            context_sha256=context_sha256,
+            now=args.now or datetime.now(TZ).isoformat(timespec="seconds"))
+    except agent_decide.DecisionPayloadError as exc:
+        return _paper_fail(exc)
+    except agent_spec.DecisionConflict as exc:
+        return _paper_fail(exc, EXIT_CONFLICT)
+    except agent_spec.SpecViolation as exc:
+        return _paper_fail(exc)
+    finally:
+        conn.close()
+    print(json.dumps({
+        "arm": args.arm, "asof": args.asof, "decision_id": decision_id,
+        "status": "已写入", "n_decisions": len(validated["decisions"]),
+        "sum_weight_pct": validated["sum_weight_pct"],
+        "cash_pct": validated["cash_pct"],
+        "payload_sha256": agent_decide.payload_sha256(validated),
+        "context_sha256": context_sha256,
+        "pool_codes": len(pool["codes"]),
+        "note": "写入口只校验/落库；执行在 `paper step --asof 同一日`"},
+        ensure_ascii=False, sort_keys=True, indent=2))
+    return 0
+
+
+def cmd_paper_agent_random(args: argparse.Namespace) -> int:
+    """给**随机对照臂**生成并落一条决策（种子固定 ⇒ 逐字节可复现）。
+
+    它不是一个「AI 结果」：`model_id = random-control`，载荷由
+    `(arm, asof, seed)` 的 sha256 决定。存在的理由是 D-19 ——
+    没有它，AI 臂的读数分不清「选对了」与「同预算下多试了几次」。
+    """
+    from stocklab.paper import agent_context, agent_decide, agent_spec
+
+    conn, code = _paper_conn(args)
+    if conn is None:
+        return code
+    try:
+        _agent_arms_check(conn, args.arm)
+        state, pool, marks = _agent_decide_inputs(conn, args.arm, args.asof)
+        payload = agent_decide.random_payload(
+            arm=args.arm, asof=args.asof, pool_codes=set(pool["codes"]),
+            held_qty=state["positions"], marks=marks,
+            total_assets=state["total_assets"], seed=args.seed)
+        validated = agent_decide.validate_payload(
+            asof=args.asof, payload=payload, pool_codes=set(pool["codes"]),
+            held_qty=state["positions"], marks=marks,
+            total_assets=state["total_assets"])
+        ctx = agent_context.build_decision_context(
+            conn, arm=args.arm, asof=args.asof, pool=pool, cash=state["cash"],
+            positions=state["positions"], marks=marks,
+            total_assets=state["total_assets"])
+        context_sha256 = agent_context.decision_context_sha256(ctx)
+        existing = agent_decide.decision_on(conn, args.arm, args.asof)
+        if existing is not None:
+            same = (agent_decide.canonical_payload(existing["payload"])
+                    == agent_decide.canonical_payload(validated))
+            if not same:
+                return _spec_conflict(args.arm, args.asof, existing, validated)
+            print(json.dumps({"arm": args.arm, "asof": args.asof,
+                              "decision_id": existing["decision_id"],
+                              "status": "已存在且一致（未写入）",
+                              "seed": args.seed,
+                              "payload_sha256": agent_decide.payload_sha256(validated)},
+                             ensure_ascii=False, sort_keys=True, indent=2))
+            return 0
+        decision_id = agent_decide.record_portfolio_decision(
+            conn, arm=args.arm, asof=args.asof, payload=validated, pool=pool,
+            agent_kind=agent_spec.AGENT_KIND_RANDOM,
+            model_id=RANDOM_MODEL_ID,
+            prompt_sha256=agent_decide.random_prompt_sha256(),
+            seed=args.seed, context_sha256=context_sha256,
+            now=args.now or datetime.now(TZ).isoformat(timespec="seconds"))
+    except agent_decide.DecisionPayloadError as exc:
+        return _paper_fail(exc)
+    except agent_spec.DecisionConflict as exc:
+        return _paper_fail(exc, EXIT_CONFLICT)
+    except agent_spec.SpecViolation as exc:
+        return _paper_fail(exc)
+    finally:
+        conn.close()
+    print(json.dumps({
+        "arm": args.arm, "asof": args.asof, "decision_id": decision_id,
+        "status": "已写入", "seed": args.seed,
+        "n_decisions": len(validated["decisions"]),
+        "cash_pct": validated["cash_pct"],
+        "payload_sha256": agent_decide.payload_sha256(validated),
+        "context_sha256": context_sha256,
+        "note": "随机对照臂：同护栏、同成本，标的与权重由固定种子决定"},
+        ensure_ascii=False, sort_keys=True, indent=2))
+    return 0
+
+
+def cmd_paper_agent_show(args: argparse.Namespace) -> int:
+    """查某一臂的决策台账与对照读数（**离线只读**，直接读库不重算）。"""
+    from stocklab.paper import agent_context, agent_decide, agent_pool, engine, store
+
+    conn, code = _paper_conn(args)
+    if conn is None:
+        return code
+    try:
+        asof = args.asof or _show_today(args)
+        rows = agent_decide.load_decisions(conn, args.arm)
+        portfolio = agent_decide.portfolio_decisions_only(rows)
+        payload = {
+            "arm": args.arm,
+            "asof": asof,
+            "account_exists": any(a["account_id"] == args.arm
+                                  for a in store.load_accounts(conn)),
+            "n_rows": len(rows),
+            "n_decisions": len(portfolio),
+            "decision_on_asof": agent_decide.decision_on(conn, args.arm, asof),
+            "latest_decision": portfolio[-1] if portfolio else None,
+            "pool_on_asof": agent_pool.pool_snapshot(conn, asof),
+            "guardrails": list(agent_context.GUARDRAILS),
+            "delta_vs_random": engine.agent_block(conn, asof)["delta_vs_random"],
+            "delta_vs_random_available": engine.agent_block(
+                conn, asof)["delta_vs_random_available"],
+        }
+    except agent_spec.SpecViolation as exc:
+        conn.close()
+        return _paper_fail(exc)
+    conn.close()
+    print(json.dumps(payload, ensure_ascii=False, sort_keys=True, indent=2))
+    return 0
+
+
+# ---------- 基金净值（P52 / D-36 第三条对照臂） ----------
+
+def cmd_fund_ingest(args: argparse.Namespace) -> int:
+    """把 `pingzhongdata/<code>.js` 落进 `fund_nav_daily`（**只增**）。
+
+    `--file` 读本地文本（离线、测试用）；不给 `--file` 才走 `--fetch` 真实抓取。
+    两者**解析路径完全一致**（同一个 `parse_pingzhongdata`）——
+    否则「离线测过的」与「线上抓的」是两条没被同时验证过的路。
+    """
+    from stocklab.fund import nav as fund_nav
+    from stocklab.paper.config import FUND_NAV_APPROX_NOTE
+
+    db = Path(args.db) if args.db else paths.DB_PATH
+    if not db.exists():
+        print(json.dumps({"error": "db not found; run `stocklab db init`"},
+                         ensure_ascii=False), file=sys.stderr)
+        return 2
+    ensure_schema(db)
+    conn = connect(db)
+    try:
+        if args.file:
+            text = Path(args.file).read_text(encoding="utf-8", errors="replace")
+            source = args.source or fund_nav.SOURCE_EASTMONEY_JS
+        else:
+            try:
+                text = fund_nav.fetch_text(args.code)
+            except Exception as exc:            # 出网失败一律显式报错，不用旧数据顶
+                print(json.dumps({"error": str(exc), "type": type(exc).__name__},
+                                 ensure_ascii=False, sort_keys=True), file=sys.stderr)
+                return 1
+            source = args.source or fund_nav.SOURCE_EASTMONEY_JS
+        points = fund_nav.parse_pingzhongdata(text)
+        written = fund_nav.ingest_points(
+            conn, code=args.code, points=points,
+            now=args.now or datetime.now(TZ).isoformat(timespec="seconds"),
+            source=source)
+    except fund_nav.FundNavError as exc:
+        conn.close()
+        print(json.dumps({"error": str(exc), "type": type(exc).__name__},
+                         ensure_ascii=False, sort_keys=True), file=sys.stderr)
+        return 2
+    conn.close()
+    print(json.dumps({"code": args.code, "parsed": len(points), "written": written,
+                      "source": source,
+                      "first_date": points[0].date if points else None,
+                      "last_date": points[-1].date if points else None},
+                     ensure_ascii=False, sort_keys=True, indent=2))
+    return 0
+
+
+def cmd_fund_show(args: argparse.Namespace) -> int:
+    """基金等权臂的现状（**离线只读**）：各基金已入库的区间 + 等权曲线的可达性。"""
+    from stocklab.fund import nav as fund_nav
+    from stocklab.paper.config import FUND_NAV_APPROX_NOTE
+
+    db = Path(args.db) if args.db else paths.DB_PATH
+    if not db.exists():
+        print(json.dumps({"error": "db not found; run `stocklab db init`"},
+                         ensure_ascii=False), file=sys.stderr)
+        return 2
+    conn = connect(db)
+    try:
+        codes = fund_nav.all_codes(conn)
+        payload = {
+            "asof": args.asof,
+            "table_present": fund_nav.has_table(conn),
+            "pool": [{"code": c, "name": n} for c, n in fund_nav.EQUAL_WEIGHT_POOL],
+            "codes_in_db": codes,
+            "codes_missing": [c for c, _ in fund_nav.EQUAL_WEIGHT_POOL
+                              if c not in codes],
+            "latest_nav_date": fund_nav.latest_nav_date(conn),
+            "approx_note": FUND_NAV_APPROX_NOTE,
+        }
+    finally:
+        conn.close()
+    print(json.dumps(payload, ensure_ascii=False, sort_keys=True, indent=2))
     return 0
 
 
@@ -3140,6 +3424,64 @@ def build_parser() -> argparse.ArgumentParser:
     pps_show.add_argument("--db")
     pps_show.add_argument("--now", help="覆盖当前时刻（测试用）")
     pps_show.set_defaults(func=cmd_paper_spec_show)
+
+    pp_agent = paper_sub.add_parser(
+        "agent", help="AI 操盘手（P52/D-34）：每交易日一条决策，append-only 台账")
+    pp_agent_sub = pp_agent.add_subparsers(dest="agent_action", required=True)
+
+    ppa_decide = pp_agent_sub.add_parser(
+        "decide", help="写一条操盘决策（载荷由**项目外**产出；本命令只校验/落库）")
+    ppa_decide.add_argument("--asof", required=True, help="决策日 YYYY-MM-DD（PIT）")
+    ppa_decide.add_argument("--file", required=True, help="决策 JSON 路径")
+    ppa_decide.add_argument("--arm", default=ARM_AGENT, help=f"目标臂（默认 {ARM_AGENT}）")
+    ppa_decide.add_argument("--model-id", dest="model_id", required=True,
+                            help="产出这条载荷的模型标识（换模型 = 换口径，必填）")
+    ppa_decide.add_argument("--prompt-sha256", dest="prompt_sha256", required=True,
+                            help="提示词（含温度）指纹（换提示词 = 换口径，必填）")
+    ppa_decide.add_argument("--seed", type=int, default=0)
+    ppa_decide.add_argument("--agent-kind", dest="agent_kind", default="llm",
+                            choices=["manual", "llm", "random"])
+    ppa_decide.add_argument("--db")
+    ppa_decide.add_argument("--now", help="覆盖当前时刻（测试/补录用）")
+    ppa_decide.set_defaults(func=cmd_paper_agent_decide)
+
+    ppa_random = pp_agent_sub.add_parser(
+        "random", help="随机对照臂：同护栏同成本，标的与权重由固定种子决定（归因必需）")
+    ppa_random.add_argument("--asof", required=True, help="决策日 YYYY-MM-DD（PIT）")
+    ppa_random.add_argument("--arm", default=ARM_AGENT_RANDOM,
+                            help=f"目标臂（默认 {ARM_AGENT_RANDOM}）")
+    ppa_random.add_argument("--seed", type=int, default=0,
+                            help="随机种子（固定它 ⇒ 逐字节可复现）")
+    ppa_random.add_argument("--db")
+    ppa_random.add_argument("--now", help="覆盖当前时刻（测试/补录用）")
+    ppa_random.set_defaults(func=cmd_paper_agent_random)
+
+    ppa_show = pp_agent_sub.add_parser(
+        "show", help="查决策台账 / 当日候选池 / 护栏 / Δ vs 随机臂（离线只读）")
+    ppa_show.add_argument("--arm", default=ARM_AGENT, help=f"目标臂（默认 {ARM_AGENT}）")
+    ppa_show.add_argument("--asof", help="asof 日期 YYYY-MM-DD（默认今天）")
+    ppa_show.add_argument("--db")
+    ppa_show.add_argument("--now", help="覆盖当前时刻（测试用）")
+    ppa_show.set_defaults(func=cmd_paper_agent_show)
+
+    fund = sub.add_parser(
+        "fund", help="基金日净值（P52/D-36）：非官方源，等权平均臂只比净值曲线")
+    fund_sub = fund.add_subparsers(dest="fund_action", required=True)
+
+    fd_ingest = fund_sub.add_parser(
+        "ingest", help="把 pingzhongdata/<code>.js 落进 fund_nav_daily（append-only）")
+    fd_ingest.add_argument("--code", required=True, help="6 位基金代码，如 110011")
+    fd_ingest.add_argument("--file", help="本地源文本（离线/测试用）")
+    fd_ingest.add_argument("--source", help="来源标签（默认 eastmoney-js）")
+    fd_ingest.add_argument("--db")
+    fd_ingest.add_argument("--now", help="覆盖当前时刻（测试/补录用）")
+    fd_ingest.set_defaults(func=cmd_fund_ingest)
+
+    fd_show = fund_sub.add_parser("show", help="库里基金的区间与等权臂可达性（离线只读）")
+    fd_show.add_argument("--asof", help="asof 日期 YYYY-MM-DD")
+    fd_show.add_argument("--db")
+    fd_show.add_argument("--now", help="覆盖当前时刻（与其余只读子命令同一套参数）")
+    fd_show.set_defaults(func=cmd_fund_show)
 
     chain = sub.add_parser(
         "chain", help="全链路准确率视图（P26）：四段分列，样本不足就明说")
