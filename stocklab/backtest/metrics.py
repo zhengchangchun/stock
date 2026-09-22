@@ -80,6 +80,24 @@ def win_rate(returns) -> float:
     return sum(1 for r in rs if r > 0) / len(rs)
 
 
+def profit_loss_ratio(returns) -> float | None:
+    """盈亏比 = 平均盈利幅度 ÷ 平均亏损幅度（需求 02 §4 的五个指标之一）。
+
+    与 `win_rate` **同域**：吃同一条收益序列、同一批观测 —— 所以两者永远不会
+    一个按日收益算、另一个按别的口径算。零收益日两边都不计入（既不是赢也不是输）。
+
+    **只有赢或只有输时返回 `None`，不返回 0、也不返回 `inf`**：
+    「还没输过」推不出「盈亏比无穷大」，那是样本还没出现亏损，不是比率成立。
+    调用方必须把它当「算不出」显示，而不是当 0 塞进表里。
+    """
+    rs = list(returns)
+    wins = [r for r in rs if r > 0]
+    losses = [r for r in rs if r < 0]
+    if not wins or not losses:
+        return None
+    return (sum(wins) / len(wins)) / abs(sum(losses) / len(losses))
+
+
 def daily_returns(nav_points: list[NavPoint]) -> list[float]:
     navs = [p.nav for p in nav_points]
     return [navs[i] / navs[i - 1] - 1.0 for i in range(1, len(navs))

@@ -3,7 +3,8 @@
 import pytest
 
 from stocklab.backtest.metrics import (buy_and_hold_nav, daily_returns,
-                                       excess_return, summarize, win_rate)
+                                       excess_return, profit_loss_ratio,
+                                       summarize, win_rate)
 from stocklab.backtest.portfolio import NavPoint
 from stocklab.config.costs import CostModel
 from stocklab.data.models import Bar
@@ -51,6 +52,27 @@ def test_excess_return():
 def test_win_rate():
     assert win_rate([0.1, -0.05, 0.2, -0.01]) == pytest.approx(0.5)
     assert win_rate([]) == 0.0
+
+
+def test_profit_loss_ratio():
+    """盈亏比 = 平均盈利 ÷ 平均亏损幅度。零收益日**两边都不算**。"""
+    rs = [0.10, -0.05, 0.03, -0.09, 0.0]
+    assert profit_loss_ratio(rs) == pytest.approx((0.13 / 2) / (0.14 / 2))
+
+
+def test_profit_loss_ratio_is_none_when_one_side_is_absent():
+    """只有赢（或只有输）时**不是** 0、也不是 inf，是「算不出」。"""
+    assert profit_loss_ratio([0.01, 0.02]) is None
+    assert profit_loss_ratio([-0.01, -0.02]) is None
+    assert profit_loss_ratio([0.0, 0.0]) is None
+    assert profit_loss_ratio([]) is None
+
+
+def test_profit_loss_ratio_uses_returns_it_is_given():
+    """与 `win_rate` **同域**：同一条序列、同一批观测，只是问的问题不同。"""
+    rs = [0.04, -0.02]
+    assert win_rate(rs) == pytest.approx(0.5)
+    assert profit_loss_ratio(rs) == pytest.approx(2.0)
 
 
 def test_daily_returns_skips_zero_base():

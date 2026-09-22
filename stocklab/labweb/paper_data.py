@@ -63,6 +63,8 @@ from __future__ import annotations
 import json
 import sqlite3
 
+from stocklab.backtest import metrics as bt
+from stocklab.backtest.portfolio import NavPoint
 from stocklab.paper import agent_spec
 from stocklab.paper import store as paper_store
 from stocklab.paper.config import (ARM_AGENT, ARM_AGENT_RANDOM, ARM_KIND_AGENT,
@@ -72,6 +74,7 @@ from stocklab.paper.engine import INDEX_300_SYMBOL, agent_block, build_report
 from stocklab.plugin import lifecycle as plugin_lifecycle
 from stocklab.plugin import store as plugin_store
 from stocklab.session.review import rolling_accuracy
+from stocklab.verify.report import MIN_DAYS
 
 #: 大盘显示名。指数**不可直接交易**，所以它没有成本 —— 对照时口径偏乐观，
 #: 这句话在报告（`build_report`）与页面上各出现一次，措辞同源。
@@ -256,7 +259,225 @@ def _empty(asof: str, start: str, *, db_missing: bool = False,
             "mirror_equals_hold": None, "real_trades": [],
             "real_trades_after_start": None, "paper_trades": [],
             "ai": ai or {}, "agent": agent or {},
+            "performance": _empty_performance(asof, start=start),
             "disclosure": [], "disclaimer": "", "sample_note": ""}
+
+
+# ---------- 绩效对比（模块2 §4 的五个指标 + 样本量门禁） ----------
+
+#: 需求 02 §4「绩效对比评估模块（固定）」点名的五个指标。**名字与顺序定死** ——
+#: 超出这五个的（Sharpe / Calmar / 波动率）一律不加：需求只点名五个，多出来的
+#: 每个都是「事后换指标救结果」的入口。
+METRIC_KEYS: tuple[str, ...] = ("total_return", "annualized_return",
+                                "max_drawdown", "profit_loss_ratio", "win_rate")
+
+#: 样本量门槛。与 `verify.report.MIN_DAYS` **同源同值**，不另写一个 120
+#: （`trend/evaluate.py` 同一条做法）。
+PERFORMANCE_THRESHOLD: int = MIN_DAYS
+
+#: 门禁没过时的**唯一**措辞（`CLAUDE.md` 度量纪律第 3 条的结构化落地）。
+PERFORMANCE_INSUFFICIENT = "样本不足，仅供观察；不得据此选策略或改口径"
+
+#: 指标中文名。放在数据层是因为 CLI 的文本表与页面表都要用**同一批**列名，
+#: 各写一份必然漂移（页面写「年化」、CLI 写「年化收益」那种）。
+METRIC_LABELS: dict[str, str] = {
+    "total_return": "总收益", "annualized_return": "年化",
+    "max_drawdown": "最大回撤", "profit_loss_ratio": "盈亏比", "win_rate": "胜率",
+}
+
+_KIND_BENCHMARK = "benchmark"
+
+
+def _metrics(values: list[float], *, missing_reason: str | None = None) -> dict:
+    """一条净值（或指数点位）序列 → 五个指标。
+
+    **唯一一处算法**：`total_return` / `max_drawdown` 走 `bt.summarize`，
+    `annualized_return` 走 `bt.annualize`，`win_rate` / `profit_loss_ratio`
+    吃同一批日收益。`paper` 侧不另写公式（需求 02 §4 与任务书 T1 的共同要求）。
+
+    `values` 的第一项是**期初基准**（账户 = `paper_accounts.initial_nav`，
+    基准 = 起跑日的指数收盘），所以 `values` 长度 = 日收益个数 + 1。
+    """
+    if missing_reason is not None or len(values) < 2:
+        reason = missing_reason or "窗口内不足两行净值 —— 算不出收益序列"
+        return {**{k: None for k in METRIC_KEYS},
+                "missing": {k: reason for k in METRIC_KEYS},
+                "n_sessions": (None if missing_reason is not None
+                               else len(values) - 1)}
+
+    points = [NavPoint(str(i), v) for i, v in enumerate(values)]
+    s = bt.summarize(points, values[0])
+    returns = bt.daily_returns(points)
+    plr = bt.profit_loss_ratio(returns)
+    out = {
+        "total_return": s["total_return"],
+        "annualized_return": bt.annualize(s["total_return"], len(returns)),
+        "max_drawdown": s["max_drawdown"],
+        "profit_loss_ratio": plr,
+        "win_rate": bt.win_rate(returns),
+        "missing": {},
+        "n_sessions": len(returns),
+    }
+    if plr is None:
+        out["missing"]["profit_loss_ratio"] = (
+            f"窗口内 {len(returns)} 个日收益里没有亏损日（或没有盈利日）—— "
+            f"盈亏比算不出。**不是 0，也不是无穷大**：分母那一侧还没出现")
+    return out
+
+
+def _empty_performance(asof: str, *, start: str, reason: str | None = None) -> dict:
+    """`available: False` 的绩效块 —— 数字一个都不编，门禁照报。"""
+    return {
+        "asof": asof, "available": False,
+        "reason": reason or (f"`paper_nav_daily` 里没有任何 ≤ {asof} 的净值行 —— "
+                             f"没有净值就没有绩效，本块不拿 0 顶替"),
+        "start_date": start, "window": [start, None],
+        "n_sessions": 0, "n_folds": None,
+        "sample_gate": _sample_gate(0),
+        "metric_keys": list(METRIC_KEYS),
+        "rows": [], "excess_vs_index_300": {}, "excess_vs_hold": {},
+        "notes": [PERFORMANCE_INSUFFICIENT],
+    }
+
+
+def _sample_gate(n_sessions: int) -> dict:
+    """样本量门禁。`n_sessions` 一律是**交易日**数（`CLAUDE.md` 度量纪律第 2 条）。"""
+    ok = n_sessions >= PERFORMANCE_THRESHOLD
+    return {
+        "threshold": PERFORMANCE_THRESHOLD,
+        "n_sessions": n_sessions,
+        "meets": ok,
+        "gate_status": "ok" if ok else "insufficient",
+        "label": "样本充足" if ok else PERFORMANCE_INSUFFICIENT,
+    }
+
+
+def _row_metrics(account: dict, rows: list[dict]) -> dict:
+    """一个账户的五个指标：期初 = `paper_accounts.initial_nav`（不是 0、不是现金）。"""
+    try:
+        initial = float(account["initial_nav"])
+    except (KeyError, TypeError, ValueError):
+        return _metrics([])
+    return _metrics([initial, *[float(r["nav"]) for r in rows]])
+
+
+def performance(conn: sqlite3.Connection, asof: str) -> dict:
+    """模块2 §4 的绩效对比：每臂一行 × 五指标 + 基准一行 + 样本量门禁。
+
+    ## 期初口径
+
+    每条线的期初 = 它**起跑日**的值：账户取 `paper_accounts.initial_nav`
+    （起跑日收盘 mark-to-market 的结果），基准取起跑日 `sh000300` 收盘。
+    五个指标全部由这一条序列推出，所以「总收益 == Π(1+日收益) − 1」恒成立 ——
+    指标集内部只有一套口径。
+
+    ⚠️ **与既有「累计收益」列的已知差异**：`paper_nav_daily.cum_return` 的基是
+    **净入金**（`net_deposits` = `initial_capital`）。起跑日持仓已经浮盈时
+    （实测 2026-09-15：20043 ÷ 20000），两处的「总收益」相差一个**对全部臂相同**
+    的常数因子，排名不变、只有水平线整体平移。任务书 §1 明写期初取 `initial_nav`，
+    故本块从任务书；差异在报告与 ADR-023 里记账，**不靠改口径去对齐**。
+
+    ## 基准
+
+    `sh000300` 与各臂**同一区间、同一交易日轴**，只按精确日期取收盘价。
+    窗口内任一日期缺收盘价 → 该行五个指标全部 `None` + 原因，
+    **绝不用相邻日顶替**（顶替出来的斜率是编的）。
+
+    ## 门禁
+
+    `n_sessions` 是窗口内的交易日数。不足 `threshold`（120）时 `gate_status`
+    为 `insufficient`，措辞在 `label` / `notes` 里 —— 结论性措辞由渲染层同源消费。
+    """
+    accounts = paper_store.load_accounts(conn)
+    start = str(accounts[0]["start_date"]) if accounts else PAPER_START_DATE
+    nav_dates = [str(r["date"]) for r in conn.execute(
+        "SELECT DISTINCT date FROM paper_nav_daily WHERE date <= ? ORDER BY date",
+        (asof,))]
+    if not accounts or not nav_dates:
+        return _empty_performance(asof, start=start)
+
+    n_sessions = len(nav_dates)
+    gate = _sample_gate(n_sessions)
+
+    rows: list[dict] = []
+    for account in accounts:
+        aid = str(account["account_id"])
+        own = paper_store.load_nav(conn, aid, asof=asof)
+        m = _row_metrics(account, own)
+        rows.append({
+            "account_id": aid, "arm": str(account["arm"]),
+            "kind": (_ARM_HOLD if str(account["arm"]) == _ARM_HOLD
+                     else "arm"),
+            "etf_target_pct": account["etf_target_pct"],
+            **{k: m[k] for k in METRIC_KEYS},
+            "n_sessions": m["n_sessions"], "missing": m["missing"],
+        })
+
+    # 基准：与各臂同一条交易日轴。任一日期缺价 → 整行不可判定。
+    # 起跑日**可能**自己就有一行净值（`paper step --asof <起跑日>`）：那时它只能占
+    # 一个位置 —— 重复放进轴里会凭空多出一个 0% 的「交易日」，把基准的
+    # `n_sessions` / 胜率 / 回撤一起带偏（真库与既有夹具都没触发，是潜在错）。
+    axis = [start, *[d for d in nav_dates if d != start]]
+    levels = _index_levels(conn, axis)
+    absent = [d for d in axis if d not in levels]
+    if absent:
+        reason = (f"基准 {INDEX_300_SYMBOL} 在窗口内 {len(absent)} 个日期上"
+                  f"没有收盘价：{'、'.join(absent)} —— 不用相邻日顶替")
+        bench = _metrics([], missing_reason=reason)
+    else:
+        bench = _metrics([levels[d] for d in axis])
+        reason = None
+    rows.append({
+        "account_id": INDEX_300_SYMBOL, "arm": "index",
+        "kind": _KIND_BENCHMARK, "etf_target_pct": None,
+        **{k: bench[k] for k in METRIC_KEYS},
+        "n_sessions": bench["n_sessions"], "missing": bench["missing"],
+    })
+
+    by_id = {r["account_id"]: r for r in rows}
+    idx_ret = by_id[INDEX_300_SYMBOL]["total_return"]
+    hold_row = next((r for r in rows if r["kind"] == _ARM_HOLD), None)
+    hold_ret = hold_row["total_return"] if hold_row is not None else None
+
+    def _excess(base: float | None, *, skip_kind: str) -> dict[str, float | None]:
+        """相对某一类线（基准 / 「不动」臂）的差值 —— 一次减法，不是新口径。
+
+        **不 round**：四舍五入到 6 位会让「差值」≠「两个显示出来的数相减」，
+        而这一段存在的意义正是「它只是一次减法」。显示端自己按位数截。
+        """
+        return {r["account_id"]: (
+            None if r["kind"] == skip_kind or r["total_return"] is None
+            or base is None else r["total_return"] - base)
+            for r in rows}
+
+    excess_idx = _excess(idx_ret, skip_kind=_KIND_BENCHMARK)
+    excess_hold = _excess(hold_ret, skip_kind=_ARM_HOLD)
+
+    notes = [
+        f"窗口 {start} ~ {asof}，共 {n_sessions} 个交易日"
+        f"（净值行数 = 日收益数；横轴另外含起跑日锚点一个点）。",
+        f"期初口径：账户 = `paper_accounts.initial_nav`、基准 = 起跑日 "
+        f"`{INDEX_300_SYMBOL}` 收盘；五个指标全部由这一条序列推出。",
+        "本载荷的 `max_drawdown` 为**负值**（`backtest/metrics` 口径）；"
+        "渲染层按页面既有列的正值口径显示同一个数。",
+    ]
+    if not gate["meets"]:
+        notes.append(f"{PERFORMANCE_INSUFFICIENT}（{n_sessions} < "
+                     f"{PERFORMANCE_THRESHOLD} 个交易日）—— 只给读数："
+                     f"不出任何「谁更好」的结论，也不改口径。")
+    if reason is not None:
+        notes.append(reason)
+
+    return {
+        "asof": asof, "available": True, "reason": None,
+        "start_date": start, "window": [start, nav_dates[-1]],
+        "n_sessions": n_sessions, "n_folds": None,
+        "sample_gate": gate, "metric_keys": list(METRIC_KEYS),
+        "rows": rows,
+        "excess_vs_index_300": excess_idx,
+        "excess_vs_hold": excess_hold,
+        "notes": notes,
+    }
 
 
 def agent_track(conn: sqlite3.Connection, asof: str) -> dict:
@@ -393,6 +614,7 @@ def track(conn: sqlite3.Connection, asof: str) -> dict:
         "paper_trades": _paper_trades(conn, asof),
         "ai": ai,
         "agent": agent,
+        "performance": performance(conn, asof),
         "disclosure": list(report.get("disclosure") or []),
         "disclaimer": report.get("disclaimer", ""),
         "sample_note": report.get("sample_note", ""),

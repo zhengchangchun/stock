@@ -49,6 +49,7 @@ from __future__ import annotations
 
 from typing import Any, Mapping, Sequence
 
+from stocklab.labweb.paper_data import INDEX_LABEL, METRIC_KEYS, METRIC_LABELS
 from stocklab.labweb.render import (cell, esc, glance, glance_html, layout, money,
                                     more, num, ratio_pct, rich, section,
                                     sign_cls)
@@ -764,6 +765,134 @@ def ai_block(ev: Mapping) -> str:
         label="查看详细：产出清单与消费明细")
 
 
+# ---------- 绩效对比（模块2 §4） ----------
+
+#: 「已算出的比率」与「一个比值」两种数在页面上不能长得一样：
+#: 前者是百分数、后者是倍数（`2.0` = 平均赢 2 倍于平均亏）。
+_PLAIN_METRICS = ("profit_loss_ratio",)
+#: 回撤的真源（`backtest/metrics`）是负值；本页既有那一列写的是正值。
+#: 符号是展示约定、不是第二套口径 —— 但同一页上同一个事实只能有一种写法，
+#: 所以这里取绝对值对齐既有列（`test_drawdown_is_shown_with_the_pages_positive_convention`）。
+_NEGATIVE_METRICS = ("max_drawdown",)
+
+
+def _metric_cell(data: Mapping, row: Mapping, key: str) -> str:
+    """一格指标。缺值 → 「未知」+ `title` 里写**为什么**缺（不写裸 `None`）。"""
+    v = row.get(key)
+    reason = (row.get("missing") or {}).get(key)
+    if v is None:
+        inner = UNKNOWN
+    elif key in _PLAIN_METRICS:
+        inner = num(v, 4)
+    elif key in _NEGATIVE_METRICS:
+        inner = ratio_pct(-float(v))
+    else:
+        inner = ratio_pct(float(v))
+    cls = {"total_return": "num", "annualized_return": "num",
+           "max_drawdown": "num", "win_rate": "num",
+           "profit_loss_ratio": "num"}[key]
+    t = f' title="{esc(reason)}"' if reason else ""
+    return f'<td class="{cls}"{t}>{inner}</td>'
+
+
+def _performance_rows(data: Mapping) -> list[str]:
+    """每 arm 一行 + 基准一行。`arm-hold` 明写「不动」，不许被读成 AI 表现。"""
+    out = []
+    excess_idx = data["excess_vs_index_300"]
+    excess_hold = data["excess_vs_hold"]
+    for row in data["rows"]:
+        aid = str(row["account_id"])
+        if row["kind"] == "benchmark":
+            color, dash, _ = _INDEX_STYLE
+            label, sub = INDEX_LABEL, f'<code>{esc(aid)}</code> 收盘'
+            tr_cls = ' class="mut"'
+        else:
+            color, dash, _ = arm_style(row)
+            label = esc(arm_label(row))
+            sub = f'<code>{esc(aid)}</code>'
+            if row["kind"] == "hold":
+                sub += '　<span class="s-warn">不动臂（冻结快照，不是 AI 表现）</span>'
+            tr_cls = ""
+        e_idx, e_hold = excess_idx.get(aid), excess_hold.get(aid)
+        out.append(
+            f'<tr{tr_cls}><td class="l">{_swatch(color, dash)}<b>{label}</b>'
+            f'<div class="note">{sub}</div></td>'
+            + "".join(_metric_cell(data, row, k) for k in data["metric_keys"])
+            + f'<td class="num {sign_cls(e_idx)}">{ratio_pct(e_idx)}</td>'
+            f'<td class="num {sign_cls(e_hold)}">{ratio_pct(e_hold)}</td></tr>')
+    return out
+
+
+def performance_block(data: Mapping) -> str:
+    """「绩效对比（模块2 §4）」一节：五个指标 × 每臂一行 + 基准一行 + 样本量门禁。
+
+    数据**只能**来自 `paper_data.performance`（与 `paper metrics` 同一个函数）——
+    这里一个数都不算，只负责摆。缺值是「未知」，`None` 与 0 在页面上长得不一样。
+    """
+    if not data or not data.get("available"):
+        why = (data or {}).get("reason") or "没有净值数据"
+        gate = (data or {}).get("sample_gate") or {}
+        return (f'<p class="note">{rich(why)}</p>'
+                f'<p class="note">{rich(gate.get("label", ""))}</p>')
+
+    gate = data["sample_gate"]
+    head = ('<tr><th>线</th>'
+            + "".join(f'<th>{esc(METRIC_LABELS[k])}</th>'
+                      for k in data["metric_keys"])
+            + '<th>相对大盘</th><th>相对「不动」</th></tr>')
+    table = (f'<div class="scroll-x"><table class="tbl">{head}'
+             + "".join(_performance_rows(data)) + '</table></div>')
+    return table + glance([f"窗口 {data['window'][0]} ~ {data['asof']}，"
+                           f"{data['n_sessions']} 个交易日"
+                           f"（门槛 {gate['threshold']}）—— {gate['label']}",
+                           "期初：账户取 `paper_accounts.initial_nav`、基准取起跑日"
+                           " `sh000300` 收盘；五个指标由同一条序列推出。"
+                           "回撤按既有列写正值（真源 `backtest/metrics` 是负值）。"])
+
+
+def performance_text(data: Mapping) -> str:
+    """`paper metrics` 的文本表（Markdown）—— 与页面**同一份数据函数**。
+
+    CLI 与页面各写一次渲染是可以的（一个是终端、一个是 HTML），
+    但它们**不许各算一次指标**：入参永远是 `paper_data.performance` 的返回。
+    """
+    if not data or not data.get("available"):
+        return f"# 绩效对比 · {data.get('asof', '')}\n\n{(data or {}).get('reason', '无数据')}\n"
+    gate = data["sample_gate"]
+    L = [f"# 绩效对比（模块2 §4）· {data['asof']}", ""]
+    L.append(f"窗口 {data['window'][0]} ~ {data['window'][1]}，"
+             f"{data['n_sessions']} 个交易日（门槛 {gate['threshold']}）"
+             f"｜{gate['label']}")
+    L.append("")
+    cols = ["线"] + [METRIC_LABELS[k] for k in data["metric_keys"]] + \
+        ["相对大盘", "相对「不动」"]
+    L.append("| " + " | ".join(cols) + " |")
+    L.append("|" + "---|" * len(cols))
+    for row in data["rows"]:
+        aid = str(row["account_id"])
+        name = INDEX_LABEL if row["kind"] == "benchmark" else arm_label(row)
+        if row["kind"] == "hold":
+            name += "（不动臂，不是 AI 表现）"
+        cells = [f"`{aid}` {name}"]
+        for k in data["metric_keys"]:
+            v = row.get(k)
+            if v is None:
+                why = (row.get("missing") or {}).get(k, "缺数据")
+                cells.append(f"未知（{why}）")
+            elif k in _PLAIN_METRICS:
+                cells.append(f"{float(v):.4f}")
+            elif k in _NEGATIVE_METRICS:
+                cells.append(f"{-float(v) * 100:.2f}%")
+            else:
+                cells.append(f"{float(v) * 100:.2f}%")
+        for d in (data["excess_vs_index_300"], data["excess_vs_hold"]):
+            x = d.get(aid)
+            cells.append("未知" if x is None else f"{x * 100:.2f}%")
+        L.append("| " + " | ".join(cells) + " |")
+    L = [*L, "", *[f"> {n}" for n in data["notes"]]]
+    return "\n".join(L) + "\n"
+
+
 def _empty_body(data: Mapping) -> str:
     return (section(
         "还没有模拟盘净值",
@@ -778,6 +907,8 @@ def _empty_body(data: Mapping) -> str:
         note="没有净值行就是没有 —— 本页不拿成本价、也不拿 0 冒充一条曲线。")
     + section("智能体臂（P37）：条文的数字可改", agent_arm_block(data),
               right="台账里的 spec，不是模型信号")
+    + section("绩效对比（模块2 §4）", performance_block(data.get("performance") or {}),
+              right="五个指标 + 样本量门禁")
     + section("AI 自己编排的东西，用上了没有", ai_block(data.get("ai") or {}),
               right="用计数回答"))
 
@@ -838,6 +969,9 @@ def paper_page(data: Mapping, *, base: str, built_at: str) -> str:
                      "所以它那两行没有成本与回撤 —— 与各臂比时口径偏乐观。"),
         section("智能体臂（P37）：条文的数字可改", agent_arm_block(data),
                 right="台账里的 spec，不是模型信号"),
+        section("绩效对比（模块2 §4）",
+                performance_block(data.get("performance") or {}),
+                right="五个指标 + 样本量门禁"),
         section("AI 自己编排的东西，用上了没有", ai_block(data.get("ai") or {}),
                 right="用计数回答"),
         section("这段时间发生了什么", summary,

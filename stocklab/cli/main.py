@@ -2295,6 +2295,49 @@ def cmd_paper_show(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_paper_metrics(args: argparse.Namespace) -> int:
+    """绩效对比（模块2 §4）：五个指标 + 样本量门禁。**离线只读**。
+
+    数字全部来自 `labweb.paper_data.performance` —— 与 `/lab/paper` 新节是
+    **同一个函数**（任务书 T4）：两处各算一遍必然会走样。
+
+    只读：不写任何表、默认不落盘。`--out` 才写文本报告，`--json` 打完整载荷。
+    样本不足时只给读数；结论性措辞由渲染层同源消费（门禁在 `sample_gate` 里）。
+    """
+    from stocklab.labweb import paper_data, paper_render
+    from stocklab.paper import engine
+
+    conn, code = _paper_conn(args)
+    if conn is None:
+        return code
+    try:
+        asof = engine.resolve_show_asof(conn, _show_today(args),
+                                        requested=args.asof)["asof"]
+        payload = paper_data.performance(conn, asof)
+    finally:
+        conn.close()
+    text = paper_render.performance_text(payload)
+    if args.out:
+        path = Path(args.out)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(text, encoding="utf-8")
+    if args.json:
+        print(json.dumps(payload, ensure_ascii=False, sort_keys=True, indent=2))
+        return 0
+    sys.stdout.write(text)
+    gate = payload["sample_gate"]
+    print(json.dumps({"asof": payload["asof"], "report": args.out,
+                      "n_sessions": payload["n_sessions"],
+                      "threshold": gate["threshold"],
+                      "gate_status": gate["gate_status"],
+                      "rows": [{"account_id": r["account_id"],
+                                "total_return": r["total_return"],
+                                "max_drawdown": r["max_drawdown"]}
+                               for r in payload["rows"]]},
+                     ensure_ascii=False, sort_keys=True), file=sys.stderr)
+    return 0
+
+
 # ---------- 智能体动态编排臂的 spec（P37） ----------
 
 #: `paper spec` 只许管这两个账户：spec 是**这两个臂**的条文来源。
@@ -3020,6 +3063,17 @@ def build_parser() -> argparse.ArgumentParser:
     pp_show.add_argument("--db")
     pp_show.add_argument("--now", help="覆盖当前时刻（测试用）")
     pp_show.set_defaults(func=cmd_paper_show)
+
+    pp_metrics = paper_sub.add_parser(
+        "metrics", help="绩效对比（模块2 §4）：五指标 + 样本量门禁（离线只读）")
+    pp_metrics.add_argument("--asof",
+                            help="asof 日期 YYYY-MM-DD（默认今天；今天无净值则回落最新）")
+    pp_metrics.add_argument("--db")
+    pp_metrics.add_argument("--now", help="覆盖当前时刻（测试用）")
+    pp_metrics.add_argument("--json", action="store_true",
+                            help="把整份载荷打到 stdout（默认打文本表）")
+    pp_metrics.add_argument("--out", help="文本报告落盘路径（默认不落盘）")
+    pp_metrics.set_defaults(func=cmd_paper_metrics)
 
     pp_spec = paper_sub.add_parser(
         "spec", help="智能体动态编排臂（P37）的条文 spec：只增台账，不覆盖")
