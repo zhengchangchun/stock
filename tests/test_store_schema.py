@@ -31,6 +31,8 @@ EXPECTED_TABLES = {
     "validation_cycles",               # P44：模块2 验证周期台账（append-only）
     "validation_rounds",               # P44：逐轮观测（append-only，UNIQUE(cycle_id,round_no)）
     "validation_events",               # P44：熔断/冻结/解冻事件（append-only）
+    "m2_channel_runs",                 # P47：通路运行台账（append-only，ran 部分唯一）
+    "m2_forecasts",                    # P47：A3/B1 插桩预测（append-only，(账户,日,标的) 唯一）
 }
 
 

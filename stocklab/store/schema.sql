@@ -1072,3 +1072,99 @@ BEGIN SELECT RAISE(ABORT, 'validation_events is append-only'); END;
 CREATE TRIGGER IF NOT EXISTS trg_validation_events_no_delete
 BEFORE DELETE ON validation_events
 BEGIN SELECT RAISE(ABORT, 'validation_events is append-only'); END;
+
+-- ---------- 模块2 双通路运行台账（P47，append-only）----------
+-- 一次「跑通路」= 一行：这条通路在这个账户、这个 `asof` 上**做了什么**。
+-- 三件事只有这张表回答得了：
+--   ① 「跳过」与「没跑」的区别（T7：缺当日 K 线 → 跳过并留痕，不许用前值顶）；
+--   ② 「拒绝」的原因（T6：契约越界 → 不下单，但拒绝理由要留事件）；
+--   ③ 「这一天是哪几版插桩跑出来的」（plugins_json：plugin_id → script_id/version/sha）。
+--
+-- 状态列只有三个值。**「已存在」不是状态**：同 `(channel, account_id, asof)` 重放时
+-- 通路**一个字节都不写**（连台账行都不写）—— 那才是幂等，而不是把它记成一次
+-- 「跑过了但没做事」。**零写入不需要留痕，因为幂等判据本身就在净值表里看得见。**
+--
+-- `reason` 不许为空：留痕的意义就是它。`ran` 也写摘要，不是空串。
+CREATE TABLE IF NOT EXISTS m2_channel_runs (
+    run_id       INTEGER PRIMARY KEY AUTOINCREMENT,
+    channel      TEXT NOT NULL CHECK (channel IN ('A','B')),
+    account_id   TEXT NOT NULL,
+    asof         TEXT NOT NULL,
+    status       TEXT NOT NULL CHECK (status IN ('ran','skipped','rejected')),
+    reason       TEXT NOT NULL,
+    -- plugin_id → {script_id, version, source_sha256}（append-only 版本溯源）
+    plugins_json TEXT NOT NULL DEFAULT '{}',
+    n_orders     INTEGER NOT NULL DEFAULT 0,
+    detail_json  TEXT NOT NULL DEFAULT '{}',
+    created_at   TEXT NOT NULL
+);
+
+-- **部分唯一索引**：同一 `(通路, 账户, 日)` 只许有一条 `ran`。
+-- 不能对整表加 UNIQUE —— 那会让「今天缺 K 线跳过」永久占住这一格，
+-- 数据补齐后连一次成功的运行都写不进来（而这正是 T7 要留痕的那种情形）。
+-- 结构性防线仍然在：`ran` 那一格只能被占一次（与其它 append-only 表同款思路：
+-- 结构性防线优先于代码检查）。
+CREATE UNIQUE INDEX IF NOT EXISTS uq_m2_channel_runs_ran
+    ON m2_channel_runs (channel, account_id, asof) WHERE status = 'ran';
+
+CREATE INDEX IF NOT EXISTS idx_m2_channel_runs_asof
+    ON m2_channel_runs (asof, channel, account_id);
+
+CREATE TRIGGER IF NOT EXISTS trg_m2_channel_runs_no_update
+BEFORE UPDATE ON m2_channel_runs
+BEGIN SELECT RAISE(ABORT, 'm2_channel_runs is append-only'); END;
+
+CREATE TRIGGER IF NOT EXISTS trg_m2_channel_runs_no_delete
+BEFORE DELETE ON m2_channel_runs
+BEGIN SELECT RAISE(ABORT, 'm2_channel_runs is append-only'); END;
+
+-- ---------- 模块2 插桩预测（A3 / B1，append-only）----------
+-- 口径（P47 §6.1 的归属规则）：**模块2 的两支预测插桩只写这张表**，
+-- `predictions` 表只装 `predict` 管线的产出。分开的理由不是洁癖：
+-- `predictions` 的红线基线按 `model_version` **分列**，拿插桩版本当
+-- `model_version` 会污染那套分列；而 `verifications` 用 `pred_id` 外键，
+-- 混进去会把模块2 的插桩预测卷进「模型准确率」的统计里（D-30 的口径分工）。
+--
+-- 列名沿用 `predictions` 的**落库列名**（`range_lo/range_hi`、`direction_*`），
+-- 而不是契约里的字段名（`range_80` / `direction`）—— 两套名字是既有分工：
+-- 契约名是 `predict/model.py::CONTRACT_FIELDS` 的真源，列名是 `payload_to_row`
+-- 的落库约定（见 `plugin/contract.py` 的 m2 段注释）。这里跟落库列名走。
+--
+-- `script_id` / `script_version` / `input_sha256` 是**溯源三件套**：
+-- 这一行是哪一版插桩、在什么输入（PIT 上下文指纹）上算出来的。缺了它们，
+-- 事后读这一行的人回答不了「当时那一版脚本是不是已经换了」。
+CREATE TABLE IF NOT EXISTS m2_forecasts (
+    forecast_id     INTEGER PRIMARY KEY AUTOINCREMENT,
+    plugin_id       TEXT NOT NULL CHECK (plugin_id IN ('m2_a3','m2_b1')),
+    channel         TEXT NOT NULL CHECK (channel IN ('A','B')),
+    account_id      TEXT NOT NULL,
+    asof_date       TEXT NOT NULL,
+    code            TEXT NOT NULL,
+    range_lo        REAL,
+    range_hi        REAL,
+    direction_up    REAL,
+    direction_flat  REAL,
+    direction_down  REAL,
+    invalidate_if   TEXT,
+    na_reasons_json TEXT NOT NULL DEFAULT '[]',
+    schema_version  TEXT NOT NULL,
+    script_id       INTEGER NOT NULL,
+    script_version  TEXT NOT NULL,
+    input_sha256    TEXT NOT NULL,
+    created_at      TEXT NOT NULL,
+    -- 幂等键 = (账户, 决策日, 标的)。同一天同一标的只许一条预测 ——
+    -- 补跑不许静默覆盖（改口径要升 `script_version`，与 predictions 要改就升
+    -- `model_version` 同款纪律）。
+    UNIQUE (account_id, asof_date, code)
+);
+
+CREATE INDEX IF NOT EXISTS idx_m2_forecasts_asof
+    ON m2_forecasts (asof_date, account_id, code);
+
+CREATE TRIGGER IF NOT EXISTS trg_m2_forecasts_no_update
+BEFORE UPDATE ON m2_forecasts
+BEGIN SELECT RAISE(ABORT, 'm2_forecasts is append-only'); END;
+
+CREATE TRIGGER IF NOT EXISTS trg_m2_forecasts_no_delete
+BEFORE DELETE ON m2_forecasts
+BEGIN SELECT RAISE(ABORT, 'm2_forecasts is append-only'); END;

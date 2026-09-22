@@ -2989,6 +2989,111 @@ def cmd_ops_schedule(args: argparse.Namespace) -> int:
     return 0 if ok else 1
 
 
+# ---------- 模块2 双通路（P47） ----------
+
+#: 通路运行的退出码。**跳过不是成功**（ERROR_DIARY #54：一步都没跑成的链报绿码，
+#: 「没跑完」与「跑完了都成功」在返回值上不可区分）。所以：
+#:   `ran` / `already` → 0；`skipped` → 3（等数据）；`rejected` → 4（要人看）。
+EXIT_SKIPPED = 3
+EXIT_REJECTED = 4
+
+
+def _m2_conn(args):
+    """打开库并确认模块2 的两张表已前滚；返回 `(conn, None)` 或 `(None, 退出码)`。"""
+    conn, code = _paper_conn(args)
+    if conn is None:
+        return None, code
+    has = conn.execute(
+        "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name IN"
+        " ('m2_channel_runs','m2_forecasts')").fetchone()[0]
+    if has < 2:
+        conn.close()
+        print(json.dumps({"error": "模块2 的表不存在 —— 先跑 `stocklab db init` 前滚 schema"},
+                         ensure_ascii=False), file=sys.stderr)
+        return None, 2
+    return conn, None
+
+
+def _m2_exit(result: dict) -> int:
+    status = result.get("status")
+    if status in ("ran", "already"):
+        return 0
+    if status == "skipped":
+        return EXIT_SKIPPED
+    return EXIT_REJECTED
+
+
+def cmd_m2_account_init(args: argparse.Namespace) -> int:
+    """建一个策略版本的账户（`arm-agent-<策略版本>`）：D-26 的资金隔离单元。"""
+    from stocklab.m2 import channel_a
+
+    conn, code = _m2_conn(args)
+    if conn is None:
+        return code
+    try:
+        out = channel_a.create_account(
+            conn, strategy_version=args.strategy_version,
+            now=args.now or datetime.now(TZ).isoformat(timespec="seconds"))
+    except (channel_a.config.ChannelReject, channel_a.config.StrategyVersionError) as exc:
+        return _paper_fail(exc)
+    finally:
+        conn.close()
+    print(json.dumps(out, ensure_ascii=False, sort_keys=True, indent=2))
+    return 0
+
+
+def cmd_m2_channel_run(args: argparse.Namespace) -> int:
+    """跑通路 A 或 B 的一天（幂等；跳过与拒绝都留痕，退出码分开）。"""
+    from stocklab.m2 import channel_a, channel_b
+
+    conn, code = _m2_conn(args)
+    if conn is None:
+        return code
+    now = args.now or datetime.now(TZ).isoformat(timespec="seconds")
+    try:
+        if args.channel == "a":
+            if not args.strategy_version:
+                print(json.dumps({"error": "通路 A 必须给 --strategy-version（账户 = "
+                                           "arm-agent-<策略版本>，D-35）"},
+                                 ensure_ascii=False), file=sys.stderr)
+                return 2
+            out = channel_a.run(conn, asof=args.asof,
+                                strategy_version=args.strategy_version, now=now)
+        else:
+            out = channel_b.run(conn, asof=args.asof, now=now)
+    except channel_a.config.StrategyVersionError as exc:
+        return _paper_fail(exc)
+    finally:
+        conn.close()
+    print(json.dumps(out, ensure_ascii=False, sort_keys=True, indent=2))
+    return _m2_exit(out)
+
+
+def cmd_m2_runs(args: argparse.Namespace) -> int:
+    """查通路运行台账（只读；`skipped` / `rejected` 的原因都在 reason 里）。"""
+    from stocklab.m2 import store as m2_store
+
+    conn, code = _m2_conn(args)
+    if conn is None:
+        return code
+    try:
+        rows = m2_store.list_runs(
+            conn, channel=(args.channel.upper() if args.channel else None),
+            asof=args.asof)
+        forecasts = m2_store.list_forecasts(conn, asof=args.asof)
+    finally:
+        conn.close()
+    print(json.dumps({"runs": rows,
+                      "n_runs": len(rows),
+                      "n_forecasts": len(forecasts),
+                      "forecast_counts": {
+                          pid: sum(1 for f in forecasts if f["plugin_id"] == pid)
+                          for pid in sorted({str(f["plugin_id"])
+                                             for f in forecasts})}},
+                     ensure_ascii=False, sort_keys=True, indent=2))
+    return 0
+
+
 # ---------- parser ----------
 
 def build_parser() -> argparse.ArgumentParser:
@@ -3704,6 +3809,40 @@ def build_parser() -> argparse.ArgumentParser:
     cand_run.add_argument("--now", help="覆盖当前时刻（测试用）")
     cand_run.add_argument("--db")
     cand_run.set_defaults(func=cmd_candidate_run)
+
+    m2 = sub.add_parser(
+        "m2", help="模块2 双通路（P47）：通路 A 纯模拟 / 通路 B 人工镜像")
+    m2_sub = m2.add_subparsers(dest="m2_action", required=True)
+
+    m2_acct = m2_sub.add_parser(
+        "account", help="通路 A 的策略版本账户（每版本一行 + 独立 NAV，D-26）")
+    m2_acct_sub = m2_acct.add_subparsers(dest="m2_account_action", required=True)
+    m2_acct_init = m2_acct_sub.add_parser(
+        "init", help="建 `arm-agent-<策略版本>`（幂等；起跑口径从 arm-hold 派生）")
+    m2_acct_init.add_argument("--strategy-version", dest="strategy_version",
+                              required=True, help="策略版本，如 v1 / a1a2a3-v1")
+    m2_acct_init.add_argument("--db")
+    m2_acct_init.add_argument("--now", help="覆盖当前时刻（测试用）")
+    m2_acct_init.set_defaults(func=cmd_m2_account_init)
+
+    m2_ch = m2_sub.add_parser("channel", help="跑通路的一天（幂等；跳过/拒绝分开留痕）")
+    m2_ch_sub = m2_ch.add_subparsers(dest="channel", required=True)
+    for name, help_text in (("a", "通路 A：A1 选股 → 模拟买入 → A2 → A3（纯模拟）"),
+                            ("b", "通路 B：人工流水 → 镜像复刻（arm-now）→ B1")):
+        node = m2_ch_sub.add_parser(name, help=help_text)
+        node.add_argument("--asof", required=True, help="决策日 YYYY-MM-DD（PIT）")
+        if name == "a":
+            node.add_argument("--strategy-version", dest="strategy_version",
+                              required=True, help="策略版本（账户 = arm-agent-<版本>）")
+        node.add_argument("--db")
+        node.add_argument("--now", help="覆盖当前时刻（测试/补录用）")
+        node.set_defaults(func=cmd_m2_channel_run)
+
+    m2_runs = m2_sub.add_parser("runs", help="查通路运行台账与预测条数（只读）")
+    m2_runs.add_argument("--channel", choices=["a", "b"], help="只看某条通路")
+    m2_runs.add_argument("--asof", help="只看某一天 YYYY-MM-DD")
+    m2_runs.add_argument("--db")
+    m2_runs.set_defaults(func=cmd_m2_runs)
 
     return parser
 

@@ -83,6 +83,13 @@ FEATURE_KEYS: tuple[str, ...] = (
 #: ⏳ `candidates` / `holdings` / `cash` 是模块2 通路（P46）的输入形状，
 #: 这里先给**空形状**占位。P46 定稿 ctx 时必须回来核对：键名对不上就等于
 #: 探针在拿一份不存在的契约认证脚本。
+#:
+#: ✅ **P47 已核对**（这次核对的结果就长在下面）：模块2 的 ctx 由
+#: `stocklab/m2/context.py::channel_ctx` 构造，顶层键与这里**逐一对齐**
+#: （`tests/test_m2_channel_a.py::test_probe_ctx_keys_cover_the_real_ctx` 钉住）。
+#: `candidates` / `holdings` 仍留空列表：探针的职责是「结构完整但**无数据**」，
+#: 而它们的**有数据形状**（每一项是一份 `build_ctx` 产物 + 池内评分/持仓字段）
+#: 在 `m2/context.py` 里定义 —— 把样例数据塞进探针会让「无数据分支」不再被走到。
 PROBE_CTX: dict = {
     "code": "__probe__",
     "name": "__probe__",
@@ -98,8 +105,21 @@ PROBE_CTX: dict = {
     # 现金给 `None` 而不是 0.0 —— 探针**没有**账户数据，「不知道」≠「没钱」
     # （规则 4；同理 `raw_score=0.0` 是既有约定：探针确实算得出 0 分）。
     "candidates": {"short": [], "mid": [], "long": []},
+    "candidates_excluded": {},
+    "candidate_pool": {"asof": "1970-01-01", "available": False, "pools": {},
+                       "codes": [], "missing_pools": ["short", "mid", "long"],
+                       "reason": "探针：没有候选池数据"},
     "holdings": [],
     "cash": None,
+    "channel": "__probe__",
+    "account_id": "__probe__",
+    "total_assets": None,
+    "focus": None,
+    "marks": {},
+    "index_300": None,
+    "guardrails": [],
+    "disclosure": [],
+    "non_goals": [],
     "features": {
         "period": None,
         "roe": None, "roe_pct": None, "roe_n": 0,

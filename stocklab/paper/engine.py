@@ -63,6 +63,7 @@ from stocklab.paper.config import (
     DISCIPLINE_PREFIX,
     ETF_TRANCHES,
     ETF_WHITELIST,
+    EXECUTOR_KEY,
     HOLD_CODE,
     HOLD_QTY,
     INITIAL_CAPITAL,
@@ -256,8 +257,15 @@ def _ledger_arm_state(conn: sqlite3.Connection, account: dict, asof: str) -> dic
             "net_deposits": float(json.loads(account["params_json"])["initial_capital"])}
 
 
-def _mark_to_market(positions: dict[str, int],
-                    marks: dict[str, Price]) -> tuple[float, list[dict]]:
+def mark_to_market(positions: dict[str, int],
+                   marks: dict[str, Price]) -> tuple[float, list[dict]]:
+    """持仓市值。**这是净值口径的唯一实现** —— 模块2 的通路（`m2/`）也调它。
+
+    公开而不是下划线私有：通路 A/B 已经要用同一口径算净值（D-25/D-30 的
+    「一切复用 paper 引擎」），而「从别的包调私有函数」这种耦合没有测试能拦住 ——
+    与其让下一条通路偷偷抄一份，不如把入口正名。
+    取不到价 → `MissingPriceError`（**不用成本价冒充现价**：那会把浮亏恒显示成 0）。
+    """
     mv, out = 0.0, []
     for code in sorted(positions):
         qty = positions[code]
@@ -272,12 +280,29 @@ def _mark_to_market(positions: dict[str, int],
     return round(mv, 4), out
 
 
-def _drawdown(history: list[float], nav: float) -> float:
-    """相对**历史峰值**的回撤（正数 = 回撤幅度）。首行峰值即自身 → 0。"""
+def drawdown(history: list[float], nav: float) -> float:
+    """相对**历史峰值**的回撤（正数 = 回撤幅度）。首行峰值即自身 → 0。
+
+    与 `mark_to_market` 同理公开：回撤是净值的一部分口径，不许有第二份实现。
+    """
     peak = max([*history, nav]) if history else nav
     if peak <= 0:
         return 0.0
     return round((peak - nav) / peak, 6)
+
+
+def external_executor(account: dict) -> str | None:
+    """这条账户的日终净值由**外部通路**认领吗？（非空 = 是，返回执行者名）
+
+    P47 / D-35：模块2 通路 A 的账户（`arm-agent-<策略版本>`）由 A1/A2/A3 插桩驱动，
+    它**不进** `paper step` 的遍历 —— 否则 `paper step` 会先给它写一条「没有成交的
+    净值」，而 `step` 的幂等判据正是净值行的存在性，于是那条策略**永远不下单**。
+
+    「谁落这一天的净值」因此是一个**显式字段**，不靠账户名前缀猜：
+    前缀猜法会让 `arm-agent-v1` 与 `arm-agent` 这种只差后缀的命名各走一条路，
+    而改名字的那天没人会记得同步这条判据。
+    """
+    return json.loads(account["params_json"]).get(EXECUTOR_KEY) or None
 
 
 # ---------- init ----------
@@ -584,9 +609,53 @@ def step(conn: sqlite3.Connection, asof: str, *, now: str,
     return state_payload(conn, asof)
 
 
+def step_account(conn: sqlite3.Connection, account_id: str, asof: str, *,
+                 now: str, prices: dict[str, Price] | None = None) -> dict:
+    """只推进**一个**账户的一天（模块2 通路 B 的镜像用，P47）。
+
+    与 `step` 共用 `_step_all` 的**同一段实现** —— D-25 明令镜像「不新建第二套
+    镜像代码」：通路 B 的净值必须与 `arm-now` 逐字段相同，所以它只能是同一个函数，
+    不能是「照着它写的那一份」。
+
+    只允许推进 `arm-now`（实盘账本镜像）与「自身成交驱动」的臂：拿这个入口去推
+    `arm-hold` 或 `arm-discipline-*` 等于绕过 `step` 的整批语义，
+    而调用方多半是想「只跑这一条」—— 那属于另一条口径，应当显式写出来。
+
+    幂等仍由 `_step_all` 的 `nav_exists` 判据承担；返回值里的 `wrote_nav` 让调用方
+    能分清「这次真写了」与「早就有了」（两者都不能靠猜）。
+    """
+    account = next((a for a in store.load_accounts(conn)
+                    if a["account_id"] == account_id), None)
+    if account is None:
+        raise PaperError(f"账户 {account_id} 不存在；先跑 `paper init`")
+    if account["arm"] != ARM_KIND_NOW and not replays_own_trades(account):
+        raise PaperError(
+            f"账户 {account_id} 的臂是 {account['arm']!r} —— `step_account` 只推进"
+            f"实盘账本镜像与自身成交驱动的臂（{ARM_KIND_NOW} / "
+            f"{list(ARM_KINDS_SELF_DRIVEN)}）")
+    if asof < account["start_date"]:
+        raise PaperError(f"asof {asof} 早于 {account_id} 的起跑日 "
+                         f"{account['start_date']} —— 起跑日之前不记净值")
+    if prices is not None:
+        check_no_lookahead(asof, prices)
+    existed = store.nav_exists(conn, account_id, asof)
+    with transaction(conn):
+        _step_all(conn, asof, accounts=[account], now=now, prices=prices)
+    return {"account_id": account_id, "asof": asof,
+            "wrote_nav": (not existed) and store.nav_exists(conn, account_id, asof),
+            "nav": (store.latest_nav(conn, account_id, asof=asof) or {}).get("nav")}
+
+
 def _step_all(conn: sqlite3.Connection, asof: str, *, accounts: list[dict],
               now: str, prices: dict[str, Price] | None) -> None:
     for account in accounts:
+        # 外部通路（模块2 通路 A）认领的账户：它的日终由那条通路自己落，
+        # 本引擎**让出**这一格。理由见 `external_executor`——不让出会让那条
+        # 策略永远不下单，而症状出现在净值表上，排查方向会跑到订单生成上去。
+        # 跳过是**显式**的（账户行里写着 `executor`），所以 `paper show` 里
+        # 仍然能看到这条账户（它有净值行），不是「悄悄消失」。
+        if external_executor(account):
+            continue
         if store.nav_exists(conn, account["account_id"], asof):
             continue
         state = _arm_state(conn, account, asof)
@@ -609,7 +678,7 @@ def _step_all(conn: sqlite3.Connection, asof: str, *, accounts: list[dict],
         if missing:
             raise MissingPriceError(f"持仓/决策标的缺少 {asof} 及之前的收盘价：{missing}")
         cash, positions = state["cash"], dict(state["positions"])
-        mv, _ = _mark_to_market(positions, marks)
+        mv, _ = mark_to_market(positions, marks)
         total = round(cash + mv, 4)
         orders: list[Decision] = []
         if decision is not None and decision_codes:
@@ -629,7 +698,7 @@ def _step_all(conn: sqlite3.Connection, asof: str, *, accounts: list[dict],
         for d in orders:
             store.insert_trade(conn, account_id=account["account_id"], date=asof,
                                decision=d, now=now, commit=False)
-        mv, _marks = _mark_to_market(positions, marks)
+        mv, _marks = mark_to_market(positions, marks)
         nav = round(cash + mv, 4)
         history = [r["nav"] for r in store.load_nav(conn, account["account_id"],
                                                     asof=asof)]
@@ -641,7 +710,7 @@ def _step_all(conn: sqlite3.Connection, asof: str, *, accounts: list[dict],
         store.insert_nav(
             conn, account_id=account["account_id"], date=asof, cash=round(cash, 4),
             positions=[{"code": c, "qty": q} for c, q in sorted(positions.items())],
-            market_value=mv, nav=nav, drawdown=_drawdown(history, nav),
+            market_value=mv, nav=nav, drawdown=drawdown(history, nav),
             cum_cost=round(cum_cost, 4),
             cum_return=round(nav / state["net_deposits"] - 1.0, 6)
             if state["net_deposits"] else 0.0,
@@ -780,7 +849,7 @@ def arm_state_for(conn: sqlite3.Connection, arm: str, asof: str) -> dict | None:
         return None
     state = _arm_state(conn, account, asof)
     marks = resolve_marks(conn, set(state["positions"]), asof)
-    mv, _ = _mark_to_market(state["positions"], marks)
+    mv, _ = mark_to_market(state["positions"], marks)
     return {
         "account_id": arm, "arm": account["arm"],
         "cash": state["cash"], "positions": dict(state["positions"]),

@@ -75,6 +75,12 @@ RULE_CITATIONS: dict[str, str] = {
 ARM_AGENT: str = "arm-agent"
 ARM_AGENT_RANDOM: str = "arm-agent-random"
 
+#: `paper_accounts.params_json` 里的**执行者声明**（P47 / D-35）。
+#: 值非空 ⇒ 该账户的日终净值由**外部通路**认领（模块2 通路 A 的 `arm-agent-<版本>`），
+#: `paper step` 让出它。见 `engine.external_executor` 与 `m2/config.py`。
+#: 键名放在这里而不是 `m2/` 里：`paper/` 不许 import 模块2（方向是 m2 → paper）。
+EXECUTOR_KEY: str = "executor"
+
 #: `paper_accounts.arm` 的取值（与 `store/schema.sql` 的 CHECK **同文**，改一处须同步）。
 ARM_KIND_HOLD: str = "hold"
 ARM_KIND_NOW: str = "now"
