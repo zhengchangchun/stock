@@ -26,6 +26,7 @@ EXPECTED_TABLES = {
     "candidate_members",               # P插桩：候选池成员（append-only）
     "candidate_rejects",               # P插桩：候选池淘汰记录（append-only）
     "financial_reports",               # 财报采集层（PIT 公告日锚，append-only）
+    "paper_agent_decisions",           # P37：智能体臂 spec 台账（append-only，UNIQUE(arm,asof)）
 }
 
 

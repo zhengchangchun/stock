@@ -53,8 +53,94 @@ C_NO_ADD = "no_add_above_87"             # 现价 ≥87.00 禁补仓
 C_WHITELIST = "diversifier_whitelist"    # 分散工具白名单
 C_NO_PRICE = "missing_price"             # 取不到价格 → 不判定
 C_NO_LINES = "no_discipline_lines"       # 该标的没配纪律线 → 不拿别人的线量它
+C_STOP_OFF = "stop_loss_off_by_spec"      # 止损按 spec 关闭（只可能出现在 arm-agent*）
 
 _EPS = 1e-9
+
+
+@dataclass(frozen=True)
+class RuleParams:
+    """一次决策用到的**全部可参数化条文**。默认值 = 写死条文（静态三臂口径）。
+
+    ## 为什么默认值必须逐字等于现有常量
+
+    这张 dataclass 存在的唯一理由是让 `arm-agent` 与静态臂**共用同一个执行内核**
+    （设计 §4.3：不许复制规则代码）。既然共用，静态臂就必须走「默认参数」这条路径 ——
+    否则两套参数各跑各的，迟早漂移，而漂移是静默的：净值只是「有点不一样」。
+
+    - 默认值一律引用 `paper/config.py` / `portfolio/discipline.py` 的**现值**，
+      不在本模块抄字面量（`test_static_params_are_the_written_rules` 逐字段对表）；
+    - `STATIC_PARAMS` 是那个默认实例，也是 `plan_*` 的默认参数；
+    - 静态臂「零变化」的最终证据是 `paper show` 的逐字节对拍（任务书 T3）。
+
+    ## 条文表为什么不放进默认值
+
+    `citations` 默认空元组 = 用模块级 `RULE_CITATIONS`。把 dict 塞成默认值会让
+    这个 frozen dataclass 不可哈希（`replace()` 与相等比较都要用它）；
+    空元组表示「没覆盖」，语义上也更准。
+    """
+
+    #: ETF 目标占比。`None` = 本账户不做分散建仓（`arm-hold` / `arm-now`）。
+    etf_target_pct: float | None = None
+    whitelist: tuple[str, ...] = ETF_WHITELIST
+    single_position_max_pct: float = DISCIPLINE["single_position_max_pct"]
+    cash_floor_pct: float = DISCIPLINE["cash_band_pct"][0]
+    per_step_cash_pct: float = PER_STEP_CASH_PCT
+    order_target_amount: float = ORDER_TARGET_AMOUNT
+    lot: int = LOT
+    #: 止损线（**绝对价**）。`None` ⇒ 用 `lines_for(code)` 的线（静态臂走这条）。
+    stop_loss_line: float | None = None
+    #: `False` ⇒ 不判止损。只有 spec 的 `stop_loss_pct="off"` 会关掉它。
+    stop_loss_enabled: bool = True
+    #: 条文表覆盖（`()` ⇒ 用 `RULE_CITATIONS`，即写死条文）。
+    citations: tuple[tuple[str, str], ...] = ()
+    #: 溯源标签（spec 指纹），只有 `arm-agent*` 非空；为空则 reason 一字不改。
+    spec_tag: str = ""
+
+    def cite(self, key: str) -> str:
+        """条文原文：有覆盖就用覆盖的，否则用写死条文。"""
+        for k, text in self.citations:
+            if k == key:
+                return text
+        return RULE_CITATIONS[key]
+
+    def cash_floor_code(self) -> str:
+        """现金下限的约束代号**带着那个百分数**：换了下限就必须换代号。
+
+        硬用 `C_CASH_FLOOR`（`cash_band_floor_45pct`）去标一条 50% 的下限，
+        等于在 append-only 的 `binding_json` 里写下一句假话 —— 以后统计
+        「45% 那条下限 bind 过几次」就会把 50% 的单子也算进去。
+        """
+        if self.cash_floor_pct == DISCIPLINE["cash_band_pct"][0]:
+            return C_CASH_FLOOR
+        return f"cash_floor_min_{self.cash_floor_pct:g}pct"
+
+    def per_step_code(self) -> str:
+        if self.per_step_cash_pct == PER_STEP_CASH_PCT:
+            return C_PER_STEP
+        return f"cash_per_step_max_{self.per_step_cash_pct:g}pct"
+
+    def order_target_code(self) -> str:
+        if self.order_target_amount == ORDER_TARGET_AMOUNT:
+            return C_ORDER_TARGET
+        return f"order_target_{self.order_target_amount:g}"
+
+    def amount_text(self, key: str) -> str:
+        """约束项 → 人话（**数字从这里取，不写死**）。"""
+        return {
+            "leg_gap": "该腿缺口",
+            "order_target": f"单笔目标 {self.order_target_amount:,.0f} 元",
+            "per_step": f"本步剩余额度 {self.per_step_cash_pct:.0f}%",
+            "cash_floor": f"现金下限 {self.cash_floor_pct:.0f}%",
+        }[key]
+
+
+#: 「写死条文」的那一组参数，也是 `plan_*` 的默认值。
+STATIC_PARAMS = RuleParams()
+
+
+def _params(p: RuleParams | None) -> RuleParams:
+    return STATIC_PARAMS if p is None else p
 
 
 class LookaheadError(RuntimeError):
@@ -144,24 +230,38 @@ def check_no_lookahead(asof: str, prices: Mapping[str, Price]) -> None:
 def plan_stop_loss(*, code: str, close: float | None, qty: int,
                    costs: CostModel | None = None,
                    source: str | None = None,
-                   price_asof: str | None = None) -> Decision:
+                   price_asof: str | None = None,
+                   params: RuleParams | None = None) -> Decision:
     """收盘价跌破止损线 → **整清**。判据复用 `discipline.check_stop_loss_close`。
 
-    判据复用而不是重写：纪律线的数字只有一处真相（`PER_CODE_LINES`），
-    判定语义（「跌破才动，正好在线上不算破」）也只有一处。
+    判据复用而不是重写：纪律线的数字只有一处真相，判定语义（「跌破才动，
+    正好在线上不算破」）也只有一处。
+
+    止损线从哪来由 `params` 决定：`None` ⇒ 该标的写死的纪律线（静态臂）；
+    给了绝对值 ⇒ 用它的（`arm-agent` 按 spec 的 `stop_loss_pct` 推出）。
     """
-    lines = lines_for(code)
-    if lines is None:
-        return _hold(code, f"{code} 未配置纪律线（止损线由入场价推出，不是全局常数），"
-                           f"不拿别的标的的线去量它", constraints=(C_NO_LINES,))
-    check = check_stop_loss_close(code, close, source=source, price_asof=price_asof)
+    p = _params(params)
+    if not p.stop_loss_enabled:
+        return _hold(
+            code,
+            f"止损规则按 spec 关闭（`stop_loss_pct=\"off\"`）→ 本步只有「单票上限」"
+            f"与「分散建仓」两条在跑。**关闭不等于风险消失**，只是不再由这条规则拦住",
+            constraints=(C_STOP_OFF,), ref_price=close)
+    line = p.stop_loss_line
+    if line is None:
+        lines = lines_for(code)
+        if lines is None:
+            return _hold(code, f"{code} 未配置纪律线（止损线由入场价推出，不是全局常数），"
+                               f"不拿别的标的的线去量它", constraints=(C_NO_LINES,))
+        line = float(lines["stop_loss_close"])
+    check = check_stop_loss_close(code, close, source=source, price_asof=price_asof,
+                                  line=line)
     if close is None:
         return _hold(code, f"无收盘价（{C_NO_PRICE}）：持仓与止损都不判定，"
                            f"不拿成本价冒充现价", constraints=(C_NO_PRICE,))
-    line = lines["stop_loss_close"]
     if check["status"] != "FAIL":
         return _hold(code, f"收盘 {close:.2f} 未触发止损线 {line:.2f}（跌破才动）",
-                     rule=RULE_CITATIONS["stop_loss"], ref_price=close)
+                     rule=p.cite("stop_loss"), ref_price=close)
     if qty <= 0:
         # 规则失效了、但手里没货（典型：昨天已按这条线整清，今天收盘仍在线下）。
         # 这里必须回 `hold` 而不是「卖 0 股」：后者 `is_trade` 会把它当成成交，
@@ -170,13 +270,13 @@ def plan_stop_loss(*, code: str, close: float | None, qty: int,
             code,
             f"{code} 收盘 {close:.2f} **跌破**止损线 {line:.2f}，但持仓为 0 股"
             f"→ 无可执行动作（不是忘了卖）",
-            rule=RULE_CITATIONS["stop_loss"], ref_price=close)
+            rule=p.cite("stop_loss"), ref_price=close)
     costs = costs or CostModel()
     fill, fees = costs.total("sell", close, qty)
     fee_parts = _fee_parts(costs, "sell", fill, qty, ref=close)
     return Decision(
         action="sell", code=code, qty=qty,
-        rule_citation=RULE_CITATIONS["stop_loss"],
+        rule_citation=p.cite("stop_loss"),
         reason=(f"{code} 收盘 {close:.2f} **跌破**止损线 {line:.2f} → 整清 {qty} 股"
                 f"（含费净收 ¥{fill * qty - fees:,.2f}）"),
         ref_price=close, fill_price=round(fill, 4), fees=fee_parts,
@@ -189,17 +289,21 @@ def plan_stop_loss(*, code: str, close: float | None, qty: int,
 
 def plan_trim(*, code: str, qty: int, close: float, total_assets: float,
               costs: CostModel | None = None, intent_pct: float | None = None,
-              lot: int = LOT) -> Decision:
-    """单票权重 >40% → 减到 ≤40%（整手向下取整；不足 1 手 → 不动 + 如实上报）。
+              params: RuleParams | None = None) -> Decision:
+    """单票权重 >上限 → 减到 ≤上限（整手向下取整；不足 1 手 → 不动 + 如实上报）。
 
     `intent_pct` 给定时用它当减仓意图（用户声明的 `trim_light_pct` = 单次减仓 10%），
-    但**仍以「减到 ≤40% 所需」为下界**：40% 是硬约束，10% 只是动作偏好，
-    两者冲突时硬约束赢。默认（`None`）直接用「减到 40% 所需」。
+    但**仍以「减到 ≤上限 所需」为下界**：上限是硬约束，10% 只是动作偏好，
+    两者冲突时硬约束赢。默认（`None`）直接用「减到上限所需」。
+
+    上限的值从 `params.single_position_max_pct` 取（静态臂 = `DISCIPLINE` 的 40%）。
 
     取整方向：**向下**。向上会把仓位减过头（且可能把一笔 10% 的减仓变成整清），
     向下则最坏是「不动」，此时 `violation_remaining=True` 把违规如实标出来。
     """
-    limit = DISCIPLINE["single_position_max_pct"]
+    p = _params(params)
+    limit = p.single_position_max_pct
+    lot = p.lot
     costs = costs or CostModel()
     mv = close * qty
     weight = mv / total_assets * 100.0 if total_assets > 0 else None
@@ -208,7 +312,7 @@ def plan_trim(*, code: str, qty: int, close: float, total_assets: float,
                      constraints=(C_NO_PRICE,), ref_price=close)
     if weight <= limit + _EPS:
         return _hold(code, f"{code} 占总资产 {weight:.2f}%，未超 {limit:.0f}% 上限",
-                     rule=RULE_CITATIONS["single_max"], ref_price=close,
+                     rule=p.cite("single_max"), ref_price=close,
                      weight_after=_clip(weight))
 
     needed_value = (weight - limit) / 100.0 * total_assets
@@ -227,7 +331,7 @@ def plan_trim(*, code: str, qty: int, close: float, total_assets: float,
             f"{code} 占总资产 {weight:.2f}%，超 {limit:.0f}% 上限；"
             f"想减 {raw:.2f} 股 < 1 手（{lot} 股）→ **不动**。"
             f"硬约束**未消除**，如实上报（不假装已合规，也不擅自整清）",
-            rule=RULE_CITATIONS["single_max"], constraints=tuple(constraints),
+            rule=p.cite("single_max"), constraints=tuple(constraints),
             raw=raw, remaining=True, ref_price=close, weight_after=_clip(weight))
 
     # 卖出会减少总资产（手续费），故减完要**回代验证**；不够就再加一手，
@@ -243,7 +347,7 @@ def plan_trim(*, code: str, qty: int, close: float, total_assets: float,
         constraints.append(C_LOT)
     return Decision(
         action="sell", code=code, qty=sell,
-        rule_citation=RULE_CITATIONS["single_max"],
+        rule_citation=p.cite("single_max"),
         reason=(f"{code} 占总资产 {weight:.2f}%，超 {limit:.0f}% 上限 "
                 f"{weight - limit:.2f} 个百分点 → 卖出 {sell} 股"
                 f"（想减 {raw:.2f} 股，整手向下取整；卖后权重 "
@@ -284,17 +388,19 @@ def etf_leg_targets(*, etf_target_pct: float, total_assets: float,
 
 def plan_etf_buy(*, code: str, price: float, cash: float, total_assets: float,
                  leg_gap_value: float, costs: CostModel,
-                 deployed_today: float = 0.0, order_target: float = ORDER_TARGET_AMOUNT,
-                 per_step_pct: float = PER_STEP_CASH_PCT, lot: int = LOT,
-                 whitelist: tuple[str, ...] = ETF_WHITELIST) -> Decision:
+                 deployed_today: float = 0.0,
+                 params: RuleParams | None = None) -> Decision:
     """白名单 ETF 的买入计划：可动用额度取四项的**最小值**，并逐条留痕。
 
-    四项：① 该腿缺口 ② 单笔 ≈1,000 元 ③ 本步剩余额度（5% 总资产 − 今日已动用）
-    ④ 现金下限（现金 − 45% 总资产）。
+    四项：① 该腿缺口 ② 单笔目标 ③ 本步剩余额度（`per_step_cash_pct` 总资产 − 今日已动用）
+    ④ 现金下限（现金 − `cash_floor_pct` 总资产）。四个参数全部从 `params` 取，
+    默认 = 写死条文。
 
     `code` 不在白名单 → **抛 ValueError**：换家电股/家电 ETF 不算分散，
     静默照买就是拿「加倍下注同一个行业」冒充分散。
     """
+    p = _params(params)
+    whitelist, lot = p.whitelist, p.lot
     if code not in whitelist:
         raise ValueError(
             f"{C_WHITELIST}: {code} 不在分散白名单 {list(whitelist)} 中 —— "
@@ -305,49 +411,48 @@ def plan_etf_buy(*, code: str, price: float, cash: float, total_assets: float,
             f"{code} 是 ETF（ADR-008 标的口径），成本模型给的是 "
             f"{costs.asset_class!r} —— 口径错会让成本算错，且错的方向对策略有利"
         )
-    floor_value = DISCIPLINE["cash_band_pct"][0] / 100.0 * total_assets
-    per_step_cap = per_step_pct / 100.0 * total_assets
+    floor_value = p.cash_floor_pct / 100.0 * total_assets
+    per_step_cap = p.per_step_cash_pct / 100.0 * total_assets
     remaining_step = max(0.0, per_step_cap - deployed_today)
     available = max(0.0, cash - floor_value)
-    cands = {"leg_gap": leg_gap_value, "order_target": order_target,
+    cands = {"leg_gap": leg_gap_value, "order_target": p.order_target_amount,
              "per_step": remaining_step, "cash_floor": available}
+    codes = {"order_target": p.order_target_code(), "per_step": p.per_step_code(),
+             "cash_floor": p.cash_floor_code(), "leg_gap": "leg_gap"}
     budget = min(cands.values())
     # 与最小值相等的都算「binding」（并列时全部列出，不挑一个）
-    binding = tuple(sorted({C_ORDER_TARGET if k == "order_target" else
-                            C_PER_STEP if k == "per_step" else
-                            C_CASH_FLOOR if k == "cash_floor" else "leg_gap"
-                            for k, v in cands.items() if v <= budget + _EPS}))
+    binding = tuple(sorted({codes[k] for k, v in cands.items()
+                            if v <= budget + _EPS}))
     fill = costs.fill_price("buy", price)
     if budget <= 0:
         return _hold(code, f"本次可动用 ¥{budget:,.2f}（"
-                           f"{_binding_text(cands)}）→ 不动", rule=RULE_CITATIONS["etf_first_build"],
+                           f"{_binding_text(cands, p)}）→ 不动",
+                     rule=p.cite("etf_first_build"),
                      constraints=binding, ref_price=price)
     qty = floor_lot(budget / fill, lot)
     if qty <= 0:
         one_lot = fill * lot
         return _hold(
             code,
-            f"1 手需 ¥{one_lot:,.2f}，本次可动用 ¥{budget:,.2f}（{_binding_text(cands)}）"
+            f"1 手需 ¥{one_lot:,.2f}，本次可动用 ¥{budget:,.2f}（{_binding_text(cands, p)}）"
             f"→ 不足 1 手，**不动**（不四舍五入买一手：那会放大到超过纪律允许的额度）",
-            rule=RULE_CITATIONS["etf_first_build"],
+            rule=p.cite("etf_first_build"),
             constraints=tuple(sorted(set(binding) | {C_LOT})), ref_price=price)
     fees = _fee_parts(costs, "buy", fill, qty, ref=price)
     outflow = fill * qty + fees["total"]
     return Decision(
         action="buy", code=code, qty=qty,
-        rule_citation=RULE_CITATIONS["etf_first_build"],
+        rule_citation=p.cite("etf_first_build"),
         reason=(f"分散建仓：买 {qty} 份 {code} @{fill:.4f}（含滑点），"
-                f"支出 ¥{outflow:,.2f}；可动用额度受 {_binding_text(cands)} 约束"),
+                f"支出 ¥{outflow:,.2f}；可动用额度受 {_binding_text(cands, p)} 约束"),
         binding_constraints=binding, ref_price=price, fill_price=round(fill, 4),
         fees=fees, amount=round(outflow, 2), cash_after=round(cash - outflow, 2),
         asset_class=costs.asset_class,
     )
 
 
-def _binding_text(cands: Mapping[str, float]) -> str:
-    names = {"leg_gap": "该腿缺口", "order_target": "单笔目标 1,000 元",
-             "per_step": "本步剩余额度 5%", "cash_floor": "现金下限 45%"}
-    return "、".join(f"{names[k]} ¥{v:,.2f}" for k, v in cands.items())
+def _binding_text(cands: Mapping[str, float], p: RuleParams) -> str:
+    return "、".join(f"{p.amount_text(k)} ¥{v:,.2f}" for k, v in cands.items())
 
 
 def _fee_parts(costs: CostModel, side: str, price: float, qty: int, *,

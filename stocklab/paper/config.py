@@ -65,6 +65,45 @@ RULE_CITATIONS: dict[str, str] = {
                        "其余落现金；单次动用现金 ≤5% 总资产、单笔 ≈1,000 元、整手",
 }
 
+# ---------- 智能体动态编排臂（P37；设计见 docs/superpowers/specs/2026-09-21-…） ----------
+
+#: 账户 id。`arm-agent` 的条文数字来自台账（`paper_agent_decisions`）里的当前 spec；
+#: `arm-agent-random` 是**必需的对照臂**（同预算、同变更空间，但 spec 随机抽）。
+#: 阶段 1–2 期间 random 臂不产生任何 spec、也不产生任何成交 —— 这是占位，
+#: 不是「随机改没用」的结论。没有它，`arm-agent` 领先静态臂这件事无法归因。
+ARM_AGENT: str = "arm-agent"
+ARM_AGENT_RANDOM: str = "arm-agent-random"
+
+#: `paper_accounts.arm` 的取值（与 `store/schema.sql` 的 CHECK **同文**，改一处须同步）。
+ARM_KIND_HOLD: str = "hold"
+ARM_KIND_NOW: str = "now"
+ARM_KIND_DISCIPLINE: str = "discipline"
+ARM_KIND_AGENT: str = "agent"
+ARM_KIND_AGENT_RANDOM: str = "agent_random"
+
+#: 会**跑条文**（即可能下单）的臂。其余（hold / now / agent_random）只记净值。
+ARM_KINDS_WITH_RULES: tuple[str, ...] = (ARM_KIND_DISCIPLINE, ARM_KIND_AGENT)
+
+#: `arm-agent` 的默认 spec 对齐**这一条**静态臂，默认值一律从它反推
+#: （见 `paper/agent_spec.py`，不另抄一份数字）。
+AGENT_DEFAULT_ARM: str = f"{DISCIPLINE_PREFIX}10"
+
+#: 每次复审最多试几版（D-17「每次 ≤3 版」）。超预算的记录会被 `record_decision` 拒绝。
+MAX_TRIALS_PER_REVIEW: int = 3
+
+#: `arm-agent*` 的条文表。与 `RULE_CITATIONS` **并列而不合并**：静态表是「写死的条文」，
+#: 这张表是「同一批被 spec 参数化的规则」，数字来源不同 —— 合成一张表之后，
+#: `paper_data.ai_evidence` 就再也数不清「有几笔成交由智能体的 spec 触发」。
+#: 这几条**刻意不带数字**（数字进 `reason`），这样它们能按规则类型被稳定计数。
+RULE_CITATIONS_AGENT: dict[str, str] = {
+    "stop_loss": "智能体 spec·止损：收盘价跌破 spec.stop_loss_pct 推出的线 → 整清"
+                 "（参数台账见 paper_agent_decisions）",
+    "single_max": "智能体 spec·单票上限：超出 spec.max_single_pct 即减到该上限"
+                  "（整手向下取整；不足 1 手则不动）",
+    "etf_first_build": "智能体 spec·分散建仓：按 spec.etf_target_pct 建白名单 ETF，"
+                       "单次动用现金与现金下限同守",
+}
+
 # ---------- 免责声明（报告里逐字出现，测试钉住） ----------
 
 DISCLAIMER: str = (

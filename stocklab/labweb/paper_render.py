@@ -18,7 +18,22 @@
 
 我 = accent 深蓝实线（最粗）；什么都不做 = 灰虚线；AI 三档 = 绿 / 琥珀 / 青
 （同一规则、不同参数，色相分开是为了在图上分得清，**不是**区分好坏）；
+智能体臂 = 紫（`arm-agent` 实线、`arm-agent-random` 同色虚线 —— 同一家族的对照臂，
+线型分开是因为它**还没接线**：定稿阶段 3 前它只记净值、不下单）；
 大盘 = 深灰点线。颜色不是唯一信号：图下每条线都有色块 + 文字 + 最新值。
+
+## 「智能体臂」这一节
+
+它回答的不是「AI 准不准」，而是「**条文里的数字可以改**这件事本身带来什么」：
+当前 spec 是哪五个数、改了几次、试错预算用掉多少、与随机对照臂差多少。
+所以本节每个数都从 `paper.engine.agent_block` 拿（与 `paper show` 同源），
+连 `delta_vs_random` 的 `null` 也是上游写好的 `null` —— 见下。
+
+## `null` 与 `0` 在页面上必须长得不一样
+
+`delta_vs_random` 在阶段 3 前恒为 `null`（对照臂没接线 ⇒ 差分**不存在**，
+不是 0）。页面上它显示为「无法判定」+ 原因，绝不显示 `+0.00%`。
+同理，复现性还没被真正检验过时写「无法判定」而不是「可复现」。
 
 ## 「AI 自己编排的东西，用上了没有」这一节
 
@@ -35,12 +50,17 @@ from __future__ import annotations
 from typing import Any, Mapping, Sequence
 
 from stocklab.labweb.render import (cell, esc, glance, glance_html, layout, money,
-                                    more, num, ratio_pct, rich, section, sign_cls)
+                                    more, num, ratio_pct, rich, section,
+                                    sign_cls)
+from stocklab.paper.config import (ARM_KIND_AGENT, ARM_KIND_AGENT_RANDOM,
+                                   RULE_CITATIONS_AGENT)
 
 #: 账户 → 人话。**只换标签**，不改任何数字。
 _LABELS: dict[str, str] = {
     "arm-now": "我 · 实盘账本镜像",
     "arm-hold": "什么都不做 · 起跑日冻结快照",
+    "arm-agent": "AI 智能体臂 · spec 台账",
+    "arm-agent-random": "AI 智能体臂 · 随机对照（阶段 3 才下单）",
 }
 
 #: 账户 → (颜色, 虚线 dash, 线宽)。我 = accent 实线最粗；大盘单列在 `_INDEX_STYLE`。
@@ -50,6 +70,10 @@ _STYLES: dict[str, tuple[str, str, float]] = {
     "arm-discipline-05": ("#0f6b3b", "", 1.8),
     "arm-discipline-10": ("#8a5a00", "", 1.8),
     "arm-discipline-15": ("#2a6f8f", "", 1.8),
+    # 智能体臂：紫色家族。random 用**同色虚线** —— 它们是一对（同预算、同变更空间），
+    # 线型分开是因为它还没接线，不是因为它“更差”。
+    "arm-agent": ("#6a3d9a", "", 2.0),
+    "arm-agent-random": ("#6a3d9a", "6 3", 1.6),
 }
 
 #: 大盘：深灰点线。与「什么都不做」的灰虚线靠**线型**分开（不只是靠颜色深浅）。
@@ -58,10 +82,11 @@ _INDEX_STYLE: tuple[str, str, float] = ("#5a6672", "2 3", 2.0)
 #: 认不出的账户：中性灰 + 短虚线（一眼看出它不是几条已知线之一）。
 _UNKNOWN_STYLE: tuple[str, str, float] = ("#5a6672", "4 3", 1.6)
 
-#: 展示顺序：**我 → 什么都不做 → AI 三档**。这是给读者的阅读顺序
+#: 展示顺序：**我 → 什么都不做 → AI 三档 → 智能体臂两档**。这是给读者的阅读顺序
 #: （先看自己的线），不是排名。字典里没有的账户排最后，按 id 升序。
 _DISPLAY_ORDER = ("arm-now", "arm-hold", "arm-discipline-05",
-                  "arm-discipline-10", "arm-discipline-15")
+                  "arm-discipline-10", "arm-discipline-15",
+                  "arm-agent", "arm-agent-random")
 
 _TABLE_HEAD = ("<tr><th>线</th><th>净值</th><th>累计收益</th><th>相对大盘</th>"
                "<th>相对我</th><th>最大回撤</th><th>累计成本</th>"
@@ -75,7 +100,12 @@ def arm_label(arm: Mapping) -> str:
     aid = str(arm.get("account_id"))
     if aid in _LABELS:
         return _LABELS[aid]
-    if arm.get("arm") == "discipline" and arm.get("etf_target_pct") is not None:
+    kind = str(arm.get("arm") or "")
+    if kind == ARM_KIND_AGENT:
+        return f"{aid} · 智能体 spec 编排"
+    if kind == ARM_KIND_AGENT_RANDOM:
+        return f"{aid} · 随机对照（阶段 3 才下单）"
+    if kind == "discipline" and arm.get("etf_target_pct") is not None:
         return f"AI 纪律臂 · ETF 目标 {float(arm['etf_target_pct']):.0f}%"
     return f"{aid}（口径未知）"
 
@@ -343,6 +373,9 @@ def _why(data: Mapping) -> list[str]:
         '「AI 纪律臂」= <code>arm-discipline-05/10/15</code>：三条<b>同一套写死条文</b>的账户',
         '（止损 + 单票 ≤40% + ETF 分散），只差「ETF 目标占比」这一个数 —— '
         '单变量对照，<b>不含任何模型方向预测</b>。',
+        '「AI 智能体臂」= <code>arm-agent</code>：条文<b>同一套，但 5 个数字放在台账里</b>'
+        '（<code>paper_agent_decisions</code>），可以改；<code>arm-agent-random</code> 是'
+        '它的随机对照 —— 阶段 3 之前只记净值、不下单。两条都<b>不用模型</b>。',
         f'「相对我」= 该线累计收益 − 我（<code>{esc(data.get("now_account_id"))}</code>）'
         '的累计收益，一个减法，不是独立口径。',
     ]
@@ -405,6 +438,130 @@ def _trades_detail(data: Mapping) -> str:
               '本页只读，不改库。</p>')
 
 
+# ---------- 智能体臂（P37） ----------
+
+
+def _spec_html(spec: Mapping) -> str:
+    """spec 的五个数 → 一行可读文本（每个值都过 `esc()`）。"""
+    stop = spec.get("stop_loss_pct")
+    stop_txt = ("关掉（判定不做，但风险不会因此消失）"
+                if stop == "off" else f'{float(stop):.6f}%')
+    return (f'ETF 目标 <code>{esc(spec.get("etf_target_pct"))}</code>%、'
+            f'止损 <code>{esc(stop_txt)}</code>、'
+            f'单票上限 <code>{esc(spec.get("max_single_pct"))}</code>%、'
+            f'现金下限 <code>{esc(spec.get("cash_floor_pct"))}</code>%、'
+            f'复审节奏 <code>{esc(spec.get("rebalance_cadence"))}</code> 交易日')
+
+
+def _agent_history_table(ev: Mapping) -> str:
+    hist = ev.get("history") or []
+    if not hist:
+        return ('<p class="note">' + rich(
+                    '台账里还没有任何一行 —— 现在是**默认 spec**'
+                    '（= `arm-discipline-10` 口径），不是「没有条文」。') + '</p>')
+    head = ("<tr><th>@asof</th><th>decision_id</th><th>来源</th><th>试错</th>"
+            "<th>被拒</th><th>spec sha256</th><th>为什么改</th><th>spec</th></tr>")
+    rows = "".join(
+        f'<tr><td>{esc(d["asof"])}</td>'
+        f'<td class="num">{int(d["decision_id"])}</td>'
+        f'<td><code>{esc(d["agent_kind"])}</code> / <code>{esc(d["model_id"])}</code></td>'
+        f'<td class="num">{int(d["n_trials"])}</td>'
+        f'<td class="num">{int(d["n_rejected"])}</td>'
+        f'<td><code>{esc(str(d["spec_sha256"])[:12])}</code></td>'
+        f'<td class="l">{esc(str(d.get("rationale") or "（未写理由）"))}</td>'
+        f'<td class="l"><code>{esc(str(d["spec_after"]))}</code></td></tr>' for d in hist)
+    return (f'<div class="scroll-x"><table class="tbl">{head}{rows}</table></div>'
+            + '<p class="note">' + rich(
+                '只列最近几版；台账本身 append-only、不截断。'
+                '`来源` 列写的是「谁写的这一版」：阶段 1–2 的 spec 由人手写或人工'
+                '复核后落库，**不是模型自动改的**。') + '</p>')
+
+
+def _agent_change_space(ev: Mapping) -> str:
+    space = ev.get("change_space") or {}
+    default = ev.get("default_spec") or {}
+    items = "".join(
+        f'<li><code>{esc(k)}</code>：{rich(v)}　默认 <code>{esc(default.get(k))}</code></li>'
+        for k, v in space.items())
+    return ('<ul class="list">' + items + '</ul>'
+            + '<p class="note">' + rich(
+                '这张白名单就是智能体**能改的全部**：越界、未知字段、类型不符一律'
+                '拒绝并记入 `rejected`，**不夹紧**。成本口径 / PIT 判据 / 整手口径 /'
+                ' ETF 白名单 / append-only 纪律都不在白名单里 ——'
+                '所以「扩大自己的变更空间」在这张表上不可表达。') + '</p>')
+
+
+def _agent_reproducibility(ev: Mapping) -> str:
+    rep = ev.get("reproducibility") or {}
+    if not rep:
+        return ''
+    n = int(rep.get("n_groups_tested") or 0)
+    if rep.get("reproducible") is None:
+        head = ('<span class="s-warn">复现性：无法判定</span> —— 还没有一组 '
+                '<code>(context_sha256, model_id, prompt_sha256, seed)</code> 重复'
+                '出现过，所以「同输入同输出」这条判据<b>还没被检验</b>，'
+                '不是已经通过。')
+    elif rep["reproducible"]:
+        head = (f'复现性：{esc(n)} 组同指纹的复审给出了同一个 spec —— 通过。')
+    else:
+        head = (f'<span class="s-warn">复现性：不可复现</span> —— {esc(n)} 组重复'
+                f'指纹里出现了不同结果，逐条列在下方。')
+    viol = rep.get("violations") or []
+    body = "".join(
+        f'<li><code>{esc(v["key"]["context_sha256"])}</code> … '
+        f'于 {esc("、".join(str(a) for a in v["asof"]))} 给出 '
+        f'{esc(v["n_distinct_specs"])} 个不同的 spec</li>' for v in viol)
+    return head + (f'<ul class="list">{body}</ul>' if body else '')
+
+
+def agent_arm_block(data: Mapping) -> str:
+    """智能体臂一段：当前 spec / 台账 / 与随机臂的差分 / 复现性。
+
+    数字全部来自 `paper_data.agent_track`（它调 `engine.agent_block`），
+    本函数**不重算**任何口径、不做排名。
+    """
+    ev = data.get("agent") or {}
+    if not ev:
+        return ('<p class="note">这一段没取到数据（旧库 / 缺表）—— '
+                '本页不编数。</p>')
+    if not ev.get("available"):
+        return (f'<p class="note">这一段没法回答：{rich(ev.get("reason") or "未知原因")}'
+                f'</p>')
+
+    spec = ev.get("spec") or {}
+    lines: list[str] = [
+        f'当前 spec：{_spec_html(spec)}；'
+        f'它推出的止损线是 <code>{num(ev.get("stop_loss_line"), 2)}</code> 元。'
+        f'spec sha256 <code>{esc(str(ev.get("spec_sha256"))[:12])}</code>。',
+        f'台账：{esc(ev.get("n_reviews"))} 次复审、累计试错 '
+        f'{esc(ev.get("n_trials_total"))} 版（每次上限 '
+        f'{esc(ev.get("max_trials_per_review"))}）、被拒 {esc(ev.get("n_rejected"))} 条；'
+        f'最近一次复审 {esc(ev.get("last_asof") or "（还没有）")}。',
+    ]
+
+    if ev.get("delta_vs_random_available") and ev.get("delta_vs_random") is not None:
+        d = float(ev["delta_vs_random"])
+        lines.append(
+            f'与随机对照臂的累计收益差 '
+            f'<b class="{sign_cls(d)}">{ratio_pct(d)}</b>'
+            f'（<code>arm-agent</code> − <code>arm-agent-random</code>）。')
+    else:
+        lines.append('<span class="s-warn">与随机对照臂的差分<b>不存在</b></span>'
+                     '（不是 0）：'
+                     + rich(ev.get("delta_vs_random_note") or ""))
+
+    lines.append(
+        '这两条臂<b>都不用模型</b>：<code>arm-agent</code> 只是把同一条纪律的 5 个数字'
+        '搬到台账里（<code>paper_agent_decisions</code>），阶段 1–2 的 spec 由人手写'
+        '或由人复核后落库。它回答的是「条文数字可变之后会怎样」，'
+        '不是「AI 会操盘」。')
+
+    detail = (_agent_history_table(ev) + _agent_change_space(ev)
+              + '<p class="note">复现性判据（同 context + 同 model + 同 prompt + 同 seed '
+                '→ 同 spec）：</p>' + _agent_reproducibility(ev))
+    return glance_html(lines) + more(detail, label="查看详细：spec 台账、变更空间与复现性")
+
+
 # ---------- 「AI 自己编排的东西，用上了没有」 ----------
 
 #: 写死条文 → 人话。**只换标签**，不改条文本身。
@@ -459,19 +616,22 @@ def _consumption_detail(ev: Mapping) -> str:
     cons = ev.get("consumption") or {}
     cited = [str(c) for c in (cons.get("cited_rules") or [])]
     unknown = [str(c) for c in (cons.get("unknown_rules") or [])]
+    spec = [str(c) for c in (cons.get("spec_rules") or [])]
     items = "".join(
         f'<li><code>{_rule_short(c)}</code> —— '
-        + (rich('在写死条文**表外**') if c in unknown
-           else rich('落在 `paper/config.RULE_CITATIONS` 内'))
+        + (rich('在两张条文表**之外**（模型信号 / 插桩脚本）') if c in unknown
+           else (rich('落在 `paper/config.RULE_CITATIONS_AGENT` 内（智能体 spec）')
+                 if c in spec else rich('落在 `paper/config.RULE_CITATIONS` 内')))
         + '</li>' for c in cited)
     keys = esc(", ".join(cons.get("param_keys") or [])) or "（无）"
     refs = [str(x) for x in (cons.get("param_refs") or [])]
     return (
         '<p class="note">' + rich(
-            '判据：把 `paper_trades` 每一行的 `rule_citation` 与 '
-            '`paper.config.RULE_CITATIONS` 逐条对表。表外为空 ⇒ 没有任何一笔成交由'
-            '模型预测或插桩脚本触发（真接了模型/插桩会以新条文或新参数键出现，'
-            '所以这一段将来会自己变成非空）。') + '</p>'
+            '判据：把 `paper_trades` 每一行的 `rule_citation` 与两张条文表'
+            '（`paper/config.RULE_CITATIONS` ＋ `RULE_CITATIONS_AGENT`）逐条对表。'
+            '两张表**之外**为空 ⇒ 没有任何一笔成交由模型预测或插桩脚本触发'
+            '（真接了模型/插桩会以新条文或新参数键出现，所以这一段将来会自己变成非空）。')
+        + '</p>'
         + (f'<ul class="list">{items}</ul>' if items
            else '<p class="note">`paper_trades` 里还没有任何成交行。</p>')
         + f'<p class="note">账户参数键：<code>{keys}</code>　'
@@ -568,12 +728,13 @@ def ai_block(ev: Mapping) -> str:
     unknown = [str(c) for c in (cons.get("unknown_rules") or [])]
     refs = [str(x) for x in (cons.get("param_refs") or [])]
     cited = [str(c) for c in (cons.get("cited_rules") or [])]
+    n_spec = int(cons.get("n_trades_by_spec") or 0)
     if not unknown and not refs:
         lines.append(
-            '<span class="s-warn">模拟盘没用上</span>：'
+            '<span class="s-warn">模型与插桩没用上</span>：'
             f'{esc(cons.get("n_accounts", 0))} 个账户的 '
             f'{esc(cons.get("n_trades", 0))} 笔成交，'
-            f'触发理由全部落在 {len(cited)} 条写死条文里（'
+            f'触发理由全部落在 {len(cited)} 条已登记条文里（'
             + "、".join(_rule_short(c) for c in cited)
             + '）；账户参数键 <code>'
             + (esc(", ".join(cons.get("param_keys") or [])) or "（无）")
@@ -581,9 +742,16 @@ def ai_block(ev: Mapping) -> str:
               '<b>引用模型预测 0 条、引用插桩脚本 0 条</b>。')
     else:
         lines.append(
-            f'<b>模拟盘已经接了写死条文之外的东西</b>：{len(unknown)} 条表外触发理由'
+            f'<b>模拟盘已经接了已登记条文之外的东西</b>：{len(unknown)} 条表外触发理由'
             + '（' + "、".join(_rule_short(u) for u in unknown) + '）'
             + f'、参数标记 {esc(", ".join(refs))} —— 逐条见下。')
+
+    if n_spec:
+        lines.append(
+            f'<b>智能体 spec 臂用上了</b>：{n_spec} 笔成交的触发理由落在 '
+            '<code>RULE_CITATIONS_AGENT</code> 里（条文来自 '
+            '<code>paper_agent_decisions</code> 台账的当前 spec）。这是'
+            '<b>同一条纪律的参数化</b>，不是模型信号 —— 两条 AI 线都不含方向预测。')
 
     lines.append('这个「没用上」是<b>被钉住的</b>，不是漏接：'
                  '<code>test_paper_never_imports_model_or_kelly</code> 用源码扫描'
@@ -597,7 +765,7 @@ def ai_block(ev: Mapping) -> str:
 
 
 def _empty_body(data: Mapping) -> str:
-    return section(
+    return (section(
         "还没有模拟盘净值",
         glance([
             f'`paper_accounts` {"没有账户" if data["db_missing"] else "有账户"}，'
@@ -608,8 +776,10 @@ def _empty_body(data: Mapping) -> str:
             "已有这一步。",
         ]),
         note="没有净值行就是没有 —— 本页不拿成本价、也不拿 0 冒充一条曲线。")
+    + section("智能体臂（P37）：条文的数字可改", agent_arm_block(data),
+              right="台账里的 spec，不是模型信号")
     + section("AI 自己编排的东西，用上了没有", ai_block(data.get("ai") or {}),
-              right="用计数回答")
+              right="用计数回答"))
 
 
 def paper_page(data: Mapping, *, base: str, built_at: str) -> str:
@@ -666,6 +836,8 @@ def paper_page(data: Mapping, *, base: str, built_at: str) -> str:
         section("逐条对照", compare_table(data),
                 note="「相对大盘」「相对我」都是减法，不是新口径；指数不可交易，"
                      "所以它那两行没有成本与回撤 —— 与各臂比时口径偏乐观。"),
+        section("智能体臂（P37）：条文的数字可改", agent_arm_block(data),
+                right="台账里的 spec，不是模型信号"),
         section("AI 自己编排的东西，用上了没有", ai_block(data.get("ai") or {}),
                 right="用计数回答"),
         section("这段时间发生了什么", summary,

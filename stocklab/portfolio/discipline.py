@@ -106,20 +106,27 @@ def check_cash_band(cash_pct: float | None) -> dict:
 
 def check_stop_loss_close(code: str, close: float | None, *,
                           source: str | None = None,
-                          price_asof: str | None = None) -> dict:
+                          price_asof: str | None = None,
+                          line: float | None = None) -> dict:
     """收盘价口径止损线：**跌破**才动，正好落在线上不算破。
 
     `close` 必须是**日收盘价**（`bars_daily`），不是盘中快照价 ——
     拿盘中价去判「收盘有没有破位」，盘中每一分钟都会给出不同的答案。
     收盘价取不到、或该标的没配过纪律线 → `UNDETERMINED`。
+
+    `line` 给定时用它当线（`arm-agent` 按 spec 的 `stop_loss_pct` 推出的绝对值）；
+    不给才回落到 `PER_CODE_LINES`。**同一份判据只写一次** —— 让调用方自己在外面
+    比大小，就等于把「跌破才动、正好在线上不算破」这条语义拄成两份，
+    而两份迟早在某个边界上不一致（那种不一致看起来就像是真实信号）。
     """
     lines = lines_for(code)
-    if lines is None:
-        return _out("stop_loss_close_85", "UNDETERMINED",
-                    f"{code} 未配置纪律线（止损线由**入场价**推出，不是全局常数）；"
-                    "不拿别的标的的线去量它",
-                    {"line": None, "close": close}, subject=code)
-    line = lines["stop_loss_close"]
+    if line is None:
+        if lines is None:
+            return _out("stop_loss_close_85", "UNDETERMINED",
+                        f"{code} 未配置纪律线（止损线由**入场价**推出，不是全局常数）；"
+                        "不拿别的标的的线去量它",
+                        {"line": None, "close": close}, subject=code)
+        line = lines["stop_loss_close"]
     if close is None:
         return _out("stop_loss_close_85", "UNDETERMINED",
                     f"{code}：{UNDETERMINED_REASON}（收盘价需 bars_daily，当前取不到）",

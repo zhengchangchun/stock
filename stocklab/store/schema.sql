@@ -634,7 +634,10 @@ BEGIN SELECT RAISE(ABORT, 'experiment_decisions is append-only'); END;
 CREATE TABLE IF NOT EXISTS paper_accounts (
     account_id     TEXT PRIMARY KEY,     -- 'arm-hold' | 'arm-now' | 'arm-discipline-05' …
     arm            TEXT NOT NULL
-                   CHECK (arm IN ('hold', 'now', 'discipline')),
+                   -- 与 paper/config.py 的 ARM_KIND_* **同文**（改一处须同步另一处）。
+                   -- 'agent' = 条文数字来自 paper_agent_decisions 当前有效的 spec；
+                   -- 'agent_random' = 必需的随机对照臂（阶段 3 才有交易，此前只记净值）。
+                   CHECK (arm IN ('hold', 'now', 'discipline', 'agent', 'agent_random')),
     etf_target_pct REAL,                 -- 纪律臂的 ETF 目标占比 %；hold/now 为 NULL
     start_date     TEXT NOT NULL,        -- 起跑日（收盘口径）YYYY-MM-DD
     initial_cash   REAL NOT NULL,
@@ -716,6 +719,33 @@ BEGIN SELECT RAISE(ABORT, 'paper_nav_daily is append-only'); END;
 CREATE TRIGGER IF NOT EXISTS trg_paper_nav_daily_no_delete
 BEFORE DELETE ON paper_nav_daily
 BEGIN SELECT RAISE(ABORT, 'paper_nav_daily is append-only'); END;
+
+CREATE TABLE IF NOT EXISTS paper_agent_decisions (
+    decision_id      INTEGER PRIMARY KEY AUTOINCREMENT,
+    arm              TEXT NOT NULL,        -- 账户 id：'arm-agent' | 'arm-agent-random'
+    asof             TEXT NOT NULL,        -- 复审日（PIT：只许喂 <= 这天的数据）
+    agent_kind       TEXT NOT NULL
+                     CHECK (agent_kind IN ('manual', 'llm', 'random')),
+    model_id         TEXT NOT NULL,        -- 'manual' / '<模型名>'（换模型 = 换口径）
+    prompt_sha256    TEXT NOT NULL,        -- 提示词（含温度）指纹（换提示词 = 换口径）
+    seed             INTEGER NOT NULL DEFAULT 0,
+    context_sha256   TEXT NOT NULL,        -- 喂进去的 PIT 快照指纹（同输入应得同 spec）
+    spec_before_json TEXT NOT NULL,
+    spec_after_json  TEXT NOT NULL,
+    n_trials         INTEGER NOT NULL DEFAULT 1,  -- 本次试了几版（预算 K=3）
+    rejected_json    TEXT NOT NULL DEFAULT '[]',  -- 被拒的版本与理由
+    rationale        TEXT NOT NULL DEFAULT '',    -- 智能体自述（只作展示，不作证据）
+    created_at       TEXT NOT NULL,
+    UNIQUE (arm, asof)
+);
+
+CREATE TRIGGER IF NOT EXISTS trg_paper_agent_decisions_no_update
+BEFORE UPDATE ON paper_agent_decisions
+BEGIN SELECT RAISE(ABORT, 'paper_agent_decisions is append-only (改错请再审一版)'); END;
+
+CREATE TRIGGER IF NOT EXISTS trg_paper_agent_decisions_no_delete
+BEFORE DELETE ON paper_agent_decisions
+BEGIN SELECT RAISE(ABORT, 'paper_agent_decisions is append-only'); END;
 
 -- P28：估值 / 资金流原始表 append-only（历史行一次写入后永不改写；源站重算不覆盖）。
 CREATE TRIGGER IF NOT EXISTS trg_valuation_daily_no_update

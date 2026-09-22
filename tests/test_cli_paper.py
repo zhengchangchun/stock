@@ -5,8 +5,16 @@ import json
 import pytest
 
 from stocklab.cli.main import main
+from stocklab.paper.config import ARM_AGENT, ARM_AGENT_RANDOM, ETF_TRANCHES
 from stocklab.store.db import connect
 from stocklab.store.migrate import init_db
+
+#: `init` 建出的全部账户（hold + now + 三档纪律臂 + 智能体臂与它的随机对照）。
+#: 从配置推出来 —— 写死 5 的话，下次多一条臂又要一处处改。
+N_ACCOUNTS = 2 + len(ETF_TRANCHES) + 2
+ALL_ARMS = ("arm-hold", "arm-now",
+            *(f"arm-discipline-{int(t):02d}" for t in ETF_TRANCHES),
+            ARM_AGENT, ARM_AGENT_RANDOM)
 
 NOW = "2026-09-15T16:00:00+08:00"
 CAL = ("2026-09-11", "2026-09-14", "2026-09-15", "2026-09-16")
@@ -52,7 +60,8 @@ def test_paper_init_then_step_then_show(db, tmp_path, capsys):
     code, out, _ = run(db, "paper", "init", capsys=capsys)
     assert code == 0, out
     rep = json.loads(out)
-    assert rep["created"] is True and len(rep["accounts"]) == 5
+    assert rep["created"] is True and len(rep["accounts"]) == N_ACCOUNTS
+    assert set(rep["accounts"]) == set(ALL_ARMS)
 
     out_path = tmp_path / "2026-09-15-paper.md"
     code, out, err = run(db, "paper", "step", "--asof", "2026-09-15",
@@ -60,14 +69,17 @@ def test_paper_init_then_step_then_show(db, tmp_path, capsys):
     assert code == 0, err
     payload = json.loads(out)
     assert payload["asof"] == "2026-09-15"
-    assert len(payload["accounts"]) == 5
+    assert len(payload["accounts"]) == N_ACCOUNTS
     assert payload["index_300"]["level"] == 4450.04
+    # 智能体臂（P37 阶段 1）：块必须在，且 `delta_vs_random` 是 `null` 而不是 0
+    assert payload["agent"]["arm"] == ARM_AGENT
+    assert payload["agent"]["delta_vs_random"] is None
+    assert payload["agent"]["delta_vs_random_available"] is False
 
     md = out_path.read_text(encoding="utf-8")
     assert "模拟盘 ≠ 实盘" in md and "LIVE 仍为 0" in md
     assert "样本 <120 交易日不算结论" in md
-    for tag in ("arm-hold", "arm-now", "arm-discipline-05", "arm-discipline-10",
-                "arm-discipline-15"):
+    for tag in ALL_ARMS:
         assert tag in md
     assert "最大回撤" in md and "累计成本" in md and "index_300" in md
 
@@ -186,7 +198,7 @@ def test_show_without_asof_falls_back_to_latest_nav_date(db, tmp_path, capsys):
     assert p["asof"] == "2026-09-15", "必须回落到最新有净值的日期"
     assert p["asof_source"] == "latest_nav"
     assert p["latest_nav_date"] == "2026-09-15"
-    assert len(p["accounts"]) == 5, "回落之后必须看得到三条臂（5 个账户）"
+    assert len(p["accounts"]) == N_ACCOUNTS, "回落之后必须看得到全部臂"
     assert "今日净值未生成，展示 2026-09-15" in p["disclosure"], \
         "必须显式披露「展示的不是今天」"
     assert json.loads(err)["asof"] == "2026-09-15"
@@ -210,7 +222,7 @@ def test_show_without_asof_does_not_fall_back_when_today_has_nav(db, tmp_path,
     assert p["asof_source"] == "today"
     assert p["latest_nav_date"] == "2026-09-16"
     assert not any("今日净值未生成" in d for d in p["disclosure"])
-    assert len(p["accounts"]) == 5
+    assert len(p["accounts"]) == N_ACCOUNTS
 
 
 def test_show_with_explicit_asof_is_honoured_verbatim(db, tmp_path, capsys):

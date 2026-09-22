@@ -1,15 +1,24 @@
 """模拟盘引擎（P19）：`init` / `step` / `show` 的编排层。
 
-## 三条臂（口径见 `paper/config.py` 与 ADR-010）
+## 四条臂（口径见 `paper/config.py` 与 ADR-010）
 
-| 账户 | 状态来源 | 交易 |
-|---|---|---|
-| `arm-hold` | `init` 时**冻结**的快照 | 永不 |
-| `arm-now` | 每步从 `real_trades`+`cash_flows` **重放**（实盘账本的镜像） | 永不 |
-| `arm-discipline-{05,10,15}` | 自身 `paper_trades` | 只在触发纪律时 |
+| 账户 | 状态来源 | 交易 | 条文数字从哪来 |
+|---|---|---|---|
+| `arm-hold` | `init` 时**冻结**的快照 | 永不 | —— |
+| `arm-now` | 每步从 `real_trades`+`cash_flows` **重放**（实盘账本的镜像） | 永不 | —— |
+| `arm-discipline-{05,10,15}` | 自身 `paper_trades` | 只在触发纪律时 | 写死常量 |
+| `arm-agent` | 自身 `paper_trades` | 只在触发纪律时 | 台账里当前有效的 spec |
+| `arm-agent-random` | 自身 `paper_trades` | 阶段 3 才有 | 同（随机抽） |
 
 起跑日 `arm-hold` 与 `arm-now` 数值**必然相同**（描述同一份状态），
 区别在之后：用户录一笔真成交，`arm-now` 跟着变、`arm-hold` 不变。
+
+## 「写死的条文」与「spec 参数化的同一批条文」共用一条执行路径
+
+`arm-agent` 不是第二套规则实现：它走的是**同一个** `_plan_steps` / `evaluate`，
+只是条文参数从 `RuleParams`（`STATIC_PARAMS` 或 spec 推出的那一组）来。
+设计 §4.3 「不复制规则代码」就靠这一点 —— 复制一份再两边各自维护，
+两条臂的差异就分不清是「编排的功劳」还是「抄错了」。
 
 ## 输出是**数据库状态的函数**
 
@@ -32,9 +41,17 @@ import sqlite3
 from dataclasses import replace
 
 from stocklab.config.costs import ASSET_ETF, ASSET_STOCK, CostModel
-from stocklab.paper import store
+from stocklab.paper import agent_spec, store
 from stocklab.paper.config import (
+    ARM_AGENT,
+    ARM_AGENT_RANDOM,
     ARM_HOLD,
+    ARM_KIND_AGENT,
+    ARM_KIND_AGENT_RANDOM,
+    ARM_KIND_DISCIPLINE,
+    ARM_KIND_HOLD,
+    ARM_KIND_NOW,
+    ARM_KINDS_WITH_RULES,
     ARM_NOW,
     DISCLAIMER,
     DISCLOSURE_ITEMS,
@@ -54,6 +71,8 @@ from stocklab.paper.rules import (
     C_NO_PRICE,
     C_SINGLE,
     Decision,
+    RuleParams,
+    STATIC_PARAMS,
     check_no_lookahead,
     etf_leg_targets,
     floor_lot,
@@ -72,6 +91,9 @@ from stocklab.store.db import transaction
 
 INDEX_300_SYMBOL = "sh000300"
 MAX_ORDERS_PER_STEP = 10          # ETF 建仓循环上限（跑满要留痕，见 `_build_etf`）
+
+#: `paper show` / 页面的 `agent.history` 保留最近几版（台账本身不截断）。
+HISTORY_KEEP = 5
 
 BARS_CLOSE_SQL = (
     "SELECT date, close FROM bars_daily"
@@ -143,11 +165,48 @@ def ledger_state(conn: sqlite3.Connection, asof: str) -> dict:
     }
 
 
-# ---------- 账户状态 ----------
+# ---------- 臂的分派 ----------
 
-def _positions_of(account: dict) -> dict[str, int]:
+def has_rules(account: dict) -> bool:
+    """这条臂跑不跑条文（= 会不会下单）。其余臂只记净值。
+
+    `arm-agent-random` 阶段 1–2 不在这个集合里：它现在只做 mark-to-market，
+    阶段 3 接了随机 spec 才开交易。占位臂与「随机无信息」是两件事，
+    不能让一个还没接线的臂看起来像是已经跑出了一个结果。
+    """
+    return account["arm"] in ARM_KINDS_WITH_RULES
+
+
+def _position_snapshot(account: dict) -> dict[str, int]:
     return {p["code"]: int(p["qty"])
             for p in json.loads(account["initial_positions_json"])}
+
+
+def params_for_account(conn: sqlite3.Connection, account: dict, asof: str) -> RuleParams:
+    """这条臂本次决策的参数组。
+
+    - `arm-discipline-*` ⇒ `STATIC_PARAMS` 换一个 `etf_target_pct`（账户列里的档位）；
+    - `arm-agent` ⇒ 台账里当前有效 spec 推出来的一组（四项来自 spec，成本/整手/白名单
+      只能是默认值）；
+    - `arm-hold` / `arm-now` / `arm-agent-random` ⇒ `STATIC_PARAMS`（它们不下单；
+      参数只用于 `evaluate` 里的「不动的理由」，`etf_target_pct=None` ⇒ 不建仓）。
+    """
+    if account["arm"] == ARM_KIND_AGENT:
+        spec = agent_spec.current_spec(conn, account["account_id"], asof)
+        det = agent_spec.latest_decision(conn, account["account_id"], asof)
+        return agent_spec.params_for(
+            spec, source_asof=None if det is None else str(det["asof"]))
+    target = account["etf_target_pct"]
+    return replace(STATIC_PARAMS,
+                   etf_target_pct=None if target is None else float(target))
+
+
+def _arm_state(conn: sqlite3.Connection, account: dict, asof: str) -> dict:
+    if account["arm"] == ARM_KIND_NOW:
+        led = ledger_state(conn, asof)
+        return {"cash": led["cash"], "positions": dict(led["positions"]),
+                "cum_cost": led["cum_cost"], "net_deposits": led["net_deposits"]}
+    return _ledger_arm_state(conn, account, asof)
 
 
 def _apply(positions: dict[str, int], code: str, side: str, qty: int) -> None:
@@ -162,11 +221,15 @@ def _apply(positions: dict[str, int], code: str, side: str, qty: int) -> None:
 
 
 def _ledger_arm_state(conn: sqlite3.Connection, account: dict, asof: str) -> dict:
-    """`arm-hold`（冻结）与 `arm-discipline-*`（自身成交）的状态。"""
+    """`arm-hold`（冻结）与「自身成交」那些臂（纪律 / 智能体）的状态。
+
+    `has_rules(account)` 决定要不要重放自己的成交 —— `arm-agent` 与
+    `arm-discipline-*` 共用同一条重放路径（都不读 `real_trades`）。
+    """
     cash = float(account["initial_cash"])
-    positions = _positions_of(account)
+    positions = _position_snapshot(account)
     cum_cost = float(json.loads(account["params_json"]).get("seed_fee", 0.0))
-    if account["arm"] == "discipline":
+    if has_rules(account):
         for t in store.load_trades(conn, account_id=account["account_id"], asof=asof):
             _apply(positions, t["code"], t["side"], int(t["qty"]))
             gross = float(t["fill_price"]) * int(t["qty"])
@@ -178,14 +241,6 @@ def _ledger_arm_state(conn: sqlite3.Connection, account: dict, asof: str) -> dic
     return {"cash": round(cash, 4), "positions": positions,
             "cum_cost": round(cum_cost, 4),
             "net_deposits": float(json.loads(account["params_json"])["initial_capital"])}
-
-
-def _arm_state(conn: sqlite3.Connection, account: dict, asof: str) -> dict:
-    if account["arm"] == "now":
-        led = ledger_state(conn, asof)
-        return {"cash": led["cash"], "positions": dict(led["positions"]),
-                "cum_cost": led["cum_cost"], "net_deposits": led["net_deposits"]}
-    return _ledger_arm_state(conn, account, asof)
 
 
 def _mark_to_market(positions: dict[str, int],
@@ -234,10 +289,17 @@ def _declared_seed(led: dict, start_date: str) -> None:
 
 def init_accounts(conn: sqlite3.Connection, *, start_date: str = PAPER_START_DATE,
                   now: str) -> dict:
-    """建三条臂（纪律臂按 `ETF_TRANCHES` 展开成 3 档）。幂等：已存在则不改写。"""
+    """建臂（纪律臂按 `ETF_TRANCHES` 展开 3 档 + 智能体臂与它的随机对照）。
+
+    幂等：已存在则不改写。
+
+    `arm-agent` / `arm-agent-random` 的 `etf_target_pct` 列写 `None` —— 它们的 ETF
+    目标来自**台账里的当前 spec**，不来自账户行。把当时的 spec 抄进这一列，
+    等于在库里存下第二个真相，而它不会随 spec 变。
+    """
     led = ledger_state(conn, start_date)
     _declared_seed(led, start_date)
-    positions = _positions_of({"initial_positions_json": json.dumps(
+    positions = _position_snapshot({"initial_positions_json": json.dumps(
         [{"code": c, "qty": q} for c, q in led["positions"].items()])})
     marks = resolve_marks(conn, positions, start_date)
     if set(marks) != set(positions):
@@ -250,11 +312,21 @@ def init_accounts(conn: sqlite3.Connection, *, start_date: str = PAPER_START_DAT
               "per_step_cash_pct": PER_STEP_CASH_PCT,
               "etf_whitelist": list(ETF_WHITELIST),
               "start_date": start_date, "initial_capital": INITIAL_CAPITAL}
-    specs = [(ARM_HOLD, "hold", None), (ARM_NOW, "now", None)]
-    specs += [(f"{DISCIPLINE_PREFIX}{int(t):02d}", "discipline", t)
+    specs = [(ARM_HOLD, ARM_KIND_HOLD, None, params),
+             (ARM_NOW, ARM_KIND_NOW, None, params)]
+    specs += [(f"{DISCIPLINE_PREFIX}{int(t):02d}", ARM_KIND_DISCIPLINE, t, params)
               for t in ETF_TRANCHES]
+    # 智能体臂：台账为空 ⇒ 跑 `AGENT_DEFAULT_SPEC`（= arm-discipline-10 口径），
+    # 所以它在起跑日与静态臂对齐，差别只看之后的编排。
+    specs += [(ARM_AGENT, ARM_KIND_AGENT, None,
+               {**params, "spec_source": agent_spec.TABLE_DECISIONS,
+                "agent_default_spec": dict(agent_spec.AGENT_DEFAULT_SPEC)}),
+              (ARM_AGENT_RANDOM, ARM_KIND_AGENT_RANDOM, None,
+               {**params, "spec_source": agent_spec.TABLE_DECISIONS,
+                "counter_arm": ARM_AGENT,
+                "wired_from": "阶段 3：随机改 spec（现在只记净值，不下单）"})]
     created = []
-    for account_id, arm, target in specs:
+    for account_id, arm, target, acct_params in specs:
         if store.account_exists(conn, account_id):
             continue
         store.insert_account(
@@ -262,7 +334,7 @@ def init_accounts(conn: sqlite3.Connection, *, start_date: str = PAPER_START_DAT
             start_date=start_date, initial_cash=led["cash"],
             initial_positions=[{"code": c, "qty": q}
                                for c, q in sorted(led["positions"].items())],
-            initial_nav=initial_nav, params=params, now=now)
+            initial_nav=initial_nav, params=acct_params, now=now)
         created.append(account_id)
     return {"created": bool(created), "accounts": created, "start_date": start_date,
             "initial_nav": initial_nav, "initial_cash": led["cash"],
@@ -273,8 +345,14 @@ def init_accounts(conn: sqlite3.Connection, *, start_date: str = PAPER_START_DAT
 
 def evaluate(conn: sqlite3.Connection, account: dict, *, asof: str,
              cash: float, positions: dict[str, int], marks: dict[str, Price],
-             total_assets: float) -> list[Decision]:
-    """当前状态下各条规则怎么说（含**不动的理由**）。不写库、无副作用。"""
+             total_assets: float,
+             params: RuleParams | None = None) -> list[Decision]:
+    """当前状态下各条规则怎么说（含**不动的理由**）。不写库、无副作用。
+
+    `params` 不给就用写死条文（静态臂）；给了就按它跑 —— 这就是「智能体臂与静态臂
+    共用同一个内核」在代码上的全部含义。
+    """
+    p = params or STATIC_PARAMS
     stock_costs = CostModel(asset_class=ASSET_STOCK)
     out: list[Decision] = []
     held = positions.get(HOLD_CODE, 0)
@@ -282,40 +360,51 @@ def evaluate(conn: sqlite3.Connection, account: dict, *, asof: str,
     close = p_hold.price if p_hold else None
     src = p_hold.source if p_hold else None
     pasof = p_hold.price_asof if p_hold else None
-    if held > 0 or account["arm"] == "discipline":
-        out.append(_stamp(plan_stop_loss(
+    if held > 0 or has_rules(account):
+        out.append(_finalize(plan_stop_loss(
             code=HOLD_CODE, close=close, qty=held, costs=stock_costs,
-            source=src, price_asof=pasof), p_hold))
+            source=src, price_asof=pasof, params=p), p_hold, p))
         if held > 0 and close is not None:
-            out.append(_stamp(plan_trim(
+            out.append(_finalize(plan_trim(
                 code=HOLD_CODE, qty=held, close=close, total_assets=total_assets,
-                costs=stock_costs, intent_pct=None), p_hold))
-    if account["arm"] == "discipline" and account["etf_target_pct"]:
-        targets = etf_leg_targets(etf_target_pct=account["etf_target_pct"],
-                                  total_assets=total_assets)
-        if not [c for c in ETF_WHITELIST if c in marks]:
+                costs=stock_costs, intent_pct=None, params=p), p_hold, p))
+    if p.etf_target_pct:
+        targets = etf_leg_targets(etf_target_pct=p.etf_target_pct,
+                                  total_assets=total_assets, whitelist=p.whitelist)
+        if not [c for c in p.whitelist if c in marks]:
             out.append(Decision(
                 action="hold", code=None, qty=0,
-                rule_citation=RULE_CITATIONS["etf_first_build"],
-                reason=f"白名单 ETF {list(ETF_WHITELIST)} 在 {asof} 前都取不到收盘价 "
+                rule_citation=p.cite("etf_first_build"),
+                reason=f"白名单 ETF {list(p.whitelist)} 在 {asof} 前都取不到收盘价 "
                        f"→ 不建仓（不猜价、不用别的标的价格顶替）",
                 binding_constraints=(C_NO_PRICE,)))
-        for code in ETF_WHITELIST:
-            p = marks.get(code)
-            if p is None:
+        for code in p.whitelist:
+            mark = marks.get(code)
+            if mark is None:
                 continue
-            leg_value = (positions.get(code, 0) or 0) * p.price
-            out.append(_stamp(plan_etf_buy(
-                code=code, price=p.price, cash=cash, total_assets=total_assets,
+            leg_value = (positions.get(code, 0) or 0) * mark.price
+            out.append(_finalize(plan_etf_buy(
+                code=code, price=mark.price, cash=cash, total_assets=total_assets,
                 leg_gap_value=max(0.0, targets[code] - leg_value),
-                costs=CostModel(asset_class=ASSET_ETF)), p))
+                costs=CostModel(asset_class=ASSET_ETF), params=p), mark, p))
     return out
 
 
-def _stamp(d: Decision, price: Price | None) -> Decision:
-    if price is None:
-        return d
-    return replace(d, price_source=price.source, price_asof=price.price_asof)
+def _finalize(d: Decision, price: Price | None,
+              params: RuleParams | None = None) -> Decision:
+    """盖章：标上价格出处 + （智能体臂）spec 溯源标签。
+
+    标价格出处：规则层不认识数据源，而「这个价是哪来的」是事后审计的第一问。
+    标 spec 溯源：`paper_trades` 是 append-only 的，所以「这笔单照哪一版 spec 下的」
+    必须在成交行自己说得清，否则读单笔成交的人还得自己 JOIN 台账。
+    静态臂的 `spec_tag` 为空 → reason 一个字不改（逐字节对拍的前提）。
+    """
+    p = params or STATIC_PARAMS
+    if price is not None:
+        d = replace(d, price_source=price.source, price_asof=price.price_asof)
+    if p.spec_tag:
+        d = replace(d, reason=f"{d.reason}（{p.spec_tag}）")
+    return d
 
 
 def discipline_checks(*, cash: float, positions: dict[str, int], total: float,
@@ -342,19 +431,21 @@ def discipline_checks(*, cash: float, positions: dict[str, int], total: float,
 def _build_etf(conn: sqlite3.Connection, account: dict, *, asof: str,
                cash: float, positions: dict[str, int], marks: dict[str, Price],
                total: float, deployed_today: float,
-               evaluations: list[Decision]) -> tuple[float, float, list[Decision]]:
+               evaluations: list[Decision],
+               params: RuleParams | None = None) -> tuple[float, float, list[Decision]]:
     """按「缺口最大者先」的顺序建仓，直到本步额度/缺口用尽。
 
     返回 `(cash, deployed_today, 实际下单的 decisions)`。
     """
+    p = params or STATIC_PARAMS
     orders: list[Decision] = []
     etf_costs = CostModel(asset_class=ASSET_ETF)
     for _ in range(MAX_ORDERS_PER_STEP):
-        targets = etf_leg_targets(etf_target_pct=account["etf_target_pct"],
-                                  total_assets=total)
+        targets = etf_leg_targets(etf_target_pct=p.etf_target_pct or 0.0,
+                                  total_assets=total, whitelist=p.whitelist)
         # 缺口最大者先；并列取 code 升序（确定性，不含任何偏好）。
         # 取不到价的腿直接排除：不猜价、不用另一条腿的价格顶替。
-        available = [c for c in ETF_WHITELIST if c in marks]
+        available = [c for c in p.whitelist if c in marks]
         if not available:
             break
         ranked = sorted(
@@ -366,10 +457,10 @@ def _build_etf(conn: sqlite3.Connection, account: dict, *, asof: str,
             gap = max(0.0, targets[code] - positions.get(code, 0) * marks[code].price)
             if gap <= 0:
                 continue
-            d = _stamp(plan_etf_buy(
+            d = _finalize(plan_etf_buy(
                 code=code, price=marks[code].price, cash=cash, total_assets=total,
                 leg_gap_value=gap, costs=etf_costs,
-                deployed_today=deployed_today), marks[code])
+                deployed_today=deployed_today, params=p), marks[code], p)
             evaluations.append(d)
             if not d.is_trade:
                 continue
@@ -387,7 +478,7 @@ def _build_etf(conn: sqlite3.Connection, account: dict, *, asof: str,
             # 触到上限**必须留痕**（铁律③：不许静默截断）
             evaluations.append(Decision(
                 action="hold", code=None, qty=0,
-                rule_citation=RULE_CITATIONS["etf_first_build"],
+                rule_citation=p.cite("etf_first_build"),
                 reason=f"⚠️ 本步下单数已达上限 {MAX_ORDERS_PER_STEP} → 停止建仓（留痕）",
                 binding_constraints=("max_orders_per_step",)))
             break
@@ -396,46 +487,57 @@ def _build_etf(conn: sqlite3.Connection, account: dict, *, asof: str,
 
 def _plan_steps(conn: sqlite3.Connection, account: dict, *, asof: str,
                 cash: float, positions: dict[str, int], marks: dict[str, Price],
-                total: float) -> tuple[float, dict[str, int], float, list[Decision],
-                                       list[Decision]]:
-    """跑一遍固定优先级：止损 → 超限减仓 → 分散建仓。返回新状态 + 评估 + 下单。"""
+                total: float,
+                params: RuleParams | None = None,
+                ) -> tuple[float, dict[str, int], float, list[Decision],
+                           list[Decision]]:
+    """跑一遍固定优先级：止损 → 超限减仓 → 分散建仓。返回新状态 + 评估 + 下单。
+
+    静态臂与智能体臂都走这里（区别只在 `params`）。
+    """
+    p = params or STATIC_PARAMS
     evaluations = evaluate(conn, account, asof=asof, cash=cash,
-                           positions=positions, marks=marks, total_assets=total)
+                          positions=positions, marks=marks, total_assets=total,
+                          params=p)
     orders: list[Decision] = []
     stock_costs = CostModel(asset_class=ASSET_STOCK)
     deployed = 0.0
+
+    def _recompute() -> float:
+        return round(cash + sum(positions[c] * marks[c].price
+                                for c in positions if c in marks), 4)
 
     held = positions.get(HOLD_CODE, 0)
     p_hold = marks.get(HOLD_CODE)
 
     # a. 止损（硬，安全）
-    d = _stamp(plan_stop_loss(code=HOLD_CODE, close=p_hold.price if p_hold else None,
-                              qty=held, costs=stock_costs,
-                              source=p_hold.source if p_hold else None,
-                              price_asof=p_hold.price_asof if p_hold else None), p_hold)
+    d = _finalize(plan_stop_loss(
+        code=HOLD_CODE, close=p_hold.price if p_hold else None,
+        qty=held, costs=stock_costs,
+        source=p_hold.source if p_hold else None,
+        price_asof=p_hold.price_asof if p_hold else None, params=p), p_hold, p)
     if d.is_trade:
         _apply(positions, HOLD_CODE, "sell", d.qty)
         cash += d.amount
-        total = round(cash + sum(positions[c] * marks[c].price
-                                 for c in positions if c in marks), 4)
+        total = _recompute()
         orders.append(d)
 
     # b. 超限减仓（硬，上限）
     held = positions.get(HOLD_CODE, 0)
     if held > 0 and p_hold is not None:
-        d = _stamp(plan_trim(code=HOLD_CODE, qty=held, close=p_hold.price,
-                             total_assets=total, costs=stock_costs), p_hold)
+        d = _finalize(plan_trim(code=HOLD_CODE, qty=held, close=p_hold.price,
+                               total_assets=total, costs=stock_costs, params=p),
+                      p_hold, p)
         if d.is_trade:
             _apply(positions, HOLD_CODE, "sell", d.qty)
             cash += d.amount
-            total = round(cash + sum(positions[c] * marks[c].price
-                                     for c in positions if c in marks), 4)
+            total = _recompute()
             orders.append(d)
 
     # c. 分散建仓
     cash, deployed, etf_orders = _build_etf(
         conn, account, asof=asof, cash=cash, positions=positions, marks=marks,
-        total=total, deployed_today=deployed, evaluations=evaluations)
+        total=total, deployed_today=deployed, evaluations=evaluations, params=p)
     orders.extend(etf_orders)
     return cash, positions, total, evaluations, orders
 
@@ -470,8 +572,10 @@ def _step_all(conn: sqlite3.Connection, asof: str, *, accounts: list[dict],
         if store.nav_exists(conn, account["account_id"], asof):
             continue
         state = _arm_state(conn, account, asof)
-        codes = set(state["positions"]) | ({HOLD_CODE} | set(ETF_WHITELIST)
-                                          if account["arm"] == "discipline" else set())
+        params = params_for_account(conn, account, asof)
+        codes = set(state["positions"])
+        if has_rules(account):
+            codes |= {HOLD_CODE} | set(params.whitelist)
         marks = dict(prices) if prices is not None else resolve_marks(conn, codes, asof)
         check_no_lookahead(asof, marks)
         missing = sorted(c for c in state["positions"] if c not in marks)
@@ -481,10 +585,10 @@ def _step_all(conn: sqlite3.Connection, asof: str, *, accounts: list[dict],
         mv, _ = _mark_to_market(positions, marks)
         total = round(cash + mv, 4)
         orders: list[Decision] = []
-        if account["arm"] == "discipline":
+        if has_rules(account):
             cash, positions, total, _evals, orders = _plan_steps(
                 conn, account, asof=asof, cash=cash, positions=positions,
-                marks=marks, total=total)
+                marks=marks, total=total, params=params)
         for d in orders:
             store.insert_trade(conn, account_id=account["account_id"], date=asof,
                                decision=d, now=now, commit=False)
@@ -492,7 +596,7 @@ def _step_all(conn: sqlite3.Connection, asof: str, *, accounts: list[dict],
         nav = round(cash + mv, 4)
         history = [r["nav"] for r in store.load_nav(conn, account["account_id"],
                                                     asof=asof)]
-        if account["arm"] == "discipline":
+        if has_rules(account):
             cum_cost = state["cum_cost"] + sum(d.fees.get("total", 0.0) for d in orders)
         else:
             cum_cost = state["cum_cost"]
@@ -517,8 +621,10 @@ def _account_entry(conn: sqlite3.Connection, account: dict, asof: str,
     if nav_row is None or nav_row["date"] != asof:
         raise PaperError(f"{account['account_id']} 在 {asof} 没有净值行；先跑 `paper step`")
     positions = {p["code"]: int(p["qty"]) for p in json.loads(nav_row["positions_json"])}
-    codes = set(positions) | ({HOLD_CODE} | set(ETF_WHITELIST)
-                              if account["arm"] == "discipline" else {HOLD_CODE})
+    params = params_for_account(conn, account, asof)
+    codes = set(positions) | ({HOLD_CODE} if has_rules(account) else set())
+    if params.etf_target_pct:
+        codes |= set(params.whitelist)
     marks = dict(prices) if prices is not None else resolve_marks(conn, codes, asof)
     check_no_lookahead(asof, marks)
     total = nav_row["nav"]
@@ -537,7 +643,8 @@ def _account_entry(conn: sqlite3.Connection, account: dict, asof: str,
         "evaluation": [json.loads(json.dumps(_decision_json(d)))
                        for d in evaluate(conn, account, asof=asof,
                                          cash=nav_row["cash"], positions=positions,
-                                         marks=marks, total_assets=total)],
+                                         marks=marks, total_assets=total,
+                                         params=params)],
         "decisions": [_trade_json(t) for t in
                       store.trades_on(conn, account["account_id"], asof)],
         "nav_history_points": len(store.load_nav(conn, account["account_id"],
@@ -591,7 +698,93 @@ def state_payload(conn: sqlite3.Connection, asof: str) -> dict:
                      if store.nav_exists(conn, a["account_id"], asof)],
         "index_300": ({"level": idx.price, "price_asof": idx.price_asof}
                       if idx else None),
+        "agent": agent_block(conn, asof),
         "disclosure": list(DISCLOSURE_ITEMS),
+    }
+
+
+# ---------- 智能体臂的报告块 ----------
+
+NO_RANDOM_FMT = ("`{arm}` 还没有任何一版 spec（阶段 3 才接线）⇒ 差分**不存在**，"
+                 "不是 0。拿一个没接线的臂当基准，算出来的差是噪音。")
+
+
+def arm_target_label(arm_kind: str, etf_target_pct: float | None) -> str:
+    """账户 → 「它的规矩是什么」的人话（报告与页面共用同一套措辞）。"""
+    if arm_kind == ARM_KIND_HOLD:
+        return "什么都不做"
+    if arm_kind == ARM_KIND_NOW:
+        return "实盘账本镜像"
+    if arm_kind == ARM_KIND_AGENT:
+        return "智能体动态编排（spec 台账）"
+    if arm_kind == ARM_KIND_AGENT_RANDOM:
+        return "智能体随机改（阶段 3 才下单）"
+    if arm_kind == ARM_KIND_DISCIPLINE and etf_target_pct is not None:
+        return f"ETF 目标 {etf_target_pct:.0f}%"
+    return f"{arm_kind}（口径未登记）"
+
+
+def _cum_return_at(conn: sqlite3.Connection, account_id: str,
+                   asof: str) -> float | None:
+    row = conn.execute(
+        "SELECT cum_return FROM paper_nav_daily WHERE account_id = ? AND date <= ?"
+        " ORDER BY date DESC LIMIT 1", (account_id, asof)).fetchone()
+    return None if row is None else float(row["cum_return"])
+
+
+def agent_block(conn: sqlite3.Connection, asof: str) -> dict:
+    """`arm-agent` 的报告块（`paper show` 与 `/lab/paper` **同源**，不重算）。
+
+    `delta_vs_random` 在阶段 3 之前恒为 `null`，但**字段必须出现**：省略字段会让
+    「还没接线」和「两臂一样」在 JSON 上长得一模一样。
+    """
+    spec = agent_spec.current_spec(conn, ARM_AGENT, asof)
+    ledger = agent_spec.ledger_summary(conn, ARM_AGENT, asof)
+    random_ledger = agent_spec.ledger_summary(conn, ARM_AGENT_RANDOM, asof)
+    history = []
+    for d in agent_spec.load_decisions(conn, ARM_AGENT)[-HISTORY_KEEP:]:
+        history.append({
+            "decision_id": int(d["decision_id"]), "asof": str(d["asof"]),
+            "agent_kind": str(d["agent_kind"]), "model_id": str(d["model_id"]),
+            "n_trials": int(d["n_trials"]), "n_rejected": len(d["rejected"]),
+            "spec_sha256": agent_spec.spec_sha256(d["spec_after"]),
+            "spec_after": d["spec_after"], "rationale": str(d["rationale"]),
+            "context_sha256": str(d["context_sha256"]),
+        })
+    delta, available = None, random_ledger["n_reviews"] > 0
+    if available:
+        mine = _cum_return_at(conn, ARM_AGENT, asof)
+        theirs = _cum_return_at(conn, ARM_AGENT_RANDOM, asof)
+        if mine is not None and theirs is not None:
+            delta = round(mine - theirs, 6)
+        else:
+            available = False
+    return {
+        "arm": ARM_AGENT,
+        "asof": asof,
+        "spec": spec,
+        "spec_sha256": agent_spec.spec_sha256(spec),
+        "stop_loss_line": agent_spec.stop_loss_line(spec),
+        "change_space": {name: f.range_text()
+                         for name, f in agent_spec.SPEC_SCHEMA.items()},
+        "n_reviews": ledger["n_reviews"],
+        "n_trials_total": ledger["n_trials_total"],
+        "n_rejected": ledger["n_rejected"],
+        "max_trials_per_review": ledger["max_trials_per_review"],
+        "rebalance_cadence": ledger["cadence"],
+        "first_asof": ledger["first_asof"],
+        "last_asof": ledger["last_asof"],
+        "history": history,
+        # 阶段 3 之前恒为 null（字段必须出现，见 docstring）。
+        "delta_vs_random": delta,
+        "delta_vs_random_available": available,
+        "delta_vs_random_note": (
+            None if available else NO_RANDOM_FMT.format(arm=ARM_AGENT_RANDOM)),
+        "counter_arm": {"arm": ARM_AGENT_RANDOM,
+                        "n_reviews": random_ledger["n_reviews"],
+                        "wired": available},
+        "evidence_note": ("n_trials_total 与 n_rejected 必须与净值同时读："
+                          "试了很多版选最好那版，读数是**上界**不是期望"),
     }
 
 
@@ -702,14 +895,12 @@ def render_report(rep: dict) -> str:
     L.append("")
     L.append(f"> {rep['sample_note']}")
     L.append("")
-    L.append("## 一、三条臂净值（并列，不挑「推荐」）")
+    L.append("## 一、各臂净值（并列，不挑「推荐」）")
     L.append("")
     L.append("| 账户 | 口径 | 净值 | 累计收益 | 最大回撤 | 累计成本 | ETF 实际占比 |")
     L.append("|---|---|---|---|---|---|---|")
     for a in rep["accounts"]:
-        target = (f"ETF 目标 {a['etf_target_pct']:.0f}%"
-                  if a["etf_target_pct"] is not None else
-                  ("什么都不做" if a["arm"] == "hold" else "实盘账本镜像"))
+        target = arm_target_label(a["arm"], a["etf_target_pct"])
         actual = ("—" if a["etf_actual_pct"] is None
                   else f"{a['etf_actual_pct']:.2f}%")
         L.append(f"| `{a['account_id']}` | {target} | {a['nav']:,.2f} | "

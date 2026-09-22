@@ -6,6 +6,7 @@
 |---|---|---|
 | 我 · 实盘账本镜像（`arm-now`） | `real_trades` + `cash_flows` 逐笔重放 | 真人这笔钱现在值多少 |
 | AI 纪律臂（`arm-discipline-{05,10,15}`） | 自身 `paper_trades` | 写死的规则跑出来是多少 |
+| AI 智能体臂（`arm-agent` / `arm-agent-random`） | 自身 `paper_trades` | 条文数字**可改**时（台账里的当前 spec）跑出来是多少 |
 | 什么都不做（`arm-hold`） | `init` 时**冻结**的快照 | 一动不动是什么结果 |
 | 大盘（`sh000300`） | `bars_daily` 收盘 | 市场本身涨了多少 |
 
@@ -17,6 +18,11 @@
 被 `test_paper_never_imports_model_or_kelly` 源码扫描钉死。口径是
 「AI 纪律臂（规则执行，不含方向预测）」，不是「AI 操盘手」。
 
+`arm-agent` 同样**不用模型**：它只是把同一条纪律的 5 个数字搬到台账里
+（`paper_agent_decisions`），阶段 1–2 的 spec 由人手写或由人复核后落库。
+所以它回答的是「条文数字可变之后会怎样」，不是「AI 会操盘」。这一点在页面上
+必须写清楚，否则两条 AI 线会被读成「有模型在里面」。
+
 ## 「自己编排的东西用上了没有」（`ai_evidence`）
 
 对照页还要回答一个问题：**页面上那条「AI」线，究竟用没用上我们自己编排的东西**
@@ -26,11 +32,16 @@
 |---|---|---|
 | `accuracy` | `session.review.rolling_accuracy`（与「数据」页、`review` 报告同源） | AI 自己的准确率是多少 |
 | `scripts` / `backtests` / `candidate` / `routing` | `plugin_*`、`candidate_*` 表 + `candidate.score.POOL_PLUGIN` | 自己编排的产出有哪些、谁在调 |
-| `consumption` | `paper_trades.rule_citation` 对表 `paper.config.RULE_CITATIONS` + `paper_accounts.params_json` | 模拟盘**实际**消费了几条 |
+| `consumption` | `paper_trades.rule_citation` 对表 `paper.config.RULE_CITATIONS` **＋** `RULE_CITATIONS_AGENT` ＋ `paper_accounts.params_json` | 模拟盘**实际**消费了几条 |
 
-第三段是**实测**而不是描述：落在写死条文之外的触发理由会被逐条列出（空 = 没有
+第三段是**实测**而不是描述：落在两张条文表之外的触发理由会被逐条列出（空 = 没有
 任何一笔成交由模型或插桩脚本触发）。将来真接了模型臂，这里会自己变成非空 ——
 所以它同时是一块看板和一个钩子。
+
+`arm-agent` 的成交引用的是 `RULE_CITATIONS_AGENT`（第二张表）。它与写死条文表
+**并列而不合并**：合并之后「有几笔成交由 spec 触发」就再也数不出来了。所以这里
+分开计数（`n_trades_by_spec`），而 `unknown_rules` **仍然为空** —— 阶段 1 的 spec
+是人手写的，不是模型信号。
 
 ## 本模块不产生新口径
 
@@ -52,9 +63,12 @@ from __future__ import annotations
 import json
 import sqlite3
 
+from stocklab.paper import agent_spec
 from stocklab.paper import store as paper_store
-from stocklab.paper.config import PAPER_START_DATE, RULE_CITATIONS
-from stocklab.paper.engine import INDEX_300_SYMBOL, build_report
+from stocklab.paper.config import (ARM_AGENT, ARM_AGENT_RANDOM, ARM_KIND_AGENT,
+                                   ARM_KIND_AGENT_RANDOM, PAPER_START_DATE,
+                                   RULE_CITATIONS, RULE_CITATIONS_AGENT)
+from stocklab.paper.engine import INDEX_300_SYMBOL, agent_block, build_report
 from stocklab.plugin import lifecycle as plugin_lifecycle
 from stocklab.plugin import store as plugin_store
 from stocklab.session.review import rolling_accuracy
@@ -66,6 +80,19 @@ INDEX_LABEL = "沪深300 指数"
 #: 认得出「我」的那条臂（`paper/config.ARM_NOW` 的 row 值）。
 _ARM_NOW = "now"
 _ARM_HOLD = "hold"
+
+#: 智能体臂的两种 row 值（`paper_accounts.arm`）。
+_ARM_AGENT = ARM_KIND_AGENT
+_ARM_AGENT_RANDOM = ARM_KIND_AGENT_RANDOM
+
+
+def _has_table(conn: sqlite3.Connection, name: str) -> bool:
+    """表在不在。新表在老库上可能还没前滚 —— 页面**只读**，不外滚 schema，
+    所以缺表时要能给一个「不知道怎么答」，而不是 500。
+    """
+    return conn.execute(
+        "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name=?",
+        (name,)).fetchone()[0] > 0
 
 
 def _anchor_cum_return(account: dict) -> float | None:
@@ -176,9 +203,12 @@ def ai_evidence(conn: sqlite3.Connection, asof: str) -> dict:
         " ORDER BY asof")]
 
     known = set(RULE_CITATIONS.values())
+    agent_known = set(RULE_CITATIONS_AGENT.values())
     rows = conn.execute("SELECT rule_citation FROM paper_trades").fetchall()
     cited = sorted({str(r["rule_citation"] or "") for r in rows})
-    unknown = [c for c in cited if c not in known]
+    unknown = [c for c in cited if c not in known and c not in agent_known]
+    spec_cited = [c for c in cited if c in agent_known]
+    n_by_spec = sum(1 for r in rows if str(r["rule_citation"] or "") in agent_known)
     blobs = [str(r["params_json"] or "") for r in conn.execute(
         "SELECT params_json FROM paper_accounts")]
     param_keys = sorted({k for blob in blobs for k in json.loads(blob or "{}")})
@@ -208,6 +238,10 @@ def ai_evidence(conn: sqlite3.Connection, asof: str) -> dict:
             "n_trades": len(rows),
             "cited_rules": cited,
             "unknown_rules": unknown,
+            # `arm-agent` 的成交：条文来自 spec 台账（第二张表），**单列计数**。
+            # 它不是「表外」—— 表外为空与这里有数，两件事必须能同时成立。
+            "spec_rules": spec_cited,
+            "n_trades_by_spec": n_by_spec,
             "param_keys": param_keys,
             "param_refs": param_refs,
         },
@@ -215,14 +249,41 @@ def ai_evidence(conn: sqlite3.Connection, asof: str) -> dict:
 
 
 def _empty(asof: str, start: str, *, db_missing: bool = False,
-           ai: dict | None = None) -> dict:
+           ai: dict | None = None, agent: dict | None = None) -> dict:
     return {"asof": asof, "available": False, "db_missing": db_missing,
             "start_date": start, "date": None, "dates": [], "n_sessions": 0,
             "arms": [], "index": None, "now_account_id": None,
             "mirror_equals_hold": None, "real_trades": [],
             "real_trades_after_start": None, "paper_trades": [],
-            "ai": ai or {},
+            "ai": ai or {}, "agent": agent or {},
             "disclosure": [], "disclaimer": "", "sample_note": ""}
+
+
+def agent_track(conn: sqlite3.Connection, asof: str) -> dict:
+    """智能体臂（P37）的页面取数：台账现状 + **直接复用** `engine.agent_block`。
+
+    规格、试错计数、`delta_vs_random` 的口径全部只在一个地方写（`engine`），
+    页面不再拼第二套 —— 否则 `paper show` 与页面上会出现两个「试了几版」。
+    台账表缺失（老库未前滚）时返回 `available: False` + 原因，**不报 500**。
+    """
+    if not _has_table(conn, agent_spec.TABLE_DECISIONS):
+        return {"available": False,
+                "reason": f"库里没有 `{agent_spec.TABLE_DECISIONS}` 表 —— "
+                          f"这份库还没前滚到 P37；页面不编数",
+                "default_spec": dict(agent_spec.AGENT_DEFAULT_SPEC),
+                "change_space": {name: f.range_text()
+                                 for name, f in agent_spec.SPEC_SCHEMA.items()}}
+    block = agent_block(conn, asof)
+    block["available"] = True
+    block["default_spec"] = dict(agent_spec.AGENT_DEFAULT_SPEC)
+    block["counter_arm_n_reviews"] = agent_spec.ledger_summary(
+        conn, ARM_AGENT_RANDOM, asof)["n_reviews"]
+    block["reproducibility"] = agent_spec.reproducibility(conn, ARM_AGENT)
+    block["present"] = next((a for a in (
+        dict(r) for r in conn.execute(
+            "SELECT account_id, arm FROM paper_accounts"))
+        if str(a["arm"]) == _ARM_AGENT), None) is not None
+    return block
 
 
 def track(conn: sqlite3.Connection, asof: str) -> dict:
@@ -230,6 +291,7 @@ def track(conn: sqlite3.Connection, asof: str) -> dict:
     accounts = paper_store.load_accounts(conn)
     start = str(accounts[0]["start_date"]) if accounts else PAPER_START_DATE
     ai = ai_evidence(conn, asof)
+    agent = agent_track(conn, asof)
 
     # `date <= asof`：**不取全表 MAX(date)** —— 那会让 `--asof` 的历史截图
     # 显示未来某天的净值（`data._paper` 同一条纪律）。
@@ -237,7 +299,7 @@ def track(conn: sqlite3.Connection, asof: str) -> dict:
         "SELECT DISTINCT date FROM paper_nav_daily WHERE date <= ? ORDER BY date",
         (asof,))]
     if not accounts or not session_dates:
-        return _empty(asof, start, ai=ai)
+        return _empty(asof, start, ai=ai, agent=agent)
 
     display_date = session_dates[-1]
     # 锚点（起跑日）永远在横轴上：没有它，「相对大盘」就没有公共起点。
@@ -330,6 +392,7 @@ def track(conn: sqlite3.Connection, asof: str) -> dict:
                                        if str(t["date"]) > start),
         "paper_trades": _paper_trades(conn, asof),
         "ai": ai,
+        "agent": agent,
         "disclosure": list(report.get("disclosure") or []),
         "disclaimer": report.get("disclaimer", ""),
         "sample_note": report.get("sample_note", ""),

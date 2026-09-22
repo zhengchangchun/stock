@@ -14,9 +14,12 @@ from stocklab.paper.rules import (
     C_ORDER_TARGET,
     C_PER_STEP,
     C_SINGLE,
+    C_STOP_OFF,
     C_WHITELIST,
     Decision,
     LookaheadError,
+    RuleParams,
+    STATIC_PARAMS,
     check_no_lookahead,
     etf_leg_targets,
     floor_lot,
@@ -24,7 +27,9 @@ from stocklab.paper.rules import (
     plan_stop_loss,
     plan_trim,
 )
-from stocklab.paper.config import ETF_WHITELIST, LOT
+from stocklab.paper.config import (ETF_WHITELIST, LOT, ORDER_TARGET_AMOUNT,
+                                   PER_STEP_CASH_PCT, RULE_CITATIONS)
+from stocklab.portfolio.discipline import DISCIPLINE
 
 ETF = CostModel(asset_class="etf")
 STOCK = CostModel(asset_class="stock")
@@ -233,3 +238,90 @@ def test_etf_leg_targets_split_evenly_across_whitelist():
     assert set(t) == set(ETF_WHITELIST)
     assert t["510300"] == pytest.approx(t["510880"])
     assert sum(t.values()) == pytest.approx(2003.791)
+
+
+# ---------- 参数化：默认值必须**逐字段**等于写死条文（P37） ----------
+#
+# 这张 dataclass 存在的唯一理由是让 `arm-agent` 与静态臂共用同一个执行内核。
+# 既然共用，静态臂就走「默认参数」这条路径 —— 于是默认值抄错一个字都会**静默**
+# 改变静态臂的读数（净值只是「有点不一样」）。这里是那条防线的第一层，
+# 第二层是任务书 T3 的 `paper show` 对拍。
+
+def test_static_params_are_the_written_rules():
+    """`STATIC_PARAMS` 的每一项都能在 `config` / `discipline` 里找到同一个数。"""
+    p = STATIC_PARAMS
+    assert p.etf_target_pct is None               # 静态臂的档位在账户行里，不在默认值
+    assert p.whitelist == ETF_WHITELIST
+    assert p.single_position_max_pct == DISCIPLINE["single_position_max_pct"]
+    assert p.cash_floor_pct == DISCIPLINE["cash_band_pct"][0]
+    assert p.per_step_cash_pct == PER_STEP_CASH_PCT
+    assert p.order_target_amount == ORDER_TARGET_AMOUNT
+    assert p.lot == LOT
+    assert p.stop_loss_line is None               # 静态臂的线来自 PER_CODE_LINES
+    assert p.stop_loss_enabled is True
+    assert p.citations == ()                      # 空 ⇒ 用模块级 RULE_CITATIONS
+    assert p.spec_tag == ""
+
+
+def test_default_params_reproduce_the_written_constraint_codes():
+    """默认参数下的约束代号必须**回落**到写死代号（否则 `binding_json` 会写假话）。"""
+    p = RuleParams()
+    assert p.cash_floor_code() == C_CASH_FLOOR
+    assert p.per_step_code() == C_PER_STEP
+    assert p.order_target_code() == C_ORDER_TARGET
+    # 换了值 ⇒ 代号必须跟着换（同一个代号不能同时指两个数）
+    assert RuleParams(cash_floor_pct=50.0).cash_floor_code() != C_CASH_FLOOR
+    assert "50" in RuleParams(cash_floor_pct=50.0).cash_floor_code()
+    assert RuleParams(per_step_cash_pct=3.0).per_step_code() != C_PER_STEP
+    assert RuleParams(order_target_amount=500.0).order_target_code() != C_ORDER_TARGET
+
+
+def test_amount_text_takes_its_numbers_from_the_params():
+    p = RuleParams(cash_floor_pct=50.0, order_target_amount=500.0)
+    assert p.amount_text("cash_floor") == "现金下限 50%"
+    assert p.amount_text("order_target") == "单笔目标 500 元"
+    assert p.amount_text("per_step") == f"本步剩余额度 {PER_STEP_CASH_PCT:.0f}%"
+    assert p.amount_text("leg_gap") == "该腿缺口"
+
+
+def test_cite_falls_back_to_the_written_book():
+    assert RuleParams().cite("stop_loss") == RULE_CITATIONS["stop_loss"]
+    overridden = RuleParams(citations=(("stop_loss", "别的写法"),))
+    assert overridden.cite("stop_loss") == "别的写法"
+    assert overridden.cite("single_max") == RULE_CITATIONS["single_max"]
+
+
+def test_cash_floor_is_movable_by_params_without_touching_the_codes():
+    """把现金下限抬到 50% 之后：成交量变了、**硬约束仍生效**、代号如实换了。"""
+    loose = plan_etf_buy(code="510300", price=4.523, cash=10000.0,
+                         total_assets=20000.0, leg_gap_value=1001.90, costs=ETF)
+    tight = plan_etf_buy(code="510300", price=4.523, cash=10000.0,
+                         total_assets=20000.0, leg_gap_value=1001.90, costs=ETF,
+                         params=RuleParams(cash_floor_pct=50.0))
+    assert loose.action == "buy" and tight.action == "hold"
+    assert C_CASH_FLOOR in loose.binding_constraints
+    assert C_CASH_FLOOR not in tight.binding_constraints
+    assert any("50" in c for c in tight.binding_constraints)
+
+
+def test_stop_loss_can_be_switched_off_only_by_params():
+    """`stop_loss_enabled=False` 走的是「不判」那条分支，且**如实写进条文**。"""
+    on = plan_stop_loss(code="000333", close=80.00, qty=100, costs=STOCK)
+    off = plan_stop_loss(code="000333", close=80.00, qty=100, costs=STOCK,
+                         params=RuleParams(stop_loss_enabled=False))
+    assert on.action == "sell"
+    assert off.action == "hold"
+    assert C_STOP_OFF in off.binding_constraints
+    assert "关闭不等于风险消失" in off.reason
+
+
+def test_single_position_limit_comes_from_params():
+    """单票上限参数化之后，「减到 ≤ 上限」仍按参数算（整手向下取整）。"""
+    base = plan_trim(code="000333", qty=1000, close=87.23, total_assets=100000.0,
+                     costs=STOCK)
+    tighter = plan_trim(code="000333", qty=1000, close=87.23, total_assets=100000.0,
+                        costs=STOCK, params=RuleParams(single_position_max_pct=20.0))
+    assert base.action == "sell" and tighter.action == "sell"
+    assert tighter.qty > base.qty
+    assert base.rule_citation == RULE_CITATIONS["single_max"]
+

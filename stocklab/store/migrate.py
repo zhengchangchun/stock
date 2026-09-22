@@ -121,19 +121,116 @@ def migrate_p32_predictions_origin(conn) -> list[str]:
     return ["predictions.origin"]
 
 
+# ---------------------------------------------------------------------------
+# P37：`paper_accounts.arm` 的 CHECK 要放开到 'agent' / 'agent_random'。
+#
+# SQLite 改不了 CHECK 约束（只有 ADD COLUMN 是原地的），所以只能**重建表**。
+# 而 `paper_accounts` 是 append-only 的，重建必须：
+#   ① 在一个事务里做（失败就回滚，绝不留半张表）；
+#   ② 逐行搬运且**校验行数**；
+#   ③ 把随 DROP 一起消失的两个触发器重新建起来。
+# 触发器文本与 schema.sql **同文**（两处都改才算改完）。
+# 只动 `arm` 列的允许集合，不动任何历史行的值。
+# ---------------------------------------------------------------------------
+_MIGRATE_P37_MARKER = "agent_random"
+
+_MIGRATE_P37_DDL = """
+CREATE TABLE paper_accounts (
+    account_id     TEXT PRIMARY KEY,
+    arm            TEXT NOT NULL
+                   CHECK (arm IN ('hold', 'now', 'discipline', 'agent', 'agent_random')),
+    etf_target_pct REAL,
+    start_date     TEXT NOT NULL,
+    initial_cash   REAL NOT NULL,
+    initial_positions_json TEXT NOT NULL,
+    initial_nav    REAL NOT NULL,
+    params_json    TEXT NOT NULL,
+    created_at     TEXT NOT NULL
+)"""
+
+_MIGRATE_P37_TRIGGERS = (
+    "CREATE TRIGGER IF NOT EXISTS trg_paper_accounts_no_update"
+    " BEFORE UPDATE ON paper_accounts"
+    " BEGIN SELECT RAISE(ABORT, 'paper_accounts is append-only'); END;\n"
+    "CREATE TRIGGER IF NOT EXISTS trg_paper_accounts_no_delete"
+    " BEFORE DELETE ON paper_accounts"
+    " BEGIN SELECT RAISE(ABORT, 'paper_accounts is append-only'); END;"
+)
+
+_MIGRATE_P37_COLUMNS = ("account_id", "arm", "etf_target_pct", "start_date",
+                        "initial_cash", "initial_positions_json", "initial_nav",
+                        "params_json", "created_at")
+
+
+def paper_accounts_needs_agent_arms(conn) -> bool:
+    """该表的 CHECK 还不允许 'agent_random' 吗？（只读探测，供 doctor 用）
+
+    表不存在时返回 False：`executescript` 会按 schema.sql 的新 shape 直接建出，
+    没有迁移可做也不该备份。
+    """
+    if not _table_exists(conn, "paper_accounts"):
+        return False
+    row = conn.execute(
+        "SELECT sql FROM sqlite_master WHERE type='table' AND name='paper_accounts'"
+    ).fetchone()
+    return row is not None and _MIGRATE_P37_MARKER not in (row[0] or "")
+
+
+def migrate_p37_paper_accounts_agent_arms(conn) -> list[str]:
+    """放开 `paper_accounts.arm` 的 CHECK（P37），返回变更列表。
+
+    重建 + 搬行是这里唯一可行的手法（SQLite 不支持改 CHECK），所以它也是本项目里
+    唯一会「重写」 append-only 表的迁移。为此：整段在一个事务里、搬完核对行数、
+    核对不过就回滚报错，且**一行值都不改**（只换允许集合）。
+    """
+    if not paper_accounts_needs_agent_arms(conn):
+        return []
+    cols = ", ".join(_MIGRATE_P37_COLUMNS)
+    rows = [tuple(r) for r in conn.execute(
+        f"SELECT {cols} FROM paper_accounts ORDER BY account_id")]
+    conn.execute("BEGIN")
+    try:
+        conn.execute("DROP TABLE paper_accounts")
+        conn.execute(_MIGRATE_P37_DDL)
+        conn.executemany(
+            f"INSERT INTO paper_accounts ({cols})"
+            f" VALUES ({', '.join('?' * len(_MIGRATE_P37_COLUMNS))})", rows)
+        conn.executescript(_MIGRATE_P37_TRIGGERS)
+        after = [tuple(r) for r in conn.execute(
+            f"SELECT {cols} FROM paper_accounts ORDER BY account_id")]
+        if after != rows:
+            raise RuntimeError(
+                f"paper_accounts 重建后内容不一致（{len(rows)} 行 → {len(after)} 行）"
+                f"—— 已回滚，库未被改动")
+        conn.commit()
+    except BaseException:
+        conn.rollback()
+        raise
+    return ["paper_accounts.arm"]
+
+
 #: 已知迁移 marker 清单：doctor 逐个报告在位与否（只读，不迁移）。
-#: (name, table, column)。新增迁移时必须在这里登记，否则 doctor 看不出来。
-_KNOWN_MARKERS: list[tuple[str, str, str]] = [
+#: (name, table, 判据)。判据是列名（str）或一个只读探测函数。
+#: 新增迁移时必须在这里登记，否则 doctor 看不出来。
+_KNOWN_MARKERS: list[tuple[str, str, object]] = [
     ("p28_resp_sha256_valuation", "valuation_daily", "resp_sha256"),
     ("p28_resp_sha256_moneyflow", "money_flow_daily", "resp_sha256"),
     ("p32_predictions_origin", "predictions", "origin"),
 ]
 
 
+def _marker_present(conn, table: str, check: object) -> bool:
+    if not _table_exists(conn, table):
+        return False
+    if callable(check):
+        return bool(check(conn))
+    return check in _table_columns(conn, table)
+
+
 def _pending_column_migrations(conn) -> list[str]:
     """只读探测：哪些「改既有表结构」的前滚还没做（不含建新表）。
 
-    只统计**表已存在但缺 marker 列**的情况 —— 表不存在时 `executescript` 会按
+    只统计**表已存在但缺 marker** 的情况 —— 表不存在时 `executescript` 会按
     schema.sql 的新 shape 直接建出（无需迁移、无需备份），不算 pending。
     """
     pending: list[str] = []
@@ -153,10 +250,12 @@ def schema_status(conn) -> dict:
     都会前滚），绝不擅自改库。
     """
     markers = {}
-    for name, table, column in _KNOWN_MARKERS:
-        present = (_table_exists(conn, table)
-                   and column in _table_columns(conn, table))
-        markers[name] = {"table": table, "column": column, "present": present}
+    for name, table, check in _KNOWN_MARKERS:
+        markers[name] = {
+            "table": table,
+            "column": check if isinstance(check, str) else "（结构判据）",
+            "present": _marker_present(conn, table, check),
+        }
     return {
         "markers": markers,
         "ok": all(m["present"] for m in markers.values()),
@@ -165,7 +264,7 @@ def schema_status(conn) -> dict:
 
 
 def _apply_schema(conn, sql: str) -> list[str]:
-    """executescript 建表 + P28/P32 前滚，返回实际结构变更列表。"""
+    """executescript 建表 + 历史前滚，返回实际结构变更列表。"""
     conn.executescript(sql)
     changes: list[str] = []
     changes += migrate_p28_valuation_moneyflow(conn)

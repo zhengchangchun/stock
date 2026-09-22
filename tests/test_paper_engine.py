@@ -9,11 +9,15 @@ import sqlite3
 
 import pytest
 
-from stocklab.paper import engine
+from stocklab.paper import agent_spec, engine
 from stocklab.paper import store
 from stocklab.paper.rules import Decision
 from stocklab.paper.config import (
+    ARM_AGENT,
+    ARM_AGENT_RANDOM,
     ARM_HOLD,
+    ARM_KIND_AGENT,
+    ARM_KIND_AGENT_RANDOM,
     ARM_NOW,
     DISCLAIMER,
     ETF_TRANCHES,
@@ -57,6 +61,12 @@ BARS_LOW = {
     "2026-09-18": {"000333": 80.00, "510300": 4.470, "510880": 3.360},
     "2026-09-21": {"000333": 79.00, "510300": 4.460, "510880": 3.350},
 }
+
+#: `init` 建出的全部账户：hold + now + 三档纪律臂 + 智能体臂与它的随机对照。
+#: **从配置推出来**，不写死 7 —— 下一次多一条臂时，这里与下面几条计数一起自动跟上。
+AGENT_ARMS = (ARM_AGENT, ARM_AGENT_RANDOM)
+DISCIPLINE_ARMS = tuple(f"arm-discipline-{int(t):02d}" for t in ETF_TRANCHES)
+ALL_ARMS = (ARM_HOLD, ARM_NOW, *DISCIPLINE_ARMS, *AGENT_ARMS)
 
 
 @pytest.fixture
@@ -107,14 +117,13 @@ def _run_step(db, asof, **kw):
 
 # ---------- init ----------
 
-def test_init_creates_hold_now_and_three_discipline_tranches(db):
+def test_init_creates_hold_now_discipline_and_agent_arms(db):
     rep = _run_init(db)
     assert rep["created"] is True
     c = _conn(db)
     rows = {r["account_id"]: dict(r) for r in c.execute("SELECT * FROM paper_accounts")}
     c.close()
-    assert set(rows) == {ARM_HOLD, ARM_NOW,
-                         *(f"arm-discipline-{int(t):02d}" for t in ETF_TRANCHES)}
+    assert set(rows) == set(ALL_ARMS)
     assert rows[ARM_HOLD]["arm"] == "hold" and rows[ARM_HOLD]["etf_target_pct"] is None
     assert rows[ARM_NOW]["arm"] == "now"
     assert [rows[f"arm-discipline-{int(t):02d}"]["etf_target_pct"]
@@ -125,6 +134,33 @@ def test_init_creates_hold_now_and_three_discipline_tranches(db):
     # 持仓按当日收盘重估）。100×87.23 + 11314.91 = 20037.91
     assert rows[ARM_HOLD]["initial_nav"] == pytest.approx(100 * 87.23 + 11314.91)
     assert rows[ARM_HOLD]["initial_nav"] != pytest.approx(20000)
+
+
+def test_init_wires_the_agent_arms_to_the_ledger_without_copying_the_spec(db):
+    """智能体臂的 `etf_target_pct` 写 `None` —— ETF 目标来自台账，不抄第二份真相。
+
+    把当时的 spec 抄进账户行，等于在库里存下第二个真相，而它**不随 spec 变**：
+    `paper spec set` 改了台账之后，那一列会开始说谎。所以它必须是 `None`。
+    """
+    _run_init(db)
+    c = _conn(db)
+    rows = {r["account_id"]: dict(r) for r in c.execute("SELECT * FROM paper_accounts")}
+    c.close()
+    agent = rows[ARM_AGENT]
+    random_arm = rows[ARM_AGENT_RANDOM]
+    assert agent["arm"] == ARM_KIND_AGENT
+    assert random_arm["arm"] == ARM_KIND_AGENT_RANDOM
+    assert agent["etf_target_pct"] is None and random_arm["etf_target_pct"] is None
+    # 两臂都指向同一张台账；random 还指名它对的是哪一条臂。
+    assert json.loads(agent["params_json"])["spec_source"] == \
+        agent_spec.TABLE_DECISIONS
+    assert json.loads(random_arm["params_json"])["counter_arm"] == ARM_AGENT
+    # 账户行里**没有** spec 的当前值（避免第二份真相）；`agent_default_spec` 只是
+    # `init` 当时那一份默认值的快照，改配置不会回写已存账户，所以它必须与现推一致
+    # —— 不一致就说明「默认 spec 从配置推出来」这句话在 init 那一刻就不成立了。
+    params = json.loads(agent["params_json"])
+    assert params["agent_default_spec"] == agent_spec.AGENT_DEFAULT_SPEC
+    assert "spec" not in params and "spec_sha256" not in params
 
 
 def test_init_rejects_ledger_disagreeing_with_declared_tape(db):
@@ -146,7 +182,7 @@ def test_init_is_idempotent(db):
     c = _conn(db)
     n = c.execute("SELECT COUNT(*) n FROM paper_accounts").fetchone()["n"]
     c.close()
-    assert n == 2 + len(ETF_TRANCHES)
+    assert n == len(ALL_ARMS)
 
 
 # ---------- step：幂等（验收 ①） ----------
@@ -159,7 +195,7 @@ def test_step_is_byte_identical_on_rerun(db):
     n_trades = c.execute("SELECT COUNT(*) n FROM paper_trades").fetchone()["n"]
     n_nav = c.execute("SELECT COUNT(*) n FROM paper_nav_daily").fetchone()["n"]
     c.close()
-    assert n_nav == 2 + len(ETF_TRANCHES)
+    assert n_nav == len(ALL_ARMS)
     assert n_trades > 0, "纪律臂起跑日应当建仓"
 
     second = _run_step(db, PAPER_START_DATE)
@@ -441,7 +477,7 @@ def test_step_after_stop_loss_cleared_the_position_does_not_crash(db):
     _run_step(db, CAL_LOW[0])            # 收盘 80.00 < 止损线 82.14 → 纪律臂整清
     rep = _run_step(db, CAL_LOW[1])      # 仍在线下、已无持仓 → 不许炸
     by_id = {a["account_id"]: a for a in rep["accounts"]}
-    assert len(rep["accounts"]) == 5, "整天的净值必须都落库（事务不许半截）"
+    assert len(rep["accounts"]) == len(ALL_ARMS), "整天的净值必须都落库（事务不许半截）"
     for tranche in ETF_TRANCHES:
         acc = by_id[f"arm-discipline-{int(tranche):02d}"]
         assert HOLD_CODE not in acc["positions"]

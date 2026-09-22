@@ -57,7 +57,7 @@ BARS = {
 }
 
 ARMS = ("arm-hold", "arm-now", "arm-discipline-05", "arm-discipline-10",
-        "arm-discipline-15")
+        "arm-discipline-15", "arm-agent", "arm-agent-random")
 
 
 def _fixture_db(tmp_path, *, index_gap: bool = False, steps: bool = True):
@@ -99,8 +99,8 @@ def _add_late_arm(path, *, account_id="arm-discipline-99", target=None,
                   date="2026-09-18", nav=1000.0):
     """加一条**从某天起才记净值**的臂。
 
-    这是本系统里唯一可能出现的「认不出的账户」：`paper_accounts.arm` 有
-    `CHECK (arm IN ('hold','now','discipline'))`，所以「未知」只能是没见过的
+    这是本系统里唯一可能出现的「认不出的账户」：`paper_accounts.arm` 的 CHECK 只认
+    `'hold'`/`'now'`/`'discipline'`/`'agent'`/`'agent_random'`，所以「未知」只能是没见过的
     `account_id`，或 `discipline` 但 `etf_target_pct` 为空。
     """
     c = connect(path)
@@ -431,15 +431,15 @@ def test_ai_evidence_flags_a_citation_outside_the_rule_book(db):
     assert novel not in "\n".join(RULE_CITATIONS.values()), "该条文得是真表外的"
     assert ev["consumption"]["unknown_rules"] == [novel]
     html = paper_render.ai_block(ev)
-    assert "已经接了写死条文之外的东西" in html
-    assert "模拟盘没用上" not in html
+    assert "已经接了已登记条文之外的东西" in html
+    assert "模型与插桩没用上" not in html
 
 
 def test_page_shows_the_ai_evidence_section(db):
     html = _html(db)
     assert "AI 自己编排的东西，用上了没有" in html
     assert "AI 的准确率" in html
-    assert "模拟盘没用上" in html
+    assert "模型与插桩没用上" in html
     assert "引用模型预测 0 条、引用插桩脚本 0 条" in html
 
 

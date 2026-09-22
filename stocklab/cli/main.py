@@ -34,6 +34,9 @@ from stocklab.data.fetch import EARLIEST as EARLIEST_ACTION_START
 from stocklab.store import repo
 from stocklab.store.db import connect
 from stocklab.store.migrate import ensure_schema, init_db
+# `paper/config.py` 是纯常量叶子模块（无 import），在模块级引用它不会成环 ——
+# 这样 `SPEC_ARMS` 不需要在自己内部再抄一遍臂名字面量。
+from stocklab.paper.config import ARM_AGENT, ARM_AGENT_RANDOM
 from stocklab.cli.plugin import (cmd_plugin_approve, cmd_plugin_list,
                                  cmd_plugin_reject, cmd_plugin_sandbox,
                                  cmd_plugin_submit)
@@ -2282,10 +2285,159 @@ def cmd_paper_show(args: argparse.Namespace) -> int:
     print(json.dumps({"asof": payload["asof"],
                       "asof_source": payload["asof_source"],
                       "latest_nav_date": payload["latest_nav_date"],
+                      "agent_n_reviews": payload["agent"]["n_reviews"],
+                      "agent_n_trials_total": payload["agent"]["n_trials_total"],
                       "accounts": [{"account_id": a["account_id"], "nav": a["nav"],
                                     "cum_return": a["cum_return"],
                                     "max_or_last_drawdown": a["drawdown"]}
                                    for a in payload["accounts"]]},
+                     ensure_ascii=False, sort_keys=True), file=sys.stderr)
+    return 0
+
+
+# ---------- 智能体动态编排臂的 spec（P37） ----------
+
+#: `paper spec` 只许管这两个账户：spec 是**这两个臂**的条文来源。
+#: 在别的账户上写 spec 只会产出一张没人读的台账（而且会让人以为规则改了）。
+SPEC_ARMS: tuple[str, ...] = (ARM_AGENT, ARM_AGENT_RANDOM)
+
+#: 冲突退出码。与 `_paper_fail` 的「可预期失败」（2）分开：
+#: 2 = 你给的东西不合法；1 = 你给的合法，但与库里已有的一版撞了。
+EXIT_CONFLICT = 1
+
+
+def _spec_conflict(arm: str, asof: str, existing: dict, mine: dict) -> int:
+    print(json.dumps({
+        "error": f"{arm} 在 {asof} 已有一版 spec —— append-only，本命令不改写历史",
+        "hint": "要么把 --asof 改成一个还没复审过的交易日，要么先把两版的差异读清楚",
+        "existing": {"decision_id": existing["decision_id"],
+                     "created_at": existing["created_at"],
+                     "agent_kind": existing["agent_kind"],
+                     "model_id": existing["model_id"],
+                     "n_trials": existing["n_trials"],
+                     "spec_after": existing["spec_after"]},
+        "attempted": mine,
+    }, ensure_ascii=False, sort_keys=True), file=sys.stderr)
+    return EXIT_CONFLICT
+
+
+def cmd_paper_spec_set(args: argparse.Namespace) -> int:
+    """写一版 spec（**只增**）：增量合并 → 校验 → 算 PIT 上下文指纹 → 落台账。
+
+    幂等：同 `(arm, asof)` 且合并结果与已有那行**一致** → exit 0、台账仍 1 行。
+    不一致 → exit 1，原行一个字节都不改。
+    """
+    from stocklab.paper import agent_context, agent_spec, store
+    from stocklab.paper.config import ARM_AGENT, ARM_AGENT_RANDOM
+
+    conn, code = _paper_conn(args)
+    if conn is None:
+        return code
+    try:
+        if args.arm not in SPEC_ARMS:
+            raise agent_spec.SpecViolation(
+                "arm", args.arm,
+                f"`paper spec` 只管 {list(SPEC_ARMS)}（别的账户的条文不来自 spec）")
+        accounts = {a["account_id"] for a in store.load_accounts(conn)}
+        if args.arm not in accounts:
+            raise agent_spec.SpecViolation(
+                "arm", args.arm,
+                f"账户不存在（现有 {sorted(accounts)}）—— 先跑 `paper init`")
+        try:
+            patch = json.loads(args.spec)
+        except json.JSONDecodeError as exc:
+            raise agent_spec.SpecViolation(
+                "--spec", args.spec, f"不是合法 JSON（{exc.msg}）") from None
+        before = agent_spec.spec_before(conn, args.arm, args.asof)
+        after = agent_spec.apply_spec(before, patch)
+        rejected = []
+        if args.rejected:
+            try:
+                rejected = json.loads(args.rejected)
+            except json.JSONDecodeError as exc:
+                raise agent_spec.SpecViolation(
+                    "--rejected", args.rejected, f"不是合法 JSON（{exc.msg}）") from None
+            if not isinstance(rejected, list):
+                raise agent_spec.SpecViolation("--rejected", rejected, "必须是 JSON 数组")
+        ctx = agent_context.build_context(conn, arm=args.arm, asof=args.asof)
+        context_sha256 = agent_context.context_sha256(ctx)
+        existing = agent_spec.decision_on(conn, args.arm, args.asof)
+        if existing is not None:
+            same = (existing["spec_after"] == after
+                    and existing["n_trials"] == args.n_trials
+                    and existing["rejected"] == rejected)
+            if not same:
+                return _spec_conflict(args.arm, args.asof, existing, after)
+            print(json.dumps({"arm": args.arm, "asof": args.asof,
+                              "decision_id": existing["decision_id"],
+                              "status": "已存在且一致（未写入）",
+                              "spec": after,
+                              "spec_sha256": agent_spec.spec_sha256(after),
+                              "context_sha256": existing["context_sha256"]},
+                             ensure_ascii=False, sort_keys=True, indent=2))
+            return 0
+        decision_id = agent_spec.record_decision(
+            conn, arm=args.arm, asof=args.asof, spec_before=before, spec_after=after,
+            agent_kind=agent_spec.AGENT_KIND_MANUAL,
+            model_id=agent_spec.MANUAL_MODEL_ID,
+            prompt_sha256=agent_spec.MANUAL_PROMPT_SHA256,
+            seed=0, context_sha256=context_sha256,
+            now=args.now or datetime.now(TZ).isoformat(timespec="seconds"),
+            n_trials=args.n_trials, rejected=rejected,
+            rationale=args.rationale or "")
+    except (agent_spec.SpecViolation, agent_spec.DecisionConflict) as exc:
+        conn.close()
+        return _paper_fail(exc)
+    conn.close()
+    print(json.dumps({"arm": args.arm, "asof": args.asof,
+                      "decision_id": decision_id, "status": "已写入",
+                      "spec_before": before, "spec": after,
+                      "spec_sha256": agent_spec.spec_sha256(after),
+                      "n_trials": args.n_trials, "n_rejected": len(rejected),
+                      "context_sha256": context_sha256},
+                     ensure_ascii=False, sort_keys=True, indent=2))
+    return 0
+
+
+def cmd_paper_spec_show(args: argparse.Namespace) -> int:
+    """查某一臂的当前 spec 与台账历史（**直接读库，不重算**）。"""
+    from stocklab.paper import agent_spec, store
+    from stocklab.paper.config import ARM_AGENT, ARM_AGENT_RANDOM
+
+    conn, code = _paper_conn(args)
+    if conn is None:
+        return code
+    try:
+        if args.arm not in SPEC_ARMS:
+            raise agent_spec.SpecViolation(
+                "arm", args.arm, f"`paper spec` 只管 {list(SPEC_ARMS)}")
+        asof = args.asof or _show_today(args)
+        accounts = {a["account_id"] for a in store.load_accounts(conn)}
+        rows = agent_spec.load_decisions(conn, args.arm)
+        payload = {
+            "arm": args.arm,
+            "asof": asof,
+            "account_exists": args.arm in accounts,
+            "spec": agent_spec.current_spec(conn, args.arm, asof),
+            "spec_sha256": agent_spec.spec_sha256(
+                agent_spec.current_spec(conn, args.arm, asof)),
+            "change_space": {name: f.range_text()
+                             for name, f in agent_spec.SPEC_SCHEMA.items()},
+            "default_spec": dict(agent_spec.AGENT_DEFAULT_SPEC),
+            "summary": agent_spec.ledger_summary(conn, args.arm, asof),
+            "reproducibility": agent_spec.reproducibility(conn, args.arm),
+            "n_rows": len(rows),
+            "history": rows,
+        }
+    except agent_spec.SpecViolation as exc:
+        conn.close()
+        return _paper_fail(exc)
+    conn.close()
+    print(json.dumps(payload, ensure_ascii=False, sort_keys=True, indent=2))
+    print(json.dumps({"arm": args.arm, "asof": asof,
+                      "n_reviews": payload["summary"]["n_reviews"],
+                      "n_trials_total": payload["summary"]["n_trials_total"],
+                      "current_spec_sha256": payload["spec_sha256"]},
                      ensure_ascii=False, sort_keys=True), file=sys.stderr)
     return 0
 
@@ -2868,6 +3020,37 @@ def build_parser() -> argparse.ArgumentParser:
     pp_show.add_argument("--db")
     pp_show.add_argument("--now", help="覆盖当前时刻（测试用）")
     pp_show.set_defaults(func=cmd_paper_show)
+
+    pp_spec = paper_sub.add_parser(
+        "spec", help="智能体动态编排臂（P37）的条文 spec：只增台账，不覆盖")
+    pp_spec_sub = pp_spec.add_subparsers(dest="spec_action", required=True)
+
+    pps_set = pp_spec_sub.add_parser(
+        "set", help="写一版 spec（增量合并 + 校验 + PIT 上下文指纹；append-only）")
+    pps_set.add_argument("--arm", required=True,
+                         help="目标臂：arm-agent / arm-agent-random")
+    pps_set.add_argument("--asof", required=True,
+                         help="复审日 YYYY-MM-DD（= 这一版 spec 的生效起点）")
+    pps_set.add_argument("--spec", required=True,
+                         help='只写要改的字段，如 \'{"etf_target_pct": 12}\''
+                              "（未知字段/越界一律拒绝，不夹紧）")
+    pps_set.add_argument("--rationale", help="为什么这么改（写进台账，append-only）")
+    pps_set.add_argument("--n-trials", dest="n_trials", type=int, default=1,
+                         help="本次复审试了几版（默认 1；上限见 MAX_TRIALS_PER_REVIEW）")
+    pps_set.add_argument("--rejected",
+                         help="被拒的试错（JSON 数组，与 --n-trials 一起构成预算证据）")
+    pps_set.add_argument("--db")
+    pps_set.add_argument("--now", help="覆盖当前时刻（测试/补录用）")
+    pps_set.set_defaults(func=cmd_paper_spec_set)
+
+    pps_show = pp_spec_sub.add_parser(
+        "show", help="查当前 spec / 变更空间 / 试错台账 / 复现性判定（离线只读）")
+    pps_show.add_argument("--arm", required=True,
+                          help="目标臂：arm-agent / arm-agent-random")
+    pps_show.add_argument("--asof", help="asof 日期 YYYY-MM-DD（默认今天）")
+    pps_show.add_argument("--db")
+    pps_show.add_argument("--now", help="覆盖当前时刻（测试用）")
+    pps_show.set_defaults(func=cmd_paper_spec_show)
 
     chain = sub.add_parser(
         "chain", help="全链路准确率视图（P26）：四段分列，样本不足就明说")
