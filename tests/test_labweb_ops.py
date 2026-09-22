@@ -35,6 +35,8 @@ from stocklab.ops import chain, patrol, schedule
 from stocklab.store.db import connect
 from stocklab.store.migrate import init_db
 
+ROOT = Path(__file__).resolve().parents[1]
+
 NOW = "2026-09-22T12:00:00+08:00"
 #: 2026-09-22 是周二。
 TZ_NOW = datetime.fromisoformat(NOW)
@@ -210,6 +212,87 @@ def test_next_trigger_returns_none_when_the_shape_is_unknown():
     assert ops_data.next_trigger((), TZ_NOW) is None
 
 
+def _at(ts: str) -> datetime:
+    return datetime.fromisoformat(ts)
+
+
+def test_next_trigger_monthly_rolls_over_to_the_first_of_next_month():
+    """S2（P43）：每月任务在**当月 1 日 08:00 之后**必须给出**下月 1 日 08:00**。
+
+    原来的实现对每条 entry 只找**第一个**匹配日就 `break`：1 日那天 08:00 一过，
+    这条 entry 的候选落在过去 → 不更新 `best` 就放弃 → 返回 `None`，页面于是显示
+    「推算不出来（形态认不出）」。**形态认得出**，是函数放弃了：每月 1 日的
+    08:00–24:00 这 16 小时里，`/lab/ops` 一直在说一句假话。
+    """
+    monthly = schedule.JOB_BY_NAME["monthly"].calendar
+    assert ops_data.next_trigger(monthly, _at("2026-10-01T07:00:00+08:00")) == \
+        "2026-10-01T08:00:00+08:00"                   # 触发点之前 → 当月 1 日
+    assert ops_data.next_trigger(monthly, _at("2026-10-01T08:00:00+08:00")) == \
+        "2026-11-01T08:00:00+08:00"                   # 触发点**整点**（严格大于）
+    assert ops_data.next_trigger(monthly, _at("2026-10-01T08:01:00+08:00")) == \
+        "2026-11-01T08:00:00+08:00"                   # 触发点之后 1 分钟
+    assert ops_data.next_trigger(monthly, _at("2026-10-01T23:59:00+08:00")) == \
+        "2026-11-01T08:00:00+08:00"                   # 1 日当天最后一分钟
+    assert ops_data.next_trigger(monthly, _at("2026-10-15T09:00:00+08:00")) == \
+        "2026-11-01T08:00:00+08:00"                   # 月中（原本就对，钉住不回归）
+    assert ops_data.next_trigger(monthly, _at("2026-12-01T09:00:00+08:00")) == \
+        "2027-01-01T08:00:00+08:00"                   # 跨年：给的是次年 1 月 1 日
+
+
+def test_next_trigger_never_gives_up_while_a_slot_is_still_ahead():
+    """S2 的硬判据：三条任务的**真实**日历在「最后一个槽已过」之后仍要给出下一槽。
+
+    `close` 原来侥幸不发病，是因为它同一天有 5 条 entry（周一到周五）、别的 entry
+    会兜住；发病的是**同一天只有一条 entry** 的那种形状（`monthly` 在 1 日，
+    以及周五 15:31 之后的 `close` —— 周五那条 entry 已经过期，要靠**下周**的 entry）。
+    """
+    for name in schedule.JOB_NAMES:
+        cal = schedule.JOB_BY_NAME[name].calendar
+        for ts in ("2026-09-25T23:59:00+08:00",    # 周五深夜：三任务的最后槽都已过去
+                   "2026-09-26T12:00:00+08:00",    # 周六
+                   "2026-10-01T09:00:00+08:00"):   # 国庆假日（按工作日形状照推）
+            got = ops_data.next_trigger(cal, _at(ts))
+            assert got is not None, f"{name} @ {ts} 推不出下一槽"
+
+
+def test_next_trigger_reason_separates_unknown_shape_from_no_slot_left():
+    """S2：`None` 的两种原因**必须分开说**（页面原来把两者都说成「形态认不出」）。
+
+    - `形态认不出`：日历里没有一条是本函数解释得了的（缺 `Hour`/`Minute`，或带别的键）；
+    - `认得出，但没有下一槽`：形态完全合法，只是往后 `LOOKAHEAD_DAYS` 天内没有命中
+      （`{"Month": 2, "Day": 30}` 这种永远不存在的日期）。
+    """
+    assert ops_data.next_trigger_reason(({"Hour": 9},)) == "形态认不出"
+    assert ops_data.next_trigger_reason(()) == "形态认不出"
+    never = ({"Month": 2, "Day": 30, "Hour": 8, "Minute": 0},)
+    assert ops_data.next_trigger(never, TZ_NOW) is None
+    reason = ops_data.next_trigger_reason(never)
+    assert "没有下一槽" in reason
+    # 文案必须**限定推演范围**：`LOOKAHEAD_DAYS` 之外没查过，就不能说「就是没有」。
+    assert f"{ops_data.LOOKAHEAD_DAYS} 天" in reason
+
+
+# ---------- 回执结论句（`_verdict`） ----------
+
+def test_verdict_has_no_total_steps_branch_whose_key_nobody_writes():
+    """S1（P43）：`_verdict` 曾有一句「／共 N 步」，读的键 `steps_total` 全仓库无人写入。
+
+    `chain.run_close` / `run_monthly` 的回执载荷里**没有** `steps_total`（`grep` 实测），
+    所以 `total` 恒为 `None`，那段格式化**永远不执行**，页面始终只打「跑完 N 步」。
+    这正是 ERROR_DIARY #52 的形状：语法合法、测试全绿、分支恒不成立。而
+    `test_source_no_dead_code.py` 的 AST 规则只抓「`return`/`raise` **之后**的同层语句」，
+    看不到「条件恒假」。
+
+    选定的修法是**删分支**（不是补写这个键：`summary_line` 已经有 `steps={len}/{total}`
+    的单一真源，页面再拼第二份口径只会走样）。所以这里在**源码层**钉住：`stocklab/`
+    里不得再出现 `steps_total` —— 重新引入就当场红。
+    """
+    hits = [str(p.relative_to(ROOT))
+            for p in (ROOT / "stocklab").rglob("*.py")
+            if "steps_total" in p.read_text(encoding="utf-8")]
+    assert hits == []
+
+
 # ---------- 渲染 ----------
 
 def _html(tmp_path, *, runs: tuple = (), plist: bool = False) -> str:
@@ -295,7 +378,12 @@ def test_route_serves_the_page(tmp_path, loopback_http, monkeypatch):
         res = conn.getresponse()
         body = res.read().decode("utf-8")
         assert res.status == 200
-        assert "定时任务" in body and "每交易日 15:30" in body
+        # 页面上的窗口文案就是 `close` 的**窗口定义本身**（P43 §S5）：说「工作日 15:30，
+        # 非交易日整轮跳过」——`StartCalendarInterval` 只能表达「星期几 15:30」，
+        # 节假日照样会被拉起，靠链自己判 `is_trading_day=False` 整轮跳过。
+        # 文案本身由 `test_ops_close.py` 逐字钉住；这里钉「页面 == 定义」。
+        assert "定时任务" in body
+        assert schedule.JOB_BY_NAME["close"].window in body
         # 导航条要能点到它（同页里的 rail 就是全站导航）
         assert 'href="/lab/ops"' in body
         assert 'href="/lab/paper"' in body

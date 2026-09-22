@@ -2205,11 +2205,15 @@ def _paper_conn(args):
     return conn, None
 
 
-def _paper_fail(exc: Exception) -> int:
-    """模拟盘的可预期失败一律**退出码 2 + 原因上 stderr**（不写半截状态）。"""
+def _paper_fail(exc: Exception, code: int = 2) -> int:
+    """模拟盘的可预期失败：原因上 stderr、**退出码默认 2**（不写半截状态）。
+
+    `code` 只给 `paper spec set` 的**撞键**用：那是「你给的合法，但与库里已有的一版撞了」，
+    与「你给的东西不合法」是两件事，退出码必须分开（ADR-019：退出码一个语义只许一个真源）。
+    """
     print(json.dumps({"error": str(exc), "type": type(exc).__name__},
                      ensure_ascii=False, sort_keys=True), file=sys.stderr)
-    return 2
+    return code
 
 
 def cmd_paper_init(args: argparse.Namespace) -> int:
@@ -2452,7 +2456,12 @@ def cmd_paper_spec_set(args: argparse.Namespace) -> int:
             now=args.now or datetime.now(TZ).isoformat(timespec="seconds"),
             n_trials=args.n_trials, rejected=rejected,
             rationale=args.rationale or "")
-    except (agent_spec.SpecViolation, agent_spec.DecisionConflict) as exc:
+    except agent_spec.DecisionConflict as exc:
+        # 竞态路径（预检与落库之间被别人插了一行）撞的也是**冲突**，与预检分支
+        # （`_spec_conflict`）同一个退出码 —— 2 的语义是「输入不合法」，用在这里是错的。
+        conn.close()
+        return _paper_fail(exc, EXIT_CONFLICT)
+    except agent_spec.SpecViolation as exc:
         conn.close()
         return _paper_fail(exc)
     conn.close()

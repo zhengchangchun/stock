@@ -63,19 +63,32 @@ def now_iso() -> str:
     return datetime.now(TZ).isoformat(timespec="seconds")
 
 
+#: `StartCalendarInterval` 里**本函数解释**的键；出现别的键就由 launchd 解释，我不猜。
+KNOWN_TRIGGER_KEYS = frozenset({"Hour", "Minute", "Weekday", "Day", "Month"})
+
+
+def _recognizes(entry) -> bool:
+    """这条 entry 的形态**认不认得**（认不得就不猜 —— 见 `next_trigger`）。"""
+    return (isinstance(entry, dict) and "Hour" in entry and "Minute" in entry
+            and not (set(entry) - KNOWN_TRIGGER_KEYS))
+
+
 def next_trigger(calendar, now: datetime) -> str | None:
     """`StartCalendarInterval` 数组 → 第一个 `> now` 的触发点（ISO8601）。
 
     认不出的形态（缺 `Hour` / `Minute`，或出现本函数不解释的键）一律**返回 `None`**，
     不猜 —— plist 里那些键由 launchd 解释，我猜错就是一句假话。
+
+    **每条 entry 往后扫到第一个「还没到的」匹配日为止**，取其中最早的一个。
+    不能只看第一个匹配日就收工：每月任务在 1 日 08:00 之后，那条 entry 的候选
+    就落在过去了，若不继续往后找（下个月的 1 日）就会返回 `None`，
+    而页面会把这读成「形态认不出」——**形态认得出，是函数放弃了**（P43 §S2）。
     """
     if now.tzinfo is None:
         now = now.replace(tzinfo=TZ)
     best: datetime | None = None
     for entry in calendar:
-        if not isinstance(entry, dict) or "Hour" not in entry or "Minute" not in entry:
-            continue
-        if set(entry) - {"Hour", "Minute", "Weekday", "Day", "Month"}:
+        if not _recognizes(entry):
             continue
         for i in range(LOOKAHEAD_DAYS + 1):
             day = (now + timedelta(days=i)).date()
@@ -89,8 +102,27 @@ def next_trigger(calendar, now: datetime) -> str | None:
                                     tzinfo=now.tzinfo)
             if cand > now and (best is None or cand < best):
                 best = cand
-            break                        # 这一条 entry 已经定案（要么取它、要么跳过）
+                break            # 这一条 entry 已定案：再往后扫只会更晚
+            # 这一天的那个时刻已经过去 ⇒ 继续找**下一个**匹配日（i+1…），别收工。
     return best.isoformat(timespec="seconds") if best else None
+
+
+def next_trigger_reason(calendar) -> str:
+    """`next_trigger` 推不出时刻时，页面该照实说的**原因**（P43 §S2）。
+
+    两种原因必须**分开**，否则页面就是在说假话：
+
+    - `形态认不出`：整份日历里没有一条是本函数解释得了的（缺 `Hour`/`Minute`，
+      或带本函数不解释的键）—— 那些条目归 launchd，我不猜；
+    - `认得出，但没有下一槽`：形态完全合法，只是往后 `LOOKAHEAD_DAYS` 天内没有一天
+      命中（`{"Month": 2, "Day": 30}` 这种永远不存在的日期）。
+
+    `next_trigger` 返回的是时刻而不是原因（大多数调用方只关心时刻），所以原因另放一处。
+    """
+    if any(_recognizes(e) for e in calendar):
+        return f"认得出，但往后 {LOOKAHEAD_DAYS} 天内没有下一槽（更远的不推）"
+    return "形态认不出"
+
 
 
 def _read_receipt(job_name: str, report_dir: Path | None) -> tuple[dict | None, str | None]:
@@ -169,6 +201,9 @@ class OpsLab:
             "stdout_log": str(self.log_dir / f"{job.name}.out.log"),
             "stderr_log": str(self.log_dir / f"{job.name}.err.log"),
             "next_trigger": next_trigger(job.calendar, now),
+            #: 只在 `next_trigger` 为 `None` 时有意义：把「形态认不出」与「认得出但
+            #: 没有下一槽」分开说（P43 §S2）—— 合成一句就是页面在说假话。
+            "next_trigger_reason": next_trigger_reason(job.calendar),
             "receipt_path": str(journal.report_path(name, self.report_dir)),
             "receipt_present": payload is not None or error is not None,
             "latest": payload,
@@ -230,4 +265,5 @@ class OpsLab:
         }
 
 
-__all__ = ["HISTORY_LIMIT", "LOOKAHEAD_DAYS", "OpsLab", "next_trigger", "now_iso"]
+__all__ = ["HISTORY_LIMIT", "LOOKAHEAD_DAYS", "OpsLab", "next_trigger",
+           "next_trigger_reason", "now_iso"]

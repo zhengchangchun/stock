@@ -123,7 +123,11 @@ class Job:
 JOBS: tuple[Job, ...] = (
     Job(
         name="close", label=f"{LABEL_PREFIX}.close", args=("ops", "close"),
-        window="每交易日 15:30",
+        # `StartCalendarInterval` 只能表达「星期几 15:30」，**表达不了「只在交易日」**：
+        # 节假日照样会被拉起，然后由链自己判 `is_trading_day=False` **整轮跳过**
+        # （exit 0，不是异常）。文案必须说 plist 实际做的事，否则读页面的人会以为
+        # 节假日不会触发（P43 §S5）。
+        window="工作日 15:30（非交易日整轮跳过）",
         why="收盘链：库备份 → 12 步（ingest→快照→预测→验证→复盘→模拟盘）→ 事后体检",
         calendar=tuple({"Hour": 15, "Minute": 30, "Weekday": d} for d in WEEKDAYS),
     ),
@@ -173,7 +177,9 @@ def render_plist(job: Job, *, project_root: Path | str | None = None,
         "WorkingDirectory": str(root),
         "EnvironmentVariables": {"PYTHONPATH": str(root)},
         "StartCalendarInterval": list(job.calendar),
-        # 不设 RunAtLoad：登录/bootout 之后不该立刻跑一条收盘链（今天可能还没收盘）。
+        # **显式**写 `RunAtLoad=False`，不是省略这一项：省略在 launchd 里语义上也等于
+        # false，但只有写下来才**能被断言、被看见**（页面与测试都读它）。语义是
+        # 「登录 / `bootout` 之后不该立刻跑一条收盘链」—— 那时今天可能还没收盘。
         "RunAtLoad": False,
         "StandardOutPath": str(log / f"{job.name}.out.log"),
         "StandardErrorPath": str(log / f"{job.name}.err.log"),

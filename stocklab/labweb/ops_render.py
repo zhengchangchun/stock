@@ -76,8 +76,7 @@ def _verdict(latest: Mapping) -> str:
     if latest.get("error"):
         return f'**没跑起来**（{latest["error"]}）'
     steps = latest.get("steps") or []
-    total = latest.get("steps_total")
-    return f'跑完 {len(steps)} 步' + (f'／共 {total} 步' if total else "")
+    return f'跑完 {len(steps)} 步'
 
 
 def _steps_table(steps: Sequence[Mapping]) -> str:
@@ -130,6 +129,9 @@ def _skipped_block(skipped: Sequence[Mapping]) -> str:
 def _job_section(job: Mapping) -> str:
     """一条任务 = 一段：窗口 / 命令 / 回执 / 最近一次 / 历史。"""
     latest = job.get("latest")
+    #: 推不出时刻时**照实**写原因：「形态认不出」与「认得出但没有下一槽」是两件事
+    #: （P43 §S2），合成一句会让页面在后一种情况说假话。
+    when = job["next_trigger"] or f'推算不出来（{job["next_trigger_reason"]}）'
     lines = [
         f'<table class="kv">'
         f'<tr><th>窗口</th><td>{esc(job["window"])}</td></tr>'
@@ -137,7 +139,7 @@ def _job_section(job: Mapping) -> str:
         f'<tr><th>命令</th><td><code>{esc(" ".join(job["argv"]))}</code></td></tr>'
         f'<tr><th>plist</th><td><code>{esc(job["plist"])}</code>　'
         f'{_present_pill(job["plist_present"])}</td></tr>'
-        f'<tr><th>下一次触发</th><td>{esc(job["next_trigger"] or "推算不出来（形态认不出）")}'
+        f'<tr><th>下一次触发</th><td>{esc(when)}'
         f'　<span class="sub">按 plist 里的 `StartCalendarInterval` 推算；'
         f'机器睡过去时 launchd 会在唤醒后补跑一次</span></td></tr>'
         f'<tr><th>回执</th><td><code>{esc(job["receipt_path"])}</code></td></tr>'

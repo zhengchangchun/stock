@@ -197,6 +197,43 @@ def test_conflicting_second_version_exits_one_and_leaves_the_row_alone(db, capsy
     assert _rows(db) == [before], "原行必须一个字节都不改"
 
 
+def test_conflict_that_races_past_the_precheck_also_exits_one(db, capsys, monkeypatch):
+    """S3（P43）：预检漏掉、由 `record_decision` 撞上 `DecisionConflict` 的**竞态路径**，
+    退出码也必须是 **1**（与预检分支同码）。
+
+    预检（`decision_on`）就在正上方，所以这条路径几乎不可达 —— 但「同一件事两个退出码」
+    正是本仓库反复要消掉的东西（ADR-019 的动机就是退出码只有一个真源）：**2** 在项目里
+    是「你给的东西不合法」，而这个输入完全合法，只是撞了历史。
+
+    复现方式：让第 1 次 `decision_on`（预检）返回 `None`（＝那时还没有这一行），
+    第 2 次（`record_decision` 内部，ERROR_DIARY #25 的顺序）返回真实行 ——
+    等价于「预检之后、落库之前，另一个写者把这一行写进去了」。
+    """
+    _init(db, capsys)
+    code, _, err = run(db, "paper", "spec", "set", "--arm", ARM_AGENT,
+                       "--asof", "2026-09-16", "--spec", '{"etf_target_pct": 12}',
+                       capsys=capsys)
+    assert code == 0, err
+    before = _rows(db)[0]
+
+    real = agent_spec.decision_on
+    seen = []
+
+    def flaky(conn, arm, asof):
+        seen.append((arm, asof))
+        return None if len(seen) == 1 else real(conn, arm, asof)
+
+    monkeypatch.setattr(agent_spec, "decision_on", flaky)
+    code, out, err = run(db, "paper", "spec", "set", "--arm", ARM_AGENT,
+                         "--asof", "2026-09-16", "--spec", '{"etf_target_pct": 20}',
+                         capsys=capsys)
+    assert len(seen) == 2, "这条用例要的正是「预检过了、落库撞上」"
+    assert code == 1, "竞态撞的也是「冲突」，不是「输入非法」"
+    assert out == ""
+    assert json.loads(err)["type"] == "DecisionConflict"
+    assert _rows(db) == [before], "原行必须一个字节都不改"
+
+
 def test_n_trials_and_rejected_are_part_of_the_idempotency_key(db, capsys):
     """同 spec 但试错次数不同 ⇒ 不是同一版（否则预算证据会被静默抹掉）。"""
     _init(db, capsys)

@@ -478,6 +478,10 @@ def test_plist_is_generated_for_the_three_jobs(tmp_path):
         text = path.read_text(encoding="utf-8")
         assert "<key>StartCalendarInterval</key>" in text
         assert "<key>RunAtLoad</key>" in text
+        # S4（P43）：注释说「显式写 False」就必须真的写下来 —— `render_plist` 的注释
+        # 曾经说「不设 RunAtLoad」，而下一行就是 `"RunAtLoad": False`：语义（不自动跑）
+        # 是对的，注释在说谎。谁为了「加上 RunAtLoad」来改这里，会以为自己动了行为。
+        assert plistlib.loads(path.read_bytes())["RunAtLoad"] is False
 
 
 def _generated_calendars(tmp_path: Path) -> dict[str, tuple[dict[str, int], ...]]:
@@ -537,10 +541,18 @@ def test_patrol_plist_covers_0900_to_1430_and_no_slot_reaches_the_close(tmp_path
 
 
 def test_close_plist_still_fires_weekdays_at_1530(tmp_path):
-    """T2：`close` 仍是工作日 15:30 —— 错峰靠挪 patrol，不动收盘链时点。"""
+    """T2：`close` 仍是工作日 15:30 —— 错峰靠挪 patrol，不动收盘链时点。
+
+    S5（P43）：窗口**文案**必须是 plist **实际**说的那件事。`StartCalendarInterval`
+    只能表达「星期几 15:30」，表达不了「只在交易日」—— 节假日（如 10-01）照样会被拉起，
+    然后由链自己判 `is_trading_day=False` **整轮跳过**（exit 0，不是异常）。
+    原来文案写「每交易日 15:30」，会让读页面的人以为节假日不会触发；
+    跳过行为本身由 `test_non_trading_day_skips_the_whole_round_with_exit_zero` 钉住。
+    """
     cal = _generated_calendars(tmp_path)["close"]
     assert {(e["Hour"], e["Minute"]) for e in cal} == {(15, 30)}
     assert {e["Weekday"] for e in cal} == {1, 2, 3, 4, 5}
+    assert schedule.JOB_BY_NAME["close"].window == "工作日 15:30（非交易日整轮跳过）"
 
 
 def test_no_two_jobs_fire_at_the_same_moment(tmp_path):

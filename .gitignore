@@ -47,6 +47,9 @@ __pycache__/
 .claude/scheduled_tasks.json
 .claude/session-state/
 
+# nanobot - 本地工具调用回执（agent 运行时 scratch，不是项目产物）
+.nanobot/
+
 # SDD 工作区（superpowers:subagent-driven-development 的临时区：
 # 台账 / task brief / 实现者报告 / review diff 包）
 # 属本地进程间协作的 scratch，不是项目产物；方案收尾时整体删除，git 历史才是记录。
