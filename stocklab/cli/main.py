@@ -3,6 +3,7 @@
 用法:
     .venv/bin/python -m stocklab.cli.main db init [--db PATH]
     .venv/bin/python -m stocklab.cli.main doctor
+    .venv/bin/python -m stocklab.cli.main ops patrol [--fix]
     .venv/bin/python -m stocklab.cli.main ingest bars [--days N] [--code C]...
     .venv/bin/python -m stocklab.cli.main session tick
     .venv/bin/python -m stocklab.cli.main review daily
@@ -2099,7 +2100,7 @@ def cmd_lab_serve(args: argparse.Namespace) -> int:
     2026-09-21 服务合并：这里曾经有两个网页服务（`dashboard serve` 只读快照 /
     `lab serve` 应用），默认端口都是 8791 —— 撞端口、且只能靠记忆区分。
     现在只留这一个：看板变成**离线单文件产物**（`dashboard build`），
-    所有网页入口统一在 `/lab/*`（总览 / 模拟盘对照 / 候选池 / 成交流水 /
+    所有网页入口统一在 `/lab/*`（总览 / 模拟盘对照 / 候选池 / 定时任务 / 成交流水 /
     现金流 / 风险 / 数据 / 健康检查）。
 
     写路径（录入成交 / 冲正 / 录入本金 / 候选池「跑一次」）全程走既有账本函数，
@@ -2107,6 +2108,7 @@ def cmd_lab_serve(args: argparse.Namespace) -> int:
     """
     from stocklab.labweb import app as labweb
     from stocklab.labweb.cand_data import CandLab
+    from stocklab.labweb.ops_data import OpsLab
 
     try:
         labweb.assert_loopback(args.host)
@@ -2123,7 +2125,7 @@ def cmd_lab_serve(args: argparse.Namespace) -> int:
         return 2
     ensure_schema(db)   # lab 应用写入口前滚（P33）
     ctx = labweb.Context(lab=labweb.Lab(db, asof=args.asof),
-                         cand=CandLab(db),
+                         cand=CandLab(db), ops=OpsLab(db),
                          signer=labweb.TokenSigner(labweb.new_secret()),
                          base_path=base_path)
     try:
@@ -2334,6 +2336,143 @@ def cmd_chain_accuracy(args: argparse.Namespace) -> int:
                       "segments": segs},
                      ensure_ascii=False, sort_keys=True, indent=2))
     return 0
+
+
+# ---------- ops patrol（P38：巡检本体在项目里） ----------
+
+def cmd_ops_patrol(args: argparse.Namespace) -> int:
+    """巡检 = 7 项体检（只读）+ 缺哪步补哪步；**退出码由项目定义**（ADR-019）。
+
+    退出码：0 全绿 / 1 链路完整但有异常 / 2 判不了或断链（含拒绝跨库补步）。
+    以前这个判定写在 nanobot cron 的任务正文里，于是出现「任务 ok 而巡检报异常」
+    两个口径打架（见 `ops/patrol.py` 模块 docstring）。
+
+    stdout = 完整 JSON（供机器读）；stderr = 每条异常一行 + **一行摘要**（供 cron
+    直接贴回来，`patrol: exit=... ①ok ②ok ...`）。
+    """
+    from stocklab.ops import patrol
+
+    payload = patrol.run_patrol(
+        db_path=args.db, now=args.now, fix=args.fix,
+        timeout_s=args.timeout_seconds, report_dir=args.report_dir)
+    print(json.dumps(payload, ensure_ascii=False, sort_keys=True, indent=2))
+    for a in payload.get("anomalies") or []:
+        print(f"⚠️  {a['kind']}: {a.get('detail') or a.get('step') or ''}",
+              file=sys.stderr)
+    print(patrol.summary_line(payload), file=sys.stderr)
+    return int(payload["exit_code"])
+
+
+# ---------- ops close / monthly（P38：收盘链与月度刷新的顺序在项目里） ----------
+
+def _print_ops_payload(payload: dict, summary_fn) -> int:
+    """共用的输出形状：stdout = 完整 JSON；stderr = 异常逐条 + 一行摘要。
+
+    与 `ops patrol` 一致（那边已经证明了这是好形状：cron/launchd 侧只需看退出码，
+    人排查时 stderr 的一行就够定位）。
+    """
+    print(json.dumps(payload, ensure_ascii=False, sort_keys=True, indent=2))
+    for a in payload.get("anomalies") or []:
+        print(f"⚠️  {a.get('kind')}: {a.get('detail') or a.get('step') or ''}",
+              file=sys.stderr)
+    for key in ("refused", "error", "skipped", "journal_error"):
+        if payload.get(key):
+            print(f"⚠️  {key}: {payload[key]}", file=sys.stderr)
+    print(summary_fn(payload), file=sys.stderr)
+    return int(payload["exit_code"])
+
+
+def cmd_ops_close(args: argparse.Namespace) -> int:
+    """收盘链（ADR-020）：库备份 → 12 步（asof = **运行当天**）→ 事后体检。
+
+    退出码：0 全绿（含非交易日跳过）/ 1 链跑完但有异常 / 2 断链或**还没收盘**。
+    收盘前拒绝执行是硬约束：半截 bar 与当日 LIVE 预测都是 append-only。
+    """
+    from stocklab.ops import chain
+
+    payload = chain.run_close(
+        db_path=args.db, now=args.now, timeout_s=args.timeout_seconds,
+        report_dir=args.report_dir, backup_dir=args.backup_dir)
+    return _print_ops_payload(payload, chain.summary_line)
+
+
+def cmd_ops_monthly(args: argparse.Namespace) -> int:
+    """月度刷新：休市公告 → 长窗行情 → 财报复核 → 体检（每月 1 日 08:00）。"""
+    from stocklab.ops import chain
+
+    payload = chain.run_monthly(
+        db_path=args.db, now=args.now, timeout_s=args.timeout_seconds,
+        report_dir=args.report_dir)
+    return _print_ops_payload(payload, chain.summary_line)
+
+
+def cmd_ops_schedule(args: argparse.Namespace) -> int:
+    """调度（launchd）：`generate` 只看不写，`install/uninstall/status/kickstart` 动系统。
+
+    退出码：0 成功 / 1 有一步失败（失败项在 stderr 点名）/ 2 参数不合法。
+    `generate` **不碰文件系统**（只看内容，便于先审后装）。
+    """
+    from stocklab.ops import schedule
+
+    names = args.job or list(schedule.JOB_NAMES)
+    unknown = [n for n in names if n not in schedule.JOB_BY_NAME]
+    if unknown:
+        print(f"未知任务：{'、'.join(unknown)}（可选："
+              f"{'、'.join(schedule.JOB_NAMES)}）", file=sys.stderr)
+        return 2
+    pdir = Path(args.plist_dir) if args.plist_dir else None
+    out: list[dict] = []
+
+    if args.schedule_action == "generate":
+        for name in names:
+            job = schedule.JOB_BY_NAME[name]
+            doc = schedule.render_plist(
+                job, project_root=args.project_root, python=args.python,
+                logs=args.log_dir)
+            out.append({"job": name, "label": job.label,
+                        "plist_path": str(schedule.plist_path(job, plist_dir=pdir)),
+                        "triggers": len(job.calendar), "window": job.window,
+                        "why": job.why,
+                        "plist": doc.decode("utf-8")})
+        print(json.dumps(out, ensure_ascii=False, sort_keys=True, indent=2))
+        return 0
+
+    if args.schedule_action == "status":
+        out = [schedule.status(schedule.JOB_BY_NAME[n], plist_dir=pdir)
+               for n in names]
+        print(json.dumps(out, ensure_ascii=False, sort_keys=True, indent=2))
+        for r in out:
+            mark = "✅" if (r["loaded"] and r["plist_present"]) else "❌"
+            print(f"{mark} {r['job']}: loaded={r['loaded']}"
+                  f" plist={r['plist_present']} last_exit={r['last_exit_status']}"
+                  f"（{r['window']}）", file=sys.stderr)
+        return 0 if all(r["loaded"] and r["plist_present"] for r in out) else 1
+
+    if args.schedule_action == "install":
+        for name in names:
+            out.append(schedule.install(
+                schedule.JOB_BY_NAME[name], plist_dir=pdir,
+                project_root=args.project_root, python=args.python,
+                logs=args.log_dir))
+            if args.kickstart and out[-1]["ok"]:
+                out[-1]["kickstart"] = schedule.kickstart(
+                    schedule.JOB_BY_NAME[name])
+    elif args.schedule_action == "uninstall":
+        for name in names:
+            out.append(schedule.uninstall(schedule.JOB_BY_NAME[name],
+                                          plist_dir=pdir))
+    else:
+        for name in names:
+            out.append(schedule.kickstart(schedule.JOB_BY_NAME[name]))
+
+    print(json.dumps(out, ensure_ascii=False, sort_keys=True, indent=2))
+    ok = all(r.get("ok") for r in out)
+    for r in out:
+        state = "✅" if r.get("ok") else "❌"
+        note = r.get("stderr") or r.get("detail") or ""
+        print(f"{state} {r['job']}: {args.schedule_action} {note}".rstrip(),
+              file=sys.stderr)
+    return 0 if ok else 1
 
 
 # ---------- parser ----------
@@ -2747,6 +2886,83 @@ def build_parser() -> argparse.ArgumentParser:
 
     doctor = sub.add_parser("doctor", help="数据健康度报告（离线）")
     doctor.set_defaults(func=lambda _a: cmd_doctor())
+
+    from stocklab.ops.chain import CLOSE_TIMEOUT_S, MONTHLY_TIMEOUT_S
+    from stocklab.ops.patrol import DEFAULT_TIMEOUT_S as PATROL_TIMEOUT_S
+    from stocklab.ops import schedule
+
+    ops = sub.add_parser(
+        "ops", help="运维（P38）：巡检 = 7 项体检 + 缺步补跑，退出码由本命令定义")
+    ops_sub = ops.add_subparsers(dest="ops_action", required=True)
+    ops_patrol = ops_sub.add_parser(
+        "patrol", help="链路体检（**只读**）；--fix 按收盘链顺序补缺步 + 复检")
+    ops_patrol.add_argument("--db", help="数据库路径（默认 data/stocklab.db）")
+    ops_patrol.add_argument("--now", help="覆盖当前时刻（ISO8601；仅供测试/补跑）")
+    ops_patrol.add_argument(
+        "--fix", action="store_true",
+        help="按收盘链顺序补跑缺失步骤（幂等；非默认库时受跨库守卫拒绝）")
+    ops_patrol.add_argument(
+        "--timeout-seconds", dest="timeout_seconds", type=float,
+        default=PATROL_TIMEOUT_S,
+        help=f"整轮预算（默认 {PATROL_TIMEOUT_S:.0f}s；用完即停并记 aborted）")
+    ops_patrol.add_argument("--report-dir", dest="report_dir",
+                            help="报告根目录（默认 reports/；体检只读：读 <它>/<date>-review.md"
+                                 "、回执写 <它>/ops/latest-patrol.json）")
+    ops_patrol.set_defaults(func=cmd_ops_patrol)
+
+    ops_close = ops_sub.add_parser(
+        "close", help="收盘链（ADR-020）：库备份 → 12 步 → 事后体检；asof = 运行当天")
+    ops_close.add_argument("--db", help="数据库路径（默认 data/stocklab.db）")
+    ops_close.add_argument("--now", help="覆盖当前时刻（ISO8601；仅供测试/补跑）")
+    ops_close.add_argument(
+        "--timeout-seconds", dest="timeout_seconds", type=float,
+        default=CLOSE_TIMEOUT_S,
+        help=f"整轮预算（默认 {CLOSE_TIMEOUT_S:.0f}s；用完即停并记 aborted）")
+    ops_close.add_argument("--report-dir", dest="report_dir",
+                           help="报告根目录（默认 reports/）：⑤ 复盘报告读 <它>/<date>-review.md，"
+                                "回执写 <它>/ops/latest-close.json")
+    ops_close.add_argument("--backup-dir", dest="backup_dir",
+                           help="库备份目录（默认 data/backups/）")
+    ops_close.set_defaults(func=cmd_ops_close)
+
+    ops_monthly = ops_sub.add_parser(
+        "monthly", help="月度刷新：休市公告 → 长窗行情 → 财报复核 → 体检")
+    ops_monthly.add_argument("--db", help="数据库路径（默认 data/stocklab.db）")
+    ops_monthly.add_argument("--now", help="覆盖当前时刻（ISO8601；仅供测试/补跑）")
+    ops_monthly.add_argument(
+        "--timeout-seconds", dest="timeout_seconds", type=float,
+        default=MONTHLY_TIMEOUT_S,
+        help=f"整轮预算（默认 {MONTHLY_TIMEOUT_S:.0f}s）")
+    ops_monthly.add_argument("--report-dir", dest="report_dir",
+                             help="报告根目录（默认 reports/）：⑤ 复盘报告读 <它>/<date>-review.md，"
+                                  "回执写 <它>/ops/latest-monthly.json")
+    ops_monthly.set_defaults(func=cmd_ops_monthly)
+
+    ops_sched = ops_sub.add_parser(
+        "schedule", help="调度（launchd）：plist 的生成 / 安装 / 卸载 / 查看")
+    ops_sched_sub = ops_sched.add_subparsers(dest="schedule_action", required=True)
+    for _name, _help in (
+            ("generate", "只打印将要写入的 plist（不碰文件系统）"),
+            ("install", "写 plist 到 ~/Library/LaunchAgents 并 bootstrap"),
+            ("uninstall", "bootout 并删掉 plist"),
+            ("status", "看三条任务加载了没 / 上次退出码"),
+            ("kickstart", "立刻跑一次（安装后的自证）")):
+        sp = ops_sched_sub.add_parser(_name, help=_help)
+        sp.add_argument("--job", action="append", default=None,
+                        help=f"只操作某条任务，可重复（默认全部："
+                             f"{'、'.join(schedule.JOB_NAMES)}）")
+        sp.add_argument("--plist-dir", dest="plist_dir",
+                        help="plist 目录（默认 ~/Library/LaunchAgents）")
+        sp.add_argument("--project-root", dest="project_root",
+                        help="WorkingDirectory / PYTHONPATH（默认仓库根）")
+        sp.add_argument("--python", help="解释器路径（默认当前 sys.executable）")
+        sp.add_argument("--log-dir", dest="log_dir",
+                        help="stdout/stderr 落盘目录（默认 data/logs/）")
+        sp.set_defaults(func=cmd_ops_schedule)
+    ops_sched_install = ops_sched_sub.choices["install"]
+    ops_sched_install.add_argument(
+        "--kickstart", action="store_true",
+        help="装完立刻跑一次（巡检可安全自证；收盘链未收盘会拒绝执行）")
 
     feat = sub.add_parser("features", help="特征层（离线，只读 bars_daily）")
     feat_sub = feat.add_subparsers(dest="feat_action")

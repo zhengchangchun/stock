@@ -42,9 +42,10 @@ from urllib.parse import parse_qs, quote, urlsplit
 from stocklab.dashboard.server import (LOOPBACK_HOSTS, NonLoopbackHost,
                                        assert_loopback)
 from stocklab.labweb import SERVICE, VERSION
-from stocklab.labweb import cand_data, cand_render, paper_data, paper_render
+from stocklab.labweb import cand_data, cand_render, ops_data, ops_render, paper_data, paper_render
 from stocklab.labweb.cand_data import CandLab
 from stocklab.labweb.data import Lab, now_iso
+from stocklab.labweb.ops_data import OpsLab
 from stocklab.labweb.render import (CASH_FIELDS, CSS_PATH, JS_PATH,
                                     TRADE_FIELDS, cash_page, cash_pane,
                                     data_page, duplicate_page, error_page,
@@ -125,6 +126,8 @@ class Context:
     #: `/candidate`，`None` 不影响它们）。生产路径（`make_server` /
     #: `cmd_lab_serve`）显式注入。
     cand: "CandLab | None" = None
+    #: 定时任务页（`/ops`）的取数门面。同样是末位 + 默认值，理由同上。
+    ops: "OpsLab | None" = None
 
 
 # ---------- 小工具 ----------
@@ -491,6 +494,26 @@ def _get_candidate(ctx: Context, query: dict, built_at: str) -> Response:
         sid=int(raw_sid) if raw_sid.isdigit() else None))
 
 
+def _ops_required(ctx: Context) -> Response | None:
+    """`ctx.ops` 未注入时的**显式**答复（`None` = 可以继续）。理由同 `_cand_required`。"""
+    if ctx.ops is not None:
+        return None
+    return html_response(500, error_page(
+        base=ctx.base_path, status=500,
+        message=("定时任务页需要 `ctx.ops`（P38 取数门面），本进程没有注入。"
+                 "用 `lab serve` 起服务会自动注入。"),
+        asof=ctx.lab.asof, built_at=now_iso()))
+
+
+def _get_ops(ctx: Context, built_at: str) -> Response:
+    """`GET /ops`：三条链最近跑成什么样（**只读回执**）。"""
+    missing = _ops_required(ctx)
+    if missing is not None:
+        return missing
+    return html_response(200, ops_render.ops_page(
+        ctx.ops.view(), base=ctx.base_path, built_at=built_at))
+
+
 def _candidate_param_error(asof: str, run_kind: str) -> str:
     """表单参数校验（返回空串 = 通过）。**先于任何写库动作**。"""
     if not asof:
@@ -694,6 +717,8 @@ def _get(ctx: Context, rel: str, query: dict, built_at: str) -> Response:
             ctx.lab.paper_track(), base=base, built_at=built_at))
     if rel == "/candidate":
         return _get_candidate(ctx, query, built_at)
+    if rel == "/ops":
+        return _get_ops(ctx, built_at)
     if rel == "/data":
         return html_response(200, data_page(ctx.lab.data(), base=base,
                                             built_at=built_at))
@@ -774,7 +799,7 @@ def make_server(host: str = DEFAULT_HOST, port: int = DEFAULT_PORT, *,
         ctx = Context(lab=Lab(db_path, asof=asof),
                       signer=signer or TokenSigner(secret or new_secret()),
                       base_path=normalize_base_path(base_path),
-                      cand=CandLab(db_path))
+                      cand=CandLab(db_path), ops=OpsLab(db_path))
     httpd = ThreadingHTTPServer((host, port), make_handler())
     httpd.daemon_threads = True
     httpd.ctx = ctx          # type: ignore[attr-defined]

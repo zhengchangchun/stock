@@ -135,3 +135,22 @@ def report_dir_is_tmp(tmp_path, monkeypatch):
     d = tmp_path / "reports"
     monkeypatch.setattr(paths, "REPORT_DIR", d)
     return d
+
+
+@pytest.fixture(autouse=True)
+def backup_dir_is_tmp(tmp_path, monkeypatch):
+    """备份目录**永不落进仓库 `data/backups/`**（与 `report_dir_is_tmp` 同一个理由）。
+
+    `ops close` 的第 0 步就是库备份，而 `chain.run_close(backup_dir=None)` 的默认值是
+    `paths.BACKUP_DIR` = 仓库的 `data/backups/`。于是**每一个**忘了传 `backup_dir` 的
+    用例都在仓库里丢一份夹具库的副本：2026-09-22 实测 `data/backups/` 里堆了 22 个
+    `close.preclose.*.db`（360 KB，全是 `tmp_path/close.db` 的副本，真库是 196 MB）。
+    `data/` 在 `.gitignore` 里 → `git status` 看不见，判据同样是 `ls -lt`（ERROR_DIARY #51）。
+
+    显式传 `backup_dir` 的用例不受影响。
+    """
+    from stocklab.config import paths
+
+    d = tmp_path / "backups"
+    monkeypatch.setattr(paths, "BACKUP_DIR", d)
+    return d
