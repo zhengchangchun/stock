@@ -548,6 +548,62 @@ _P56_TRIGGER_NO_UPDATE = (
 )
 
 
+# ---------------------------------------------------------------------------
+# P58：插桩5 复盘台账 `plugin_reviews`（**新表**）。
+#
+# 新表**不需要数据迁移**：`schema.sql` 的 `CREATE TABLE IF NOT EXISTS` 会在下一次
+# `init_db` / `ensure_schema` 时把它建出来 —— 老库与新库走的是同一条路径，所以
+# 「对老库是空动作」这句话在这里是**字面成立**的（表不存在 ⇒ 不 pending ⇒ 不备份
+# ⇒ executescript 直接建）。
+#
+# 本函数只在**结构漂移**时动手：表在、但 append-only 触发器不见了（被 DROP 过 /
+# 有人手工建过同名表）。那种库看着「有这张表」，实际可以改历史行 —— 必须前滚。
+#
+# 判据刻意**不含「表不存在」**：既有约定是「表不存在 ⇒ 按新 shape 建出，无需迁移、
+# 无需备份，不算 pending」（见 `_pending_column_migrations` 的 docstring）。把「表
+# 不存在」也算成 pending，会让每一次写库入口都给老库做一次备份。
+#
+# 触发器文本与 `schema.sql` **同文**（改一处须同步两处）。
+# ---------------------------------------------------------------------------
+
+_P58_TABLE = "plugin_reviews"
+
+_P58_TRIGGERS = (
+    "CREATE TRIGGER IF NOT EXISTS trg_plugin_reviews_no_update"
+    " BEFORE UPDATE ON plugin_reviews"
+    " BEGIN SELECT RAISE(ABORT, 'plugin_reviews is append-only'); END;\n"
+    "CREATE TRIGGER IF NOT EXISTS trg_plugin_reviews_no_delete"
+    " BEFORE DELETE ON plugin_reviews"
+    " BEGIN SELECT RAISE(ABORT, 'plugin_reviews is append-only'); END;"
+)
+
+_P58_TRIGGER_NAMES = ("trg_plugin_reviews_no_update", "trg_plugin_reviews_no_delete")
+
+
+def _trigger_exists(conn, name: str) -> bool:
+    return conn.execute(
+        "SELECT COUNT(*) FROM sqlite_master WHERE type='trigger' AND name=?",
+        (name,)).fetchone()[0] > 0
+
+
+def plugin_reviews_needs_p58(conn) -> bool:
+    """复盘台账在、但 append-only 触发器缺席吗？（只读探测，供 doctor 用）
+
+    表**不存在**时返回 False —— 那不是「待迁移」，是「等着被建出来」。
+    """
+    if not _table_exists(conn, _P58_TABLE):
+        return False
+    return any(not _trigger_exists(conn, name) for name in _P58_TRIGGER_NAMES)
+
+
+def migrate_p58_plugin_reviews(conn) -> list[str]:
+    """补回复盘台账的 append-only 触发器（P58）。**可重入**、老库上零动作。"""
+    if not plugin_reviews_needs_p58(conn):
+        return []
+    conn.executescript(_P58_TRIGGERS)
+    return ["plugin_reviews.triggers"]
+
+
 #: 已知迁移 marker 清单：doctor 逐个报告在位与否（只读，不迁移）。#: (name, table, 判据)。判据是列名（str）或一个只读探测函数。
 #: 新增迁移时必须在这里登记，否则 doctor 看不出来。
 _KNOWN_MARKERS: list[tuple[str, str, object]] = [
@@ -562,6 +618,8 @@ _KNOWN_MARKERS: list[tuple[str, str, object]] = [
      lambda conn: not agent_decisions_need_portfolio_columns(conn)),
     ("p56_agent_arms_executor", "paper_accounts",
      lambda conn: not agent_arms_need_executor(conn)),
+    ("p58_plugin_reviews", "plugin_reviews",
+     lambda conn: not plugin_reviews_needs_p58(conn)),
 ]
 
 
@@ -594,6 +652,8 @@ def _pending_column_migrations(conn) -> list[str]:
         pending.append("p52:paper_agent_decisions.portfolio")
     if agent_arms_need_executor(conn):
         pending.append("p56:paper_accounts.params.executor")
+    if plugin_reviews_needs_p58(conn):
+        pending.append("p58:plugin_reviews.triggers")
     return pending
 
 
@@ -627,6 +687,7 @@ def _apply_schema(conn, sql: str) -> list[str]:
     changes += migrate_p44_plugin_audit_events(conn)
     changes += migrate_p52_agent_decisions_portfolio(conn)
     changes += migrate_p56_agent_arms_executor(conn)
+    changes += migrate_p58_plugin_reviews(conn)
     return changes
 
 

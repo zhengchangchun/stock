@@ -475,6 +475,62 @@ def test_monthly_refuses_a_non_default_db_too(tmp_path):
     assert "拒绝在非默认库" in payload["refused"]
 
 
+def test_monthly_review_step_gets_the_month_asof(tmp_path, monkeypatch):
+    """插桩5 复盘那一步拿到的 `--asof` = 本轮 asof（月度链此前**没有**给步骤传 asof）。
+
+    既有 5 步的 argv 里没有 `{asof}` 占位符，所以给它们传与不传逐字节相同 ——
+    这条测试反过来钉住「传了也没改到它们」。
+    """
+    db = _green(tmp_path)
+    _default_db(monkeypatch, db)
+    runner = FakeRunner()
+    payload = chain.run_monthly(db_path=db, now="2026-09-23T08:00:00+08:00",
+                                runner=runner, report_dir=tmp_path / "reports")
+    argv = {c["step"]: c["argv"][3:] for c in runner.calls}
+    assert argv["candidate_review"][:3] == ["candidate", "review", "--asof"]
+    assert argv["candidate_review"][3] == payload["asof"]
+    assert argv["candidate_review"][-2] == "--db"
+    # 既有步骤的 argv 一个字符都没变
+    assert argv["ingest_financials"] == ["ingest", "financials"]
+    assert argv["doctor"] == ["doctor"]
+
+
+def test_monthly_candidate_review_is_not_blocking(tmp_path, monkeypatch):
+    """P58：插桩5 复盘失败**不把整条月度链拖红**，也不挡住它后面的步骤。
+
+    `candidate review` 没有在役版本时 exit 2（结构性拒绝）。复盘是派生读数 ——
+    「维护活跑完了」这句话不该因为一条补充读数没算成就变成红的；但那次失败
+    必须在 `steps`、回执摘要（`bad=`）与 `anomalies` 里**看得见**。
+    """
+    db = _green(tmp_path)
+    _default_db(monkeypatch, db)
+    runner = FakeRunner(codes={"candidate_review": 2})
+    payload = chain.run_monthly(db_path=db, now="2026-09-23T08:00:00+08:00",
+                                runner=runner, report_dir=tmp_path / "reports")
+
+    steps = [c["step"] for c in runner.calls]
+    assert steps == list(MONTHLY_STEP_ORDER)      # 一步都没被跳过
+    assert steps[-1] == "doctor"                  # 它后面的步骤照跑
+    got = {s["name"]: s["exit_code"] for s in payload["steps"]}
+    assert got["candidate_review"] == 2           # 失败可见
+    assert payload["exit_code"] == 0              # 但不拖红（不把 0 变成 2）
+    assert payload["ok"] is True
+    assert "bad=candidate_review=2" in chain.summary_line(payload)
+    assert [a["step"] for a in payload["anomalies"]] == ["candidate_review"]
+
+
+def test_monthly_a_blocking_step_failure_is_still_fatal(tmp_path, monkeypatch):
+    """非阻断是**逐步骤**的属性，不是「整条链不在乎失败」—— 对照组。"""
+    db = _green(tmp_path)
+    _default_db(monkeypatch, db)
+    runner = FakeRunner(codes={"ingest_financials": 2})
+    payload = chain.run_monthly(db_path=db, now="2026-09-23T08:00:00+08:00",
+                                runner=runner, report_dir=tmp_path / "reports")
+    assert payload["exit_code"] == 2
+    stop = MONTHLY_STEP_ORDER.index("ingest_financials")
+    assert [c["step"] for c in runner.calls] == list(MONTHLY_STEP_ORDER[:stop + 1])
+
+
 # ---------- 调度（plist） ----------
 
 def test_plist_is_generated_for_the_three_jobs(tmp_path):

@@ -954,6 +954,41 @@ CREATE TRIGGER IF NOT EXISTS trg_candidate_rejects_no_delete
 BEFORE DELETE ON candidate_rejects
 BEGIN SELECT RAISE(ABORT, 'candidate_rejects is append-only'); END;
 
+-- ---------- 插桩5 复盘台账（P58）----------
+-- 插桩5（定期复盘分析）的落库点。它是**台账**不是缓存：一行 = 「asof 这一天的复盘
+-- 是哪版脚本、在什么输入上跑出来的」。
+--
+-- 幂等键 `(asof, script_id)`：同一天同一版脚本重跑**不增行**（`ON CONFLICT DO NOTHING`）。
+-- 换版脚本重跑 = 新的一行（要能回答「这条结论是哪版算的」）。
+--
+-- `analysis_json` 是脚本返回的 `analysis_result` **原文**：桩的输出（
+-- `status='not_implemented'`）也照记，**不许重写成结论**（P58 §1.2）。
+-- 与 `store/migrate.py` 的登记保持同步（marker `p58_plugin_reviews`）。
+CREATE TABLE IF NOT EXISTS plugin_reviews (
+    review_id      INTEGER PRIMARY KEY AUTOINCREMENT,
+    asof           TEXT NOT NULL,
+    plugin_id      TEXT NOT NULL,
+    script_id      INTEGER NOT NULL,
+    script_version TEXT NOT NULL,
+    source_sha256  TEXT NOT NULL,
+    status         TEXT NOT NULL CHECK (status IN ('ok','not_implemented')),
+    analysis_json  TEXT NOT NULL,
+    bad_case_json  TEXT NOT NULL,
+    inputs_json    TEXT NOT NULL,
+    report_path    TEXT NOT NULL,
+    report_sha256  TEXT NOT NULL,
+    created_at     TEXT NOT NULL,
+    UNIQUE (asof, script_id)
+);
+
+CREATE TRIGGER IF NOT EXISTS trg_plugin_reviews_no_update
+BEFORE UPDATE ON plugin_reviews
+BEGIN SELECT RAISE(ABORT, 'plugin_reviews is append-only'); END;
+
+CREATE TRIGGER IF NOT EXISTS trg_plugin_reviews_no_delete
+BEFORE DELETE ON plugin_reviews
+BEGIN SELECT RAISE(ABORT, 'plugin_reviews is append-only'); END;
+
 -- ---------- 财报（本轮的采集层）----------
 -- 单位一律：元。PIT 锚点是 `notice_date`（公告日），**不是** `report_date`（报告期）。
 --

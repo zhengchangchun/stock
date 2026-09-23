@@ -62,6 +62,14 @@ class Step:
     #: 采集类命令（`ingest *`）**不接受** `--db`，固定写 `paths.DB_PATH`。
     supports_db: bool
     why: str
+    #: **阻断**（默认）＝ 非 0 退出码按既有停止线处理；`False` ＝ 派生的补充读数，
+    #: 它的失败**不中止整链、也不抬升链的退出码**（P58：月度链上的插桩5 复盘）。
+    #: 失败**不是静默的**：该步的 `exit_code` 照旧进 `steps`、进回执摘要的 `bad=`、
+    #: 进 `anomalies`，只是不把整条链判成红的。
+    #:
+    #: 刻意用「默认值」而不是「给既有步骤逐个加参数」：既有 5 步与巡检、收盘链的
+    #: 行为因此**逐字节不变**（`blocking` 只在显式 `False` 时走新分支）。
+    blocking: bool = True
 
 
 def tail(text: str) -> str:
@@ -123,7 +131,8 @@ def run_steps(steps: list[str], *, registry: dict[str, Step], runner,
                          "note": "整轮预算用尽 → 停在这里，下轮幂等重跑兜底"}
         argv = build_argv(step, db_path=db_path, asof=asof, action_start=start)
         res = runner(step, argv, remaining)
-        out.append({"name": name, "why": step.why, "args": argv[3:], **res})
+        out.append({"name": name, "why": step.why, "blocking": step.blocking,
+                    "args": argv[3:], **res})
         if res.get("timeout"):
             return out, {"kind": "step_timeout", "step": name,
                          "limit_s": round(remaining, 3)}
@@ -131,7 +140,7 @@ def run_steps(steps: list[str], *, registry: dict[str, Step], runner,
         if code is None:
             return out, {"kind": "step_error", "step": name,
                          "detail": res.get("error", "子进程没跑起来")}
-        if code >= EXIT_BLOCKED:
+        if code >= EXIT_BLOCKED and step.blocking:
             return out, {"kind": "step_fatal", "step": name, "exit_code": code}
     return out, None
 
@@ -160,10 +169,19 @@ def worst_code(steps_out: list[dict], aborted: dict | None) -> int:
     三条停止线（预算用尽 / 单步超时 / 单步 ≥2）一律算 **2**：它们都是「这一轮没跑完」，
     与「跑完了但如实报了异常」（1）不是同一句话。**预算用尽时可能一步都没跑成**，
     这时若按「没有非 0 步骤」给 0，整条链就会以绿码收场（ERROR_DIARY #54）。
+
+    **非阻断步骤（`blocking=False`）的退出码不参与定级**（P58）：它的失败是「这条
+    派生读数没算成」，不是「这一轮没跑完」。跑不起来（`exit_code is None`）**仍然**
+    算致命 —— 那是链级故障（解释器都起不来），与脚本自己的判断无关。
     """
-    fatal = any(s.get("exit_code") is None or s["exit_code"] >= EXIT_BLOCKED
+    def blocking(s: dict) -> bool:
+        return bool(s.get("blocking", True))       # 缺键＝阻断（既有行为）
+
+    fatal = any(s.get("exit_code") is None
+                or (s["exit_code"] >= EXIT_BLOCKED and blocking(s))
                 for s in steps_out)
-    soft = any(s.get("exit_code") == EXIT_ANOMALY for s in steps_out)
+    soft = any(s.get("exit_code") == EXIT_ANOMALY and blocking(s)
+               for s in steps_out)
     if (aborted or {}).get("kind") in ("budget_exhausted", "step_timeout",
                                       "step_error", "step_fatal"):
         fatal = True

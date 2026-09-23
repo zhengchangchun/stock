@@ -36,6 +36,7 @@ EXPECTED_TABLES = {
     "m2_forecast_scores",              # P48：插桩预测的事后校验分数（append-only，一条预测一行）
     "m2_judgements",                   # P49：自评估判定建议（append-only，UNIQUE(cycle_id,asof)）
     "m2_attributions",                 # P50：误差归因（append-only，候选 auto / 结论 manual）
+    "plugin_reviews",                  # P58：插桩5 复盘台账（append-only，UNIQUE(asof,script_id)）
 }
 
 

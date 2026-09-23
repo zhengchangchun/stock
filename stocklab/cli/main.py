@@ -42,7 +42,7 @@ from stocklab.paper.config import (ARM_AGENT, ARM_AGENT_RANDOM,
 from stocklab.cli.plugin import (cmd_plugin_approve, cmd_plugin_list,
                                  cmd_plugin_reject, cmd_plugin_sandbox,
                                  cmd_plugin_submit)
-from stocklab.cli.candidate import cmd_candidate_run
+from stocklab.cli.candidate import cmd_candidate_review, cmd_candidate_run
 
 TZ = ZoneInfo("Asia/Shanghai")
 
@@ -4368,6 +4368,18 @@ def build_parser() -> argparse.ArgumentParser:
     cand_run.add_argument("--now", help="覆盖当前时刻（测试用）")
     cand_run.add_argument("--db")
     cand_run.set_defaults(func=cmd_candidate_run)
+
+    cand_review = cand_sub.add_parser(
+        "review", help="插桩5「定期复盘分析」（P58）：独立命令（复盘不是每日动作，"
+                       "不进每日主干）；只读历史快照 / 回测台账 / 模块2 回流；"
+                       "产出 reports/plugin-review/<asof>.md ＋ append-only 台账")
+    cand_review.add_argument("--asof", required=True,
+                             help="复盘目标日 YYYY-MM-DD（PIT：只用 <= 该日的数据）")
+    cand_review.add_argument("--now", help="覆盖当前时刻（测试用）")
+    cand_review.add_argument("--report-dir", dest="report_dir",
+                             help="报告根目录（默认 paths.REPORT_DIR）")
+    cand_review.add_argument("--db")
+    cand_review.set_defaults(func=cmd_candidate_review)
 
     m2 = sub.add_parser(
         "m2", help="模块2 双通路（P47）：通路 A 纯模拟 / 通路 B 人工镜像")

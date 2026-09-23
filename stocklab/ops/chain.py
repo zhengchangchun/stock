@@ -128,6 +128,12 @@ MONTHLY_STEPS: tuple[Step, ...] = (
          "同批 —— 日链只跑默认窗口，深历史是月度的事"),
     Step("ingest_financials", ("ingest", "financials"), False,
          "东财三表全量复核（季报频率，月度一次足够；已入库的期数 rows=0）"),
+    Step("candidate_review", ("candidate", "review", "--asof", "{asof}"), True,
+         "插桩5「定期复盘分析」（P58）：读历史快照 / 回测台账 / 模块2 回流，"
+         "落 `reports/plugin-review/<asof>.md` ＋ append-only 台账。**非阻断** —— "
+         "复盘是派生读数，它失败不该把整条维护链判红、也不该挡住后面的体检"
+         "（失败仍逐条记在回执的 `steps` / `bad=` / `anomalies` 里，不静默）",
+         blocking=False),
     Step("doctor", ("doctor",), False,
          "数据健康度报告（含 financial_reports 覆盖检查）"),
 )
@@ -348,7 +354,8 @@ def run_monthly(*, db_path: Path | str | None = None, now: str | None = None,
 
     steps_out, aborted = run_steps(
         list(MONTHLY_STEP_ORDER), registry=MONTHLY_STEP_BY_NAME, runner=runner,
-        db_path=db, now=stamp, timeout_s=timeout_s)
+        db_path=db, now=stamp, asof=_as_datetime(stamp).date().isoformat(),
+        timeout_s=timeout_s)
 
     after = check_db(db, stamp, report_dir=report_dir)
     if aborted:
