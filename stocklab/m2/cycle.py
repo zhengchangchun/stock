@@ -51,6 +51,17 @@ from stocklab.store import validation as ledger
 KIND_CIRCUIT_BREAKER = "circuit_breaker"
 KIND_VALIDATION_END = "validation_end"
 
+#: 幂等返回（`status='already'`）的**自证键**：说明「本次入参一个都没被使用」。
+#: 键名**只增不减** —— `already` 的既有字段逐字不变（消费者可能只认旧字段），
+#: 这里只往上加。没有这两个键时，`judge --freeze-days 999` 撞上已有判定行会返回
+#: 一个 `status=already` 的成功，读起来像「你的请求被接受了」，而它其实连校验都没过
+#: （P59 F2；入口校验前移之后越界值已经进不来，但「入参没用上」这件事仍要说清）。
+ALREADY_INPUT_KEYS: dict = {
+    "input_used": False,
+    "input_note": "本次入参未被使用：命中幂等键 `(周期, 判定日)`，返回的是**已存行**"
+                  "（本次的 `--fix-kind` / `--freeze-days` 一个都没参与判定）",
+}
+
 
 class CycleConflict(ValueError):
     """与库里的既有行冲突（周期已存在 / 已收尾 / 轮次已存在）—— 退出码 1。
@@ -279,16 +290,22 @@ def judge(conn: sqlite3.Connection, *, cycle_id: int, asof: str, fix_kind: str,
     判定所用读数全部来自 P41/P48 的既有函数（`m2_data.cycle_readings` /
     `m2_data.case_summary`），本模块不重算任何一个指标。
     幂等键 = `(cycle_id, asof_date)`。
+
+    `--freeze-days` 的边界校验在**入口**、在进任何分支之前：与 `--fix-kind` 无关、
+    与「是否已有判定行」无关（P59 收的两个口子都出在这里）。越界 ⇒ 退出码 2 ＋
+    **零写入**；`FREEZE_MAX_DAYS` 的数值一个字不改 —— 改的只是这道校验的位置。
     """
     from stocklab.labweb import m2_data
 
+    if freeze_days is not None:                 # 越界即拒：先于分支、先于幂等判断
+        limits.check_freeze_days(days=int(freeze_days))
     cycle = _load_cycle(conn, cycle_id)
     date = _iso_date(asof, field="asof")
     if _ended(conn, cycle["cycle_id"]) is not None:
         raise CycleConflict(f"周期 {cycle['cycle_id']} 已收尾 —— 不再判定")
     existing = m2_store.find_judgement(conn, int(cycle["cycle_id"]), date)
     if existing is not None:
-        return {"status": "already", **existing}
+        return {"status": "already", **existing, **ALREADY_INPUT_KEYS}
     readings = m2_data.cycle_readings(conn, cycle, date)
     cases = m2_data.case_summary(conn, cycle, date)
     verdict = selfeval.decide_branch(
@@ -314,7 +331,7 @@ def judge(conn: sqlite3.Connection, *, cycle_id: int, asof: str, fix_kind: str,
         existing = m2_store.find_judgement(conn, int(cycle["cycle_id"]), date)
         if existing is None:
             raise
-        return {"status": "already", **existing}
+        return {"status": "already", **existing, **ALREADY_INPUT_KEYS}
     return {
         "status": "judged", "judgement_id": judgement_id,
         "cycle_id": int(cycle["cycle_id"]), "script_id": int(cycle["script_id"]),
