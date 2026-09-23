@@ -2999,14 +2999,14 @@ EXIT_REJECTED = 4
 
 
 def _m2_conn(args):
-    """打开库并确认模块2 的两张表已前滚；返回 `(conn, None)` 或 `(None, 退出码)`。"""
+    """打开库并确认模块2 的三张表已前滚；返回 `(conn, None)` 或 `(None, 退出码)`。"""
     conn, code = _paper_conn(args)
     if conn is None:
         return None, code
     has = conn.execute(
         "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name IN"
-        " ('m2_channel_runs','m2_forecasts')").fetchone()[0]
-    if has < 2:
+        " ('m2_channel_runs','m2_forecasts','m2_forecast_scores')").fetchone()[0]
+    if has < 3:
         conn.close()
         print(json.dumps({"error": "模块2 的表不存在 —— 先跑 `stocklab db init` 前滚 schema"},
                          ensure_ascii=False), file=sys.stderr)
@@ -3092,6 +3092,83 @@ def cmd_m2_runs(args: argparse.Namespace) -> int:
                                              for f in forecasts})}},
                      ensure_ascii=False, sort_keys=True, indent=2))
     return 0
+
+
+def cmd_m2_score(args: argparse.Namespace) -> int:
+    """给 `m2_forecasts` 打事后校验分并**落库**（P48 §2 的落库判据）。
+
+    校验**只能由 CLI 触发**（P48 §3）：页面是只读的，没有「触发校验」按钮 ——
+    「分数什么时候算的」必须由一次显式的命令行动作回答。
+
+    幂等：一条预测一行分数（`forecast_id` UNIQUE），重跑不重复写。
+    `--asof` 是**评分截止日**：只给 `target_date <= asof` 的预测打分，
+    目标日还没到的先不落行（等行情到位）。窗口取的是 `asof`，不是「库里的最大日期」
+    —— 那会让历史截图读到未来的分数。
+    """
+    from stocklab.m2 import score as m2_score
+
+    conn, code = _m2_conn(args)
+    if conn is None:
+        return code
+    now = args.now or datetime.now(TZ).isoformat(timespec="seconds")
+    try:
+        asof = args.asof or _latest_session(conn)
+        if asof is None:
+            print(json.dumps(
+                {"error": "库里没有任何 K 线日期，推不出评分截止日 —— 先跑 `ingest`"},
+                ensure_ascii=False), file=sys.stderr)
+            return 2
+        out = m2_score.score_all(conn, asof=asof, now=now)
+    finally:
+        conn.close()
+    print(json.dumps(out, ensure_ascii=False, sort_keys=True, indent=2))
+    return 0
+
+
+def cmd_m2_report(args: argparse.Namespace) -> int:
+    """三方对标 + 预测校验读数（只读）。与 `/lab/m2` **同一个取数函数**。"""
+    from stocklab.labweb import m2_data, m2_render
+
+    conn, code = _m2_conn(args)
+    if conn is None:
+        return code
+    try:
+        asof = args.asof or _latest_session(conn)
+        if asof is None:
+            print(json.dumps({"error": "库里没有任何 K 线日期，推不出 asof"},
+                             ensure_ascii=False), file=sys.stderr)
+            return 2
+        payload = m2_data.panel(conn, asof)
+    finally:
+        conn.close()
+    text = m2_render.m2_text(payload)
+    if args.out:
+        path = Path(args.out)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(text, encoding="utf-8")
+    if args.json:
+        print(json.dumps(payload, ensure_ascii=False, sort_keys=True, indent=2))
+        return 0
+    sys.stdout.write(text)
+    gate = payload["three_way"]["sample_gate"]
+    print(json.dumps({
+        "asof": payload["asof"], "report": args.out,
+        "n_sessions": payload["three_way"]["n_sessions"],
+        "threshold": gate["threshold"], "gate_status": gate["gate_status"],
+        "n_sides": len(payload["three_way"]["sides"]),
+        "forecast": {"n_scored": payload["forecast"]["n_scored"],
+                     "n_unscored": payload["forecast"]["n_unscored"]},
+        "cases": {"n_miss_total": payload["cases"]["n_miss_total"],
+                  "n_cases": payload["cases"]["n_cases"],
+                  "limit": payload["cases"]["limit"]}},
+        ensure_ascii=False, sort_keys=True), file=sys.stderr)
+    return 0
+
+
+def _latest_session(conn) -> str | None:
+    """库里出现过的最后一个交易日（只读，用于 `--asof` 的默认值）。"""
+    row = conn.execute("SELECT MAX(date) AS d FROM bars_daily").fetchone()
+    return None if row is None or row["d"] is None else str(row["d"])
 
 
 # ---------- parser ----------
@@ -3843,6 +3920,21 @@ def build_parser() -> argparse.ArgumentParser:
     m2_runs.add_argument("--asof", help="只看某一天 YYYY-MM-DD")
     m2_runs.add_argument("--db")
     m2_runs.set_defaults(func=cmd_m2_runs)
+
+    m2_score = m2_sub.add_parser(
+        "score", help="给 A3/B1 预测打事后校验分并落库（幂等；页面不可触发）")
+    m2_score.add_argument("--asof", help="评分截止日 YYYY-MM-DD（默认：库里的最后一天）")
+    m2_score.add_argument("--db")
+    m2_score.add_argument("--now", help="覆盖当前时刻（测试用）")
+    m2_score.set_defaults(func=cmd_m2_score)
+
+    m2_report = m2_sub.add_parser(
+        "report", help="三方对标 + 预测校验读数（只读；与 `/lab/m2` 同源）")
+    m2_report.add_argument("--asof", help="截止日 YYYY-MM-DD（默认：库里的最后一天）")
+    m2_report.add_argument("--out", help="把文本报告写到这个路径")
+    m2_report.add_argument("--json", action="store_true", help="打完整载荷（JSON）")
+    m2_report.add_argument("--db")
+    m2_report.set_defaults(func=cmd_m2_report)
 
     return parser
 

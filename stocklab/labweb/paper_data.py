@@ -347,15 +347,20 @@ def _empty_performance(asof: str, *, start: str, reason: str | None = None) -> d
                              f"没有净值就没有绩效，本块不拿 0 顶替"),
         "start_date": start, "window": [start, None],
         "n_sessions": 0, "n_folds": None,
-        "sample_gate": _sample_gate(0),
+        "sample_gate": sample_gate(0),
         "metric_keys": list(METRIC_KEYS),
         "rows": [], "excess_vs_index_300": {}, "excess_vs_hold": {},
         "notes": [PERFORMANCE_INSUFFICIENT],
     }
 
 
-def _sample_gate(n_sessions: int) -> dict:
-    """样本量门禁。`n_sessions` 一律是**交易日**数（`CLAUDE.md` 度量纪律第 2 条）。"""
+def sample_gate(n_sessions: int) -> dict:
+    """样本量门禁。`n_sessions` 一律是**交易日**数（`CLAUDE.md` 度量纪律第 2 条）。
+
+    公开而不是下划线私有：P48 的预测校验读数要用**同一把尺子**（同一套
+    `ok`/`insufficient` 词表与同一个阈值），再写一份就等于给「两个门禁慢慢漂」
+    留门 —— 与 `paper/engine.py::drawdown` 正名是同一个理由。
+    """
     ok = n_sessions >= PERFORMANCE_THRESHOLD
     return {
         "threshold": PERFORMANCE_THRESHOLD,
@@ -423,7 +428,7 @@ def performance(conn: sqlite3.Connection, asof: str) -> dict:
         return _empty_performance(asof, start=start)
 
     n_sessions = len(nav_dates)
-    gate = _sample_gate(n_sessions)
+    gate = sample_gate(n_sessions)
 
     rows: list[dict] = []
     for account in accounts:
@@ -482,8 +487,10 @@ def performance(conn: sqlite3.Connection, asof: str) -> dict:
     notes = [
         f"窗口 {start} ~ {asof}，共 {n_sessions} 个交易日"
         f"（净值行数 = 日收益数；横轴另外含起跑日锚点一个点）。",
-        f"期初口径：账户 = `paper_accounts.initial_nav`、基准 = 起跑日 "
-        f"`{INDEX_300_SYMBOL}` 收盘；五个指标全部由这一条序列推出。",
+        f"期初口径：账户 = **净入金**（`paper_nav_daily.net_deposits`，ADR-023 修正段 "
+        f"D-37）、基准 = 起跑日 `{INDEX_300_SYMBOL}` 收盘；"
+        f"五个指标全部由这一条序列推出，所以本节的「总收益」与既有「累计收益」列"
+        f"**逐位一致**。",
         "本载荷的 `max_drawdown` 为**负值**（`backtest/metrics` 口径）；"
         "渲染层按页面既有列的正值口径显示同一个数。",
     ]

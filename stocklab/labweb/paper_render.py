@@ -915,8 +915,9 @@ def performance_block(data: Mapping) -> str:
     return table + glance([f"窗口 {data['window'][0]} ~ {data['asof']}，"
                            f"{data['n_sessions']} 个交易日"
                            f"（门槛 {gate['threshold']}）—— {gate['label']}",
-                           "期初：账户取 `paper_accounts.initial_nav`、基准取起跑日"
-                           " `sh000300` 收盘；五个指标由同一条序列推出。"
+                           "期初：账户取**净入金**（`paper_nav_daily.net_deposits`，"
+                           "ADR-023 修正段 D-37）、基准取起跑日 `sh000300` 收盘；"
+                           "五个指标由同一条序列推出，与既有「累计收益」列逐位一致。"
                            "回撤按既有列写正值（真源 `backtest/metrics` 是负值）。"])
 
 

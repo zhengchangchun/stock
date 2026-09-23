@@ -25,6 +25,7 @@ from __future__ import annotations
 import re
 
 from stocklab.paper.config import ARM_AGENT, ARM_NOW
+from stocklab.paper.engine import INDEX_300_SYMBOL
 
 # ---------- 通路 ----------
 
@@ -87,6 +88,41 @@ CHANNEL_PLUGINS: dict[str, tuple[str, ...]] = {
 #: 预测口径的落库表（§6.1 的归属规则：模块2 的预测**不进** `predictions`）。
 TABLE_RUNS: str = "m2_channel_runs"
 TABLE_FORECASTS: str = "m2_forecasts"
+
+#: 预测的事后校验分数（P48）。append-only；幂等键 = 一条预测一行分数。
+TABLE_SCORES: str = "m2_forecast_scores"
+
+# ---------- 三方对标的基准（D-43） ----------
+
+#: 本轮**唯一**的基准指数。D-43 拍板：沪深300 必做；`sh000905`（中证500）只在能证明
+#: 「同一采集路径落进 `bars_daily`、同一 `adj_mode='none'` 口径」时才加。
+#: `INDEX_300_SYMBOL` 是这个元组里那一项的**真源**（`paper/engine.py`）——
+#: 这里不另写一遍字面量，写两遍就会在改名那天漂开。
+BENCHMARKS: tuple[str, ...] = (INDEX_300_SYMBOL,)
+
+#: 本轮**未接入**的基准（D-43 要求「明文写清并列出代价」，不许悄悄少一个）。
+#: 取数层会检查它是否**已经**落进 `bars_daily` —— 一旦落进去了就必须显式接入，
+#: 而不是继续显示「本轮只对沪深300」（否则这句说明会在数据到位后变成假话）。
+DEFERRED_BENCHMARKS: tuple[dict[str, str], ...] = (
+    {"code": "sh000905", "name": "中证500",
+     "requirement": "04 §P1-1「沪深300、中证500等指数同周期对标」",
+     "missing": ("真库 `bars_daily` 里没有 `sh000905` 任何一行（实测 0 行）—— "
+                 "没有点位就没有读数，不许拿别的指数/ETF 顶替（那会换掉口径）"),
+     "prerequisite": ("先用**既有采集路径**把指数点位落进 `bars_daily`"
+                      "（`adj_mode='none'`，与 `sh000300` 同一张表、同一列），"
+                      "再按同一指标函数接入；采集属联网动作，不在本轮离线范围内")},
+)
+
+# ---------- 预测校验（P48 §2） ----------
+
+#: 预测载荷自带 `direction=None`（插桩明说「不知道」，见 `na_reasons`）时用这个原因码。
+#: **不是**数据缺口（那几种沿用 `verify/score.py` 的原因码），而是「这条预测本身
+#: 没有方向可说」—— 两类不可评分必须分得开：一个要等行情，一个要人去看插桩。
+REASON_NO_DIRECTION: str = "NO_DIRECTION"
+
+#: 错判案例集的**条数上限**。**不是可选参数** —— P48 §2 明令「没有『挑好看的 /
+#: 最有利的』筛选参数」，所以它只能是一个常量：要列就按时间倒序取最近 N 条。
+CASE_LIMIT: int = 50
 
 # ---------- 运行状态 ----------
 

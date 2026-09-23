@@ -42,7 +42,8 @@ from urllib.parse import parse_qs, quote, urlsplit
 from stocklab.dashboard.server import (LOOPBACK_HOSTS, NonLoopbackHost,
                                        assert_loopback)
 from stocklab.labweb import SERVICE, VERSION
-from stocklab.labweb import cand_data, cand_render, ops_data, ops_render, paper_data, paper_render
+from stocklab.labweb import (cand_data, cand_render, m2_render, ops_data,
+                             ops_render, paper_data, paper_render)
 from stocklab.labweb.cand_data import CandLab
 from stocklab.labweb.data import Lab, now_iso
 from stocklab.labweb.ops_data import OpsLab
@@ -715,6 +716,11 @@ def _get(ctx: Context, rel: str, query: dict, built_at: str) -> Response:
     if rel == "/paper":
         return html_response(200, paper_render.paper_page(
             ctx.lab.paper_track(), base=base, built_at=built_at))
+    if rel == "/m2":
+        # 只读：`/m2` 不在 `handle` 的 POST 分支里 —— 校验由 CLI 触发
+        # （`stocklab m2 score`），页面**没有任何写入口**（P48 §3）。
+        return html_response(200, m2_render.m2_page(
+            ctx.lab.m2_panel(), base=base, built_at=built_at))
     if rel == "/candidate":
         return _get_candidate(ctx, query, built_at)
     if rel == "/ops":

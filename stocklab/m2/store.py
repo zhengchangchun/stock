@@ -27,6 +27,7 @@ from stocklab.m2.config import (
     STATUS_RAN,
     TABLE_FORECASTS,
     TABLE_RUNS,
+    TABLE_SCORES,
 )
 
 RUN_STATUSES: frozenset[str] = frozenset({"ran", "skipped", "rejected"})
@@ -178,3 +179,63 @@ def list_forecasts(conn: sqlite3.Connection, *, account_id: str | None = None,
             "down": row["direction_down"]})
         out.append(row)
     return out
+
+
+# ---------- 预测的事后校验分数（P48） ----------
+
+
+#: `m2_forecast_scores` 的列（顺序即 INSERT 顺序）。`score_id` / `created_at` 由库或
+#: 调用方给，不在这里 —— 分数的内容列与身份列分开，与 `verifications` 同款。
+_SCORE_COLUMNS: tuple[str, ...] = (
+    "forecast_id", "plugin_id", "account_id", "script_version", "asof_date",
+    "target_date", "code", "scorable", "reason_code", "actual_close",
+    "actual_pct", "range_lo", "range_hi", "range_hit", "dev_pct",
+    "hit_direction", "pred_class", "actual_class", "bet_pct", "invalidated",
+)
+
+
+def find_score(conn: sqlite3.Connection, forecast_id: int) -> dict | None:
+    """该预测的分数行（幂等判据）。"""
+    row = conn.execute(
+        f"SELECT * FROM {TABLE_SCORES} WHERE forecast_id = ?",
+        (int(forecast_id),)).fetchone()
+    return None if row is None else dict(row)
+
+
+def insert_score(conn: sqlite3.Connection, *, score: dict, now: str,
+                 commit: bool = True) -> int:
+    """落一行校验分数。**幂等键 = `forecast_id` UNIQUE**。
+
+    与 `insert_forecast` 同款：**不先查再写**（先查再写会让「幂等」变成一句
+    由调用方保证的口头约定）。走到这里还撞唯一键，说明调用方没走 `find_score`
+    那道判据 —— 那是调用方的 bug，报出来比静默返回旧 id 好。
+    """
+    row = {**{k: score.get(k) for k in _SCORE_COLUMNS}, "created_at": now}
+    cols = ", ".join(row)
+    cur = conn.execute(
+        f"INSERT INTO {TABLE_SCORES} ({cols})"
+        f" VALUES ({', '.join('?' * len(row))})", tuple(row.values()))
+    if commit:
+        conn.commit()
+    return int(cur.lastrowid)
+
+
+def list_scores(conn: sqlite3.Connection, *, plugin_id: str | None = None,
+                asof: str | None = None) -> list[dict]:
+    """分数行（含预测侧的 `code`/`asof_date` —— 它们是冗余列，不再 JOIN 回去）。
+
+    默认按 `target_date, plugin_id, script_version, code` 排序：读数按
+    `plugin_id` + `script_version` **分列**，聚合层自己再分组，这里只保证稳定序。
+    """
+    sql = f"SELECT * FROM {TABLE_SCORES}"
+    where, args = [], []
+    if plugin_id is not None:
+        where.append("plugin_id = ?")
+        args.append(plugin_id)
+    if asof is not None:
+        where.append("target_date <= ?")
+        args.append(asof)
+    if where:
+        sql += " WHERE " + " AND ".join(where)
+    sql += " ORDER BY target_date, plugin_id, script_version, account_id, code"
+    return _rows(conn, sql, tuple(args))

@@ -341,14 +341,20 @@ def test_t3_channel_b_does_not_recompute_nav_itself():
 
 
 def test_t3_no_m2_module_writes_paper_tables_itself():
-    """成交与净值**只有一个写入口**（`paper/store.py`，ERROR_DIARY #61 的反面）。"""
+    """成交与净值**只有一个写入口**（`paper/store.py`，ERROR_DIARY #61 的反面）。
+
+    `store.py` 里允许的 INSERT 是**模块2 自己的三张表**（P47 两张 + P48 的
+    校验分数表）—— 白名单只增，且不许出现任何 `paper_*` 表。
+    """
+    m2_tables = ("{TABLE_RUNS}", "{TABLE_FORECASTS}", "{TABLE_SCORES}")
     for path in sorted((ROOT / "stocklab/m2").glob("*.py")):
         text = path.read_text(encoding="utf-8")
         if path.name == "store.py":
             inserts = [ln.strip() for ln in text.splitlines()
                        if "INSERT INTO" in ln]
-            assert inserts and all(("{TABLE_RUNS}" in ln or "{TABLE_FORECASTS}" in ln)
+            assert inserts and all(any(t in ln for t in m2_tables)
                                    for ln in inserts), inserts
+            assert not any("paper_" in ln for ln in inserts), inserts
             continue
         assert "INSERT INTO" not in text, (
             f"{path.name} 自己拼了 INSERT —— 落库必须经既有写入口")

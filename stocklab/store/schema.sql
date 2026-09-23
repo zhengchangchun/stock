@@ -1168,3 +1168,60 @@ BEGIN SELECT RAISE(ABORT, 'm2_forecasts is append-only'); END;
 CREATE TRIGGER IF NOT EXISTS trg_m2_forecasts_no_delete
 BEFORE DELETE ON m2_forecasts
 BEGIN SELECT RAISE(ABORT, 'm2_forecasts is append-only'); END;
+
+-- ---------- 模块2 插桩预测的**事后校验分数**（P48 / 读数落库，append-only）----------
+-- 口径（P48 §2「落库判据」）：校验结果**必须落库**，不许「页面实时算不落库」——
+-- 下一轮换口径后，页面重算出来的就不是当时那个数了，而报告却是拿它下结论的
+-- （ERROR_DIARY #36/#59 同型：把「当时算出来的数」与「现在算出来的数」混为一谈）。
+--
+-- **幂等键 = `forecast_id` UNIQUE**：一条预测一行分数。改口径 = 升 `script_version`
+-- 重跑并追加新行，**不覆盖历史行** —— 与 `predictions` 升 `model_version` 同款纪律。
+--
+-- `plugin_id` / `script_version` / `account_id` / `code` / `asof_date` 是从
+-- `m2_forecasts` **冗余**下来的：那张表 append-only 且行不可变，所以冗余不会漂移；
+-- 冗余的理由是「分版本读数」不该依赖 JOIN 的正确性（读数按它们分列、不许相加）。
+--
+-- **没有归因列**（D-31）：四分类（大盘冲击 / 行业黑天鹅 / 个股突发利空 / 因子失效）
+-- 代码判不了，只做「程序给候选标签 + 人工确认」的结构位（P50）。列都不开，
+-- 「忘了填充」与「没打算填充」就不可能被读成同一件事。
+--
+-- `dev_pct` = 实际收盘**超出**预测区间的那一段收益（落在区间内为 0）：
+--   (close_t − clamp(close_t, lo, hi)) / close_asof
+-- `bet_pct` = 按预测方向下注一单位的收益（预测跌 ⇒ 取反；预测平 ⇒ 0，被盈亏比排除）。
+CREATE TABLE IF NOT EXISTS m2_forecast_scores (
+    score_id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    forecast_id      INTEGER NOT NULL UNIQUE,
+    plugin_id        TEXT NOT NULL CHECK (plugin_id IN ('m2_a3','m2_b1')),
+    account_id       TEXT NOT NULL,
+    script_version   TEXT NOT NULL,
+    asof_date        TEXT NOT NULL,
+    target_date      TEXT NOT NULL,
+    code             TEXT NOT NULL,
+    -- 0 = 不可评分（原因在 reason_code，结果列一律 NULL，**不许写 0**）
+    scorable         INTEGER NOT NULL CHECK (scorable IN (0,1)),
+    reason_code      TEXT,
+    actual_close     REAL,
+    actual_pct       REAL,
+    range_lo         REAL,
+    range_hi         REAL,
+    range_hit        INTEGER,
+    dev_pct          REAL,
+    hit_direction    INTEGER,
+    pred_class       TEXT,
+    actual_class     TEXT,
+    bet_pct          REAL,
+    -- 0/1 来自 `invalidate_if` 原文解析；NULL = 解析不出来（UNDETERMINED，与 0 不同）
+    invalidated      INTEGER,
+    created_at       TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_m2_forecast_scores_version
+    ON m2_forecast_scores (plugin_id, script_version, account_id, target_date);
+
+CREATE TRIGGER IF NOT EXISTS trg_m2_forecast_scores_no_update
+BEFORE UPDATE ON m2_forecast_scores
+BEGIN SELECT RAISE(ABORT, 'm2_forecast_scores is append-only'); END;
+
+CREATE TRIGGER IF NOT EXISTS trg_m2_forecast_scores_no_delete
+BEFORE DELETE ON m2_forecast_scores
+BEGIN SELECT RAISE(ABORT, 'm2_forecast_scores is append-only'); END;

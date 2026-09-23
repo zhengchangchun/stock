@@ -3367,3 +3367,33 @@ $ （真库只读）select code, report_date, notice_date, notice_date_source,
   只有 `implausible` 才发 `warn: notice_date_suspect`（`stocklab/data/ingest.py`）。
 - 用例钉死闰年：`tests/test_notice_date.py::test_statutory_leap_year_is_121_days_and_that_is_legitimate`、
   `tests/test_ingest_financials.py::test_leap_year_statutory_121_days_is_not_a_suspect`。
+
+---
+
+## #66 2026-09-23：实现者的最后一跳 `403` —— 工作区里代码全绿，但「做完了」这句话从没说出口（P48）
+
+**现象**：P48 那一轮 `claude -p` 跑了 34 分钟、127 轮、$7.12，`/tmp/cc-p48.json` 里
+`subtype=success`、`terminal_reason=completed`，但 `is_error=true`：
+
+```
+"api_error_status": 403, "result": "Failed to authenticate. API Error: 403 <html>..."
+```
+
+**工作区**（15 个文件）在，`pytest` 2653 passed、`verify.sh` exit 0 —— 也就是
+**代码确实做完了**，但：任务书 §7 进度表**五行全是 ⬜ 未开始**、文末**没有「实施记录」**、
+没有任何一条「我验了哪些判据」的自述。审阅者拿到的是一个「绿但不说话」的工作区。
+
+**为什么危险**：① 若按「自报绿」的流程走，这一站会被当成「未开工」丢掉重做（浪费一整轮）；
+若反过来默认「绿＝完成」，那一站就会**在没有任何验收记录的情况下**被 commit 进主干。
+② `terminal_reason=completed` 与 `is_error=true` **可以同时成立** ——
+只看 `subtype`/`terminal_reason` 的看门狗会把它当成功。
+
+**教训**：① 队列看门狗必须以 **`is_error`** 为主判据，并**检查任务书 §7 是否已打勾**：
+勾没打上就等于「交付声明缺失」，无论退出码多好看。② 交付物与**交付声明**必须分开验：
+代码能跑是「有没有」，§7/实施记录是「说了没有」；两者都缺才是未开工，只缺后者是**审计来补**。
+③ 审计侧本来就该按任务书逐条自跑（不采信自报）—— 这条事故恰好证明了那条纪律的价值：
+它把一次「失联」变成了「一次正常的独立复核」，成本只是多跑两遍测试。
+
+**已加判据**：`docs/tasks/2026-09-22-p48-模块2-三方对标与预测校验.md` §7 已由 nanobot 逐条打勾，
+新增 §8「实施记录（nanobot 独立复核）」（含真库只读读数、副本上的端到端写路径、禁词与页面证据、
+5 条未验证口子）；队列派发脚本下次运行时须在收尾判定里查 `is_error` 与 §7 勾。

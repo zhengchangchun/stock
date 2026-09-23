@@ -26,7 +26,7 @@ from pathlib import Path
 from zoneinfo import ZoneInfo
 
 from stocklab.dashboard.summary import build_summary
-from stocklab.labweb import paper_data
+from stocklab.labweb import m2_data, paper_data
 from stocklab.portfolio.decision import position_decision
 from stocklab.portfolio.prices import resolve_prices
 from stocklab.portfolio.view import build_portfolio, daily_close, nav_series
@@ -111,6 +111,15 @@ class Lab:
         """
         with self.conn() as c:
             return paper_data.track(c, self.asof)
+
+    def m2_panel(self) -> dict:
+        """模块2 页取数（P48）—— 见 `m2_data.panel`。
+
+        本方法不产生口径：三方对标直接挑 `paper_data.performance` 的行，
+        预测读数只读已落库的 `m2_forecast_scores`，一个数都不重算。
+        """
+        with self.conn() as c:
+            return m2_data.panel(c, self.asof)
 
     def _paper(self, conn) -> dict:
         """模拟盘各臂**最新一交易日**的净值快照（P36）。**只读已落库的表，不重算**。
