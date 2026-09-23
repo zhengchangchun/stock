@@ -12,9 +12,12 @@ from stocklab.store.migrate import init_db
 #: `init` 建出的全部账户（hold + now + 三档纪律臂 + 智能体臂与它的随机对照）。
 #: 从配置推出来 —— 写死 5 的话，下次多一条臂又要一处处改。
 N_ACCOUNTS = 2 + len(ETF_TRANCHES) + 2
-ALL_ARMS = ("arm-hold", "arm-now",
-            *(f"arm-discipline-{int(t):02d}" for t in ETF_TRANCHES),
-            ARM_AGENT, ARM_AGENT_RANDOM)
+#: `paper step` **认领**的那些（P56 / D-50：AI 操盘手家族让出日终，
+#: 改由 `paper agent run` 落 —— 见 `test_paper_agent_run.py`）。
+STEP_ARMS = ("arm-hold", "arm-now",
+             *(f"arm-discipline-{int(t):02d}" for t in ETF_TRANCHES))
+N_STEP_ACCOUNTS = len(STEP_ARMS)
+ALL_ARMS = (*STEP_ARMS, ARM_AGENT, ARM_AGENT_RANDOM)
 
 NOW = "2026-09-15T16:00:00+08:00"
 CAL = ("2026-09-11", "2026-09-14", "2026-09-15", "2026-09-16")
@@ -56,6 +59,16 @@ def run(db, *argv, capsys):
     return code, out, err
 
 
+def _agent_run(db, asof, capsys):
+    """跑一次 AI 操盘手的日终（P56 / D-50）。**退出码 1 = 交易日缺决策**（异常，
+    不是失败）—— 夹具里本来就没有决策，所以这里断言的就是 1。"""
+    code = main(["paper", "agent", "run", "--asof", asof,
+                 "--db", str(db), "--now", NOW])
+    out, err = capsys.readouterr()
+    assert code == 1, err
+    return out
+
+
 def test_paper_init_then_step_then_show(db, tmp_path, capsys):
     code, out, _ = run(db, "paper", "init", capsys=capsys)
     assert code == 0, out
@@ -69,7 +82,10 @@ def test_paper_init_then_step_then_show(db, tmp_path, capsys):
     assert code == 0, err
     payload = json.loads(out)
     assert payload["asof"] == "2026-09-15"
-    assert len(payload["accounts"]) == N_ACCOUNTS
+    # P56 / D-50：`paper step` 认领 5 条静态臂；两条 AI 臂让出（它们的日终走
+    # `paper agent run`，见 test_paper_agent_run.py）—— 因此这里只有 5 条。
+    assert len(payload["accounts"]) == N_STEP_ACCOUNTS
+    assert {a["account_id"] for a in payload["accounts"]} == set(STEP_ARMS)
     assert payload["index_300"]["level"] == 4450.04
     # 智能体臂（P37 阶段 1）：块必须在，且 `delta_vs_random` 是 `null` 而不是 0
     assert payload["agent"]["arm"] == ARM_AGENT
@@ -190,6 +206,7 @@ def test_show_without_asof_falls_back_to_latest_nav_date(db, tmp_path, capsys):
     code, _, err = run(db, "paper", "step", "--asof", "2026-09-15",
                        "--out", str(tmp_path / "s.md"), capsys=capsys)
     assert code == 0, err
+    _agent_run(db, "2026-09-15", capsys)
 
     code, out, err = run_at(db, "2026-09-16T16:00:00+08:00", "paper", "show",
                             capsys=capsys)
@@ -213,6 +230,7 @@ def test_show_without_asof_does_not_fall_back_when_today_has_nav(db, tmp_path,
         code, _, err = run(db, "paper", "step", "--asof", d,
                            "--out", str(tmp_path / f"{d}.md"), capsys=capsys)
         assert code == 0, err
+        _agent_run(db, d, capsys)
 
     code, out, err = run_at(db, "2026-09-16T16:00:00+08:00", "paper", "show",
                             capsys=capsys)

@@ -17,6 +17,7 @@ from pathlib import Path
 
 from stocklab.cli.main import main
 from stocklab.ops import patrol
+from stocklab.ops.runner import EXIT_OK
 from stocklab.predict.version import MODEL_VERSION
 from stocklab.store.db import connect
 from stocklab.store.migrate import init_db
@@ -659,3 +660,59 @@ def test_cli_patrol_exit_code_is_the_projects_verdict(tmp_path, capsys):
     assert rc == 1
     assert "⚠️  check_review" in out.err
     assert "⑤missing" in out.err
+
+
+# ══════════════════════════════════════════════════════════════════════
+# P56 / D-50：被**决策循环**认领的账户，其净值缺口不算 §⑥ 的缺口
+# ══════════════════════════════════════════════════════════════════════
+
+def _add_claimed_account(path: Path, *, account_id="arm-agent-ds-v1",
+                         executor="agent_decision") -> None:
+    """再造一条 AI 操盘手的账户（**不写它的净值行**）。"""
+    c = connect(path)
+    try:
+        c.execute(
+            "INSERT INTO paper_accounts (account_id, arm, start_date, initial_cash,"
+            " initial_positions_json, initial_nav, params_json, created_at)"
+            " VALUES (?,?,?,10000.0,'[]',10000.0,?,?)",
+            (account_id, "agent", L, json.dumps({"executor": executor}), NOW))
+        c.commit()
+    finally:
+        c.close()
+
+
+def test_p56_paper_nav_does_not_flag_an_account_the_decision_loop_owns(tmp_path):
+    """被认领的账户当天没有净值行 ⇒ §⑥ **不报异常**，并写明「由决策循环认领」。"""
+    path = _db(tmp_path)
+    _add_claimed_account(path)
+    payload = _check(path)
+    item = payload["checks"]["paper_nav"]
+    assert item["status"] == "ok", item
+    assert item["claimed_accounts"] == ["arm-agent-ds-v1"]
+    assert "决策循环" in (item["note"] or "") and "paper agent run" in item["note"]
+    assert item["expected_accounts"] == 1, "被认领的那条不算在「该有净值」的账上"
+    assert payload["exit_code"] == EXIT_OK, payload["verdict"]
+
+
+def test_p56_a_static_arm_missing_its_nav_row_is_still_an_anomaly(tmp_path):
+    """反向自检：`arm-hold`（没被认领）缺行 ⇒ 照旧判异常、照旧要补 `paper step`。"""
+    path = _db(tmp_path, paper_nav=False)
+    _add_claimed_account(path)
+    payload = _check(path)
+    item = payload["checks"]["paper_nav"]
+    assert item["status"] == "missing", item
+    assert item["rows_for_required"] == 0 and item["expected_accounts"] == 1
+    plans = patrol.plan(payload)
+    assert "paper_step" in plans["steps"], plans
+
+
+def test_p56_an_unknown_executor_is_reported_not_silently_ignored(tmp_path):
+    """未知 `executor` ⇒ §⑥ 报出来（**不静默**当作「没被认领」）。"""
+    path = _db(tmp_path)
+    _add_claimed_account(path, account_id="arm-agent-v9", executor="nobody")
+    payload = _check(path)
+    item = payload["checks"]["paper_nav"]
+    assert item["status"] == "stale", item
+    assert item["unknown_executors"] == ["arm-agent-v9='nobody'"]
+    assert "没有对应执行者" in item["reason"]
+    assert item["claimed_accounts"] == []

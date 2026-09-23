@@ -42,12 +42,16 @@ P52 之前 `arm-agent` 走的是 `_plan_steps` + spec 参数（P37 阶段 1）�
 from __future__ import annotations
 
 import json
+import re
 import sqlite3
 from dataclasses import replace
+from typing import Mapping
 
+from stocklab.calendar.trading_calendar import Calendar
 from stocklab.config.costs import ASSET_ETF, ASSET_STOCK, CostModel
 from stocklab.paper import agent_decide, agent_spec, store
 from stocklab.paper.config import (
+    AGENT_ARM_PREFIX,
     ARM_AGENT,
     ARM_AGENT_RANDOM,
     ARM_HOLD,
@@ -58,19 +62,24 @@ from stocklab.paper.config import (
     ARM_KIND_NOW,
     ARM_KINDS_SELF_DRIVEN,
     ARM_NOW,
+    ARM_VERSION_RE,
     DISCLAIMER,
     DISCLOSURE_ITEMS,
     DISCIPLINE_PREFIX,
     ETF_TRANCHES,
     ETF_WHITELIST,
+    EXECUTOR_AGENT_DECISION,
     EXECUTOR_KEY,
     HOLD_CODE,
     HOLD_QTY,
     INITIAL_CAPITAL,
+    KNOWN_EXECUTORS,
     LOT,
     NOT_COMPARABLE,
     PAPER_START_DATE,
     PER_STEP_CASH_PCT,
+    PREREGISTERED_KEY,
+    PREREGISTRATION_KEYS,
     RULE_CITATIONS,
 )
 from stocklab.paper.rules import (
@@ -122,6 +131,15 @@ class MissingPriceError(PaperError):
 
     **报错而不是跳过**：跳过会让一个「今天没记」看起来像「今天没啥事」，
     这正是 ERROR_DIARY 里「摘要说没事、正文里有事」的同型失效。
+    """
+
+
+class UnknownExecutorError(PaperError):
+    """`params.executor` 是一个**没有对应执行者**的值（P56 §1.7）。
+
+    认领关系 fail-closed：既不是通路 A 的 `m2_channel_a`，也不是 AI 操盘手的
+    `agent_decision` ⇒ 点名报错。静默跳过 = 那条策略悄悄不下单，
+    而症状只会在净值表上出现。
     """
 
 
@@ -291,6 +309,27 @@ def drawdown(history: list[float], nav: float) -> float:
     return round((peak - nav) / peak, 6)
 
 
+def executor_kind(account: dict) -> str | None:
+    """这条账户声明的执行者（`params.executor`）——**未知值点名报错**（P56 §1.7）。
+
+    「谁落这一天的净值」是一个**显式字段**，不靠账户名前缀猜：前缀猜法会让
+    `arm-agent-v1` 与 `arm-agent` 这种只差后缀的命名各走一条路，
+    而改名字的那天没人会记得同步这条判据。
+
+    fail-closed 的理由：出现一个**没有对应执行者**的值时，让出它等于那条策略
+    悄悄不下单（`paper step` 跳过、又没人接），而症状只会在净值表上出现 ——
+    排查方向会跑到订单生成上去。所以这里直接报错，并**点名**账户与那个值。
+    """
+    value = json.loads(account["params_json"]).get(EXECUTOR_KEY) or None
+    if value is not None and value not in KNOWN_EXECUTORS:
+        raise UnknownExecutorError(
+            f"账户 {account['account_id']} 的 params.{EXECUTOR_KEY} = {value!r} "
+            f"没有对应的执行者（已知：{list(KNOWN_EXECUTORS)}）—— "
+            f"`paper step` 让出它、又没人认领它，这条账户就永远不会记净值。"
+            f"改回已知值，或先实现那个执行者")
+    return value
+
+
 def external_executor(account: dict) -> str | None:
     """这条账户的日终净值由**外部通路**认领吗？（非空 = 是，返回执行者名）
 
@@ -298,11 +337,93 @@ def external_executor(account: dict) -> str | None:
     它**不进** `paper step` 的遍历 —— 否则 `paper step` 会先给它写一条「没有成交的
     净值」，而 `step` 的幂等判据正是净值行的存在性，于是那条策略**永远不下单**。
 
-    「谁落这一天的净值」因此是一个**显式字段**，不靠账户名前缀猜：
-    前缀猜法会让 `arm-agent-v1` 与 `arm-agent` 这种只差后缀的命名各走一条路，
-    而改名字的那天没人会记得同步这条判据。
+    P56 / D-50 把同一个字段用到 AI 操盘手家族上：值 = `agent_decision` ⇒ 日终由
+    `paper agent run --asof` 落（**让出逻辑本身不变**，只是写这个键的地方多了一处）。
     """
-    return json.loads(account["params_json"]).get(EXECUTOR_KEY) or None
+    return executor_kind(account)
+
+
+# ---------- P56：预注册（D-48） ----------
+
+def preregistration(account: dict) -> dict | None:
+    """账户行里那版预注册的 `(model_id, prompt_sha256)`；没有 → `None`。
+
+    **没有预注册不是「随便什么模型都行」**：调用方（写入口）据此拒写。见
+    `require_preregistration`。
+    """
+    raw = json.loads(account["params_json"]).get(PREREGISTERED_KEY)
+    if not isinstance(raw, Mapping):
+        return None
+    got = {k: str(raw.get(k) or "") for k in PREREGISTRATION_KEYS}
+    return got if all(got.values()) else None
+
+
+def require_preregistration(account: dict, *, model_id: str,
+                            prompt_sha256: str) -> dict:
+    """这条账户的预注册与本次调用**逐字段相同**吗？不同就拒（D-48）。
+
+    三个拒绝理由都点名「字段 / 值 / 为什么」，且**不 warn、不静默改写**：
+    - 没有预注册：这个账户没声明它是哪一版 ⇒ 先 `paper agent enroll` 开新版本账户；
+    - 对不上：**换模型 / 换提示词 = 开新版本账户**，旧账户保留不删。
+    """
+    want = {k: str(v or "") for k, v in
+            zip(PREREGISTRATION_KEYS, (model_id, prompt_sha256))}
+    got = preregistration(account)
+    if got is None:
+        raise agent_decide.DecisionPayloadError(
+            PREREGISTERED_KEY, None,
+            f"账户 {account['account_id']} 没有预注册（`{PREREGISTERED_KEY}`）—— "
+            f"它没声明自己是哪一版模型/提示词，本入口一律拒写（不 warn、不静默采用）。"
+            f"要接模型请开新版本账户：`paper agent enroll --arm-name "
+            f"{AGENT_ARM_PREFIX}<版本> --model-id <m> --prompt-sha256 <s>`")
+    diff = [k for k in PREREGISTRATION_KEYS if got[k] != want[k]]
+    if diff:
+        raise agent_decide.DecisionPayloadError(
+            diff[0], want[diff[0]],
+            f"与账户 {account['account_id']} 的预注册不符"
+            f"（预注册 {got[diff[0]]!r}，本次 {want[diff[0]]!r}）—— "
+            f"**换模型 / 换提示词 = 开新版本账户**，旧账户保留不删。"
+            f"这条纪律挡的是「换到好看为止」")
+    return got
+
+
+# ---------- P56：交易日与「这一格该有决策吗」 ----------
+
+def is_trading_day(conn: sqlite3.Connection, d: str) -> dict:
+    """`d` 是不是交易日 —— 真源是**交易日历**（`Calendar`，由指数日线生成）。
+
+    日历**没覆盖** `d` 时返回 `is_trading_day: None` + 原因，**不猜**（沿用
+    `patrol.session_day` 的「判不了就明说」）：把它读成 False 会把「不知道」
+    显示成「休市」，进而把缺决策的异常吞掉。
+    """
+    try:
+        cal = Calendar.load(conn)
+    except ValueError as exc:
+        return {"is_trading_day": None, "why": "calendar_not_covered",
+                "error": str(exc)}
+    dates = cal.all_dates
+    if not dates or not (dates[0] <= d <= dates[-1]):
+        return {"is_trading_day": None, "why": "calendar_not_covered",
+                "error": f"日历区间 [{dates[0] if dates else None}, "
+                         f"{dates[-1] if dates else None}] 不含 {d}"}
+    return {"is_trading_day": cal.is_open(d),
+            "why": "trading_calendar" if cal.is_open(d) else "trading_calendar_closed"}
+
+
+def decision_expectation(conn: sqlite3.Connection, *, account: dict,
+                         asof: str) -> dict:
+    """「`(这条臂, 这一天)` 本该有决策吗」——三字段，`show` 与 `run` **共用**。
+
+    - `is_trading_day`：交易日历说了算（`None` = 判不了）；
+    - `account_in_flight`：这条账户在 `asof` 时**已经在飞**（不早于起跑日）——
+      还没起跑的账户不该有决策，那不是缺；
+    - `expected`：两者都成立 ⇒ 缺决策就是**异常**（不是「这天不用决策」）。
+    """
+    day = is_trading_day(conn, asof)
+    in_flight = asof >= str(account["start_date"])
+    return {"asof": asof, **day, "account_in_flight": in_flight,
+            "expected": bool(day["is_trading_day"]) and in_flight}
+
 
 
 # ---------- init ----------
@@ -325,6 +446,37 @@ def _declared_seed(led: dict, start_date: str) -> None:
             f"{float(buys[-1]['price']) if buys else None} ≠ 声明成本 86.80")
 
 
+def _initial_state(conn: sqlite3.Connection, start_date: str) -> dict:
+    """起跑日的现金 / 持仓 / 净值（`init_accounts` 与 `enroll_agent_arm` **共用**）。
+
+    AI 操盘手的版本账户（D-48）必须与其余各臂**同起点同本金**，否则「对照」这件事
+    在第一个数上就不成立。两条路各算一遍迟早分叉，所以只有这一份实现。
+    """
+    led = ledger_state(conn, start_date)
+    _declared_seed(led, start_date)
+    positions = _position_snapshot({"initial_positions_json": json.dumps(
+        [{"code": c, "qty": q} for c, q in led["positions"].items()])})
+    marks = resolve_marks(conn, positions, start_date)
+    if set(marks) != set(positions):
+        raise MissingPriceError(f"起跑日 {start_date} 缺少持仓收盘价："
+                                f"{sorted(set(positions) - set(marks))}")
+    return {"cash": led["cash"], "positions": positions,
+            "seed_fee": led["cum_cost"],
+            "initial_nav": round(sum(p.price * positions[c] for c, p in marks.items())
+                                 + led["cash"], 4)}
+
+
+def _agent_params(params: dict) -> dict:
+    """AI 操盘手家族的账户参数：**认领声明** `executor='agent_decision'`（D-50）。
+
+    写在这里（而不是只靠 P56 的迁移补）是为了让**新库直接是对的** ——
+    迁移只负责把老库前滚，它不该是「这个键从哪来」的唯一答案。
+    """
+    return {**params, EXECUTOR_KEY: EXECUTOR_AGENT_DECISION,
+            "decision_source": agent_decide.TABLE_DECISIONS,
+            "decision_kind": "portfolio"}
+
+
 def init_accounts(conn: sqlite3.Connection, *, start_date: str = PAPER_START_DATE,
                   now: str) -> dict:
     """建臂（纪律臂按 `ETF_TRANCHES` 展开 3 档 + 智能体臂与它的随机对照）。
@@ -335,18 +487,8 @@ def init_accounts(conn: sqlite3.Connection, *, start_date: str = PAPER_START_DAT
     目标来自**台账里的当前 spec**，不来自账户行。把当时的 spec 抄进这一列，
     等于在库里存下第二个真相，而它不会随 spec 变。
     """
-    led = ledger_state(conn, start_date)
-    _declared_seed(led, start_date)
-    positions = _position_snapshot({"initial_positions_json": json.dumps(
-        [{"code": c, "qty": q} for c, q in led["positions"].items()])})
-    marks = resolve_marks(conn, positions, start_date)
-    if set(marks) != set(positions):
-        raise MissingPriceError(f"起跑日 {start_date} 缺少持仓收盘价："
-                                f"{sorted(set(positions) - set(marks))}")
-    seed_fee = led["cum_cost"]
-    initial_nav = round(sum(p.price * positions[c] for c, p in marks.items())
-                        + led["cash"], 4)
-    params = {"seed_fee": seed_fee, "lot": LOT,
+    state = _initial_state(conn, start_date)
+    params = {"seed_fee": state["seed_fee"], "lot": LOT,
               "per_step_cash_pct": PER_STEP_CASH_PCT,
               "etf_whitelist": list(ETF_WHITELIST),
               "start_date": start_date, "initial_capital": INITIAL_CAPITAL}
@@ -360,12 +502,10 @@ def init_accounts(conn: sqlite3.Connection, *, start_date: str = PAPER_START_DAT
     # 差别从第一条决策开始。**不给它编一个默认条文**：那会把「还没决定」
     # 显示成「决定按默认纪律办」，两者在读数上是两回事。
     specs += [(ARM_AGENT, ARM_KIND_AGENT, None,
-               {**params, "decision_source": agent_decide.TABLE_DECISIONS,
-                "decision_kind": "portfolio",
+               {**_agent_params(params),
                 "wired_from": "P52：每交易日一条操盘决策（写入口 paper agent decide）"}),
               (ARM_AGENT_RANDOM, ARM_KIND_AGENT_RANDOM, None,
-               {**params, "decision_source": agent_decide.TABLE_DECISIONS,
-                "decision_kind": "portfolio",
+               {**_agent_params(params),
                 "counter_arm": ARM_AGENT,
                 "wired_from": "P52：随机抽标的与权重，同护栏同成本（归因必需）"})]
     created = []
@@ -374,14 +514,107 @@ def init_accounts(conn: sqlite3.Connection, *, start_date: str = PAPER_START_DAT
             continue
         store.insert_account(
             conn, account_id=account_id, arm=arm, etf_target_pct=target,
-            start_date=start_date, initial_cash=led["cash"],
+            start_date=start_date, initial_cash=state["cash"],
             initial_positions=[{"code": c, "qty": q}
-                               for c, q in sorted(led["positions"].items())],
-            initial_nav=initial_nav, params=acct_params, now=now)
+                               for c, q in sorted(state["positions"].items())],
+            initial_nav=state["initial_nav"], params=acct_params, now=now)
         created.append(account_id)
     return {"created": bool(created), "accounts": created, "start_date": start_date,
-            "initial_nav": initial_nav, "initial_cash": led["cash"],
-            "initial_positions": positions}
+            "initial_nav": state["initial_nav"], "initial_cash": state["cash"],
+            "initial_positions": state["positions"]}
+
+
+# ---------- P56：预注册账户（D-48） ----------
+
+def validate_arm_name(arm_name: str) -> str:
+    """`--arm-name` 必须是 `arm-agent-<版本>` 且版本形状合法 —— 否则**拒绝**。
+
+    拒绝清单（T2）：`arm-agent`（无版本）、`arm-agent-random`（**对照臂的名字，
+    不能拿它注册模型**：那条臂的产出者标识由 `RANDOM_MODEL_ID` 固定）、
+    以及大写 / 空格 / 超长 / 空版本。**不 sanitize** —— 悄悄替换字符会让
+    「报告里的版本」与「台账里的版本」变成两个东西。
+    """
+    name = str(arm_name or "")
+    reserved = (ARM_AGENT, ARM_AGENT_RANDOM)
+    if name in reserved:
+        raise agent_decide.DecisionPayloadError(
+            "arm_name", name,
+            f"{name!r} 是**内置账户名**，不能拿来注册新版本：`{ARM_AGENT}` 是 P52 的"
+            f"默认臂、`{ARM_AGENT_RANDOM}` 是随机对照臂（产出者标识固定）。"
+            f"开新版本请用 `{AGENT_ARM_PREFIX}<版本>`，如 `{AGENT_ARM_PREFIX}ds-v1`")
+    if not name.startswith(AGENT_ARM_PREFIX):
+        raise agent_decide.DecisionPayloadError(
+            "arm_name", name,
+            f"必须以 {AGENT_ARM_PREFIX!r} 开头（D-48：`{AGENT_ARM_PREFIX}<版本>`）")
+    version = name[len(AGENT_ARM_PREFIX):]
+    if not ARM_VERSION_RE.match(version):
+        raise agent_decide.DecisionPayloadError(
+            "arm_name", name,
+            f"版本号 {version!r} 形状不合法（小写字母数字开头，只允许 `. _ -`，"
+            f"总长 ≤ 32，不许空）—— 它会进账户 id 与台账，必须可读、可比较")
+    return name
+
+
+def enroll_agent_arm(conn: sqlite3.Connection, *, arm_name: str, model_id: str,
+                     prompt_sha256: str, now: str,
+                     start_date: str = PAPER_START_DATE) -> dict:
+    """建一个**预注册过的** AI 操盘手版本账户（D-48）：`(model_id, prompt_sha256)`
+    写进 `params_json`，此后 `paper agent decide` 的这两个参数**不匹配即拒**。
+
+    幂等：账户已存在且预注册**逐字段相同** ⇒ `created: false`、行一字不改；
+    预注册不同 ⇒ **拒**（换模型 / 换提示词 = 开新版本账户，旧账户保留不删）。
+
+    起跑状态（现金 / 持仓 / 净值）与其余各臂**同一份实现**（`_initial_state`）——
+    换版本不该换起跑口径，否则对照从第一个数起就不成立。
+    """
+    name = validate_arm_name(arm_name)
+    for field, value in (("model_id", model_id), ("prompt_sha256", prompt_sha256)):
+        if not str(value or "").strip():
+            raise agent_decide.DecisionPayloadError(
+                field, value, "不许留空（换模型/换提示词 = 换口径，必须留痕）")
+    if not re.fullmatch(r"[0-9a-f]{64}", str(prompt_sha256)):
+        raise agent_decide.DecisionPayloadError(
+            "prompt_sha256", prompt_sha256,
+            "必须是 64 位小写十六进制（用 `paper agent sha256 --file <提示词文件>` 算，"
+            "不要手算 —— 各算各的迟早对不上）")
+
+    want = {"model_id": str(model_id), "prompt_sha256": str(prompt_sha256)}
+    existing = next((a for a in store.load_accounts(conn)
+                     if a["account_id"] == name), None)
+    if existing is not None:
+        got = preregistration(existing)
+        if got is None:
+            raise UnknownExecutorError(
+                f"账户 {name} 已存在但没有预注册（`{PREREGISTERED_KEY}`）—— "
+                f"enroll **只建新版本**，不就地改写旧账户的预注册；"
+                f"要换口径请开新版本名")
+        if got != want:
+            raise agent_decide.DecisionPayloadError(
+                PREREGISTERED_KEY, got["model_id"],
+                f"账户 {name} 已预注册 {got['model_id']!r}，本次是 "
+                f"{want['model_id']!r} —— 换模型 = 开新版本账户（旧账户保留）")
+        return {"created": False, "account_id": name, **got,
+                "start_date": str(existing["start_date"]), "initial_nav": None,
+                "note": "账户已存在且预注册一致：**一行都没改**（幂等）"}
+
+    state = _initial_state(conn, start_date)
+    params = {"seed_fee": state["seed_fee"], "lot": LOT,
+              "per_step_cash_pct": PER_STEP_CASH_PCT,
+              "etf_whitelist": list(ETF_WHITELIST),
+              "start_date": start_date, "initial_capital": INITIAL_CAPITAL}
+    store.insert_account(
+        conn, account_id=name, arm=ARM_KIND_AGENT, etf_target_pct=None,
+        start_date=start_date, initial_cash=state["cash"],
+        initial_positions=[{"code": c, "qty": q}
+                           for c, q in sorted(state["positions"].items())],
+        initial_nav=state["initial_nav"],
+        params={**_agent_params(params), PREREGISTERED_KEY: want,
+                "wired_from": "P56 / D-48：AI 操盘手版本账户（预注册模型与提示词指纹）"},
+        now=now)
+    return {"created": True, "account_id": name, **want,
+            "start_date": start_date, "initial_nav": state["initial_nav"],
+            "note": ("新版本账户：模型/提示词指纹已预注册，decision 时逐字段比对；"
+                     "**没有存任何凭据**（项目内零 API key）")}
 
 
 # ---------- 规则评估（纯重算，不写库） ----------
@@ -647,14 +880,19 @@ def step_account(conn: sqlite3.Connection, account_id: str, asof: str, *,
 
 
 def _step_all(conn: sqlite3.Connection, asof: str, *, accounts: list[dict],
-              now: str, prices: dict[str, Price] | None) -> None:
+              now: str, prices: dict[str, Price] | None,
+              claim_handover: bool = True) -> None:
     for account in accounts:
         # 外部通路（模块2 通路 A）认领的账户：它的日终由那条通路自己落，
         # 本引擎**让出**这一格。理由见 `external_executor`——不让出会让那条
         # 策略永远不下单，而症状出现在净值表上，排查方向会跑到订单生成上去。
         # 跳过是**显式**的（账户行里写着 `executor`），所以 `paper show` 里
         # 仍然能看到这条账户（它有净值行），不是「悄悄消失」。
-        if external_executor(account):
+        #
+        # `claim_handover=False` 只有**被指定的那个执行者**会传（`paper agent run`
+        # 就是 `agent_decision` 的执行者）：让出是对 `paper step` 说的，
+        # 不是对这个执行者说的。让出逻辑本身一字未改。
+        if claim_handover and external_executor(account):
             continue
         if store.nav_exists(conn, account["account_id"], asof):
             continue
@@ -723,6 +961,10 @@ def _step_all(conn: sqlite3.Connection, asof: str, *, accounts: list[dict],
 
 def _account_entry(conn: sqlite3.Connection, account: dict, asof: str,
                    prices: dict[str, Price] | None = None) -> dict:
+    # 认领关系 fail-closed（P56 §1.7）：未知 `params.executor` 在这里就点名报错。
+    # 放在账目条目的**入口**而不是渲染时，是为了让 `paper show` / 报告 / 页面
+    # 三条读出的路都撞上同一道闸，而不是各写一份判定。
+    executor_kind(account)
     nav_row = store.latest_nav(conn, account["account_id"], asof=asof)
     if nav_row is None or nav_row["date"] != asof:
         raise PaperError(f"{account['account_id']} 在 {asof} 没有净值行；先跑 `paper step`")
@@ -819,6 +1061,87 @@ def _trade_json(t: dict) -> dict:
             "price_source": t["price_source"], "price_asof": t["price_asof"]}
 
 
+# ---------- P56：AI 操盘手的日终（D-50） ----------
+
+def agent_claim_accounts(conn: sqlite3.Connection) -> list[dict]:
+    """`executor == 'agent_decision'` 的那些账户（`paper agent run` 的认领范围）。
+
+    遍历全部账户并逐个走 `executor_kind` ⇒ **未知 `executor` 在这里就报错**（fail-closed），
+    而不是被悄悄地漏掉。范围按**字段**判定，不按账户名前缀猜。
+    """
+    return [a for a in store.load_accounts(conn)
+            if executor_kind(a) == EXECUTOR_AGENT_DECISION]
+
+
+def agent_run(conn: sqlite3.Connection, asof: str, *, now: str) -> dict:
+    """AI 操盘手家族的**日终**：先要决策在台账里，再按当日收盘价成交并写净值。
+
+    ## 为什么这条命令必须存在（D-50，写进注释与 runbook）
+
+    `paper step` 的幂等判据是「**当日净值行存在**」。收盘链 15:30 先跑完 ⇒ 之后
+    写进台账的决策**永远不会被执行**（症状出现在净值表上，排查方向会跑到订单
+    生成上去 —— P47 `external_executor` 里那条坑的同型）。所以 `agent_decision`
+    账户在 `paper step` 里**让出**，日终改由本命令落 —— **顺序是硬的：先 decide，
+    后 run**。
+
+    ## 三种结果（都不静默）
+
+    - **有决策**：按决策调仓、写成交与净值。取值与 `paper step` **同一段实现**
+      （`_step_all`，只把让出关掉），所以「AI 臂的净值」不是第二套口径。
+    - **无决策**：写一条**平盘净值行**（持仓现金照旧、成交 0 笔），并在回执里带
+      `anomaly.missing_decision` —— 交易日 ⇒ 退出码 1，非交易日 ⇒ 0。
+      **不补造默认决策**：那会把「没决定」显示成「决定按默认纪律办」。
+    - **重跑**：当日净值行已存在 ⇒ `already`，**一行都不写**、不会有第二笔成交。
+    """
+    claim = agent_claim_accounts(conn)
+    if not claim:
+        raise PaperError(
+            f"没有 `{EXECUTOR_KEY}={EXECUTOR_AGENT_DECISION}` 的账户 —— "
+            f"本命令是那个执行者，没有认领对象就无事可做。"
+            f"先 `paper init` / `paper agent enroll`")
+    entries: list[dict] = []
+    missing: list[dict] = []
+    for account in claim:
+        aid = str(account["account_id"])
+        expectation = decision_expectation(conn, account=account, asof=asof)
+        decision = agent_decide.portfolio_decision_on(conn, aid, asof)
+        present = decision is not None
+        existed = store.nav_exists(conn, aid, asof)
+        if not existed:
+            # 与 `step_account` 同款：一天的落盘是一个事务，失败不留半截状态
+            with transaction(conn):
+                _step_all(conn, asof, accounts=[account], now=now, prices=None,
+                          claim_handover=False)
+        trades = [t for t in store.trades_on(conn, aid, asof)]
+        latest = store.latest_nav(conn, aid, asof=asof) or {}
+        entry = {
+            "account_id": aid, "status": "already" if existed else "ran",
+            "wrote_nav": (not existed) and store.nav_exists(conn, aid, asof),
+            "date": latest.get("date"), "nav": latest.get("nav"),
+            "n_trades": len(trades), "decision_present": present,
+            "decision_id": (None if not present else int(decision["decision_id"])),
+            "model_id": (None if not present else str(decision["model_id"])),
+            "missing_decision": None,
+        }
+        if not present:
+            note = (f"{aid} 在 {asof} **没有决策行** ⇒ 本日不下单，"
+                    f"净值行是**平盘**（照当日收盘价重估、成交 0 笔）。"
+                    f"**不补造默认决策**：那会把「没决定」显示成「决定按默认"
+                    f"纪律办」")
+            entry["missing_decision"] = {**expectation, "note": note}
+            if expectation["expected"]:
+                missing.append({"account_id": aid, **expectation, "note": note})
+        entries.append(entry)
+    return {
+        "asof": asof, "accounts": entries,
+        "n_claimed": len(claim),
+        "anomaly": {"missing_decision": missing},
+        "note": ("AI 操盘手的日终：先要决策在台账里，再按当日收盘价成交并写净值。"
+                 "顺序是硬的 —— `paper step` 先跑会写掉当日净值，之后的决策"
+                 "永远不会被执行（D-50）"),
+    }
+
+
 def accounts_state(conn: sqlite3.Connection, asof: str | None = None) -> list[dict]:
     """全部账户的**最新**净值状态（`show` 与重跑 `step` 的返回用同一形状）。"""
     out = []
@@ -860,12 +1183,42 @@ def arm_state_for(conn: sqlite3.Connection, arm: str, asof: str) -> dict | None:
     }
 
 
+def decision_context_for(conn: sqlite3.Connection, *, arm: str,
+                         asof: str) -> dict:
+    """喂给 AI 操盘手的 **PIT 上下文**（`paper agent context` 与两个写入口共用）。
+
+    「生成器看过了什么」只能有一个答案：`paper agent context` 打印它、
+    `paper agent decide` 用它重算指纹做比对。两条路各拼一套的话，
+    `context_sha256` 比对就变成「自己跟自己比」——永远为真，也就永远没有意义。
+    """
+    # 懒 import：`agent_context` 模块级 import 本模块（取 `INDEX_300_SYMBOL` /
+    # `pit_close`），反向 import 会成环 —— 与 `comparison_block` 同款。
+    from stocklab.paper import agent_context
+
+    state = arm_state_for(conn, arm, asof)
+    if state is None:
+        raise PaperError(f"账户 {arm} 不存在；先 `paper init`（或 `paper agent enroll`）")
+    pool = agent_decide.pool_for(conn, asof)
+    marks = {**resolve_marks(conn, set(state["positions"]) | set(pool["codes"]), asof),
+             **state["marks"]}
+    return agent_context.build_decision_context(
+        conn, arm=arm, asof=asof, pool=pool, cash=state["cash"],
+        positions=state["positions"], marks=marks,
+        total_assets=state["total_assets"])
+
+
 def state_payload(conn: sqlite3.Connection, asof: str) -> dict:
     """`asof` 的载荷 —— **只由库里的行 + PIT 价格决定**，故重跑逐字节一致。"""
+    accounts = store.load_accounts(conn)
+    # 认领关系 fail-closed：**先**把每一条账户的 `executor` 验一遍，再按「当日有没有
+    # 净值行」过滤。放在过滤之后的话，一个坏掉的账户只要那天没有净值行就会被
+    # 悄悄跳过 —— 而「跳过」正是这条闸门要挡的东西（静默 ⇒ 只在净值表上看得出症状）。
+    for a in accounts:
+        executor_kind(a)
     idx = pit_close(conn, INDEX_300_SYMBOL, asof)
     return {
         "asof": asof,
-        "accounts": [_account_entry(conn, a, asof) for a in store.load_accounts(conn)
+        "accounts": [_account_entry(conn, a, asof) for a in accounts
                      if store.nav_exists(conn, a["account_id"], asof)],
         "index_300": ({"level": idx.price, "price_asof": idx.price_asof}
                       if idx else None),

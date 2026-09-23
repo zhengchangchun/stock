@@ -540,6 +540,11 @@ def comparison_block(data: Mapping) -> str:
                if latest is not None
                else f'<span class="s-warn">{esc(NOT_COMPARABLE)}</span>')
         note = str(a.get("note") or "—")
+        dec = a.get("decision") or {}
+        # 「今日无决策」与「有决策但不动手」**不同形**：这一段只在台账里没有当天
+        # 那一条（或缺当天那一条）时出现，说的是「没决定」，不是「决定不动手」。
+        dec_html = (f'<div class="note">{rich(str(dec.get("note")))}</div>'
+                    if dec.get("note") else "")
         rows.append(
             f'<tr><td class="l">{rich(str(a.get("label")))}'
             f'<div class="note"><code>{esc(str(a.get("id")))}</code></div></td>'
@@ -547,7 +552,7 @@ def comparison_block(data: Mapping) -> str:
             f'<td class="num">{ret}</td>'
             f'<td>{"是" if a.get("tradable") else "否"}</td>'
             f'<td>{"有" if a.get("has_cost") else "无"}</td>'
-            f'<td class="l">{rich(note)}</td></tr>')
+            f'<td class="l">{rich(note)}{dec_html}</td></tr>')
     d = cmp.get("delta_vs_random")
     if cmp.get("delta_vs_random_available") and d is not None:
         delta_html = (f'Δ(AI 操盘手 − 随机对照) = '

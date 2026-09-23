@@ -37,6 +37,7 @@ nanobot 侧正文于是只剩一句：跑 `ops patrol --fix`，非 0 就把 stde
 
 from __future__ import annotations
 
+import json
 import sqlite3
 from datetime import datetime
 from pathlib import Path
@@ -45,6 +46,7 @@ from zoneinfo import ZoneInfo
 from stocklab.calendar.holidays import load_holiday_table
 from stocklab.config import paths
 from stocklab.ops import journal
+from stocklab.paper import config as paper_config
 from stocklab.ops.runner import (DEFAULT_TIMEOUT_S, EXIT_ANOMALY, EXIT_BLOCKED,
                                  EXIT_OK, Step, build_argv, cross_db_refusal,
                                  default_runner, run_steps, worst_code)
@@ -277,13 +279,56 @@ def check_chain(conn: sqlite3.Connection, now: str, *, report_dir: Path | str | 
             SKIPPED, accounts=accounts,
             reason="未 paper init（或老库无该表）→ 跳过，不算异常")
     else:
+        # P56 / D-50：被**决策循环**认领的账户（`params.executor = agent_decision`）
+        # 的日终由 `paper agent run` 落，不由 `paper step` 落 —— 它们的净值行缺席
+        # **不是** `paper step` 的缺口（报成缺口等于每天都要求补跑一个补不上的步）。
+        # 认领关系按**字段**判定、不按账户名前缀；未知 `executor` 值单独报出来，
+        # 不静默当作「没被认领」—— 那正是「悄悄不下单」的入口。
+        claimed: list[str] = []
+        unknown_exec: list[str] = []
+        try:
+            for row in conn.execute(
+                    "SELECT account_id, params_json FROM paper_accounts"
+                    " ORDER BY account_id"):
+                value = (json.loads(row["params_json"] or "{}")
+                         .get(paper_config.EXECUTOR_KEY) or None)
+                if value == paper_config.EXECUTOR_AGENT_DECISION:
+                    claimed.append(str(row["account_id"]))
+                elif value is not None and value not in paper_config.KNOWN_EXECUTORS:
+                    unknown_exec.append(f"{row['account_id']}={value!r}")
+        except (sqlite3.Error, ValueError) as exc:      # 老库 / params 不是 JSON
+            unknown_exec.append(f"<params_json 读不了：{exc}>")
+        expected = int(accounts) - len(claimed)
         nav_max = _one(conn, "SELECT MAX(date) FROM paper_nav_daily", default=None)
-        rows_nav = (_one(conn, "SELECT COUNT(*) FROM paper_nav_daily WHERE date=?",
-                         (latest,), default=None) if latest else 0) or 0
+        holders = ",".join("?" * len(claimed)) if claimed else "''"
+        rows_nav = 0
+        if latest:
+            rows_nav = _one(
+                conn, "SELECT COUNT(DISTINCT account_id) FROM paper_nav_daily"
+                      f" WHERE date=? AND account_id NOT IN ({holders})",
+                (latest, *claimed), default=0) or 0
+        if unknown_exec:
+            status = STALE
+            reason = (f"`{paper_config.EXECUTOR_KEY}` 有**没有对应执行者**的值："
+                      f"{unknown_exec} —— 那条账户既不会被 `paper step` 认领、"
+                      f"也没有别的执行者，会悄悄不下单（先改回已知值）")
+        elif latest and rows_nav < expected:
+            status = MISSING
+            reason = (f"{latest} 只有 {rows_nav}/{expected} 条账户净值行"
+                      + (f"（另有 {len(claimed)} 条由决策循环认领：{claimed}）"
+                         if claimed else ""))
+        else:
+            status = OK
+            reason = None
         checks["paper_nav"] = _item(
-            OK if rows_nav else MISSING, accounts=accounts, required=latest,
+            status, accounts=accounts, required=latest, expected_accounts=expected,
+            claimed_accounts=claimed, unknown_executors=unknown_exec,
             latest_date=nav_max, rows_for_required=rows_nav,
-            reason=None if rows_nav else f"{latest} 没有净值行")
+            note=(f"{len(claimed)} 条账户由**决策循环**认领（`{paper_config.EXECUTOR_KEY}"
+                  f"={paper_config.EXECUTOR_AGENT_DECISION}`，日终走 "
+                  f"`paper agent run`）—— 它们缺净值行**不算**本项的缺口"
+                  if claimed else None),
+            reason=reason)
 
     # ⑦ 三张 PIT 表 ------------------------------------------------------------
     val = _one(conn, "SELECT MAX(date) FROM valuation_daily", default=None)

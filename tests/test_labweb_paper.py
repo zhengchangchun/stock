@@ -91,6 +91,9 @@ def _fixture_db(tmp_path, *, index_gap: bool = False, steps: bool = True):
     if steps:
         for day in STEP_DAYS:
             paper_engine.step(c, day, now=NOW)
+            # P56 / D-50：两条 AI 臂被 `paper step` 让出日终，改由决策循环落
+            # （夹具里没有决策 ⇒ 平盘行 + 缺决策异常，不影响本文件的对照读数）。
+            paper_engine.agent_run(c, day, now=NOW)
     c.close()
     return path
 

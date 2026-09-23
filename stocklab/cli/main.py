@@ -37,6 +37,7 @@ from stocklab.store.migrate import ensure_schema, init_db
 # `paper/config.py` 是纯常量叶子模块（无 import），在模块级引用它不会成环 ——
 # 这样 `SPEC_ARMS` 不需要在自己内部再抄一遍臂名字面量。
 from stocklab.paper.config import (ARM_AGENT, ARM_AGENT_RANDOM,
+                                  EXECUTOR_AGENT_DECISION, EXECUTOR_KEY,
                                   RANDOM_MODEL_ID)
 from stocklab.cli.plugin import (cmd_plugin_approve, cmd_plugin_list,
                                  cmd_plugin_reject, cmd_plugin_sandbox,
@@ -2484,17 +2485,24 @@ def cmd_paper_spec_set(args: argparse.Namespace) -> int:
 # ---------- AI 操盘手的决策（P52 / D-34） ----------
 
 def _agent_arms_check(conn, arm: str) -> None:
-    """只许在智能体臂上写决策（别的臂的决策文件没人读，写下去就是一张假台账）。"""
-    from stocklab.paper import agent_decide, store
+    """只许在**决策循环认领的**账户上写决策（别的臂的决策文件没人读）。
 
-    if arm not in (ARM_AGENT, ARM_AGENT_RANDOM):
+    P56 起范围按**字段**判定（`params.executor == 'agent_decision'`），不按账户名前缀：
+    `arm-agent-<版本>`（D-48 的预注册账户）与通路 A 的账户**同前缀**，
+    靠这个名字猜迟早猜错。未知 `executor` 值在这里就点名报错（fail-closed）。
+    """
+    from stocklab.paper import agent_decide, engine, store
+
+    accounts = store.load_accounts(conn)
+    # 逐个走 `executor_kind`：未知值会抛 `UnknownExecutorError`（不静默跳过）
+    claimed = {a["account_id"] for a in accounts
+               if engine.executor_kind(a) == EXECUTOR_AGENT_DECISION}
+    if arm not in claimed:
         raise agent_decide.DecisionPayloadError(
-            "arm", arm, f"`paper agent` 只管 {[ARM_AGENT, ARM_AGENT_RANDOM]}"
-                        f"（决策由外部编码 agent 产出，落在这两条臂的台账上）")
-    accounts = {a["account_id"] for a in store.load_accounts(conn)}
-    if arm not in accounts:
-        raise agent_decide.DecisionPayloadError(
-            "arm", arm, f"账户不存在（现有 {sorted(accounts)}）—— 先跑 `paper init`")
+            "arm", arm,
+            f"`paper agent` 只管决策循环认领的账户（`{EXECUTOR_KEY}="
+            f"{EXECUTOR_AGENT_DECISION}`，现有 {sorted(claimed)}）—— 别的臂的决策"
+            f"文件没人读，写下去就是一张假台账")
 
 
 def _agent_decide_inputs(conn, arm: str, asof: str):
@@ -2508,20 +2516,131 @@ def _agent_decide_inputs(conn, arm: str, asof: str):
     return state, pool, marks
 
 
-def cmd_paper_agent_decide(args: argparse.Namespace) -> int:
-    """写一条**操盘决策**（D-34）：校验 → 算 PIT 上下文指纹 → 落 append-only 台账。
+def cmd_paper_agent_sha256(args: argparse.Namespace) -> int:
+    """提示词文件的 sha256（`prompt_sha256` 的**唯一算法**）。
 
-    幂等：同 `(arm, asof)` 且载荷**逐字节一致** → exit 0、台账仍 1 行；
-    不一致 → exit 1（append-only，本命令不改写历史）。
-    越界（权重和≠100 / 负权重 / 池外 / 缺 reason / 想卖空）→ exit 2，**一行都不写**。
+    纯 stdlib、**不碰库、不联网**：各人手算各的 sha 迟早对不上，而对不上的那天
+    看到的是「预注册不匹配」——排查方向会跑到模型上去。所以这里把算法固定下来。
     """
-    from stocklab.paper import agent_context, agent_decide, agent_spec, store
+    path = Path(args.file)
+    try:
+        blob = path.read_bytes()
+    except OSError as exc:
+        return _paper_fail(ValueError(
+            f"读不到 {path}（{exc.strerror}）—— 这个参数要的是提示词**文件**的路径"))
+    print(json.dumps({
+        "file": str(path), "bytes": len(blob),
+        "sha256": hashlib.sha256(blob).hexdigest(),
+        "note": "对文件**字节**取 sha256（与 `paper agent enroll --prompt-sha256` 同一个算法）",
+    }, ensure_ascii=False, sort_keys=True, indent=2))
+    return 0
+
+
+def cmd_paper_agent_context(args: argparse.Namespace) -> int:
+    """打印该臂 `asof` 的 **PIT 上下文**与它的指纹（D-49 的**唯一输入源**）。
+
+    「生成器看过了什么」只有这一个答案：项目外的生成器读这份输出、把
+    `context_sha256` 原样放进载荷，`paper agent decide` 落库前重算比对。
+    只含 `<= asof` 的行 —— 塞一条 `asof+1` 的收盘价进库，这份输出**逐字节不变**。
+    """
+    from stocklab.paper import agent_context, engine
 
     conn, code = _paper_conn(args)
     if conn is None:
         return code
     try:
         _agent_arms_check(conn, args.arm)
+        ctx = engine.decision_context_for(conn, arm=args.arm, asof=args.asof)
+        sha = agent_context.decision_context_sha256(ctx)
+        payload = {
+            "arm": args.arm, "asof": args.asof,
+            "context": ctx, "context_sha256": sha,
+            "guardrails": list(agent_context.GUARDRAILS),
+            "non_goals": list(agent_context.NON_GOALS),
+            "pool_codes": len(ctx["pool"]["codes"]),
+            "note": ("只读投影：只含 `<= asof` 的行。把 `context_sha256` 原样放进"
+                     "决策载荷，写入口会重算比对（D-49）"),
+        }
+    except engine.PaperError as exc:
+        conn.close()
+        return _paper_fail(exc)
+    finally:
+        conn.close()
+    print(json.dumps(payload, ensure_ascii=False, sort_keys=True, indent=2))
+    return 0
+
+
+def cmd_paper_agent_enroll(args: argparse.Namespace) -> int:
+    """建一个**预注册过的** AI 操盘手版本账户（D-48）：换模型 = 开新版本账户。"""
+    from stocklab.paper import agent_decide, engine
+
+    conn, code = _paper_conn(args)
+    if conn is None:
+        return code
+    try:
+        rep = engine.enroll_agent_arm(
+            conn, arm_name=args.arm_name, model_id=args.model_id,
+            prompt_sha256=args.prompt_sha256,
+            now=args.now or datetime.now(TZ).isoformat(timespec="seconds"))
+    except (agent_decide.DecisionPayloadError, engine.PaperError) as exc:
+        return _paper_fail(exc)
+    finally:
+        conn.close()
+    print(json.dumps(rep, ensure_ascii=False, sort_keys=True, indent=2))
+    return 0
+
+
+def cmd_paper_agent_run(args: argparse.Namespace) -> int:
+    """AI 操盘手家族的**日终**（D-50）：先要决策在台账里，再成交并写净值。
+
+    退出码：**0** = 该有的都有（或非交易日）；**1** = 交易日**缺决策**（异常，
+    不是「你给的东西不合法」）；**2** = 库的状态坏了（未知 `executor` / 没有认领账户）。
+    """
+    from stocklab.paper import agent_decide, engine
+
+    conn, code = _paper_conn(args)
+    if conn is None:
+        return code
+    try:
+        payload = engine.agent_run(
+            conn, args.asof,
+            now=args.now or datetime.now(TZ).isoformat(timespec="seconds"))
+    except agent_decide.DecisionPayloadError as exc:
+        conn.close()
+        return _paper_fail(exc)
+    except engine.PaperError as exc:
+        conn.close()
+        return _paper_fail(exc)
+    conn.close()
+    print(json.dumps(payload, ensure_ascii=False, sort_keys=True, indent=2))
+    n_missing = len(payload["anomaly"]["missing_decision"])
+    print(json.dumps({
+        "asof": args.asof, "accounts": len(payload["accounts"]),
+        "anomaly_missing_decision": n_missing,
+        "note": ("交易日缺决策 ⇒ 退出码 1（异常）；非交易日 ⇒ 0。"
+                 "**顺序是硬的：先 decide，后 run**"),
+    }, ensure_ascii=False, sort_keys=True), file=sys.stderr)
+    return 1 if n_missing else 0
+
+
+def cmd_paper_agent_decide(args: argparse.Namespace) -> int:
+    """写一条**操盘决策**（D-34）：校验 → 算 PIT 上下文指纹 → 落 append-only 台账。
+
+    幂等：同 `(arm, asof)` 且载荷**逐字节一致** → exit 0、台账仍 1 行；
+    不一致 → exit 1（append-only，本命令不改写历史）。
+    越界（权重和≠100 / 负权重 / 池外 / 缺 reason / 想卖空）→ exit 2，**一行都不写**。
+    P56 加两道闸（都在写库之前，所以拒绝时**零写入**）：**预注册比对**（D-48）与
+    **`context_sha256` 复核**（D-49）。
+    """
+    from stocklab.paper import agent_context, agent_decide, agent_spec, engine, store
+
+    conn, code = _paper_conn(args)
+    if conn is None:
+        return code
+    try:
+        _agent_arms_check(conn, args.arm)
+        account = next((a for a in store.load_accounts(conn)
+                        if a["account_id"] == args.arm), None)
         try:
             payload = json.loads(Path(args.file).read_text(encoding="utf-8"))
         except OSError as exc:
@@ -2530,16 +2649,19 @@ def cmd_paper_agent_decide(args: argparse.Namespace) -> int:
         except json.JSONDecodeError as exc:
             raise agent_decide.DecisionPayloadError(
                 "--file", args.file, f"不是合法 JSON（{exc.msg}）") from None
+        # D-48：登记在账户行里的那版预注册。没有预注册 / 对不上 ⇒ 拒（零写入）。
+        # 放在读文件**之后**：文件读不到是调用方手上的问题，先说这一条更省事。
+        engine.require_preregistration(
+            account, model_id=args.model_id, prompt_sha256=args.prompt_sha256)
         state, pool, marks = _agent_decide_inputs(conn, args.arm, args.asof)
+        # 上下文先算（D-49）：它是**判据**，不是事后留痕 —— 载荷必须回传同一个指纹。
+        ctx = engine.decision_context_for(conn, arm=args.arm, asof=args.asof)
+        context_sha256 = agent_context.decision_context_sha256(ctx)
         validated = agent_decide.validate_payload(
             asof=args.asof, payload=payload, pool_codes=set(pool["codes"]),
             held_qty=state["positions"], marks=marks,
-            total_assets=state["total_assets"])
-        ctx = agent_context.build_decision_context(
-            conn, arm=args.arm, asof=args.asof, pool=pool, cash=state["cash"],
-            positions=state["positions"], marks=marks,
-            total_assets=state["total_assets"])
-        context_sha256 = agent_context.decision_context_sha256(ctx)
+            total_assets=state["total_assets"],
+            expected_context_sha256=context_sha256)
         existing = agent_decide.decision_on(conn, args.arm, args.asof)
         if existing is not None:
             same = (agent_decide.canonical_payload(existing["payload"])
@@ -2587,7 +2709,7 @@ def cmd_paper_agent_random(args: argparse.Namespace) -> int:
     `(arm, asof, seed)` 的 sha256 决定。存在的理由是 D-19 ——
     没有它，AI 臂的读数分不清「选对了」与「同预算下多试了几次」。
     """
-    from stocklab.paper import agent_context, agent_decide, agent_spec
+    from stocklab.paper import agent_context, agent_decide, agent_spec, engine
 
     conn, code = _paper_conn(args)
     if conn is None:
@@ -2595,19 +2717,20 @@ def cmd_paper_agent_random(args: argparse.Namespace) -> int:
     try:
         _agent_arms_check(conn, args.arm)
         state, pool, marks = _agent_decide_inputs(conn, args.arm, args.asof)
+        ctx = engine.decision_context_for(conn, arm=args.arm, asof=args.asof)
+        context_sha256 = agent_context.decision_context_sha256(ctx)
         payload = agent_decide.random_payload(
             arm=args.arm, asof=args.asof, pool_codes=set(pool["codes"]),
             held_qty=state["positions"], marks=marks,
             total_assets=state["total_assets"], seed=args.seed)
+        # 项目内产出的载荷也照同一条口径回传上下文指纹：写入口只有一条路，
+        # 「谁产出的」不影响要不要证明「它看的是这一天的输入」。
+        payload = {**payload, "context_sha256": context_sha256}
         validated = agent_decide.validate_payload(
             asof=args.asof, payload=payload, pool_codes=set(pool["codes"]),
             held_qty=state["positions"], marks=marks,
-            total_assets=state["total_assets"])
-        ctx = agent_context.build_decision_context(
-            conn, arm=args.arm, asof=args.asof, pool=pool, cash=state["cash"],
-            positions=state["positions"], marks=marks,
-            total_assets=state["total_assets"])
-        context_sha256 = agent_context.decision_context_sha256(ctx)
+            total_assets=state["total_assets"],
+            expected_context_sha256=context_sha256)
         existing = agent_decide.decision_on(conn, args.arm, args.asof)
         if existing is not None:
             same = (agent_decide.canonical_payload(existing["payload"])
@@ -2649,32 +2772,66 @@ def cmd_paper_agent_random(args: argparse.Namespace) -> int:
 
 
 def cmd_paper_agent_show(args: argparse.Namespace) -> int:
-    """查某一臂的决策台账与对照读数（**离线只读**，直接读库不重算）。"""
-    from stocklab.paper import agent_context, agent_decide, agent_pool, engine, store
+    """查某一臂的决策台账与对照读数（**离线只读**，直接读库不重算）。
+
+    P56 起多一个 `missing_decision` 块（D-50 的「缺决策看得见」）：三个字段
+    `is_trading_day` / `account_in_flight` / `expected` 回答的是「**这一格本该有
+    决策吗**」——只有三者在位才谈得上「缺」，而「还没起跑」与「判不出交易日」
+    都不是缺。
+    """
+    from stocklab.paper import (agent_context, agent_decide, agent_pool, engine,
+                                store)
 
     conn, code = _paper_conn(args)
     if conn is None:
         return code
     try:
         asof = args.asof or _show_today(args)
+        account = next((a for a in store.load_accounts(conn)
+                        if a["account_id"] == args.arm), None)
         rows = agent_decide.load_decisions(conn, args.arm)
         portfolio = agent_decide.portfolio_decisions_only(rows)
+        decision_on_asof = agent_decide.decision_on(conn, args.arm, asof)
+        if account is None:
+            expectation = {"asof": asof, "is_trading_day": None,
+                           "why": "account_missing", "account_in_flight": False,
+                           "expected": False}
+        else:
+            expectation = engine.decision_expectation(conn, account=account,
+                                                      asof=asof)
+        prereg = None if account is None else engine.preregistration(account)
         payload = {
             "arm": args.arm,
             "asof": asof,
-            "account_exists": any(a["account_id"] == args.arm
-                                  for a in store.load_accounts(conn)),
+            "account_exists": account is not None,
             "n_rows": len(rows),
             "n_decisions": len(portfolio),
-            "decision_on_asof": agent_decide.decision_on(conn, args.arm, asof),
+            "decision_on_asof": decision_on_asof,
             "latest_decision": portfolio[-1] if portfolio else None,
             "pool_on_asof": agent_pool.pool_snapshot(conn, asof),
             "guardrails": list(agent_context.GUARDRAILS),
             "delta_vs_random": engine.agent_block(conn, asof)["delta_vs_random"],
             "delta_vs_random_available": engine.agent_block(
                 conn, asof)["delta_vs_random_available"],
+            # D-48：这一臂预注册的模型/提示词指纹（`None` = 没有预注册 ⇒
+            # 写入口会拒 —— 不是「随便什么模型都行」）。
+            "preregistered": prereg,
+            "missing_decision": {
+                **expectation,
+                "present": decision_on_asof is not None,
+                "note": (None if decision_on_asof is not None else
+                         ("**今日无决策**：`paper_agent_decisions` 里没有这一行 ⇒ "
+                          "本日不下单（净值行走 `paper agent run` 的平盘分支）。"
+                          "与「有决策但不动手」不同形 —— 不补造默认决策"
+                          if expectation["expected"] else
+                          "这一格**不要求决策**（非交易日，或该账户还没起跑）"
+                          "—— 不是缺")),
+            },
         }
     except agent_spec.SpecViolation as exc:
+        conn.close()
+        return _paper_fail(exc)
+    except engine.PaperError as exc:
         conn.close()
         return _paper_fail(exc)
     conn.close()
@@ -3919,6 +4076,38 @@ def build_parser() -> argparse.ArgumentParser:
     ppa_decide.add_argument("--db")
     ppa_decide.add_argument("--now", help="覆盖当前时刻（测试/补录用）")
     ppa_decide.set_defaults(func=cmd_paper_agent_decide)
+
+    ppa_context = pp_agent_sub.add_parser(
+        "context", help="PIT 上下文与它的指纹（D-49：生成器的**唯一输入源**，只读）")
+    ppa_context.add_argument("--asof", required=True, help="决策日 YYYY-MM-DD（PIT）")
+    ppa_context.add_argument("--arm", default=ARM_AGENT, help=f"目标臂（默认 {ARM_AGENT}）")
+    ppa_context.add_argument("--db")
+    ppa_context.add_argument("--now", help="覆盖当前时刻（测试用）")
+    ppa_context.set_defaults(func=cmd_paper_agent_context)
+
+    ppa_sha = pp_agent_sub.add_parser(
+        "sha256", help="提示词文件的 sha256（`--prompt-sha256` 的**唯一算法**；不碰库）")
+    ppa_sha.add_argument("--file", required=True, help="提示词文件路径")
+    ppa_sha.set_defaults(func=cmd_paper_agent_sha256)
+
+    ppa_enroll = pp_agent_sub.add_parser(
+        "enroll", help="建**预注册**的版本账户（D-48：换模型 = 开新版本账户）")
+    ppa_enroll.add_argument("--arm-name", dest="arm_name", required=True,
+                            help="账户名：arm-agent-<版本>（如 arm-agent-ds-v1）")
+    ppa_enroll.add_argument("--model-id", dest="model_id", required=True,
+                            help="模型标识（**原样字面量**，不替网关/厂商改写）")
+    ppa_enroll.add_argument("--prompt-sha256", dest="prompt_sha256", required=True,
+                            help="提示词指纹（用 `paper agent sha256 --file` 算）")
+    ppa_enroll.add_argument("--db")
+    ppa_enroll.add_argument("--now", help="覆盖当前时刻（测试/补录用）")
+    ppa_enroll.set_defaults(func=cmd_paper_agent_enroll)
+
+    ppa_run = pp_agent_sub.add_parser(
+        "run", help="AI 操盘手的**日终**（D-50）：先有决策，再成交并写净值（幂等）")
+    ppa_run.add_argument("--asof", required=True, help="交易日 YYYY-MM-DD")
+    ppa_run.add_argument("--db")
+    ppa_run.add_argument("--now", help="覆盖当前时刻（测试/补录用）")
+    ppa_run.set_defaults(func=cmd_paper_agent_run)
 
     ppa_random = pp_agent_sub.add_parser(
         "random", help="随机对照臂：同护栏同成本，标的与权重由固定种子决定（归因必需）")

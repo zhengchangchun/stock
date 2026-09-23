@@ -51,6 +51,14 @@ BARS = {
 POOL = ("000333", "510300", "510880")
 
 
+#: P56 / D-48：`decide` 只许写在**预注册过**的账户上（内置 `arm-agent` 没有预注册，
+#: 要接模型必须开新版本账户）。本文件的绝大多数用例关心的是**载荷校验**，
+#: 所以统一用这个版本账户来写。
+TEST_ARM = "arm-agent-t1"
+TEST_MODEL = "test-model"
+TEST_PROMPT = "a" * 64          # 必须是 64 位**十六进制**（enroll 会逐字校验形状）
+
+
 @pytest.fixture
 def db(tmp_path):
     """一份 `paper init` 过、且**已有当日候选池**的库。"""
@@ -76,6 +84,10 @@ def db(tmp_path):
     c.commit()
     _add_pool(c, START, POOL)
     paper_engine.init_accounts(c, start_date=START, now=NOW)
+    # P56 / D-48：预注册的版本账户（与 `_decide` 的 model/prompt 逐字段一致）
+    paper_engine.enroll_agent_arm(c, arm_name=TEST_ARM, model_id=TEST_MODEL,
+                                  prompt_sha256=TEST_PROMPT, now=NOW,
+                                  start_date=START)
     c.close()
     return path
 
@@ -111,12 +123,23 @@ def _payload(asof, decisions, *, cash_pct=None, rationale="夹具决策"):
             "rationale": rationale}
 
 
-def _decide(db, capsys, tmp_path, payload, *, arm=ARM_AGENT, name="d.json",
-            asof=None):
+def _context_sha(db, capsys, arm, asof):
+    """按生成器的正规流程取 PIT 上下文指纹（D-49：`paper agent context` 是唯一输入源）。"""
+    code, out, err = run(db, "paper", "agent", "context", "--asof", asof,
+                         "--arm", arm, capsys=capsys)
+    assert code == 0, err
+    return json.loads(out)["context_sha256"]
+
+
+def _decide(db, capsys, tmp_path, payload, *, arm=TEST_ARM, name="d.json",
+            asof=None, context_sha256=None):
+    asof = asof or payload["asof"]
+    payload = {**payload, "context_sha256":
+               context_sha256 or _context_sha(db, capsys, arm, asof)}
     path = _write(tmp_path, payload, name)
-    return run(db, "paper", "agent", "decide", "--asof", asof or payload["asof"],
+    return run(db, "paper", "agent", "decide", "--asof", asof,
                "--file", str(path), "--arm", arm,
-               "--model-id", "test-model", "--prompt-sha256", "p" * 64,
+               "--model-id", TEST_MODEL, "--prompt-sha256", TEST_PROMPT,
                capsys=capsys)
 
 
@@ -135,7 +158,7 @@ def _dump(path) -> dict:
         c.close()
 
 
-def _ledger_rows(path, arm=ARM_AGENT):
+def _ledger_rows(path, arm=TEST_ARM):
     c = connect(path)
     try:
         return agent_decide.load_decisions(c, arm)
@@ -307,13 +330,21 @@ def test_t2_ledger_triggers_reject_update_delete_and_replace(db, tmp_path, capsy
 
 def test_t2_one_decision_per_day_but_two_arms_are_two_rows(db, tmp_path, capsys):
     """幂等键是 `(arm, asof)`：同一天两条臂各一条，互不挤占。"""
-    for arm in (ARM_AGENT, ARM_AGENT_RANDOM):
+    other = "arm-agent-t2"
+    c = connect(db)
+    try:
+        paper_engine.enroll_agent_arm(c, arm_name=other, model_id=TEST_MODEL,
+                                      prompt_sha256=TEST_PROMPT, now=NOW,
+                                      start_date=START)
+    finally:
+        c.close()
+    for arm in (TEST_ARM, other):
         code, _, err = _decide(db, capsys, tmp_path, _payload(START, []),
                                arm=arm, name=f"{arm}.json")
         assert code == 0, err
-    left = [r["arm"] for r in _ledger_rows(db, ARM_AGENT)]
-    right = [r["arm"] for r in _ledger_rows(db, ARM_AGENT_RANDOM)]
-    assert left == [ARM_AGENT] and right == [ARM_AGENT_RANDOM]
+    left = [r["arm"] for r in _ledger_rows(db, TEST_ARM)]
+    right = [r["arm"] for r in _ledger_rows(db, other)]
+    assert left == [TEST_ARM] and right == [other]
 
 
 # ---------- T3：PIT ----------
@@ -433,14 +464,18 @@ def test_t4_the_stored_trade_matches_the_cost_model_field_by_field(db, tmp_path,
     payload = _payload(START, [{"code": "510300", "side": "buy",
                                 "target_weight_pct": 10.0, "reason": "建仓"}])
     assert _decide(db, capsys, tmp_path, payload, name="a.json")[0] == 0
-    assert main(["paper", "step", "--asof", START, "--out", str(tmp_path / "s.md"),
-                 "--db", str(db), "--now", NOW]) == 0
+    # P56 / D-50：AI 臂的日终由决策循环落（`paper step` 已让出它）——
+    # 拿 `paper step` 跑这笔决策，只会得到「它永不下单」（正是 D-50 要挡的那条坑）。
+    assert main(["paper", "agent", "run", "--asof", START,
+                 "--db", str(db), "--now", NOW]) == 1, \
+        "家族里另两条臂（arm-agent / arm-agent-random）没有决策 ⇒ 退出码 1；" \
+        "本用例只关心 arm-agent-t1 的成交"
     capsys.readouterr()
 
     c = connect(db)
     try:
         t = dict(c.execute("SELECT * FROM paper_trades WHERE account_id = ?",
-                           (ARM_AGENT,)).fetchone())
+                           (TEST_ARM,)).fetchone())
         assert t["price_asof"] == START and t["price_source"] == "bars", \
             "价格出处与所属日期必须落在成交行里（可审计的第一问）"
         costs = CostModel(asset_class=t["asset_class"])
@@ -454,7 +489,7 @@ def test_t4_the_stored_trade_matches_the_cost_model_field_by_field(db, tmp_path,
         for key, value in expected.items():
             assert t[key if key != "total" else "fee_total"] == value, key
         # 溯源标签写进 reason：成交行是 append-only，必须自己说得清照哪条决策下的
-        led = agent_decide.load_decisions(c, ARM_AGENT)[0]
+        led = agent_decide.load_decisions(c, TEST_ARM)[0]
         assert agent_decide.payload_tag(led["payload"]) in t["reason"]
         assert t["rule_citation"] in set(RULE_CITATIONS_AGENT_DECISION.values())
     finally:

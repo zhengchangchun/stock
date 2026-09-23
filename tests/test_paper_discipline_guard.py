@@ -153,6 +153,10 @@ AGENT_SCOPED_MODULES: dict[str, frozenset[str] | None] = {
     "rules.py": None,
     "engine.py": None,
     "config.py": frozenset({"target_weight_pct"}),
+    # P56：对照表要能回答「这一格**有没有**决策」（页面上的「今日无决策」），
+    # 所以它**只**被允许查询 `portfolio_decision_on` —— 方向与仓位
+    # （`target_weight_pct` / `target_value` / `plan_target_weight`）在这里照旧越界。
+    "comparison.py": frozenset({"portfolio_decision_on"}),
 }
 
 #: 「操盘口径」的标识符：出现它们 = 这个模块在表达方向与仓位。

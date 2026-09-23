@@ -81,9 +81,38 @@ def _init(db, capsys):
     assert code == 0, err
 
 
-def _decide_args(path, arm=ARM_AGENT):
+#: 预注册账户（P56 / D-48）：`decide` 只许写在**声明了自己是哪一版**的账户上，
+#: 所以夹具统一 enroll 一个版本账户来写决策。内置 `arm-agent` 不在这条路上
+#: （enroll 明令拒收它）—— 见 `test_decide_refuses_a_ledger_without_preregistration`。
+TEST_ARM = "arm-agent-t1"
+TEST_MODEL = "claude-code"
+TEST_PROMPT = "a" * 64
+
+
+def _enroll(db, capsys, name=TEST_ARM, model_id=TEST_MODEL, prompt=TEST_PROMPT):
+    code, out, err = run(db, "paper", "agent", "enroll", "--arm-name", name,
+                         "--model-id", model_id, "--prompt-sha256", prompt,
+                         capsys=capsys)
+    assert code == 0, err
+    return name
+
+
+def _context_sha(db, capsys, arm, asof):
+    """按**生成器的正规流程**取 PIT 上下文指纹（D-49：唯一输入源）。"""
+    code, out, err = run(db, "paper", "agent", "context", "--asof", asof,
+                         "--arm", arm, capsys=capsys)
+    assert code == 0, err
+    return json.loads(out)["context_sha256"]
+
+
+def _with_context(db, capsys, payload, *, arm=TEST_ARM, sha=None):
+    return {**payload, "context_sha256": sha or _context_sha(
+        db, capsys, arm, payload["asof"])}
+
+
+def _decide_args(path, arm=TEST_ARM):
     return ("paper", "agent", "decide", "--asof", START, "--file", str(path),
-            "--arm", arm, "--model-id", "claude-code", "--prompt-sha256", "a" * 64)
+            "--arm", arm, "--model-id", TEST_MODEL, "--prompt-sha256", TEST_PROMPT)
 
 
 def _write(tmp_path, payload, name="d.json"):
@@ -97,10 +126,12 @@ def _write(tmp_path, payload, name="d.json"):
 def test_decide_writes_one_row_and_prints_its_fingerprints(db, tmp_path, capsys):
     """写入成功 → exit 0，stdout 带 payload/context 两个指纹（可复现的凭据）。"""
     _init(db, capsys)
+    arm = _enroll(db, capsys)
     payload = {"asof": START, "cash_pct": 90.0, "rationale": "建 10% 的 510300",
                "decisions": [{"code": "510300", "side": "buy",
                               "target_weight_pct": 10.0, "reason": "分散"}]}
-    code, out, err = run(db, *_decide_args(_write(tmp_path, payload)), capsys=capsys)
+    path = _write(tmp_path, _with_context(db, capsys, payload, arm=arm))
+    code, out, err = run(db, *_decide_args(path, arm=arm), capsys=capsys)
     assert code == 0, err
     got = json.loads(out)
     assert got["status"] == "已写入" and got["n_decisions"] == 1
@@ -150,15 +181,25 @@ def test_decide_requires_model_and_prompt_fingerprints(db, tmp_path, capsys):
 
 
 def test_random_then_step_then_show_is_a_full_round_trip(db, tmp_path, capsys):
-    """`random` → `step` → `show`：三件事串起来能跑通，且 `show` 与库同源。"""
+    """`random` → `agent run` → `show`：串起来能跑通，且 `show` 与库同源。
+
+    P56 / D-50：中间那一步从 `paper step` 换成 `paper agent run` —— 随机臂也在
+    `agent_decision` 家族里，`paper step` 已经让出它（否则决策永不执行）。
+    """
     _init(db, capsys)
     code, out, err = run(db, "paper", "agent", "random", "--asof", START,
                          "--arm", ARM_AGENT_RANDOM, "--seed", "3", capsys=capsys)
     assert code == 0, err
     assert json.loads(out)["n_decisions"] >= 1
-    code, _, err = run(db, "paper", "step", "--asof", START,
-                       "--out", str(tmp_path / "s.md"), capsys=capsys)
-    assert code == 0, err
+    code, out, err = run(db, "paper", "agent", "run", "--asof", START, capsys=capsys)
+    # 退出码是**整条家族**的结论：随机臂有决策、内置 `arm-agent` 没有
+    # ⇒ 那天仍有一条「该有的决策」缺席 ⇒ 1（异常），回执里逐账户点名。
+    assert code == 1, err
+    by_id = {a["account_id"]: a for a in json.loads(out)["accounts"]}
+    assert by_id[ARM_AGENT_RANDOM]["decision_present"] is True
+    assert by_id[ARM_AGENT_RANDOM]["status"] == "ran"
+    assert [m["account_id"] for m in json.loads(out)["anomaly"]["missing_decision"]] \
+        == [ARM_AGENT]
     code, out, err = run(db, "paper", "agent", "show", "--asof", START,
                          "--arm", ARM_AGENT_RANDOM, capsys=capsys)
     assert code == 0, err
@@ -176,8 +217,8 @@ def test_show_reports_the_audit_of_the_ledger(db, tmp_path, capsys):
     _init(db, capsys)
     run(db, "paper", "agent", "random", "--asof", START, "--arm", ARM_AGENT_RANDOM,
         "--seed", "1", capsys=capsys)
-    run(db, "paper", "step", "--asof", START, "--out", str(tmp_path / "s.md"),
-        capsys=capsys)
+    code, _, err = run(db, "paper", "agent", "run", "--asof", START, capsys=capsys)
+    assert code == 1, ("随机臂有决策、内置 arm-agent 没有 ⇒ 家族整体报缺决策：" + err)
     c = connect(db)
     try:
         audit = agent_decide.audit_decisions(

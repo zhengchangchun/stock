@@ -26,6 +26,7 @@
 from __future__ import annotations
 
 import sqlite3
+from typing import Mapping
 
 from stocklab.fund import nav as fund_nav
 from stocklab.paper import store
@@ -96,6 +97,42 @@ def _account_rows(conn: sqlite3.Connection, asof: str) -> list[dict]:
     return rows
 
 
+#: 「今日无决策」与「有决策但不动手」在页面上**必须不同形** —— 前者是这一格
+#: 没有决定，后者是决定了但没成交。合成一句话会把「没决定」读成「决定不动手」。
+def _decision_state(conn: sqlite3.Connection, account: Mapping, asof: str) -> dict | None:
+    """AI 操盘手（含随机对照与版本账户）在 `asof` 的决策状态；别的臂 → `None`。
+
+    数字全部来自台账与账户行（`agent_decide.portfolio_decision_on`），本函数不重算。
+    """
+    kind = str(account["arm_kind"])
+    if kind not in (ARM_KIND_AGENT, ARM_KIND_AGENT_RANDOM):
+        return None
+    from stocklab.paper import agent_decide          # 懒 import：避免模块成环
+    aid = str(account["account_id"])
+    present = agent_decide.portfolio_decision_on(conn, aid, asof)
+    if present is not None:
+        payload = present.get("payload") or {}
+        n_codes = len(payload.get("decisions") or [])
+        return {
+            "present": True, "asof": asof,
+            "decision_id": int(present["decision_id"]),
+            "model_id": str(present["model_id"]),
+            "n_codes": n_codes, "cash_pct": float(payload.get("cash_pct") or 0.0),
+            "note": (f"**今日有决策**：台账第 {int(present['decision_id'])} 条"
+                     f"（`{present['model_id']}`），{n_codes} 个标的、"
+                     f"现金 {float(payload.get('cash_pct') or 0.0):g}%。"
+                     f"**有没有动手看成交列** —— 「有决策但不动手」与"
+                     f"「今日无决策」不是一件事"),
+        }
+    return {
+        "present": False, "asof": asof, "decision_id": None, "model_id": None,
+        "n_codes": 0, "cash_pct": None,
+        "note": (f"**今日无决策**：`{aid}` 在 {asof} 的 `paper_agent_decisions` 里"
+                 f"没有这一行 ⇒ 那天**没决定**（不是「决定不动手」）。"
+                 f"本页不给它编一个默认决策"),
+    }
+
+
 def build(conn: sqlite3.Connection, asof: str) -> dict:
     """`asof` 的对照表（同轴、同口径、同成本说明；不含生成时刻 ⇒ 可重放）。"""
     accounts = _account_rows(conn, asof)
@@ -120,6 +157,7 @@ def build(conn: sqlite3.Connection, asof: str) -> dict:
             "has_cost": True, "is_index": False, "approximate": False,
             "points": pts, "latest": latest,
             "note": None,
+            "decision": _decision_state(conn, a, asof),
             "n_sessions": sum(1 for v in pts if v is not None),
         })
 

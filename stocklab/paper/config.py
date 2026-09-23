@@ -15,6 +15,8 @@
 
 from __future__ import annotations
 
+import re
+
 # ---------- 起点 ----------
 
 #: 起跑日（**收盘口径**）。当日的决策只用 ≤ 当日的收盘价（PIT）。
@@ -81,6 +83,45 @@ ARM_AGENT_RANDOM: str = "arm-agent-random"
 #: 键名放在这里而不是 `m2/` 里：`paper/` 不许 import 模块2（方向是 m2 → paper）。
 EXECUTOR_KEY: str = "executor"
 
+# ---------- P56：认领关系（D-50） ----------
+
+#: AI 操盘手的日终认领者（P56 / D-50）：账户带这个值 ⇒ `paper step` **让出**它，
+#: 日终由 `paper agent run --asof <交易日>` 落（先要决策在台账里，再成交并写净值）。
+#: **为什么必须让出**：`paper step` 的幂等判据是「当日净值行存在」，收盘链 15:30
+#: 先跑完 ⇒ 之后写进去的决策**永远不会被执行**（同 P47 那条坑：症状出现在净值表上，
+#: 排查方向会跑到订单生成上去）。
+EXECUTOR_AGENT_DECISION: str = "agent_decision"
+
+#: 通路 A 的认领者。**与 `m2/config.py::EXECUTOR_CHANNEL_A` 同值但不 import**：
+#: 方向是 m2 → paper，paper 反向 import 会成环。两边是同一个值由
+#: `tests/test_paper_agent_arms.py` **对拍**钉住（与 `SAMPLE_THRESHOLD` 同款手法）。
+EXECUTOR_CHANNEL_A: str = "m2_channel_a"
+
+#: `params.executor` 的**全部合法值**。认领关系 fail-closed（P56 §1.7）：
+#: 出现这个集合之外的值 ⇒ **点名报错**，不许静默跳过 —— 静默跳过的后果是
+#: 那条策略悄悄不下单，而症状只会在净值表上出现。
+KNOWN_EXECUTORS: tuple[str, ...] = (EXECUTOR_CHANNEL_A, EXECUTOR_AGENT_DECISION)
+
+# ---------- P56：预注册（D-48） ----------
+
+#: AI 操盘手的**版本账户**前缀（D-48：`arm-agent-<版本>`）。
+#: ⚠️ 它与通路 A 的账户同前缀 —— **不是冲突**：两者靠 `params.executor` 区分
+#: （通路 A = `m2_channel_a`，AI 操盘手 = `agent_decision`），这正是那个字段存在的理由。
+AGENT_ARM_PREFIX: str = f"{ARM_AGENT}-"
+
+#: 版本号的合法形状。与 `m2/config.py::STRATEGY_VERSION_RE` **同形但不 import**
+#: （同一个理由：方向不许反过来）；形状一样由对拍测试钉住。
+ARM_VERSION_RE = re.compile(r"^[a-z0-9][a-z0-9._-]{0,31}$")
+
+#: 预注册字段（写进 `paper_accounts.params_json`）。**换模型 / 换提示词 = 开新版本账户**，
+#: 旧账户保留不删 —— 这条纪律只挡一件事：「换到好看为止」。
+PREREGISTERED_KEY: str = "preregistered"
+PREREGISTRATION_KEYS: tuple[str, ...] = ("model_id", "prompt_sha256")
+
+#: 决策载荷里回传的 PIT 上下文指纹（D-49）。生成器只从 `paper agent context` 取输入、
+#: 把 `context_sha256` 原样回传，`paper agent decide` 落库前**重算比对**，不一致即拒。
+CONTEXT_SHA256_KEY: str = "context_sha256"
+
 #: `paper_accounts.arm` 的取值（与 `store/schema.sql` 的 CHECK **同文**，改一处须同步）。
 ARM_KIND_HOLD: str = "hold"
 ARM_KIND_NOW: str = "now"
@@ -111,8 +152,9 @@ MAX_TRIALS_PER_REVIEW: int = 3
 
 #: 决策载荷的**唯一形状**（D-34）：每交易日一条。
 #: `code` 必须落在当日候选池；`Σ target_weight_pct + cash_pct = 100`；不许负数。
+#: `context_sha256`（P56 / D-49）是回传的 PIT 上下文指纹 —— 写入口会**重算比对**。
 DECISION_PAYLOAD_KEYS: tuple[str, ...] = (
-    "asof", "decisions", "cash_pct", "rationale")
+    "asof", "decisions", "cash_pct", "rationale", "context_sha256")
 DECISION_ITEM_KEYS: tuple[str, ...] = (
     "code", "side", "target_weight_pct", "reason")
 

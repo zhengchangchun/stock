@@ -100,7 +100,10 @@ def _add_agent_decision(path, *, asof, payload):
             c, arm=ARM_AGENT, asof=asof, payload=validated, pool=pool,
             agent_kind=agent_spec.AGENT_KIND_LLM, model_id="test-model",
             prompt_sha256="p" * 64, seed=0, context_sha256="c" * 64, now=NOW)
-        paper_engine.step(c, asof, now=NOW)
+        # P56 / D-50：AI 臂的日终由**决策循环**落（`paper step` 已让出它）——
+        # 这里原来调 `paper_engine.step`，换成同一个执行者的入口，
+        # 否则决策永远不会被执行（这正是 D-50 要挡的那条坑）。
+        paper_engine.agent_run(c, asof, now=NOW)
     finally:
         c.close()
 
@@ -348,3 +351,56 @@ def test_agent_section_has_no_ranking_words(db):
     seg = html.split(SECTION, 1)[1].split("</section>", 1)[0]
     assert re.search(r"不做排名|不排名|并列", html), "「不做排名」这句不能丢"
     assert "AI 操盘手" in seg
+
+
+# ══════════════════════════════════════════════════════════════════════
+# P56 / D-50：「今日无决策」必须看得见，且与「有决策但不动手」不同形
+# ══════════════════════════════════════════════════════════════════════
+
+#: 结论句禁词（沿用 P48/P55 的措辞纪律）：新增一行不许把页面措辞带坏。
+FORBIDDEN_WORDS = ("跑赢", "跑输", "优于", "劣于", "领先", "胜过")
+
+
+def _comparison_html(path, asof=LAST) -> str:
+    """只渲染**对照臂同轴表** —— 禁词纪律说的是这一段（整页别处另有既有措辞）。"""
+    c = connect(path)
+    try:
+        return paper_render.comparison_block({"comparison": paper_data.track(c, asof)[
+            "comparison"]})
+    finally:
+        c.close()
+
+
+def test_p56_the_ai_row_says_today_has_no_decision(tmp_path):
+    """`/lab/paper` 的 AI 行显式写「今日无决策」，且措辞里没有买卖建议词。"""
+    path = _fixture_db(tmp_path)
+    assert "今日无决策" in _html(path), "AI 行必须显式写出「今日无决策」（整页）"
+    block = _comparison_html(path)
+    assert "今日无决策" in block
+    assert "没决定" in block and "不是「决定不动手」" in block, \
+        "「无决策」与「有决策但不动手」必须**不同形**"
+    for word in FORBIDDEN_WORDS:
+        assert word not in block, f"对照块出现禁词 {word}"
+
+
+def test_p56_the_ai_row_says_something_else_when_there_is_a_decision(tmp_path):
+    """有决策的那条臂不再写「今日无决策」，而**没决策的那条照旧写**（两形并存）。"""
+    path = _fixture_db(tmp_path, steps=False)
+    _add_agent_decision(path, asof=LAST, payload={
+        "asof": LAST, "cash_pct": 100.0, "rationale": "夹具：全现金也是一个决定",
+        "decisions": []})
+    c = connect(path)
+    try:
+        block = paper_data.track(c, LAST)["comparison"]
+    finally:
+        c.close()
+    by_id = {a["id"]: a for a in block["arms"]}
+    mine = by_id[ARM_AGENT]["decision"]
+    theirs = by_id[ARM_AGENT_RANDOM]["decision"]
+    # 两种形态**开头就不一样** —— 这是「不同形」的判据。
+    # （有决策的那条会在正文里引用「今日无决策」来对比，所以不能拿子串否定。）
+    assert mine["present"] is True and mine["note"].startswith("**今日有决策**")
+    assert theirs["present"] is False and theirs["note"].startswith("**今日无决策**")
+    # 两种形态在**渲染出来之后**也分得开
+    html = _comparison_html(path)
+    assert "今日有决策" in html and "今日无决策" in html

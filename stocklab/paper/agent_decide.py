@@ -42,6 +42,7 @@ from __future__ import annotations
 import hashlib
 import json
 import random
+import re
 import sqlite3
 from dataclasses import replace
 from typing import Iterable, Mapping, Sequence
@@ -49,6 +50,7 @@ from typing import Iterable, Mapping, Sequence
 from stocklab.config.costs import ASSET_ETF, ASSET_STOCK, CostModel
 from stocklab.paper import agent_pool, agent_spec
 from stocklab.paper.config import (
+    CONTEXT_SHA256_KEY,
     DECISION_AGENT_KIND,
     DECISION_ITEM_KEYS,
     DECISION_KIND_PORTFOLIO,
@@ -106,12 +108,18 @@ def side_for(*, target_value: float, current_value: float) -> str | None:
 
 def validate_payload(*, asof: str, payload: object, pool_codes: set[str],
                      held_qty: Mapping[str, int], marks: Mapping[str, Price],
-                     total_assets: float) -> dict:
+                     total_assets: float,
+                     expected_context_sha256: str | None = None) -> dict:
     """校验 + 规范化一条决策载荷。**纯函数**：不写库、不读时钟、不取价。
 
     `marks` 只用于「目标市值 vs 现市值」的方向判定与目标市值的落地；
     缺价的标的**不许出现在载荷里**（否则那条目标权重没法执行，
     静默跳过等于少投而不报）。
+
+    `expected_context_sha256` 给了就启用 **D-49 的 PIT 闸门**：载荷必须回传
+    `context_sha256` 且与调用方**重算**出来的值逐字符相同，否则拒。
+    不给（`None`）= 不启闸 —— 那是纯函数调用方（单元测试）的用法；
+    CLI 的两个写入口**总是**传真值，所以真实路径上没有「不启闸」这个状态。
     """
     if not isinstance(payload, Mapping):
         raise DecisionPayloadError("<payload>", payload, "决策载荷必须是一个 JSON 对象")
@@ -128,6 +136,28 @@ def validate_payload(*, asof: str, payload: object, pool_codes: set[str],
             "asof", got_asof,
             f"载荷里的 asof 必须等于本命令的 --asof（{asof}）—— "
             f"否则一条决策会落在它没看过的那个交易日上")
+    context_sha256 = payload.get(CONTEXT_SHA256_KEY)
+    if context_sha256 is not None and not (
+            isinstance(context_sha256, str)
+            and re.fullmatch(r"[0-9a-f]{64}", context_sha256)):
+        raise DecisionPayloadError(
+            CONTEXT_SHA256_KEY, context_sha256,
+            "必须是 64 位小写十六进制（直接从 `paper agent context` 的输出里抄，"
+            "不要自己拼）")
+    if expected_context_sha256 is not None:
+        if context_sha256 is None:
+            raise DecisionPayloadError(
+                CONTEXT_SHA256_KEY, None,
+                "**载荷必须回传 `context_sha256`**（D-49）：它证明这条决策是看着"
+                "`paper agent context --asof` 的输出做的。取法：先跑 "
+                "`paper agent context --asof <同一日> --arm <臂>`，把输出里的 "
+                "`context_sha256` 原样放进载荷。缺它 ⇒ 拒（零写入）")
+        if context_sha256 != expected_context_sha256:
+            raise DecisionPayloadError(
+                CONTEXT_SHA256_KEY, context_sha256,
+                f"与 `--asof` 当日的上下文指纹不符（库里重算是 "
+                f"{expected_context_sha256}）—— 说明这条载荷不是照着这一天的 "
+                f"PIT 上下文做的（写错日子 / 池子或持仓已经变了）。**拒绝，零写入**")
     rationale = payload.get("rationale", "")
     if not isinstance(rationale, str):
         raise DecisionPayloadError("rationale", rationale, "必须是字符串（可以是空串）")
@@ -161,6 +191,9 @@ def validate_payload(*, asof: str, payload: object, pool_codes: set[str],
         "rationale": rationale,
         "sum_weight_pct": weight_sum,
         "total_assets": round(total_assets, 4),
+        # 载荷里回传的 PIT 上下文指纹随载荷一起进 canonical JSON ⇒ 它是**载荷指纹
+        # 的一部分**：同一天用两份不同的上下文各做一次决策，指纹不同、不是「重放」。
+        "context_sha256": context_sha256,
         "decisions": decisions,
     }
 

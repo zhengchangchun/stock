@@ -67,6 +67,9 @@ BARS_LOW = {
 AGENT_ARMS = (ARM_AGENT, ARM_AGENT_RANDOM)
 DISCIPLINE_ARMS = tuple(f"arm-discipline-{int(t):02d}" for t in ETF_TRANCHES)
 ALL_ARMS = (ARM_HOLD, ARM_NOW, *DISCIPLINE_ARMS, *AGENT_ARMS)
+#: `paper step` **认领**的那些（P56 / D-50：AI 操盘手家族让出日终，改由
+#: `engine.agent_run` 落 —— 让出的理由见 `engine.executor_kind` 的 docstring）。
+STEP_ARMS = (ARM_HOLD, ARM_NOW, *DISCIPLINE_ARMS)
 
 
 @pytest.fixture
@@ -171,11 +174,18 @@ def test_init_wires_the_agent_arms_to_the_ledger_without_copying_a_decision(db):
     engine.step(c, PAPER_START_DATE, now=NOW)
     navs = {r["account_id"]: r["nav"] for r in c.execute(
         "SELECT account_id, nav FROM paper_nav_daily WHERE date = ?", (PAPER_START_DATE,))}
+    # P56 / D-50：`paper step` **让出**这条臂的日终（否则「先写净值 ⇒ 决策永不执行」），
+    # 于是它不在 step 的净值里 —— 这一步本身就是要被钉住的行为。
+    assert ARM_AGENT not in navs, "paper step 认领了 AI 臂的日终（D-50 的让出失效）"
+    engine.agent_run(c, PAPER_START_DATE, now=NOW)
+    navs = {r["account_id"]: r["nav"] for r in c.execute(
+        "SELECT account_id, nav FROM paper_nav_daily WHERE date = ?", (PAPER_START_DATE,))}
     trades = c.execute("SELECT COUNT(*) FROM paper_trades WHERE account_id = ?",
                        (ARM_AGENT,)).fetchone()[0]
     c.close()
     assert trades == 0, "台账里还没有操盘决策 ⇒ 这天不该下单"
-    assert navs[ARM_AGENT] == navs["arm-hold"]
+    assert navs[ARM_AGENT] == navs["arm-hold"], \
+        "还没有决策时，它与「什么都不做」同值（平盘，且**不补造**默认决策）"
 
 
 def test_init_rejects_ledger_disagreeing_with_declared_tape(db):
@@ -210,7 +220,8 @@ def test_step_is_byte_identical_on_rerun(db):
     n_trades = c.execute("SELECT COUNT(*) n FROM paper_trades").fetchone()["n"]
     n_nav = c.execute("SELECT COUNT(*) n FROM paper_nav_daily").fetchone()["n"]
     c.close()
-    assert n_nav == len(ALL_ARMS)
+    assert n_nav == len(STEP_ARMS), \
+        "P56 / D-50：step 只认领 5 条静态臂（两条 AI 臂让出给 agent_run）"
     assert n_trades > 0, "纪律臂起跑日应当建仓"
 
     second = _run_step(db, PAPER_START_DATE)
@@ -492,7 +503,8 @@ def test_step_after_stop_loss_cleared_the_position_does_not_crash(db):
     _run_step(db, CAL_LOW[0])            # 收盘 80.00 < 止损线 82.14 → 纪律臂整清
     rep = _run_step(db, CAL_LOW[1])      # 仍在线下、已无持仓 → 不许炸
     by_id = {a["account_id"]: a for a in rep["accounts"]}
-    assert len(rep["accounts"]) == len(ALL_ARMS), "整天的净值必须都落库（事务不许半截）"
+    assert len(rep["accounts"]) == len(STEP_ARMS), \
+        "整天（step 认领的那 5 条）的净值必须都落库（事务不许半截）"
     for tranche in ETF_TRANCHES:
         acc = by_id[f"arm-discipline-{int(tranche):02d}"]
         assert HOLD_CODE not in acc["positions"]

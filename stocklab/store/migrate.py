@@ -1,3 +1,4 @@
+import json
 import shutil
 from datetime import datetime, timezone
 from pathlib import Path
@@ -440,6 +441,113 @@ def migrate_instruments_sector(conn, *, now: str | None = None) -> list[str]:
 
 
 
+# ---------------------------------------------------------------------------
+# P56：给 AI 操盘手家族的账户补上 `params.executor = 'agent_decision'`（D-50）。
+#
+# 背景：P56 把 AI 臂的日终认领权从 `paper step` 划给 `paper agent run`。
+# 认领关系是**账户行里的一个字段**（`params_json.executor`），而 P52 建这两条
+# 账户时还没有这个键 —— 于是老库上它们会被 `paper step` 悄悄认领（写一条没有
+# 成交的净值），那条臂就永远不下单，而症状会出现在净值表上。
+#
+# ⚠️ 这是一次**数据**迁移（不是加列），而 `paper_accounts` 上有 append-only
+# 触发器（`trg_paper_accounts_no_update`）。做法与 P37 的处理同源：在一个事务里
+# 暂时摘掉那道触发器、逐行**只加一个键**、再把触发器原样建回来，并核对
+# 「行数不变 + 除新键外逐字段不变」，任何一步不符就回滚。
+# 触发器 DDL 与 `schema.sql` **同文**（改一处须同步另一处）。
+#
+# 判定按 `paper_accounts.arm`（`agent` / `agent_random`）而**不是**按账户名前缀：
+# `arm-agent-random` 与通路 A 的 `arm-agent-<版本>` 同前缀，靠名字猜迟早猜错
+# ——「谁落这一天」本来就是一个显式字段。
+# ---------------------------------------------------------------------------
+
+_AGENT_ARM_KINDS: tuple[str, ...] = ("agent", "agent_random")
+_P56_EXECUTOR_VALUE = "agent_decision"
+_P56_EXECUTOR_KEY = "executor"
+
+
+def agent_arms_need_executor(conn) -> list[str]:
+    """只读探测：哪些 AI 操盘手账户还没有 `params.executor`。**不写任何东西**。
+
+    表不存在 → `[]`（`executescript` 会按 schema.sql 直接建出新 shape）。
+    """
+    if not _table_exists(conn, "paper_accounts"):
+        return []
+    out: list[str] = []
+    for row in conn.execute(
+            "SELECT account_id, arm, params_json FROM paper_accounts ORDER BY account_id"):
+        if str(row["arm"]) not in _AGENT_ARM_KINDS:
+            continue
+        try:
+            params = json.loads(row["params_json"] or "{}")
+        except ValueError:
+            params = None
+        if not isinstance(params, dict) or not params.get(_P56_EXECUTOR_KEY):
+            out.append(str(row["account_id"]))
+    return out
+
+
+def migrate_p56_agent_arms_executor(conn) -> list[str]:
+    """给 `arm in (agent, agent_random)` 的账户补 `executor='agent_decision'`。
+
+    **可重入**：跑第二次返回 `[]`（键已在位即跳过）。
+    **只加一个键**：其余键值逐字不变，行数不变；不符就回滚报错。
+    返回 `["<account_id>: executor -> 'agent_decision'", ...]`。
+    """
+    targets = agent_arms_need_executor(conn)
+    if not targets:
+        return []
+    rows = [dict(r) for r in conn.execute(
+        "SELECT account_id, arm, params_json FROM paper_accounts ORDER BY account_id")]
+    before = {str(r["account_id"]): str(r["params_json"]) for r in rows}
+    n_before = len(rows)
+    conn.execute("BEGIN")
+    try:
+        conn.execute("DROP TRIGGER IF EXISTS trg_paper_accounts_no_update")
+        for r in rows:
+            if str(r["account_id"]) not in targets:
+                continue
+            params = json.loads(r["params_json"] or "{}")
+            params[_P56_EXECUTOR_KEY] = _P56_EXECUTOR_VALUE
+            conn.execute("UPDATE paper_accounts SET params_json = ? WHERE account_id = ?",
+                         (json.dumps(params, ensure_ascii=False, sort_keys=True),
+                          str(r["account_id"])))
+        conn.execute(_P56_TRIGGER_NO_UPDATE)
+        after = [dict(r) for r in conn.execute(
+            "SELECT account_id, arm, params_json FROM paper_accounts ORDER BY account_id")]
+        if len(after) != n_before:
+            raise RuntimeError(
+                f"paper_accounts 行数变了（{n_before} → {len(after)}）—— 已回滚")
+        for r in after:
+            aid = str(r["account_id"])
+            if aid not in targets:
+                if str(r["params_json"]) != before[aid]:
+                    raise RuntimeError(
+                        f"迁移动了不该动的账户 {aid} —— 已回滚（只许补 executor 键）")
+                continue
+            old = json.loads(before[aid] or "{}")
+            new = json.loads(r["params_json"] or "{}")
+            old.pop(_P56_EXECUTOR_KEY, None)
+            if new.pop(_P56_EXECUTOR_KEY, None) != _P56_EXECUTOR_VALUE:
+                raise RuntimeError(f"账户 {aid} 的 executor 没写对 —— 已回滚")
+            if old != new:
+                raise RuntimeError(
+                    f"账户 {aid} 除 executor 外的键值被改动了 —— 已回滚")
+        conn.commit()
+    except BaseException:
+        conn.rollback()
+        raise
+    return [f"{aid}: {_P56_EXECUTOR_KEY} -> {_P56_EXECUTOR_VALUE!r}"
+            for aid in targets]
+
+
+#: 与 `schema.sql` 的 `trg_paper_accounts_no_update` **同文**（改一处须同步两处）。
+_P56_TRIGGER_NO_UPDATE = (
+    "CREATE TRIGGER IF NOT EXISTS trg_paper_accounts_no_update"
+    " BEFORE UPDATE ON paper_accounts"
+    " BEGIN SELECT RAISE(ABORT, 'paper_accounts is append-only'); END"
+)
+
+
 #: 已知迁移 marker 清单：doctor 逐个报告在位与否（只读，不迁移）。#: (name, table, 判据)。判据是列名（str）或一个只读探测函数。
 #: 新增迁移时必须在这里登记，否则 doctor 看不出来。
 _KNOWN_MARKERS: list[tuple[str, str, object]] = [
@@ -452,6 +560,8 @@ _KNOWN_MARKERS: list[tuple[str, str, object]] = [
      lambda conn: not plugin_audit_needs_module2_events(conn)),
     ("p52_agent_decisions_portfolio", "paper_agent_decisions",
      lambda conn: not agent_decisions_need_portfolio_columns(conn)),
+    ("p56_agent_arms_executor", "paper_accounts",
+     lambda conn: not agent_arms_need_executor(conn)),
 ]
 
 
@@ -482,6 +592,8 @@ def _pending_column_migrations(conn) -> list[str]:
         pending.append("p44:plugin_audit.action")
     if agent_decisions_need_portfolio_columns(conn):
         pending.append("p52:paper_agent_decisions.portfolio")
+    if agent_arms_need_executor(conn):
+        pending.append("p56:paper_accounts.params.executor")
     return pending
 
 
@@ -514,6 +626,7 @@ def _apply_schema(conn, sql: str) -> list[str]:
     changes += migrate_p37_paper_accounts_agent_arms(conn)
     changes += migrate_p44_plugin_audit_events(conn)
     changes += migrate_p52_agent_decisions_portfolio(conn)
+    changes += migrate_p56_agent_arms_executor(conn)
     return changes
 
 
