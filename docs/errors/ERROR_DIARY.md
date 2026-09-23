@@ -3397,3 +3397,31 @@ $ （真库只读）select code, report_date, notice_date, notice_date_source,
 **已加判据**：`docs/tasks/2026-09-22-p48-模块2-三方对标与预测校验.md` §7 已由 nanobot 逐条打勾，
 新增 §8「实施记录（nanobot 独立复核）」（含真库只读读数、副本上的端到端写路径、禁词与页面证据、
 5 条未验证口子）；队列派发脚本下次运行时须在收尾判定里查 `is_error` 与 §7 勾。
+
+---
+
+## #67 2026-09-23：`git add -A` 把**正在跑的实现者**的半成品卷进了一个 docs commit（P54/P55）
+
+**现象**：写 P54/P55 两份任务书时，提交用了 `git add -A` —— 而同一时刻 P49 那一轮 `claude -p`
+正在工作区里改 `m2/config.py`/`m2/store.py`/`store/schema.sql`/`store/validation.py`，
+并新建了 `m2/cycle.py`/`m2/selfeval.py`。它们全部被 stage 进了那个 **docs** commit（`5d2f03d`）。
+
+**后果（两层，都很隐）**：
+① 一站一 commit 的拆批纪律破了 —— 一个 commit 里混着「两站任务书」与「第三站的半成品」，
+   日后 `git log` 再也看不出哪一批改动属于哪个判据；
+② 更贵的是**提交的是一个中间态**：那个状态从未跑过全量测试，任何一次 `git bisect`
+   或从中间 commit 检出的动作都会落在一堆可能根本不 import 得起的文件上
+   （P37/P38 当时特意逐个中间 commit 跑全量 pytest，就是为了避免这个）。
+
+**修法（工作区一根手指都没碰）**：`git reset --soft HEAD~1`（HEAD 退回、索引与工作区不动）
+→ `git restore --staged stocklab/`（只动索引，把那批半成品退回未暂存）→ 只提交 docs。
+验证：`git log` 回到 `26bbc0b`；`git status` 里那 5 个 `M` + 2 个 `??` 原样还在。
+
+**教训**：
+① **一站一派一核期间，提交只用显式路径**（或先 `git status` 认清「哪些文件属于本站」再 `git add <具体文件>`）。
+   `git add -A`/`git commit -a` 在「别人正在改同一个工作区」时**默认是错的** —— 它把「现在有什么」
+   当成「我要提交什么」。
+② **提交前先问“这个文件是我这一站改的吗”**：本次的 `stocklab/m2/cycle.py` 一眼就不是文档站的产物，
+   可当时的动作是「扫一眼 status → add -A」，status 里那些 `M` 被当成了背景。
+③ 复盘时看**代码站与文档站的提交不该共享文件**：一份 commit 里既改 `docs/` 又新建 `m2/*.py`，
+   应该直接引起怀疑（P37/P38 的拆批正是靠这个直觉做的）。
