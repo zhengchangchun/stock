@@ -182,7 +182,10 @@ def test_t1_close_runs_m2_daily_right_after_paper_step_and_before_doctor(
     assert {c["step"]: c["argv"] for c in runner.calls}["m2_daily"][3:] == [
         "m2", "daily", "--asof", TODAY, "--db", str(db)]
     assert payload["exit_code"] == 0 and payload["ok"] is True
-    assert "steps=13/13" in chain.summary_line(payload)
+    # 步数从 `CLOSE_STEP_ORDER` 取：写死数字的话，链上每加一步这条就过期
+    # （P54 自己踩过一次 12→13，P55 加了采集步 ⇒ 13→14）
+    total = len(chain.CLOSE_STEP_ORDER)
+    assert f"steps={total}/{total}" in chain.summary_line(payload)
 
 
 def test_t1_the_plists_are_byte_identical_to_the_pre_wiring_ones(tmp_path):

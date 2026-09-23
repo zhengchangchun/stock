@@ -85,9 +85,14 @@ def three_way_block(data: Mapping) -> str:
              data["scope"]]
     blocked = data.get("deferred_blocked") or []
     if blocked:
+        # 已入库但未接入的基准：**显式待办**。指名的「本轮基准」取自载荷里真实的
+        # 基准行（P55 起可能不止一个），不是写死的沪深300。
+        current = "、".join(
+            f"`{s['account_id']}`" for s in data["sides"]
+            if s["role"] == "benchmark")
         lines.append("⚠️ " + "；".join(
             f"`{d['code']}`（{d['name']}）**已经落进 `bars_daily`**，但本模块尚未把它"
-            f"接入 —— 本轮只对 `{data['sides'][-1]['account_id']}`" for d in blocked))
+            f"接入 —— 本轮只对 {current}" for d in blocked))
     for item in data.get("deferred") or []:
         if not item["present_in_db"]:
             lines.append(f"未接入 `{item['code']}`（{item['name']}）：{item['missing']}"

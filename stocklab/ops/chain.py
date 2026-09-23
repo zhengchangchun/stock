@@ -81,6 +81,9 @@ MONTHLY_TIMEOUT_S = 1800.0
 CLOSE_STEPS: tuple[Step, ...] = (
     Step("ingest_index", ("ingest", "index"), False,
          "基准 sh000300 日线，并**顺带前滚交易日历**（日历是指数日线唯一的产物）"),
+    Step("ingest_index_500", ("ingest", "index", "--symbol", "sh000905"), False,
+         "第二个基准 sh000905（中证500，P55）—— **同一采集路径、同一 `adj_mode='none'`**，"
+         "紧跟 sh000300：日历由两个指数共同前滚（`INSERT OR IGNORE`，只增不减）"),
     Step("ingest_bars", ("ingest", "bars", "--days", "30"), False,
          "21 只标的的日 K 增量（长窗 12000 天是月度刷新的事：日链会撞源站脏行）"),
     Step("ingest_actions", ("ingest", "actions", "--start", "{action_start}"), False,
@@ -119,6 +122,10 @@ MONTHLY_STEPS: tuple[Step, ...] = (
          "抓上交所休市安排并落库（fail-closed：抓不到就不写，不是猜）"),
     Step("ingest_bars_long", ("ingest", "bars", "--days", "12000"), False,
          "长窗行情回补（捕获源站修订 / 覆盖当月新加入的标的；日链只跑 30 天）"),
+    Step("ingest_index_500", ("ingest", "index", "--symbol", "sh000905",
+                              "--days", "12000"), False,
+         "第二个基准 sh000905 的**长窗**回补（P55）：与 `ingest bars --days 12000` "
+         "同批 —— 日链只跑默认窗口，深历史是月度的事"),
     Step("ingest_financials", ("ingest", "financials"), False,
          "东财三表全量复核（季报频率，月度一次足够；已入库的期数 rows=0）"),
     Step("doctor", ("doctor",), False,

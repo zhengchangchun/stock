@@ -64,14 +64,23 @@ SIDE_BENCHMARK = "benchmark"
 SIDE_LABELS: dict[str, str] = {
     SIDE_AI: "AI 模拟（arm-agent-<策略版本>）",
     SIDE_MIRROR: "人工镜像（arm-now）",
-    SIDE_BENCHMARK: "市场基准（沪深300 指数）",
 }
 
+#: 基准行的标签：**每个指数各一个**，名字取自 `m2_config.BENCHMARK_NAMES`（口径一处定义）。
+#: 两个基准共用 `role="benchmark"` —— 它们在表里是同一类行，不是两种东西；
+#: 区分靠 `account_id`（指数符号）与这个标签，不靠再造一个角色。
+def benchmark_label(code: str) -> str:
+    name = m2_config.BENCHMARK_NAMES.get(code)
+    return f"市场基准（{name} 指数）" if name else f"市场基准（{code}）"
+
+
 #: 基准的口径标注。指数**不可直接交易、无成本** ⇒ 与各臂比时口径偏乐观。
+#: `{codes}` 由 `three_way` 用**当轮实际接入的**基准填 —— 第二个基准进来时，
+#: 这句话必须仍然成立（而不是只在沪深300 那一行旁边成立）。
 BENCHMARK_CAVEAT = (
-    "基准是**指数**：不可直接交易、无成本、无仓位约束。各臂的净值都扣了自己的成本，"
-    "所以拿臂与指数相减时，那条线上少了一笔真实交易要付的钱 —— 口径**偏乐观**，"
-    "读数只能当参照，不能当「这条臂能拿到这个数」")
+    "基准（{codes}）都是**指数**：不可直接交易、无成本、无仓位约束。各臂的净值都"
+    "扣了自己的成本，所以拿臂与指数相减时，那条线上少了一笔真实交易要付的钱 —— "
+    "口径**偏乐观**，读数只能当参照，不能当「这条臂能拿到这个数」")
 
 #: 错判案例的条数上限（P48 §2：**不是可选参数**，见 `m2/config.CASE_LIMIT`）。
 CASE_LIMIT: int = m2_config.CASE_LIMIT
@@ -108,10 +117,12 @@ def _channel_a_accounts(conn: sqlite3.Connection) -> list[str]:
     return sorted(out)
 
 
-def _absent_row(role: str, account_id: str, reason: str) -> dict:
+def _absent_row(role: str, account_id: str, reason: str, *,
+                label: str | None = None) -> dict:
     """这一方**不存在**（账户没建 / 没净值行）时的行：全 `None` + 原因，不写 0。"""
     return {
-        "role": role, "label": SIDE_LABELS[role], "account_id": account_id,
+        "role": role, "label": label or SIDE_LABELS[role],
+        "account_id": account_id,
         "kind": None, "available": False, "reason": reason,
         **{k: None for k in METRIC_KEYS}, "n_sessions": None,
         "missing": {k: reason for k in METRIC_KEYS},
@@ -119,10 +130,11 @@ def _absent_row(role: str, account_id: str, reason: str) -> dict:
     }
 
 
-def _side_row(role: str, base: dict, *, excess: float | None) -> dict:
+def _side_row(role: str, base: dict, *, excess: float | None,
+              label: str | None = None) -> dict:
     """P41 的那一行 → 三方对标的一行。**五个值逐字段复制**（一个都不重算）。"""
     return {
-        "role": role, "label": SIDE_LABELS[role],
+        "role": role, "label": label or SIDE_LABELS[role],
         "account_id": str(base["account_id"]), "kind": base["kind"],
         "available": True, "reason": None,
         **{k: base[k] for k in METRIC_KEYS},
@@ -136,8 +148,11 @@ def _deferred(conn: sqlite3.Connection) -> list[dict]:
     """未接入的基准：**逐个查它在不在库里**。
 
     为什么查库而不是照抄一句「拿不到」：那句说明会在数据到位那天变成假话。
-    一旦 `sh000905` 有了行，这里就变成「已入库但本轮未接入」——
+    一旦某个候选指数有了行，这里就变成「已入库但本轮未接入」——
     「悄悄少一个基准」在页面上变成一句显式的待办，而不是一个沉默的缺口。
+
+    P55 之后 `DEFERRED_BENCHMARKS` 是**空**的（`sh000905` 已接入），这段逻辑照留：
+    下一个候选指数仍然走同一条路 —— 缺席时明文写代价、落库未接入时显式待办。
     """
     out = []
     for item in m2_config.DEFERRED_BENCHMARKS:
@@ -149,12 +164,13 @@ def _deferred(conn: sqlite3.Connection) -> list[dict]:
 
 
 def three_way(conn: sqlite3.Connection, asof: str) -> dict:
-    """三方对标：AI 模拟（每策略版本一行）/ 人工镜像 / 市场基准。
+    """三方对标：AI 模拟（每策略版本一行）/ 人工镜像 / 市场基准（**每个指数一行**）。
 
-    行**全部来自** `paper_data.performance(conn, asof)` 的返回
+    行**全部来自** `paper_data.performance(conn, asof, benchmarks=...)` 的返回
     （P41 = ADR-023 的五指标 + 120 交易日门禁），本函数只挑行。
     """
-    perf = paper_data.performance(conn, asof)
+    perf = paper_data.performance(conn, asof,
+                                  benchmarks=m2_config.BENCHMARKS)
     by_id = {str(r["account_id"]): r for r in perf["rows"]}
     excess = perf["excess_vs_index_300"]
 
@@ -185,19 +201,26 @@ def three_way(conn: sqlite3.Connection, asof: str) -> dict:
         sides.append(_side_row(
             SIDE_MIRROR, mirror, excess=excess.get(m2_config.MIRROR_ACCOUNT)))
 
-    bench_code = m2_config.BENCHMARKS[0]
-    bench = by_id.get(bench_code)
-    if bench is None:
-        sides.append(_absent_row(
-            SIDE_BENCHMARK, bench_code,
-            f"库里没有 {bench_code} 的读数行（`bars_daily` 没有窗口内的收盘价）—— "
-            "基准缺一天就是整行不可判定，**不用相邻日顶替**"))
-    else:
-        sides.append(_side_row(SIDE_BENCHMARK, bench, excess=None))
+    # 基准：`BENCHMARKS` 里**每个指数各一行**（P55 起两个）。顺序即声明顺序 ——
+    # 渲染按 `role` 稳定排序，所以这里的先后就是表里的先后。
+    for bench_code in m2_config.BENCHMARKS:
+        label = benchmark_label(bench_code)
+        bench = by_id.get(bench_code)
+        if bench is None:
+            sides.append(_absent_row(
+                SIDE_BENCHMARK, bench_code,
+                f"库里没有 {bench_code} 的读数行（`bars_daily` 没有窗口内的收盘价）—— "
+                "基准缺一天就是整行不可判定，**不用相邻日顶替**", label=label))
+        else:
+            # 相对基准那一列对两个基准都留空：它是 P41 的**一次减法**（对 sh000300），
+            # 不是「每个基准减它自己」（那恒等于 0，是个假读数）。
+            sides.append(_side_row(SIDE_BENCHMARK, bench, excess=None,
+                                   label=label))
 
     deferred = _deferred(conn)
     blocked = [d for d in deferred if d["present_in_db"]]
-    scope = (f"本轮基准只对 `{bench_code}`（D-43）"
+    codes = "、".join(f"`{c}`" for c in m2_config.BENCHMARKS)
+    scope = (f"本轮基准 = {codes}（D-43），每个指数各自一行、不合成综合基准"
              + ("" if not deferred else
                 "；未接入：" + "、".join(
                     f"`{d['code']}`（{d['name']}）" for d in deferred)))
@@ -208,7 +231,7 @@ def three_way(conn: sqlite3.Connection, asof: str) -> dict:
         "window": list(perf["window"]),
         "n_sessions": perf["n_sessions"],
         "sides": sides,
-        "benchmark_caveat": BENCHMARK_CAVEAT,
+        "benchmark_caveat": BENCHMARK_CAVEAT.format(codes=codes),
         "scope": scope,
         "deferred": deferred,
         "deferred_blocked": blocked,

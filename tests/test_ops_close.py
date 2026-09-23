@@ -249,17 +249,23 @@ def test_steps_run_in_the_declared_order_every_time(tmp_path, monkeypatch):
 
 
 def test_ingest_steps_never_get_a_db_flag(tmp_path, monkeypatch):
-    """采集类命令不接受 `--db`（固定写默认库）—— 这条在 argv 上就是硬判据。"""
+    """采集类命令不接受 `--db`（固定写默认库）—— 这条在 argv 上就是硬判据。
+
+    判据取自步骤自己的 `supports_db`（声明）与实际 argv（行为）的**一致**，
+    而不是照抄一份命令名清单：清单每加一步采集就得手工跟一次，漏跟的那一步
+    （P55 的 `ingest_index_500`）会静默地被放行。
+    """
     db = _green(tmp_path)
     _default_db(monkeypatch, db)
     runner = FakeRunner()
     chain.run_close(db_path=db, now=CLOSE_NOW, runner=runner,
                     report_dir=tmp_path / "reports")
     for call in runner.calls:
-        takes_db = call["step"] not in (
-            "ingest_index", "ingest_bars", "ingest_actions", "ingest_valuation",
-            "ingest_moneyflow", "doctor")
-        assert ("--db" in call["argv"]) is takes_db, call
+        declared = chain.CLOSE_STEP_BY_NAME[call["step"]].supports_db
+        assert ("--db" in call["argv"]) is declared, call
+    # 非空转：这一轮里**确实**有「不接受 --db」的步，否则上面那句对全 True 也成立
+    assert any(not chain.CLOSE_STEP_BY_NAME[c["step"]].supports_db
+               for c in runner.calls)
 
 
 def test_step_exit_one_is_soft_and_the_chain_continues(tmp_path, monkeypatch):

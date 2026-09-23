@@ -117,11 +117,16 @@ def _anchor_cum_return(account: dict) -> float | None:
     return round(initial_nav / capital - 1.0, 6)
 
 
-def _index_levels(conn: sqlite3.Connection, dates: list[str]) -> dict[str, float]:
-    """`dates` 里每个日期的大盘收盘价（`adj_mode='none'`，与 `engine.pit_close` 同口径）。
+def _index_levels(conn: sqlite3.Connection, dates: list[str], *,
+                  symbol: str = INDEX_300_SYMBOL) -> dict[str, float]:
+    """`dates` 里每个日期的**该指数**收盘价（`adj_mode='none'`，与 `engine.pit_close` 同口径）。
 
     **只按精确日期取**，不做「取最近的前一个交易日」——那会让「那天没开盘」
     看起来像「那天指数没动」。缺的日期就是不返回，由调用方断线。
+
+    `symbol` 有默认值：既有调用方（`/lab/paper`、P41 的用例）口径逐位不变，
+    而 P55 的第二个基准（`sh000905`）复用**同一段取数逻辑** —— 复制一份
+    「按日期取收盘」才是真的会漂。
     """
     if not dates:
         return {}
@@ -129,7 +134,7 @@ def _index_levels(conn: sqlite3.Connection, dates: list[str]) -> dict[str, float
     sql = ("SELECT date, close FROM bars_daily WHERE code = ?"
            " AND adj_mode = 'none' AND date IN (" + marks + ")")
     return {str(r["date"]): float(r["close"])
-            for r in conn.execute(sql, (INDEX_300_SYMBOL, *dates))}
+            for r in conn.execute(sql, (symbol, *dates))}
 
 
 def _real_trades(conn: sqlite3.Connection, asof: str) -> list[dict]:
@@ -391,8 +396,9 @@ def _row_metrics(account: dict, rows: list[dict]) -> dict:
     return _metrics([initial, *[float(r["nav"]) for r in rows]])
 
 
-def performance(conn: sqlite3.Connection, asof: str) -> dict:
-    """模块2 §4 的绩效对比：每臂一行 × 五指标 + 基准一行 + 样本量门禁。
+def performance(conn: sqlite3.Connection, asof: str, *,
+                benchmarks: tuple[str, ...] = (INDEX_300_SYMBOL,)) -> dict:
+    """模块2 §4 的绩效对比：每臂一行 × 五指标 + **每个基准一行** + 样本量门禁。
 
     ## 期初口径
 
@@ -410,9 +416,14 @@ def performance(conn: sqlite3.Connection, asof: str) -> dict:
 
     ## 基准
 
-    `sh000300` 与各臂**同一区间、同一交易日轴**，只按精确日期取收盘价。
-    窗口内任一日期缺收盘价 → 该行五个指标全部 `None` + 原因，
-    **绝不用相邻日顶替**（顶替出来的斜率是编的）。
+    `benchmarks` 里**每个**指数各一行，与各臂**同一区间、同一交易日轴**，
+    只按精确日期取收盘价。窗口内任一日期缺收盘价 → 该行五个指标全部 `None`
+    + 原因，**绝不用相邻日顶替**（顶替出来的斜率是编的）。
+
+    `benchmarks` 默认只有 `sh000300` ⇒ `/lab/paper` 与既有调用方的载荷逐位不变。
+    模块2 传的是 `m2_config.BENCHMARKS`（P55 起两个）。**每个基准各自一行**，
+    不许相减/取平均/合成「综合基准」；`excess_vs_index_300` 这个键名已经把
+    「相对量只对 `sh000300`」写死了，第二个基准不参与减法。
 
     ## 门禁
 
@@ -431,6 +442,8 @@ def performance(conn: sqlite3.Connection, asof: str) -> dict:
     gate = sample_gate(n_sessions)
 
     rows: list[dict] = []
+    #: 每个「缺收盘价 ⇒ 整行不可判定」的基准各留一条原因（P55 起可能不止一条）
+    reasons: list[str] = []
     for account in accounts:
         aid = str(account["account_id"])
         own = paper_store.load_nav(conn, aid, asof=asof)
@@ -449,23 +462,26 @@ def performance(conn: sqlite3.Connection, asof: str) -> dict:
     # 一个位置 —— 重复放进轴里会凭空多出一个 0% 的「交易日」，把基准的
     # `n_sessions` / 胜率 / 回撤一起带偏（真库与既有夹具都没触发，是潜在错）。
     axis = [start, *[d for d in nav_dates if d != start]]
-    levels = _index_levels(conn, axis)
-    absent = [d for d in axis if d not in levels]
-    if absent:
-        reason = (f"基准 {INDEX_300_SYMBOL} 在窗口内 {len(absent)} 个日期上"
-                  f"没有收盘价：{'、'.join(absent)} —— 不用相邻日顶替")
-        bench = _metrics([], missing_reason=reason)
-    else:
-        bench = _metrics([levels[d] for d in axis])
-        reason = None
-    rows.append({
-        "account_id": INDEX_300_SYMBOL, "arm": "index",
-        "kind": _KIND_BENCHMARK, "etf_target_pct": None,
-        **{k: bench[k] for k in METRIC_KEYS},
-        "n_sessions": bench["n_sessions"], "missing": bench["missing"],
-    })
+    for symbol in benchmarks:
+        levels = _index_levels(conn, axis, symbol=symbol)
+        absent = [d for d in axis if d not in levels]
+        if absent:
+            reason = (f"基准 {symbol} 在窗口内 {len(absent)} 个日期上"
+                      f"没有收盘价：{'、'.join(absent)} —— 不用相邻日顶替")
+            bench = _metrics([], missing_reason=reason)
+            reasons.append(reason)
+        else:
+            bench = _metrics([levels[d] for d in axis])
+        rows.append({
+            "account_id": symbol, "arm": "index",
+            "kind": _KIND_BENCHMARK, "etf_target_pct": None,
+            **{k: bench[k] for k in METRIC_KEYS},
+            "n_sessions": bench["n_sessions"], "missing": bench["missing"],
+        })
 
     by_id = {r["account_id"]: r for r in rows}
+    # 相对量始终对 `sh000300` —— **一个**基准的差值，不是「两个基准合成的基准」。
+    # 载荷键名已经把这一点写死（`excess_vs_index_300`），第二个基准不参与减法。
     idx_ret = by_id[INDEX_300_SYMBOL]["total_return"]
     hold_row = next((r for r in rows if r["kind"] == _ARM_HOLD), None)
     hold_ret = hold_row["total_return"] if hold_row is not None else None
@@ -498,8 +514,7 @@ def performance(conn: sqlite3.Connection, asof: str) -> dict:
         notes.append(f"{PERFORMANCE_INSUFFICIENT}（{n_sessions} < "
                      f"{PERFORMANCE_THRESHOLD} 个交易日）—— 只给读数："
                      f"不出任何「谁更好」的结论，也不改口径。")
-    if reason is not None:
-        notes.append(reason)
+    notes.extend(reasons)
 
     return {
         "asof": asof, "available": True, "reason": None,

@@ -198,8 +198,13 @@ stocklab portfolio show --asof 2026-09-15 --json     # P13 消费的稳定接口
   需人工 `approve` 四支插桩后才会恢复全绿），
   [`p55` 中证500 接入](tasks/2026-09-23-p55-中证500接入.md)
   — 04 §P1-1「多指数对标」的另一半：先**只读探针**证明 `sh000905` 拿得到，再走既有采集路径落
-  `bars_daily`（`adj_mode='none'`）并把 `DEFERRED_BENCHMARKS` 翻进 `BENCHMARKS`；拿不到就**明文写代价**、
-  代码零改动也是合法交付；真库首次长窗采集由 nanobot 做
+  `bars_daily`（`adj_mode='none'`）并把 `DEFERRED_BENCHMARKS` 清空、`sh000905` 进 `BENCHMARKS`；
+  拿不到就**明文写代价**、代码零改动也是合法交付；真库首次长窗采集由 nanobot 做。
+  **已交付**（探针实测 43 行 / 2026-07-27~09-23 / `adj_mode='none'` ⇒ 接入；日链与月度链各加
+  `ingest index --symbol sh000905` 一步；`/lab/m2` 与 `m2 report` 出现**第二个基准行**、
+  两个基准各自一行不合成；日历只增不减；plist 逐字节不变；真库只读、零写入。
+  ⚠️ 真库 `bars_daily` 里 `sh000905` 仍为 **0 行** —— 首次长窗采集与配置翻转后的真库动作
+  按 §3 由 nanobot 在验收后执行），
 - **AI 操盘手开跑**（2026-09-23；口径见澄清录 §8.6 **D-48/D-49/D-50**）：
   [`p56` AI 操盘手开跑（决策台账驱动的手臂上线）](tasks/2026-09-23-p56-AI操盘手开跑.md)
   — 把 P52 的地基接成能日更跑的操盘手：AI 臂家族在 `params_json` 里声明 `executor='agent_decision'`

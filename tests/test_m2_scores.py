@@ -11,7 +11,7 @@
 | T5 | 分数 append-only + **幂等** | `test_t5_*`：重跑零写入；UPDATE / DELETE 被触发器拒 |
 | T6 | **分版本不相加** | `test_t6_*`：两个 `script_version` 各一行；载荷里没有「合计」 |
 | T7 | 错判案例**纪律** | `test_t7_*`：归因恒空、有总量与上限、没有筛选参数 |
-| ＋ | 中证500（D-43） | `test_deferred_*`：缺席时明文写「本轮只对沪深300」；落库后变成显式待办 |
+| ＋ | 未接入基准（D-43 / D-47） | `test_deferred_*`：缺席时明文写代价；落库后变成显式待办 |
 
 数字**一律从被测模块取**，不手抄 —— 手抄的那份会与上游漂移。
 """
@@ -38,6 +38,8 @@ from stocklab.predict.model import FLAT_BAND
 from stocklab.store.db import connect
 from stocklab.store.migrate import init_db
 
+INDEX_500_SYMBOL = m2_config.INDEX_500_SYMBOL
+
 ROOT = Path(__file__).resolve().parents[1]
 NOW = "2026-09-22T16:00:00+08:00"
 START = "2026-09-15"
@@ -60,10 +62,13 @@ def _sessions(n: int, *, start: str = START) -> list[str]:
 
 def _paper_db(tmp_path, *, n_sessions: int = 5, with_ai: bool = True
               ) -> tuple[Path, list[str]]:
-    """一份带**两个模拟盘账户 + 基准**的最小库（三方对标用）。
+    """一份带**两个模拟盘账户 + 两个基准**的最小库（三方对标用）。
 
     净值行是直接插的（不跑 `paper step`）：这一组测的是「三方读数与 P41 同源」，
     不是「引擎会不会算净值」—— 后者已有 P19/P41 自己的用例。
+
+    P55 起基准有两个（`sh000300` / `sh000905`）：两个都放进夹具，否则第二个基准
+    会以「库里没有读数行」的形式出现，同源判据就没得比了。
     """
     tmp_path.mkdir(parents=True, exist_ok=True)
     path = tmp_path / "three_way.db"
@@ -74,7 +79,8 @@ def _paper_db(tmp_path, *, n_sessions: int = 5, with_ai: bool = True
     c.executemany(
         "INSERT INTO instruments (code, name, market, board, type, added_at)"
         " VALUES (?,?,'sh','main',?,?)",
-        [(STOCK, "贵州茅台", "stock", NOW), (INDEX_300_SYMBOL, "沪深300", "index", NOW)])
+        [(STOCK, "贵州茅台", "stock", NOW), (INDEX_300_SYMBOL, "沪深300", "index", NOW),
+         (INDEX_500_SYMBOL, "中证500", "index", NOW)])
     c.executemany(
         "INSERT INTO trading_calendar (date, is_open, source, created_at)"
         " VALUES (?,1,'tencent',?)", [(d, NOW) for d in axis])
@@ -84,7 +90,9 @@ def _paper_db(tmp_path, *, n_sessions: int = 5, with_ai: bool = True
         [(STOCK, d, 100.0 + i, 100.0 + i, 100.0 + i, 100.0 + i, NOW)
          for i, d in enumerate(axis)]
         + [(INDEX_300_SYMBOL, d, 4000.0 + 8 * i, 4000.0 + 8 * i, 4000.0 + 8 * i,
-            4000.0 + 8 * i, NOW) for i, d in enumerate(axis)])
+            4000.0 + 8 * i, NOW) for i, d in enumerate(axis)]
+        + [(INDEX_500_SYMBOL, d, 7700.0 + 5 * i, 7700.0 + 5 * i, 7700.0 + 5 * i,
+            7700.0 + 5 * i, NOW) for i, d in enumerate(axis)])
     c.commit()
     accounts = [(MIRROR, "now", {"initial_capital": 20000.0})]
     if with_ai:
@@ -181,13 +189,16 @@ def test_t1_the_three_sides_are_field_identical_to_the_p41_payload(tmp_path):
     path, days = _paper_db(tmp_path)
     c = _conn(path)
     try:
-        p41 = paper_data.performance(c, days[-1])
+        # 与模块2 同一次调用：`benchmarks=BENCHMARKS`（P55 起两个基准）。
+        # 不传参的默认仍只有沪深300（`/lab/paper` 的载荷因此逐位不变）。
+        p41 = paper_data.performance(c, days[-1],
+                                     benchmarks=m2_config.BENCHMARKS)
         panel = m2_data.panel(c, days[-1])
     finally:
         c.close()
     p41_rows = {r["account_id"]: r for r in p41["rows"]}
     assert {s["account_id"] for s in panel["three_way"]["sides"]} == {
-        AI_ACCOUNT, MIRROR, INDEX_300_SYMBOL}
+        AI_ACCOUNT, MIRROR, INDEX_300_SYMBOL, INDEX_500_SYMBOL}
     for side in panel["three_way"]["sides"]:
         base = p41_rows[side["account_id"]]
         for key in KEYS:
@@ -668,48 +679,73 @@ def test_t7_an_empty_case_set_says_why(tmp_path):
 
 
 # ══════════════════════════════════════════════════════════════════════
-# 中证500（D-43）：拿不到就明文写清代价
+# 未接入基准的「明文代价」机制（D-43 / D-47）
+#
+# P55 之前这一组直接用 `sh000905` 当例子；P55 之后它**已经是基准**，
+# 所以例子换成「下一个还没接的候选」——机制本身一样要成立：缺席 ⇒ 明文写代价，
+# 已落库但未接入 ⇒ 显式待办（**不许**沉默，也不许悄悄升格成基准行）。
 # ══════════════════════════════════════════════════════════════════════
 
+#: 假想的「下一个候选指数」（库里没有）：只用来钉住机制，不代表任何计划。
+CANDIDATE = "sh000688"
 
-def test_deferred_benchmark_is_named_with_its_cost_when_absent(tmp_path):
-    """库里没有 `sh000905` ⇒ 明文写「本轮只对沪深300」+ 缺口与前置条件。"""
+
+def _defer_candidate(monkeypatch) -> str:
+    """把 `DEFERRED_BENCHMARKS` 换成一条合成候选，返回它的 `missing` 原文。"""
+    missing = "库里没有点位 —— 没有点位就没有读数，不许拿别的指数/ETF 顶替"
+    monkeypatch.setattr(m2_config, "DEFERRED_BENCHMARKS", (
+        {"code": CANDIDATE, "name": "科创50",
+         "requirement": "（合成候选，只用于钉住机制）",
+         "missing": missing,
+         "prerequisite": "先用既有采集路径落进 `bars_daily`（`adj_mode='none'`）"},
+    ))
+    return missing
+
+
+def test_deferred_benchmark_is_named_with_its_cost_when_absent(tmp_path, monkeypatch):
+    """库里没有那个候选 ⇒ 明文写清「未接入」+ 缺口与前置条件。"""
+    _defer_candidate(monkeypatch)
     path, days = _paper_db(tmp_path)
     c = _conn(path)
     try:
         panel = m2_data.panel(c, days[-1])
     finally:
         c.close()
-    item = next(d for d in panel["three_way"]["deferred"]
-                if d["code"] == "sh000905")
+    item = next(d for d in panel["three_way"]["deferred"] if d["code"] == CANDIDATE)
     assert item["present_in_db"] is False
-    assert panel["three_way"]["scope"].startswith("本轮基准只对")
+    assert CANDIDATE in panel["three_way"]["scope"]
+    assert panel["three_way"]["deferred_blocked"] == []
     html = m2_render.three_way_block(panel["three_way"])
-    assert "中证500" in html
+    assert "科创50" in html
     assert "没有点位就没有读数" in html and "不许拿别的指数/ETF 顶替" in html
     assert item["prerequisite"]
+    # 已经接上的两个基准**不**出现在「未接入」名单里
+    deferred_codes = {d["code"] for d in panel["three_way"]["deferred"]}
+    assert INDEX_300_SYMBOL not in deferred_codes
+    assert INDEX_500_SYMBOL not in deferred_codes
 
 
-def test_deferred_benchmark_present_in_db_is_a_loud_todo(tmp_path):
-    """一旦 `sh000905` 落进 `bars_daily`，那句话就变成**显式待办**（不许沉默）。"""
+def test_deferred_benchmark_present_in_db_is_a_loud_todo(tmp_path, monkeypatch):
+    """候选一旦落进 `bars_daily`，那句话就变成**显式待办**（不许沉默）。"""
+    _defer_candidate(monkeypatch)
     path, days = _paper_db(tmp_path)
     c = _conn(path)
     try:
         c.execute("INSERT INTO bars_daily (code, date, open, high, low, close,"
                   " volume, adj_mode, source, fetched_at)"
-                  " VALUES ('sh000905', ?, 5000,5000,5000,5000, 100,'none','x',?)",
-                  (days[0], NOW))
+                  " VALUES (?, ?, 5000,5000,5000,5000, 100,'none','x',?)",
+                  (CANDIDATE, days[0], NOW))
         c.commit()
         panel = m2_data.panel(c, days[-1])
     finally:
         c.close()
     blocked = panel["three_way"]["deferred_blocked"]
-    assert [d["code"] for d in blocked] == ["sh000905"]
+    assert [d["code"] for d in blocked] == [CANDIDATE]
     html = m2_render.three_way_block(panel["three_way"])
     assert "已经落进" in html and "尚未把它接入" in html
-    # 即使它入库了，也**不许**悄悄把它当成第二个基准行（那要显式接入）
+    # 即使它入库了，也**不许**悄悄把它当成基准行（那要显式接入 ⇒ 改配置）
     assert {s["account_id"] for s in panel["three_way"]["sides"]} == {
-        AI_ACCOUNT, MIRROR, INDEX_300_SYMBOL}
+        AI_ACCOUNT, MIRROR, INDEX_300_SYMBOL, INDEX_500_SYMBOL}
 
 
 # ══════════════════════════════════════════════════════════════════════
