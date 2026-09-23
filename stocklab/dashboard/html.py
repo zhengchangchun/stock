@@ -389,9 +389,25 @@ def render_html(summary: Mapping, *, built_at: str | None = None) -> str:
         _risk_section(summary.get("risk")),
         _portfolio_section(view),
         _accuracy_section(summary["accuracy"]),
+        _m2_section(summary.get("m2")),
         _freshness_section(summary["freshness"]),
         footer,
     ])
+
+
+def _m2_section(charts: Mapping | None) -> str:
+    """模块2 的三条曲线（P50 §3）—— **复用页面的渲染函数**，不另写一套。
+
+    渲染函数是 `m2_render.charts_section`：离线报告与 `/lab/m2` 页面拿到的是
+    同一段 HTML（同一份 `m2_charts.chart_panel` 载荷 + 同一个渲染器）。
+    老载荷（没有 `m2` 键）只是不渲染这一段，**不造假数据**。
+    """
+    if not charts:
+        return ""
+    from stocklab.labweb import m2_render
+
+    return ("<section><h2>模块2 · 可视化报表（P50 §3）</h2>"
+            + m2_render.charts_section(charts) + "</section>")
 
 
 def html_sha256(doc: str) -> str:

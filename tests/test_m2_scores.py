@@ -358,15 +358,26 @@ def test_t3_the_gate_is_the_same_object_as_p41(tmp_path):
 
 
 def test_t3_missing_data_renders_none_not_zero(tmp_path):
-    """缺数据 ⇒ 「无」+ 原因，**不写 0**，也不出现裸 `None` / `nan`。"""
+    """缺数据 ⇒ 「无」+ 原因，**不写 0**，也不出现裸 `None` / `nan`。
+
+    `0.00%` 这条断言**限定在数据块**（三方对标 / 预测校验 / 错判案例）：
+    P50 起页面上多了一节「只读配置视图」，那里显示的 `10.00%` 是主干常量
+    **熔断阈值**的真实取值（不是缺数据），整页扫 `0.00%` 会把它误判成漏 0
+    （`tests/test_p50_config_charts.py::test_t3_*` 反过来钉住那些值必须显示）。
+    判据本身没放宽：缺数据的地方仍然一个 0 都不许出现。
+    """
     path, days = _scoring_db(tmp_path, n_sessions=2, scores=False,
                              closes=[100.0, 101.0, 102.0])
     c = _conn(path)
     try:
-        html = m2_render.m2_page(m2_data.panel(c, days[-1]), base="/lab", built_at=NOW)
+        panel = m2_data.panel(c, days[-1])
+        html = m2_render.m2_page(panel, base="/lab", built_at=NOW)
     finally:
         c.close()
-    assert "0.00%" not in html
+    data_blocks = (m2_render.three_way_block(panel["three_way"])
+                   + m2_render.readings_block(panel["forecast"])
+                   + m2_render.cases_block(panel["cases"]))
+    assert "0.00%" not in data_blocks
     for bad in ("None", "nan", "NaN"):
         assert bad not in html
 

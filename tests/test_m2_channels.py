@@ -347,7 +347,7 @@ def test_t3_no_m2_module_writes_paper_tables_itself():
     校验分数表 + P49 的判定建议表）—— 白名单只增，且不许出现任何 `paper_*` 表。
     """
     m2_tables = ("{TABLE_RUNS}", "{TABLE_FORECASTS}", "{TABLE_SCORES}",
-                 "{TABLE_JUDGEMENTS}")
+                 "{TABLE_JUDGEMENTS}", "{TABLE_ATTRIBUTIONS}")
     for path in sorted((ROOT / "stocklab/m2").glob("*.py")):
         text = path.read_text(encoding="utf-8")
         if path.name == "store.py":

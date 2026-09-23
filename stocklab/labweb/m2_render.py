@@ -157,14 +157,22 @@ def cases_summary(data: Mapping) -> str:
 
 
 def cases_block(data: Mapping) -> str:
-    """③ 错判案例集的**表格**（方向错的样本 + 归因列恒空）。"""
+    """③ 错判案例集的**表格**（方向错的样本 + 候选 + 人工结论）。"""
     if not data or not data.get("cases"):
         return cases_summary(data)
     head = ('<tr><th>标的</th><th>决策日 → 目标日</th><th>预测 / 实际</th>'
             '<th>实际收益</th><th>插桩 / 版本</th><th>PIT 输入 sha256</th>'
-            '<th>归因</th></tr>')
+            '<th>候选（程序）</th><th>结论（人工）</th></tr>')
     rows = []
     for case in data["cases"]:
+        cands = case.get("attribution_auto") or []
+        cand_cells = ("".join(
+            f'<div>{NONE_MARK} {esc(c["label_text"])} —— {esc(c["signal_text"])}'
+            f'；阈值 {esc(str(c["threshold"]))}；实测 {esc(str(c["at_value"]))}'
+            f'<div class="note">{esc(c["step"])}</div></div>' for c in cands)
+            or NONE_MARK)
+        manual = case.get("attribution_manual")
+        manual_cell = (esc(data["labels"].get(manual, manual)) if manual else NONE_MARK)
         rows.append(
             f'<tr><td class="l"><code>{esc(case["code"])}</code></td>'
             f'<td class="num">{esc(case["asof_date"])} → {esc(case["target_date"])}</td>'
@@ -174,7 +182,9 @@ def cases_block(data: Mapping) -> str:
             f'<td class="num">{esc(case["plugin_id"])} · '
             f'<code>{esc(case["script_version"])}</code></td>'
             f'<td class="num"><code>{esc(str(case["input_sha256"])[:16])}…</code></td>'
-            f'<td class="num" title="{esc(data["attribution_note"])}">{NONE_MARK}</td></tr>')
+            f'<td class="l">{cand_cells}</td>'
+            f'<td class="num" title="{esc(str(case.get("attribution_manual_text") or ""))}">'
+            f'{manual_cell}</td></tr>')
     return (f'<div class="scroll-x"><table class="tbl">{head}'
             + "".join(rows) + '</table></div>')
 
@@ -352,6 +362,21 @@ def m2_page(data: Mapping, *, base: str, built_at: str) -> str:
                 note="判定的输入只有台账与既有读数函数（P41/P48 同源），"
                      "输出只有**建议 + 依据**；熔断只**追加事件**、不改写历史行。"
                      "两者都不在这一页触发 —— 触发只走 CLI。"),
+        section("可视化报表（P50 §3）", charts_section(data["charts"]),
+                right="复用既有图，不另画一套",
+                note="净值 / 回撤 / 命中率三条曲线全部走 `paper_render.race_svg`，"
+                     "取数走 `paper_data.track` 与既有回撤算法；页面与离线报告"
+                     "（`dashboard build`）渲染的是**同一段** HTML。"),
+        section("只读配置视图（P50 §2 / D-32）", config_block(data["config"]),
+                right="零写入口",
+                note="主干常量的值走 `m2/selfeval.py::BOUNDARIES`（只读值视图），"
+                     "每一项的 `来源` 都指到代码里的定义处；网页端**不提供**"
+                     "主干常量的写入口。"),
+        section("事件旁路触发（P50 §4 / D-45）", bypass_block(data["bypass"]),
+                right="只读 · 无触发按钮",
+                note="触发源是机械信号清单（`stocklab/config/m2_signals.py`），"
+                     "触发走 CLI；同 `(标的, 信号, asof)` 只触发一次"
+                     "（唯一索引兜底）。"),
     ]
     return layout(base=base, title="模块2", body="".join(head + body),
                   asof=data["asof"], built_at=built_at, current="/m2")
@@ -490,9 +515,207 @@ def cycles_text(data: Mapping) -> str:
     return "\n".join(out) + "\n"
 
 
+# ---------- ⑤ 可视化报表 / ⑥ 只读配置视图 / ⑦ 旁路触发留痕（P50） ----------
+
+
+def charts_section(charts: Mapping) -> str:
+    """三条曲线（P50 §3）—— **同一段 HTML** 同时进页面与离线单文件报告。
+
+    图本身是 `paper_render.race_svg` 渲染好的（本函数一个坐标都不算）；
+    缺数据时写「无」+ 理由，`svg` 为 `None`（不画空曲线、不填 0）。
+    """
+    if not charts:
+        return f'<p class="note">没有图表载荷 —— {NONE_MARK}</p>'
+    out = []
+    for block in charts.get("blocks") or []:
+        head = f'<figcaption><b>{esc(block["title"])}</b>'
+        if not block.get("available"):
+            out.append(f'<figure class="chart">{head} {NONE_MARK}'
+                       f'<div class="note">{esc(block.get("reason") or "无")}</div>'
+                       '</figcaption></figure>')
+            continue
+        out.append(f'<figure class="chart">{block["svg"]}{head}'
+                   + glance(list(block.get("caption") or []))
+                   + '</figcaption></figure>')
+    legend = []
+    for block in charts.get("blocks") or []:
+        for item in block.get("legend") or []:
+            if item.get("label"):
+                legend.append(f'{item["label"]}')
+    if legend:
+        out.append(glance(["分列（不许相加）：" + "；".join(legend)]))
+    out.append(glance([charts.get("source_note", ""),
+                       charts.get("signal_note", "")]))
+    return "".join(out)
+
+
+def config_block(config: Mapping) -> str:
+    """只读配置视图（P50 §2 / D-32）：值原样显示，`来源` 指到代码定义处。"""
+    if not config:
+        return f'<p class="note">没有配置视图 —— {NONE_MARK}</p>'
+    blocks = []
+    for group in config.get("groups") or []:
+        head = ('<tr><th>项</th><th>值</th><th>来源（文件:符号）</th>'
+                '<th>说明</th></tr>')
+        rows = []
+        for item in group["items"]:
+            rows.append(
+                f'<tr><td class="l">{esc(item["label"])}</td>'
+                f'<td class="num"><b>{esc(item["display"])}</b></td>'
+                f'<td class="l"><code>{esc(item["source"])}</code></td>'
+                f'<td class="l">{rich(item["note"])}</td></tr>')
+        blocks.append(f'<p class="note"><b>{esc(group["label"])}</b></p>'
+                      f'<div class="scroll-x"><table class="tbl">{head}'
+                      + "".join(rows) + '</table></div>')
+    params = config.get("params")
+    if params is None:
+        body = (f'<p class="note">{NONE_MARK} —— '
+                f'{esc(config.get("params_reason") or "无生效参数")}</p>')
+    else:
+        rows = "".join(
+            f'<tr><td class="l"><code>{esc(str(k))}</code></td>'
+            f'<td class="num">{esc(str(v))}</td></tr>' for k, v in sorted(params.items()))
+        body = (
+            f'<p class="note">周期 <code>#{esc(str(config["params_cycle"]["cycle_id"]))}</code>'
+            f' · 策略版本 <code>{esc(str(config["params_cycle"]["script_id"]))}</code>'
+            f' · 账户 <code>{esc(config["params_cycle"]["account_id"])}</code>'
+            f' · 起跑 {esc(config["params_cycle"]["start_date"])}</p>'
+            f'<p class="note">来源：<code>{esc(config["params_source"])}</code></p>'
+            f'<div class="scroll-x"><table class="tbl">'
+            '<tr><th>参数</th><th>值</th></tr>' + rows + '</table></div>'
+            f'<p class="note">判据**原文**：<code>{esc(config["params_criteria"])}</code></p>')
+    return ("".join(blocks)
+            + f'<p class="note"><b>{esc(CONFIG_PARAMS_LABEL)}</b></p>' + body
+            + glance(list(config.get("notes") or [])))
+
+
+#: 「当前生效参数」那一节的标题（页面与报告引用同一串）。
+CONFIG_PARAMS_LABEL = "当前生效的策略参数（`validation_cycles` 最近一行）"
+
+
+def bypass_block(data: Mapping) -> str:
+    """旁路触发留痕（P50 §4）：**只列已落库的事件**，页面上没有触发按钮。"""
+    if not data:
+        return f'<p class="note">没有旁路台账 —— {NONE_MARK}</p>'
+    lines = [data["signal_note"], data["no_button_note"], data["idempotent_note"],
+             data["conclusion_note"], f"触发命令（CLI）：`{data['cli_hint']}`"]
+    if not data.get("n_events"):
+        return glance([f"事件：{NONE_MARK} —— 最近没有机械信号命中"
+                       "（**不是「没有利空」的结论**，只是没触发过）", *lines])
+    head = ('<tr><th>#</th><th>信号</th><th>标的</th><th>日</th><th>实测</th>'
+            '<th>阈值</th><th>留痕</th><th>指纹</th></tr>')
+    rows = []
+    for event in data["events"]:
+        rows.append(
+            f'<tr><td class="num">{event["event_id"]}</td>'
+            f'<td class="l">{esc(str(event["kind"]))}</td>'
+            f'<td class="num"><code>{esc(str(event["code"]))}</code></td>'
+            f'<td class="num">{esc(str(event["asof"]))}</td>'
+            f'<td class="num">{esc(str(event["at_value"]))}</td>'
+            f'<td class="num">{esc(str(event["threshold"]))}</td>'
+            f'<td class="l">{esc(event["step"])}</td>'
+            f'<td class="num"><code>{esc(str(event["fingerprint"])[:16])}…</code></td>'
+            f'</tr>')
+    return (f'<div class="scroll-x"><table class="tbl">{head}'
+            + "".join(rows) + '</table></div>'
+            + glance([f"共 {data['n_events']} 条已落库事件（台账 = `system_events`，"
+                      f"`module={data['module']}`）", *lines]))
+
+
+def charts_text(data: Mapping) -> str:
+    """曲线报告的文本版（曲线本身是 SVG，文本里给参数与样本量）。"""
+    if not data:
+        return "# 可视化报表\n\n无\n"
+    out = [f"# 可视化报表（P50 §3）· {data.get('asof')}", ""]
+    for block in data.get("blocks") or []:
+        if not block.get("available"):
+            out.append(f"- **{block['title']}**：无 —— {block.get('reason') or '无'}")
+            continue
+        out.append(f"- **{block['title']}**：已渲染（页面/报告用同一个 "
+                   "`paper_render.race_svg`）")
+        out += [f"  - {line}" for line in block.get("caption") or []]
+    out += [f"> {data.get('source_note', '')}", f"> {data.get('signal_note', '')}"]
+    return "\n".join(out) + "\n"
+
+
+def config_text(data: Mapping) -> str:
+    """配置视图的文本版（与页面**同一份**载荷）。"""
+    if not data:
+        return "# 只读配置视图\n\n无\n"
+    out = ["# 只读配置视图（P50 §2 / D-32）", ""]
+    for group in data.get("groups") or []:
+        out += [f"## {group['label']}", "",
+                "| 项 | 值 | 来源 |", "|---|---|---|"]
+        for item in group["items"]:
+            out.append(f"| {item['label']} | {item['display']} | "
+                       f"`{item['source']}` |")
+        out.append("")
+    out.append(f"## {CONFIG_PARAMS_LABEL}")
+    if data.get("params") is None:
+        out.append(f"无 —— {data.get('params_reason')}")
+    else:
+        out += [f"来源 `{data['params_source']}`；周期 "
+                f"#{data['params_cycle']['cycle_id']}；"
+                f"判据原文 `{data['params_criteria']}`", "",
+                "| 参数 | 值 |", "|---|---|"]
+        out += [f"| `{k}` | {v} |" for k, v in sorted(data["params"].items())]
+    out += ["", *[f"> {n}" for n in data.get("notes") or []]]
+    return "\n".join(out) + "\n"
+
+
+def bypass_text(data: Mapping) -> str:
+    """旁路触发留痕的文本版。"""
+    if not data:
+        return "# 事件旁路触发\n\n无\n"
+    out = [f"# 事件旁路触发（P50 §4 / D-45）· {data.get('asof')}", ""]
+    if not data.get("n_events"):
+        out.append("事件：无 —— 最近没有机械信号命中（不是「没有利空」的结论）")
+    else:
+        out += ["| # | 信号 | 标的 | 日 | 实测 | 阈值 | 留痕 |", "|" + "---|" * 7]
+        for event in data["events"]:
+            out.append(f"| {event['event_id']} | {event['kind']} | "
+                       f"`{event['code']}` | {event['asof']} | {event['at_value']} | "
+                       f"{event['threshold']} | {event['step']} |")
+    out += ["", f"> {data['signal_note']}", f"> {data['no_button_note']}",
+            f"> {data['idempotent_note']}", f"> {data['conclusion_note']}",
+            f"> 触发命令（CLI）：`{data['cli_hint']}`"]
+    return "\n".join(out) + "\n"
+
+
+def cases_text(data: Mapping) -> str:
+    if not data.get("cases"):
+        return f"# 错判案例集 · {data['asof']}\n\n{data.get('empty_reason', '无案例')}\n"
+    out = [f"# 错判案例集 · {data['asof']}", "",
+           f"方向判错的样本 {data['n_miss_total']} 条，本表列最近 {data['n_cases']} 条"
+           f"（上限 {data['limit']} 条，按目标日倒序，没有筛选参数）", "",
+           "| 标的 | 决策日 | 目标日 | 预测 | 实际 | 实际收益 | 插桩 | 脚本版本 | "
+           "PIT 输入 sha256 | 候选（程序） | 结论（人工） |",
+           "|" + "---|" * 12]
+    for c in data["cases"]:
+        cands = " / ".join(
+            f"{x['label_text']}({x['signal_text']}；阈值 {x['threshold']}；"
+            f"实测 {x['at_value']})" for x in c.get("attribution_auto") or [])
+        manual = c.get("attribution_manual")
+        out.append(f"| `{c['code']}` | {c['asof_date']} | {c['target_date']} | "
+                   f"{c['predicted_class']} | {c['actual_class']} | "
+                   f"{_cell(c['actual_pct'], kind='pct')} | {c['plugin_id']} | "
+                   f"`{c['script_version']}` | `{str(c['input_sha256'])[:16]}…` | "
+                   f"{cands or '（无）'} | "
+                   f"{data['labels'].get(manual, manual) if manual else '（空）'} |")
+    out += ["", f"> 分母：窗口内可评分的预测共 {data['n_scored']} 条",
+            f"> {data['attribution_note']}",
+            f"> {data['manual_note']}"]
+    if data.get("not_scanned_note"):
+        out.append(f"> {data['not_scanned_note']}")
+    return "\n".join(out) + "\n"
+
+
 def m2_text(data: Mapping) -> str:
-    """`m2 report` 的全文（四段与页面**同一份** `m2_data.panel()`）。"""
+    """`m2 report` 的全文（七段与页面**同一份** `m2_data.panel()`）。"""
     return "\n".join([three_way_text(data["three_way"]),
                       forecast_text(data["forecast"]),
                       cases_text(data["cases"]),
+                      charts_text(data["charts"]),
+                      config_text(data["config"]),
+                      bypass_text(data["bypass"]),
                       cycles_text(data["cycles"])])

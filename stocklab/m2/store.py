@@ -300,3 +300,68 @@ def list_judgements(conn: sqlite3.Connection, *, cycle_id: int | None = None,
 def _decode_judgement(row: dict) -> dict:
     row["evidence"] = json.loads(row.pop("evidence_json") or "{}")
     return row
+
+
+# ---------- 误差归因（P50：候选 + 人工结论） ----------
+
+
+#: 归因行表名（P50 新增）。`source` 两态：`auto` = 程序给的候选 / `manual` = 人工结论。
+TABLE_ATTRIBUTIONS: str = "m2_attributions"
+
+#: 归因行的列（顺序即 INSERT 顺序）。
+_ATTRIBUTION_COLUMNS: tuple[str, ...] = (
+    "score_id", "forecast_id", "code", "signal_date", "source", "label",
+    "signal", "threshold", "at_value", "step", "text", "detail_json",
+)
+
+
+def insert_attribution(conn: sqlite3.Connection, *, row: dict, now: str,
+                       commit: bool = True) -> int:
+    """落一行归因（候选或人工结论）。**幂等键 = `(案例, 来源, 标签, 信号)` UNIQUE**。
+
+    与 `insert_score` 同款：**不把「先查再写」当防线** —— 走到这里还撞唯一键，
+    说明调用方没走 `find_attribution`，报出来比静默返回旧 id 好。
+    """
+    payload = {**{k: row.get(k) for k in _ATTRIBUTION_COLUMNS}, "created_at": now}
+    if not isinstance(payload["detail_json"], str):
+        payload["detail_json"] = json.dumps(dict(payload["detail_json"] or {}),
+                                            ensure_ascii=False, sort_keys=True)
+    cols = ", ".join(payload)
+    cur = conn.execute(
+        f"INSERT INTO {TABLE_ATTRIBUTIONS} ({cols})"
+        f" VALUES ({', '.join('?' * len(payload))})", tuple(payload.values()))
+    if commit:
+        conn.commit()
+    return int(cur.lastrowid)
+
+
+def find_attribution(conn: sqlite3.Connection, *, score_id: int, source: str,
+                     label: str, signal: str) -> dict | None:
+    """该 `(案例, 来源, 标签, 信号)` 是否已有行（幂等判据）。"""
+    row = conn.execute(
+        f"SELECT * FROM {TABLE_ATTRIBUTIONS} WHERE score_id = ? AND source = ?"
+        " AND label = ? AND signal = ?",
+        (int(score_id), str(source), str(label), str(signal))).fetchone()
+    return None if row is None else _decode_attribution(dict(row))
+
+
+def list_attributions(conn: sqlite3.Connection, *, score_id: int | None = None,
+                      source: str | None = None) -> list[dict]:
+    """归因行（默认按 `attribution_id` 升序 —— 同一案例的历史顺序即解释顺序）。"""
+    sql = f"SELECT * FROM {TABLE_ATTRIBUTIONS}"
+    where, args = [], []
+    if score_id is not None:
+        where.append("score_id = ?")
+        args.append(int(score_id))
+    if source is not None:
+        where.append("source = ?")
+        args.append(str(source))
+    if where:
+        sql += " WHERE " + " AND ".join(where)
+    sql += " ORDER BY attribution_id"
+    return [_decode_attribution(r) for r in _rows(conn, sql, tuple(args))]
+
+
+def _decode_attribution(row: dict) -> dict:
+    row["detail"] = json.loads(row.pop("detail_json") or "{}")
+    return row

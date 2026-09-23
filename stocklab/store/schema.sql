@@ -1267,3 +1267,60 @@ BEGIN SELECT RAISE(ABORT, 'm2_judgements is append-only'); END;
 CREATE TRIGGER IF NOT EXISTS trg_m2_judgements_no_delete
 BEFORE DELETE ON m2_judgements
 BEGIN SELECT RAISE(ABORT, 'm2_judgements is append-only'); END;
+
+-- ---------- 模块2 误差归因结构位（P50 / D-31，append-only）----------
+-- 口径（D-31 原文）：四分类（大盘冲击 / 行业黑天鹅 / 个股突发利空 / 因子失效）
+-- **代码判不了** ⇒ 只做「程序给候选标签 + 人工确认」的结构位，**禁止自动填充**。
+--
+-- 两种来源同表两态，靠 `source` 分开（**结构性区分**，不是靠自觉）：
+--   `auto`   = 程序按 `stocklab/config/m2_signals.py` 的信号与阈值算出的**候选**；
+--   `manual` = 人工在 CLI 上写的**结论**（`m2 attribute confirm`）。
+-- 「结论字段恒不自动填」因此是结构事实：扫描路径只写 `auto`（见 `m2/attribution.py`），
+-- 人工结论是另一条命令，且**不存在**「程序填 manual」的分支。
+--
+-- 幂等键 = `(案例, 来源, 标签, 信号)`：同一案例的同一标签可以由**多条**信号支持
+-- （例如同日既停牌又出配股公告），所以唯一键要带上 `signal`；
+-- 「一份候选重复算两遍」仍然只落一行（结构性防线优先于代码检查）。
+--
+-- `attribution_manual` **不是**本表的列：结论是「有没有 `source='manual'` 的行」。
+-- 一列可以 UPDATE 的 `manual` 会抹掉「谁在什么时候改的」，而本表的纪律是
+-- **改了就是再追加一行**（页面/报告取最近那一条）。
+CREATE TABLE IF NOT EXISTS m2_attributions (
+    attribution_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    score_id       INTEGER NOT NULL,          -- 错判案例（m2_forecast_scores.score_id）
+    forecast_id    INTEGER NOT NULL,          -- 溯源：这条案例连着哪条预测
+    code           TEXT NOT NULL,
+    signal_date    TEXT NOT NULL,             -- 信号评估日 = 该预测的 target_date
+    source         TEXT NOT NULL CHECK (source IN ('auto','manual')),
+    label          TEXT NOT NULL CHECK (label IN
+                     ('market_shock','industry_blackswan','stock_news','factor_decay')),
+    signal         TEXT NOT NULL,             -- 用了哪个信号（config/m2_signals 的键）
+    threshold      REAL,                      -- 判据阈值（与 at_value **分列**）
+    at_value       REAL,                      -- 实测值（同上，只留一个数读不出是否越界）
+    step           TEXT NOT NULL,             -- 「算到哪一步」
+    text           TEXT NOT NULL,             -- 候选/结论的原文（含信号原文）
+    detail_json    TEXT NOT NULL DEFAULT '{}',
+    created_at     TEXT NOT NULL,
+    UNIQUE (score_id, source, label, signal)
+);
+
+CREATE INDEX IF NOT EXISTS idx_m2_attributions_score
+    ON m2_attributions (score_id, source);
+
+CREATE TRIGGER IF NOT EXISTS trg_m2_attributions_no_update
+BEFORE UPDATE ON m2_attributions
+BEGIN SELECT RAISE(ABORT, 'm2_attributions is append-only'); END;
+
+CREATE TRIGGER IF NOT EXISTS trg_m2_attributions_no_delete
+BEFORE DELETE ON m2_attributions
+BEGIN SELECT RAISE(ABORT, 'm2_attributions is append-only'); END;
+
+-- ---------- 事件旁路触发的**结构性幂等键**（P50 / D-45）----------
+-- 触发事件写**既有台账** `system_events`（不新造事件表），幂等靠一条**表达式唯一索引**：
+-- 指纹放在既有 `context_json` 里（`$.fingerprint`），索引只覆盖本模块的那几行 ——
+-- 「同一 `(标的, 信号, asof)` 只触发一次」因此是**数据库**保证的，不是代码检查。
+-- 表达式里的 `'m2_bypass'` 必须与 `stocklab/config/m2_signals.py::BYPASS_MODULE` 一致
+-- （`tests/test_p50_bypass.py` 钉住）。
+CREATE UNIQUE INDEX IF NOT EXISTS uq_system_events_m2_bypass
+    ON system_events (json_extract(context_json, '$.fingerprint'))
+    WHERE module = 'm2_bypass';

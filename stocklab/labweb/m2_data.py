@@ -37,8 +37,13 @@ import sqlite3
 from collections.abc import Mapping, Sequence
 
 from stocklab.backtest import metrics as bt
+from stocklab.config import m2_signals
+from stocklab.labweb import m2_charts
 from stocklab.labweb import paper_data
+from stocklab.m2 import attribution as m2_attr
+from stocklab.m2 import bypass as m2_bypass
 from stocklab.m2 import config as m2_config
+from stocklab.m2 import config_view
 from stocklab.m2 import selfeval
 from stocklab.m2 import store as m2_store
 from stocklab.paper import store as paper_store
@@ -650,10 +655,133 @@ def panel(conn: sqlite3.Connection, asof: str) -> dict:
     页面与报告各写各的取数，就会出现两个「总收益」/两个「胜率」——
     两处各算一遍必然走样（P41 T4 同款）。
     """
+    attribution = attribution_readings(conn, asof)
     return {
         "asof": asof,
         "three_way": three_way(conn, asof),
         "forecast": forecast_readings(conn, asof),
-        "cases": miss_cases(conn, asof),
+        "cases": attribution,
+        "attribution": attribution,
         "cycles": cycle_panel(conn, asof),
+        "charts": m2_charts.chart_panel(conn, asof),
+        "config": config_view.items(conn),
+        "bypass": bypass_readings(conn, asof),
+    }
+
+
+# ---------- ⑤ 归因：候选（程序）＋结论（人工）（P50 §1 / D-31） ----------
+
+
+def _candidate_view(row: Mapping) -> dict:
+    """归因行的展示形状（**原样**带出信号/阈值/实测/算到哪一步）。"""
+    return {
+        "label": str(row["label"]),
+        "label_text": str((row.get("detail") or {}).get("label_text")
+                          or m2_signals.LABELS.get(str(row["label"]),
+                                                   str(row["label"]))),
+        "signal": str(row["signal"]),
+        "signal_text": m2_signals.SIGNAL_TEXTS.get(str(row["signal"]),
+                                                   str(row["signal"])),
+        "threshold": row["threshold"], "at_value": row["at_value"],
+        "step": str(row["step"]), "text": str(row["text"]),
+        "mark": m2_signals.CANDIDATE_MARK,
+        "created_at": str(row["created_at"]),
+    }
+
+
+def attribution_readings(conn: sqlite3.Connection, asof: str) -> dict:
+    """错判案例的归因视图（P50）：**候选**（已落库的 `auto` 行）+ **结论**（`manual` 行）。
+
+    ## 为什么候选取「已落库的」而不是「现算的」
+
+    P48 的教训（ERROR_DIARY #36/#59）：把「当时算出来的数」与「现在算出来的数」
+    混为一谈。候选是扫描那一刻的读数，落库之后就有了时间戳与来源；页面**不重算**，
+    所以一个月后打开这一页看到的仍是当时给出的候选。
+
+    ## 结论恒空是结构事实
+
+    `attribution_manual` 只有人工 `m2 attribute confirm` 写过才有值；扫描路径
+    只写 `source='auto'`（`m2/attribution.py` 里没有第二条分支）。没扫过时页面
+    说的是「还没扫」而不是「没有候选」—— 两者必须分得开。
+    """
+    data = miss_cases(conn, asof)
+    rows = m2_store.list_attributions(conn)
+    by_score: dict[int, list[dict]] = {}
+    for row in rows:
+        by_score.setdefault(int(row["score_id"]), []).append(row)
+    n_candidates = n_manual = 0
+    for case in data["cases"]:
+        mine = by_score.get(int(case["score_id"]), [])
+        auto = [_candidate_view(r) for r in mine
+                if str(r["source"]) == m2_attr.SOURCE_AUTO]
+        manual = m2_attr.manual_conclusion(mine)
+        # P48 的 `attribution` 字段（结论位）保持 `None`：结论在
+        # `attribution_manual` 上（两处同名会让「恒空」的断言失真）
+        case["attribution_auto"] = auto
+        case["attribution_manual"] = (str(manual["label"]) if manual else None)
+        case["attribution_manual_text"] = (str(manual["text"]) if manual else None)
+        n_candidates += len(auto)
+        n_manual += 1 if manual else 0
+    return {
+        **data,
+        "n_candidates": n_candidates, "n_manual": n_manual,
+        "scanned": bool(rows),
+        "label_order": list(m2_signals.LABEL_ORDER),
+        "labels": dict(m2_signals.LABELS),
+        "undetermined": m2_signals.UNDETERMINED,
+        "industry_source_note": m2_attr.INDUSTRY_SOURCE_NOTE,
+        "scan_hint": ("stocklab m2 attribute scan --asof <交易日>"
+                      "（只写候选；结论另由人工确认）"),
+        "confirm_hint": ("stocklab m2 attribute confirm --score-id <N>"
+                         " --label <四分类> --reason '<依据>'"),
+        "not_scanned_note": (None if rows else
+                             "还没有扫描过候选 —— 先跑 `" + "stocklab m2 attribute"
+                             " scan --asof <交易日>`。**「还没扫」与「没有候选」"
+                             "不是一回事**：前者是没算过，后者是算了但四条信号都没命中"),
+        "manual_note": ("`attribution_manual` **恒不自动填**（D-31）：只有人工 "
+                        "`m2 attribute confirm` 写过才有值；四分类代码判不了，"
+                        "程序只给候选"),
+    }
+
+
+# ---------- ⑥ 事件旁路触发（P50 §4 / D-45） ----------
+
+
+def bypass_readings(conn: sqlite3.Connection, asof: str) -> dict:
+    """已落库的旁路触发事件（**只读**）。页面不提供触发按钮（D-45）。"""
+    events = m2_bypass.events(conn, asof=asof)
+    items = []
+    for event in events:
+        ctx = event["context"]
+        items.append({
+            "event_id": int(event["event_id"]), "ts": str(event["ts"]),
+            "level": str(event["level"]), "message": str(event["message"]),
+            "kind": ctx.get("kind"), "code": ctx.get("code"),
+            "asof": ctx.get("asof"), "signal": ctx.get("signal"),
+            "threshold": ctx.get("threshold"), "at_value": ctx.get("at_value"),
+            "step": ctx.get("step"), "rescored": ctx.get("rescored"),
+            "fingerprint": ctx.get("fingerprint"),
+            "detail": ctx.get("detail") or {},
+        })
+    items.sort(key=lambda x: x["event_id"])
+    return {
+        "asof": asof, "events": items, "n_events": len(items),
+        "module": m2_signals.BYPASS_MODULE,
+        "kinds": list(m2_signals.BYPASS_KINDS),
+        "signal_note": ("触发源 = 机械信号清单（`stocklab/config/m2_signals.py`）："
+                        "① `corp_actions` 事件类型白名单 "
+                        f"{list(m2_signals.CORP_ACTION_TEXT_WHITELIST)} "
+                        "② 单日跌幅 ≤ "
+                        f"{m2_signals.SINGLE_DAY_DROP_THRESHOLD} ③ `data_quality` 异常"
+                        f"（{list(m2_signals.DATA_QUALITY_TYPE_WHITELIST)}）—— "
+                        "**不接外部推送、不新增网络依赖**"),
+        "cli_hint": "stocklab m2 bypass scan --asof <交易日>",
+        "no_button_note": "网页端**不提供触发按钮**：触发只走 CLI（D-45）",
+        "idempotent_note": ("同 `(标的, 信号, asof)` 只触发一次 —— 结构性防线是 "
+                            "`system_events` 上的表达式唯一索引 "
+                            "`uq_system_events_m2_bypass`，重复触发返回「已存在」"),
+        "conclusion_note": ("**触发 ≠ 结论**：重打分走既有链路"
+                            "（`m2 score` → `m2_forecast_scores`），"
+                            "判定与上线仍要人（P49 / D-1）—— 本路径不 `approve`、"
+                            "不改账户、不改参数"),
     }

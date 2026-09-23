@@ -34,14 +34,15 @@ from stocklab.verify.report import MIN_DAYS
 
 #: 摘要结构版本。字段增删必须同时改这里、`docs/architecture/dashboard-json.md`
 #: 与 `tests/test_dashboard_summary.py::test_top_level_fields_are_pinned`。
-SCHEMA_VERSION = 1
+#: v2 = P50 新增 `m2`（模块2 的三条曲线，与 `/lab/m2` 同源）。
+SCHEMA_VERSION = 2
 
 SERVICE = "stocklab-dashboard"
 
 #: 顶层字段集合 —— 页面消费的接口契约。
 TOP_LEVEL_FIELDS = (
     "schema_version", "service", "asof", "portfolio", "freshness",
-    "accuracy", "risk", "alarms",
+    "accuracy", "risk", "m2", "alarms",
 )
 
 
@@ -106,8 +107,26 @@ def build_summary(conn: sqlite3.Connection, asof: str, *,
         },
         "accuracy": accuracy,
         "risk": risk_block,
+        "m2": m2_charts(conn, asof),
         "alarms": build_alarms(view, fresh, asof),
     }
+
+
+def m2_charts(conn: sqlite3.Connection, asof: str) -> dict:
+    """模块2 的三条曲线（P50 §3）—— 与 `/lab/m2` 页面**同一个取数函数**。
+
+    库里没有模块2 的表（老库未前滚）时返回「不可用 + 理由」，**不报 500、不编数**：
+    离线报告少一段，比整份报告生不出来强。
+    """
+    from stocklab.labweb import m2_charts as charts
+
+    try:
+        return charts.chart_panel(conn, asof)
+    except sqlite3.OperationalError as exc:      # 表缺失 / 老库未前滚
+        return {"asof": asof, "keys": list(charts.KEYS), "blocks": [],
+                "available": False,
+                "reason": f"模块2 的表不可读（{exc}）—— 先跑 `stocklab db init` 前滚",
+                "source_note": "", "signal_note": "", "notes": []}
 
 
 def summary_json(summary: Mapping) -> str:

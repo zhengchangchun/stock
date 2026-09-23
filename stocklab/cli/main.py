@@ -3005,9 +3005,10 @@ def _m2_conn(args):
         return None, code
     has = conn.execute(
         "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name IN"
-        " ('m2_channel_runs','m2_forecasts','m2_forecast_scores','m2_judgements')"
+        " ('m2_channel_runs','m2_forecasts','m2_forecast_scores','m2_judgements',"
+        " 'm2_attributions')"
     ).fetchone()[0]
-    if has < 4:
+    if has < 5:
         conn.close()
         print(json.dumps({"error": "模块2 的表不存在 —— 先跑 `stocklab db init` 前滚 schema"},
                          ensure_ascii=False), file=sys.stderr)
@@ -3170,6 +3171,80 @@ def _latest_session(conn) -> str | None:
     """库里出现过的最后一个交易日（只读，用于 `--asof` 的默认值）。"""
     row = conn.execute("SELECT MAX(date) AS d FROM bars_daily").fetchone()
     return None if row is None or row["d"] is None else str(row["d"])
+
+
+# ---------- 模块2 误差归因 / 配置视图 / 旁路触发（P50） ----------
+#
+# 退出码沿用既有语义：0 成功（含幂等返回 already）／1 冲突／2 输入不合法。
+# 网页端**没有**这些动作的入口：触发值只走 CLI（ADR-021 / D-45）。
+
+
+def cmd_m2_attribute_scan(args: argparse.Namespace) -> int:
+    """扫出归因**候选**并落库（只写 `source='auto'`；人工结论是另一条命令）。"""
+    from stocklab.labweb import m2_data
+    from stocklab.m2 import attribution as m2_attr
+
+    conn, code = _m2_conn(args)
+    if conn is None:
+        return code
+    now = args.now or datetime.now(TZ).isoformat(timespec="seconds")
+    try:
+        asof = args.asof or _latest_session(conn)
+        if asof is None:
+            print(json.dumps({"error": "库里没有任何 K 线日期，推不出 asof"},
+                             ensure_ascii=False), file=sys.stderr)
+            return 2
+        readings = {(str(g["plugin_id"]), str(g["script_version"]),
+                     str(g["account_id"])): g
+                    for g in m2_data.forecast_readings(conn, asof)["groups"]}
+        out = m2_attr.scan(conn, asof=asof, readings=readings, now=now)
+    finally:
+        conn.close()
+    print(json.dumps(out, ensure_ascii=False, sort_keys=True, indent=2))
+    return 0
+
+
+def cmd_m2_attribute_confirm(args: argparse.Namespace) -> int:
+    """人工确认一条归因**结论**（`attribution_manual` 的唯一写入口，D-31）。"""
+    from stocklab.m2 import attribution as m2_attr
+
+    conn, code = _m2_conn(args)
+    if conn is None:
+        return code
+    now = args.now or datetime.now(TZ).isoformat(timespec="seconds")
+    try:
+        out = m2_attr.confirm(
+            conn, score_id=args.score_id, label=args.label,
+            reason=args.reason, actor=args.actor, now=now)
+    except ValueError as exc:
+        print(json.dumps({"error": str(exc), "kind": type(exc).__name__},
+                         ensure_ascii=False), file=sys.stderr)
+        return 2
+    finally:
+        conn.close()
+    print(json.dumps(out, ensure_ascii=False, sort_keys=True, indent=2))
+    return 0
+
+
+def cmd_m2_bypass_scan(args: argparse.Namespace) -> int:
+    """扫机械信号并按 `(标的, 信号, asof)` 触发一次重打分（幂等；留痕进既有台账）。"""
+    from stocklab.m2 import bypass as m2_bypass
+
+    conn, code = _m2_conn(args)
+    if conn is None:
+        return code
+    now = args.now or datetime.now(TZ).isoformat(timespec="seconds")
+    try:
+        asof = args.asof or _latest_session(conn)
+        if asof is None:
+            print(json.dumps({"error": "库里没有任何 K 线日期，推不出 asof"},
+                             ensure_ascii=False), file=sys.stderr)
+            return 2
+        out = m2_bypass.trigger(conn, asof=asof, now=now)
+    finally:
+        conn.close()
+    print(json.dumps(out, ensure_ascii=False, sort_keys=True, indent=2))
+    return 0
 
 
 # ---------- 模块2 验证周期主干（P49） ----------
@@ -4136,6 +4211,42 @@ def build_parser() -> argparse.ArgumentParser:
     m2_cyc_status.add_argument("--cycle", type=int, required=True)
     m2_cyc_status.add_argument("--db")
     m2_cyc_status.set_defaults(func=cmd_m2_cycle_status)
+
+    m2_attr = m2_sub.add_parser(
+        "attribute", help="误差归因（P50 / D-31）：程序只给候选，结论只能人工确认")
+    m2_attr_sub = m2_attr.add_subparsers(dest="m2_attribute_action", required=True)
+    m2_attr_scan = m2_attr_sub.add_parser(
+        "scan", help="扫出错判样本的归因**候选**并落库（幂等；**不写结论**）")
+    m2_attr_scan.add_argument("--asof", help="截止日 YYYY-MM-DD（默认：库里最后一天）")
+    m2_attr_scan.add_argument("--db")
+    m2_attr_scan.add_argument("--now", help="覆盖当前时刻（测试用）")
+    m2_attr_scan.set_defaults(func=cmd_m2_attribute_scan)
+
+    m2_attr_confirm = m2_attr_sub.add_parser(
+        "confirm", help="人工确认一条归因**结论**（`attribution_manual` 的唯一写入口）")
+    m2_attr_confirm.add_argument("--score-id", dest="score_id", type=int,
+                                 required=True, help="错判案例的 score_id")
+    m2_attr_confirm.add_argument("--label", required=True,
+                                 choices=["market_shock", "industry_blackswan",
+                                          "stock_news", "factor_decay"],
+                                 help="四分类之一（需求原文，不许自造第五类）")
+    m2_attr_confirm.add_argument("--reason", required=True,
+                                 help="确认依据（不许为空：结论必须写明依据）")
+    m2_attr_confirm.add_argument("--actor", default="human",
+                                 help="谁确认的（默认 human：这条路径就是给人用的）")
+    m2_attr_confirm.add_argument("--db")
+    m2_attr_confirm.add_argument("--now", help="覆盖当前时刻（测试用）")
+    m2_attr_confirm.set_defaults(func=cmd_m2_attribute_confirm)
+
+    m2_bypass = m2_sub.add_parser(
+        "bypass", help="事件旁路触发（P50 / D-45）：机械信号命中即重打分（幂等）")
+    m2_bypass_sub = m2_bypass.add_subparsers(dest="m2_bypass_action", required=True)
+    m2_bypass_scan = m2_bypass_sub.add_parser(
+        "scan", help="扫机械信号并触发（同 (标的,信号,asof) 只触发一次）")
+    m2_bypass_scan.add_argument("--asof", help="交易日 YYYY-MM-DD（默认：库里最后一天）")
+    m2_bypass_scan.add_argument("--db")
+    m2_bypass_scan.add_argument("--now", help="覆盖当前时刻（测试用）")
+    m2_bypass_scan.set_defaults(func=cmd_m2_bypass_scan)
 
     return parser
 
