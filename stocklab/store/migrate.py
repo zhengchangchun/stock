@@ -604,6 +604,242 @@ def migrate_p58_plugin_reviews(conn) -> list[str]:
     return ["plugin_reviews.triggers"]
 
 
+# ---------------------------------------------------------------------------
+# P62：AI 臂**未结算**的净值行 —— 数据修复（不是结构迁移）。
+#
+# 缺陷是怎么产生的：`paper/agent_decide.py::execute_decision` 只生成订单、原样
+# 返回入参状态，而 `engine._step_all` 拿着返回值直接写净值 ⇒ 净值行记的是
+# **执行前**的现金（P62 任务书 §1/§2）。代码已修（同站的另一半），但真库里
+# 那几行错数据还在。
+#
+# 为什么这里**只删不写**：`paper_nav_daily` 是 append-only（`no_update` /
+# `no_delete`），改写历史行的值等于伪造账目。正确值**可以由代码重算**（修好后
+# 的 `execute_decision` 会结算）⇒ 删掉点名的那一行，再由
+# `paper agent run --asof <day>` 按同一个 `_step_all` 重写。成交（`paper_trades`）
+# **一行都不删**：那一笔是真的。
+#
+# ## 为什么这个迁移**不**登记进 `_pending_column_migrations` / `_apply_schema`
+#
+# 其余迁移都是「结构前滚」，跑多少次都不动一行数据；本条**删数据行**。把它挂到
+# 「任一写库入口都会跑」的位置，等于让某次 `paper predict` 顺手删历史净值 ——
+# 而「删了此行」这件事只能由人对着探测清单拍板。所以：**显式调用**。
+# 只登记进 `_KNOWN_MARKERS`（doctor 只读报告「还有没有未结算的 AI 臂净值行」）。
+#
+# ## 只删点名行
+#
+# 探测（`p62_defective_agent_nav_rows`）是**全表**扫自身成交驱动的臂。若缺陷行
+# 里出现了点名清单之外的行 ⇒ 抛错拒绝，绝不「顺手一起修」。
+# ---------------------------------------------------------------------------
+
+_P62_NAMED_ROWS: tuple[tuple[str, str], ...] = (("arm-agent-ds-v1", "2026-09-23"),)
+#: 「对得上」的容差：净值是「重放 + 收盘价」算出来的浮点数，逐位比较没有意义。
+_P62_TOL = 1e-6
+#: 「未结算」的现金判据（元）：P62 的签名差是**成交金额量级**（真库 ¥8,233.68 /
+#: 一条 100 股卖单），而分币级漂移每笔 ≤ ¥0.005 ⇒ 取 ¥1 一刀切开两者，既不会被
+#: 舍入噪声误触（10 笔/天也只到 ¥0.05），也不会放过任何「结算漏了一笔」的账。
+#: 持仓**集合**不等则是精确判据（真库那行的 `{"000333": 0}` vs 空仓）。
+_P62_SETTLEMENT_BAR = 1.0
+#: 与 `schema.sql` 的触发器**同文**（改一处须同步两处）。
+_P62_TRIGGERS = (
+    "CREATE TRIGGER IF NOT EXISTS trg_paper_nav_daily_no_update"
+    " BEFORE UPDATE ON paper_nav_daily"
+    " BEGIN SELECT RAISE(ABORT, 'paper_nav_daily is append-only'); END;\n"
+    "CREATE TRIGGER IF NOT EXISTS trg_paper_nav_daily_no_delete"
+    " BEFORE DELETE ON paper_nav_daily"
+    " BEGIN SELECT RAISE(ABORT, 'paper_nav_daily is append-only'); END;"
+)
+
+_P62_TRIGGER_NAMES = ("trg_paper_nav_daily_no_update", "trg_paper_nav_daily_no_delete")
+
+
+def p62_defective_agent_nav_rows(conn) -> dict:
+    """只读探测：哪些净值行与「重放 + mark-to-market」对不上（P62 §3.2 的不变量）。
+
+    判据：`paper_nav_daily` 的一行必须等于
+    **`initial_cash` + 全部 `<= asof` 的自身成交按 `_fee_parts` 口径重放
+    + 当日收盘 mark-to-market**。两半都用既有实现（`engine.arm_state_for` →
+    内部就是 `_ledger_arm_state`，市值走 `engine.mark_to_market`）——
+    这里不另算一遍净值，否则「判据」与「被测对象」会一起漂。
+
+    ## 三分类（只有第一类归 P62）
+
+    - `defective`（**未结算**，P62 的靶子）：持仓集合与重放不同，或现金差
+      **超过 ¥1.00**（`_P62_SETTLEMENT_BAR`）。「现金是执行前的 + 持仓是执行后的」
+      那种混合状态落这里。
+    - `cent_drift`：现金与重放差 **≤ ¥0.01** —— `Decision.amount` 先四舍五入
+      到分、重放不四舍五入造成的**既有**分币级漂移（真库上落在
+      `arm-discipline-*`）。**只报告，不动**（改它 = 改主干口径，另一件事）。
+    - `valuation`：现金与持仓都与重放一致，只有净值差 ⇒ 市值口径/价格源在
+      写入之后漂移过（真库 2026-09-22 那三行，差 ¥1.70–4.60）。**只报告，不动**。
+
+    **范围**：只判「自身成交驱动」的臂（`engine.replays_own_trades`）。`arm-hold`
+    是冻结快照、`arm-now` 读实盘账本，它们的净值本来就不由自身成交推出 ——
+    它们进 `skipped` 并**写明原因**（「判不了」与「判过」必须能分开）。
+
+    重放不出来（持仓缺价、账户不在）→ 进 `skipped`，**不算合格**。
+    """
+    from stocklab.paper import engine          # 懒 import：避免 store/paper 成环
+
+    empty = {"checked": 0, "defective": [], "cent_drift": [], "valuation": [],
+             "skipped": [], "named": [f"{a}/{d}" for a, d in _P62_NAMED_ROWS],
+             "note": "表不存在 ⇒ 没比对过，不是「全部干净」"}
+    if not (_table_exists(conn, "paper_nav_daily")
+            and _table_exists(conn, "paper_accounts")):
+        return empty
+    accounts = {str(r["account_id"]): dict(r) for r in
+                conn.execute("SELECT * FROM paper_accounts")}
+    checked = 0
+    defective: list[dict] = []
+    cent: list[dict] = []
+    valuation: list[dict] = []
+    skipped: list[dict] = []
+    for r in conn.execute("SELECT * FROM paper_nav_daily ORDER BY account_id, date"):
+        row = dict(r)
+        aid, date = str(row["account_id"]), str(row["date"])
+        account = accounts.get(aid)
+        if account is None:
+            skipped.append({"account_id": aid, "date": date,
+                            "reason": "净值行没有对应的账户行 —— 重放没有起点"})
+            continue
+        if not engine.replays_own_trades(account):
+            skipped.append({"account_id": aid, "date": date,
+                            "reason": f"臂 {account['arm']!r} 的状态不由自身成交推出"
+                                      f"（arm-hold 冻结快照 / arm-now 实盘账本）"
+                                      f"—— 不在本判据范围内"})
+            continue
+        try:
+            state = engine.arm_state_for(conn, aid, date)
+        except Exception as exc:                       # noqa: BLE001 —— 判不了就报出来
+            skipped.append({"account_id": aid, "date": date,
+                            "reason": f"重放失败（{type(exc).__name__}: {exc}）"
+                                      f"—— 判不了 ≠ 判过"})
+            continue
+        if state is None:
+            skipped.append({"account_id": aid, "date": date,
+                            "reason": "账户不存在 —— 重放没有起点"})
+            continue
+        expected_cash = round(float(state["cash"]), 4)
+        expected_pos = {str(c): int(q) for c, q in state["positions"].items()}
+        expected_nav = round(expected_cash + float(state["market_value"]), 4)
+        got_pos = {str(p["code"]): int(p["qty"])
+                   for p in json.loads(row["positions_json"] or "[]")}
+        dcash = float(row["cash"]) - expected_cash
+        dnav = float(row["nav"]) - expected_nav
+        checked += 1
+        item = {"account_id": aid, "date": date,
+                "d_cash": round(dcash, 4), "d_nav": round(dnav, 4),
+                "named": (aid, date) in _P62_NAMED_ROWS}
+        if got_pos != expected_pos or abs(dcash) > _P62_SETTLEMENT_BAR:
+            item["diffs"] = {
+                "cash": {"got": float(row["cash"]), "replay": expected_cash},
+                "positions_json": {"got": got_pos, "replay": expected_pos},
+                "nav": {"got": float(row["nav"]), "replay": expected_nav}}
+            defective.append(item)
+        elif abs(dcash) > _P62_TOL:
+            item["note"] = ("现金与重放差 ≤ ¥0.01：`Decision.amount` 先舍到分、重放不舍"
+                            "—— **既有**的分币级口径差，不属 P62（只报告）")
+            cent.append(item)
+        elif abs(dnav) > _P62_TOL:
+            item["note"] = ("现金与持仓都与重放一致、只有净值差 ⇒ 写入之后市值口径/"
+                            "价格源漂移过 —— 不属 P62（只报告）")
+            valuation.append(item)
+    return {
+        "checked": checked, "defective": defective, "cent_drift": cent,
+        "valuation": valuation, "skipped": skipped,
+        "named": [f"{a}/{d}" for a, d in _P62_NAMED_ROWS],
+        "note": ("零缺陷与零比对是两件事：`checked` 为 0 时说明**没有比对过**，"
+                 "不是「全部干净」"),
+    }
+
+
+def migrate_p62_agent_nav_settlement(conn) -> list[str]:
+    """删掉**点名的那一行**未结算的 AI 臂净值行，等 `paper agent run` 重写。
+
+    **可重入**：第二次跑返回 `[]`（那一行已经不在了 ⇒ 探测不到 ⇒ 无事可做）。
+    **只删点名行**：探测出的**未结算**行里有点名清单之外的 ⇒ **抛错拒绝**（人来
+    拍板）。分币级漂移 / 估值漂移两类**只报告不动**（它们不属 P62，见探测器 docstring）。
+    事务内摘/挂触发器（照 `migrate_p56_agent_arms_executor` 的先例）；其余行逐字节
+    不变、行数只少点名的那几行；事后触发器仍在。台账记进 `system_events`。
+    """
+    probe = p62_defective_agent_nav_rows(conn)
+    named = set(_P62_NAMED_ROWS)
+    outsiders = [d for d in probe["defective"]
+                 if (d["account_id"], d["date"]) not in named]
+    if outsiders:
+        raise RuntimeError(
+            "探测到**点名清单之外**的未结算净值行：" +
+            "、".join(f"{d['account_id']}/{d['date']}" for d in outsiders) +
+            f"（点名清单：{sorted(named)}）—— 本迁移只删点名行，"
+            f"其余的一行都不动。要先拍板：是补进清单，还是另有原因。**未做任何改动**")
+    targets = [d for d in probe["defective"]
+               if (d["account_id"], d["date"]) in named]
+    # 另外两类**不是本站的靶子**，但必须让人看见（否则「零改动」会被读成「全干净」）。
+    report_only = [f"⚠️ 只报告（不属 P62，未改动）：{d['account_id']}/{d['date']} "
+                   f"class=cent_drift d_cash={d['d_cash']} d_nav={d['d_nav']}"
+                   for d in probe["cent_drift"]] + [
+        f"⚠️ 只报告（不属 P62，未改动）：{d['account_id']}/{d['date']} "
+        f"class=valuation d_cash={d['d_cash']} d_nav={d['d_nav']}"
+        for d in probe["valuation"]]
+    if not targets:
+        return report_only
+
+    before = {(_key(r)): dict(r) for r in
+              conn.execute("SELECT * FROM paper_nav_daily")}
+    n_before = len(before)
+    now = datetime.now(TZ).isoformat(timespec="seconds")
+    changes: list[str] = []
+    conn.execute("BEGIN")
+    try:
+        for name in _P62_TRIGGER_NAMES:
+            conn.execute(f"DROP TRIGGER IF EXISTS {name}")
+        for d in targets:
+            row = before[(d["account_id"], d["date"])]
+            conn.execute("DELETE FROM paper_nav_daily WHERE account_id = ? AND date = ?",
+                         (d["account_id"], d["date"]))
+            conn.execute(
+                "INSERT INTO system_events (ts, module, level, message, context_json)"
+                " VALUES (?,?,?,?,?)",
+                (now, "paper_nav_daily", "warn",
+                 f"P62 修复：删除未结算的净值行 {d['account_id']}/{d['date']}"
+                 f"（旧 nav={row['nav']}、cash={row['cash']}、"
+                 f"positions={row['positions_json']}）—— 待 `paper agent run --asof "
+                 f"{d['date']}` 按修好的 execute_decision 重写",
+                 json.dumps({"task": "P62", "account_id": d["account_id"],
+                             "date": d["date"], "old": {
+                                 k: row[k] for k in
+                                 ("cash", "positions_json", "market_value", "nav",
+                                  "cum_cost", "cum_return")},
+                             "diff": d["diffs"],
+                             "basis": "docs/tasks/2026-09-23-p62-AI臂净值未结算修复.md"},
+                            ensure_ascii=False, sort_keys=True)))
+            changes.append(f"{d['account_id']}/{d['date']}: 删除未结算净值行"
+                           f"（nav {row['nav']} → 待重写）")
+        conn.executescript(_P62_TRIGGERS)
+        after = {(_key(r)): dict(r) for r in
+                 conn.execute("SELECT * FROM paper_nav_daily")}
+        gone = {k for k in before if k not in after}
+        if gone != {(d["account_id"], d["date"]) for d in targets}:
+            raise RuntimeError(f"删掉的行不是点名的那几行：{sorted(gone)} —— 已回滚")
+        if len(after) != n_before - len(targets):
+            raise RuntimeError(f"净值行数 {n_before} → {len(after)}，"
+                               f"与「只少 {len(targets)} 行」不符 —— 已回滚")
+        for k, row in after.items():
+            if row != before[k]:
+                raise RuntimeError(f"迁移动了不该动的净值行 {k[0]}/{k[1]} —— 已回滚")
+        missing_trg = [n for n in _P62_TRIGGER_NAMES if not _trigger_exists(conn, n)]
+        if missing_trg:
+            raise RuntimeError(f"append-only 触发器没挂回去：{missing_trg} —— 已回滚")
+        conn.commit()
+    except BaseException:
+        conn.rollback()
+        raise
+    return [*changes, *report_only]
+
+
+def _key(row) -> tuple[str, str]:
+    return (str(row["account_id"]), str(row["date"]))
+
+
 #: 已知迁移 marker 清单：doctor 逐个报告在位与否（只读，不迁移）。#: (name, table, 判据)。判据是列名（str）或一个只读探测函数。
 #: 新增迁移时必须在这里登记，否则 doctor 看不出来。
 _KNOWN_MARKERS: list[tuple[str, str, object]] = [
@@ -620,6 +856,11 @@ _KNOWN_MARKERS: list[tuple[str, str, object]] = [
      lambda conn: not agent_arms_need_executor(conn)),
     ("p58_plugin_reviews", "plugin_reviews",
      lambda conn: not plugin_reviews_needs_p58(conn)),
+    # P62 是**数据**修复（删未结算的净值行），不挂 `_pending_column_migrations` /
+    # `_apply_schema` —— 挂上去等于让任一写库入口顺手删历史净值。这里只让 doctor
+    # 只读报告「还有没有与重放对不上的 AI 臂净值行」。
+    ("p62_agent_nav_settled", "paper_nav_daily",
+     lambda conn: not p62_defective_agent_nav_rows(conn)["defective"]),
 ]
 
 

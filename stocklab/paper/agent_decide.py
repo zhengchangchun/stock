@@ -555,6 +555,12 @@ def plan_orders(*, decision: Mapping[str, object], cash: float,
 
     返回 `(orders, evaluations)`：`evaluations` 含「不动的理由」，
     与静态臂的 `evaluate` 同一个形状，报告里可以并排读。
+
+    **纯**：订单的股数/金额全部在 `planned` 那一趟里按**传入的** `cash` /
+    `positions` 算完，第二趟只做分类与排序 ⇒ 这里**不碰**调用方的状态。
+    （P62 之前它偷偷原地改 `positions`、而 `cash` 是局部 float 改不回去，
+    于是调用方拿到「现金是旧的、持仓是新的」混合状态 —— 见
+    `execute_decision` 的 docstring。结算已收归那一个函数。）
     """
     p = params or params_for_agent_decision()
     orders: list[Decision] = []
@@ -580,14 +586,38 @@ def plan_orders(*, decision: Mapping[str, object], cash: float,
                 continue
             if str(item["side"]) != want:
                 continue
-            if d.action == "sell":
-                positions[item["code"]] = int(positions.get(item["code"], 0)) - d.qty
-                cash += d.amount
-            else:
-                positions[item["code"]] = int(positions.get(item["code"], 0)) + d.qty
-                cash -= d.amount
             orders.append(d)
     return orders, evals
+
+
+def _settle(cash: float, positions: dict[str, int],
+            orders: Sequence[Decision]) -> tuple[float, dict[str, int]]:
+    """把订单**逐笔结算**到状态上（P62 的修法）。
+
+    这是不变量「**写入 = 重放**」的实现半边；重放半边是
+    `engine._ledger_arm_state`。两半必须逐字段相同，所以这里
+    **一行算术都不另写**：
+
+    - 持仓：懒 import `engine._apply`（模块成环：`engine` 顶部导入本模块）
+      用的就是重放路径调的那一个函数 —— 「减到 0 就 pop」（零股条目不许存在）
+      与超卖守卫都是它的；
+    - 现金：用 `fill_price × qty ± fee_total`，其中 `fill_price` 与
+      `fees["total"]` 就是 `store.insert_trade` 写进成交行的那两个数 ——
+      与 `_ledger_arm_state` 的重放式**逐字相同**。
+
+    为什么不用 `Decision.amount`：它是 `round(fill × qty ± fee, 2)`（**先**四舍
+    五入到分），而重放用的是不四舍五入的 `fill_price × qty`（`fill_price` 本身
+    已是 4 位小数）。两者每笔差 ≤ 0.005 —— 真库上实测到 ¥0.01/笔的分币级漂移
+    （P62 实施记录 §9.5 点名，那是**既有**口径、不属本站）。净值行是给「重放」
+    读的读数，所以这里跟重放走。
+    """
+    from stocklab.paper import engine      # 懒 import：避免模块成环
+    for d in orders:
+        engine._apply(positions, str(d.code), str(d.action), int(d.qty))
+        gross = float(d.fill_price) * int(d.qty)
+        fee = float(d.fees.get("total", 0.0))
+        cash += gross - fee if d.action == SIDE_SELL else -(gross + fee)
+    return round(cash, 4), positions
 
 
 def execute_decision(conn: sqlite3.Connection, *, arm: str, asof: str,
@@ -604,12 +634,24 @@ def execute_decision(conn: sqlite3.Connection, *, arm: str, asof: str,
 
     溯源标签写进 `reason`：成交行是 append-only 的，「这笔单照哪一条决策下的」
     必须在成交行里自己说得清（与 P37 的 `spec_tag` 同一个理由）。
+
+    ## 返回的必须是**结算后**的状态（P62）
+
+    调用方拿着返回值**直接**写净值（`cash` / `positions` / `nav = cash + mv`），
+    所以这里少结算一次 = 净值行记的是**执行前**的现金。P62 就是这么发生的：
+    本函数原样返回入参，而 `positions` 已被 `plan_orders` 原地改过 ⇒
+    `arm-agent-ds-v1` 在 2026-09-23 的净值行写成了「现金 ¥11,320（旧）、持仓
+    000333×0（新）」的混合状态，凭空少 ¥8,233.68。
+
+    判据是不变量（`tests/test_paper_agent_nav_settlement.py`）：**净值行 ==
+    `engine._ledger_arm_state` 的重放 + `mark_to_market`**，逐日、逐字段。
     """
     codes = {str(d["code"]) for d in decision["decisions"]}
     asset_classes = {c: asset_class_for(conn, c) for c in sorted(codes)}
     orders, evals = plan_orders(decision=decision, cash=cash, positions=positions,
                                marks=marks, total_assets=total_assets,
                                asset_classes=asset_classes)
+    cash, positions = _settle(cash, positions, orders)
     if not decision["decisions"]:
         evals.append(_no_decision_hold(arm, asof))
     tag = payload_tag(decision)
