@@ -34,11 +34,12 @@ from __future__ import annotations
 
 import json
 import sqlite3
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 
 from stocklab.backtest import metrics as bt
 from stocklab.labweb import paper_data
 from stocklab.m2 import config as m2_config
+from stocklab.m2 import selfeval
 from stocklab.m2 import store as m2_store
 from stocklab.paper import store as paper_store
 from stocklab.paper.engine import drawdown
@@ -68,6 +69,10 @@ BENCHMARK_CAVEAT = (
 
 #: 错判案例的条数上限（P48 §2：**不是可选参数**，见 `m2/config.CASE_LIMIT`）。
 CASE_LIMIT: int = m2_config.CASE_LIMIT
+
+#: 归因字段名（`m2/config.ATTRIBUTION_FIELD`）。P50 的人工确认填的就是这一格，
+#: 本期它**恒为 `None`**（D-31）。
+ATTR_FIELD: str = m2_config.ATTRIBUTION_FIELD
 
 #: 归因字段的处置（D-31）：四分类代码判不了，这里**恒空**，结构位留给 P50 的人工确认。
 ATTRIBUTION_NOTE = (
@@ -404,6 +409,9 @@ def miss_cases(conn: sqlite3.Connection, asof: str) -> dict:
     for s in misses[:CASE_LIMIT]:
         f = by_forecast.get(int(s["forecast_id"])) or {}
         cases.append({
+            # 分数行与预测行的主键都带出来：回流汇总要按 `forecast_id` 取来源行的
+            # 落库时间（生成时间），页面/报告里也是「这条案例连着哪条预测」的锚
+            "score_id": int(s["score_id"]), "forecast_id": int(s["forecast_id"]),
             "code": str(s["code"]), "asof_date": str(s["asof_date"]),
             "target_date": str(s["target_date"]),
             "plugin_id": str(s["plugin_id"]),
@@ -431,7 +439,209 @@ def miss_cases(conn: sqlite3.Connection, asof: str) -> dict:
     }
 
 
+# ---------- ④ 周期读数 / 依据 / 待复核清单（P49） ----------
+
+
+def cycle_readings(conn: sqlite3.Connection, cycle: Mapping, asof: str) -> dict:
+    """某周期在 `asof` 的读数：**全部由 P41/P48 的既有函数算出**。
+
+    本函数不重算任何一个指标：五指标与门禁逐字段复制
+    `paper_data.performance`（P41 / ADR-023），错判案例与预测读数复用
+    `miss_cases` / `forecast_readings`（P48）。窗口口径因此**只有一套** ——
+    调用方不给窗口，也不给指标，只给「哪个周期、哪一天」。
+
+    账户在绩效读数里没有行（账户没建 / 没有净值）⇒ 五个值一律 `None` + 说明，
+    **不写 0**（0% 收益是「没涨没跌」，与「不知道」不是一回事）。
+    """
+    perf = paper_data.performance(conn, asof)
+    account = str(cycle["account_id"])
+    keys = tuple(perf["metric_keys"])
+    row = next((r for r in perf["rows"] if str(r["account_id"]) == account), None)
+    unavailable = None
+    if row is None:
+        unavailable = (f"绩效读数里没有账户 `{account}` 的行（账户没建 / 窗口内没有"
+                       "净值行）—— 五个值一律留空，**不拿 0 顶替**")
+        metrics = {k: None for k in keys}
+        missing = {k: unavailable for k in keys}
+    else:
+        metrics = {k: row[k] for k in keys}
+        missing = dict(row["missing"])
+    forecast = forecast_readings(conn, asof)
+    cases = case_summary(conn, cycle, asof)
+    return {
+        "source": ("`paper_data.performance`（P41 五指标 + 120 门禁）"
+                   " + `m2_data.forecast_readings` / `miss_cases`（P48）"
+                   "—— 逐字段复制，本层不重算"),
+        "account_id": account, "asof": asof,
+        "window": [str(perf["window"][0]), str(perf["window"][1])],
+        "n_sessions": perf["n_sessions"],
+        "metric_keys": list(keys),
+        "metrics": metrics, "missing": missing,
+        "excess_vs_index_300": (perf["excess_vs_index_300"] or {}).get(account),
+        "sample_gate": dict(perf["sample_gate"]),
+        "forecast": {
+            "n_groups": forecast["n_groups"], "n_forecasts": forecast["n_forecasts"],
+            "n_scored": forecast["n_scored"], "n_unscored": forecast["n_unscored"],
+            "threshold": forecast["threshold"],
+        },
+        "cases": cases,
+        "unavailable": unavailable,
+    }
+
+
+def _cycle_cases(conn: sqlite3.Connection, cycle: Mapping, asof: str) -> list[dict]:
+    """周期内的错判案例 —— **P48 那一批**的子集（按账户 + 起跑日过滤）。
+
+    为什么是「子集」而不是另一遍筛选：`miss_cases` 是错判案例集的**唯一**取数
+    （P48 §2：没有筛选参数）。这里再写一遍筛选就等于开了第二个口径。代价是
+    周期内错判条数超过 `CASE_LIMIT` 时只看得到最近的那一段 —— 所以两个数
+    （窗口内总量 / 周期内条数）都返回，读者自己知道看到的是哪一段。
+    """
+    data = miss_cases(conn, asof)
+    account = str(cycle["account_id"])
+    start = str(cycle["start_date"])
+    return [c for c in data["cases"]
+            if str(c["account_id"]) == account and str(c["asof_date"]) >= start]
+
+
+def _fingerprints(cases: Sequence[dict]) -> dict:
+    """来源指纹：这一批案例是**哪几版脚本、在哪份 PIT 输入上**算出来的。"""
+    return {
+        "input_sha256": sorted({str(c["input_sha256"]) for c in cases
+                                if c.get("input_sha256")}),
+        "script_versions": sorted({str(c["script_version"]) for c in cases}),
+        "plugin_ids": sorted({str(c["plugin_id"]) for c in cases}),
+    }
+
+
+def case_summary(conn: sqlite3.Connection, cycle: Mapping, asof: str) -> dict:
+    """错判案例集的**汇总**（判定依据用；归因恒空，D-31）。
+
+    「有没有可归因的方向」在判定里的机械判据就是这一条的 `n_cases`：
+    0 条 ⇒ 拿不出方向 ⇒ 不许声称「优化 / 微调」（`m2/selfeval.py` 会拒绝）。
+    """
+    cases = _cycle_cases(conn, cycle, asof)
+    dates = sorted(str(c["target_date"]) for c in cases)
+    return {
+        "n_cases": len(cases),
+        "limit": CASE_LIMIT,
+        "target_date_range": ([dates[0], dates[-1]] if dates else None),
+        "codes": sorted({str(c["code"]) for c in cases}),
+        **_fingerprints(cases),
+        ATTR_FIELD: None,          # D-31：归因恒空，结构位留给 P50 的人工确认
+        "note": ATTRIBUTION_NOTE,
+    }
+
+
+def review_backlog(conn: sqlite3.Connection, cycle: Mapping, asof: str) -> dict:
+    """错判案例回流模块1 的**只读汇总**（P49 §3 / D-31）：按 `code` + 区间聚成待复核清单。
+
+    ## 三个不许
+
+    1. 不写任何表 —— 回流是「看」，不是「记事实」；
+    2. 不填归因 —— `attribution` 是结构位，值恒 `None`（P50 才有人工确认）；
+       清单**不是结论**，页面与报告都不许把它当结论渲染；
+    3. 不挑案例 —— 不按幅度/标的/版本筛（P48 §2 同款纪律）。
+
+    ## 生成时间不是墙上时钟
+
+    `generated_at` = 清单所依据的那批**已落库分数行的落库时间上界**（取不到 ⇒ `None`）。
+    墙上时钟在重放时会让同一份输入长出两个不同的「生成时间」，而这一站的
+    判据是「同输入重放逐位相同」（ERROR_DIARY「不读墙上时钟做判定」）。页面
+    顶部的「页面生成于 …」仍是墙上时钟 —— 两者是不同的东西，所以名字不同。
+    """
+    cases = _cycle_cases(conn, cycle, asof)
+    ids = {int(c["forecast_id"]) for c in cases}
+    stamps = [str(s["created_at"]) for s in m2_store.list_scores(conn, asof=asof)
+              if int(s["forecast_id"]) in ids]
+    groups: dict[str, dict] = {}
+    for c in cases:
+        g = groups.setdefault(str(c["code"]), {
+            "code": str(c["code"]), "n": 0, "items": [],
+            "window": [str(c["asof_date"]), str(c["target_date"])],
+        })
+        g["n"] += 1
+        g["window"][0] = min(g["window"][0], str(c["asof_date"]))
+        g["window"][1] = max(g["window"][1], str(c["target_date"]))
+        g["items"].append({
+            "asof_date": str(c["asof_date"]), "target_date": str(c["target_date"]),
+            "plugin_id": str(c["plugin_id"]), "script_version": str(c["script_version"]),
+            "input_sha256": c.get("input_sha256"),
+            "predicted_class": c["predicted_class"], "actual_class": c["actual_class"],
+            ATTR_FIELD: None,      # D-31：恒空
+        })
+    ordered = [groups[k] for k in sorted(groups)]
+    return {
+        "asof": asof, "cycle_id": int(cycle["cycle_id"]),
+        "account_id": str(cycle["account_id"]),
+        "generated_at": (max(stamps) if stamps else None),
+        "generated_at_note": ("生成时间 = 清单所依据的**已落库分数行的落库时间上界**"
+                              "（不读墙上时钟：同输入重放必须逐位相同）"),
+        "fingerprints": _fingerprints(cases),
+        "codes": ordered, "n_codes": len(ordered), "n_cases": len(cases),
+        "attribution_note": ATTRIBUTION_NOTE,
+        "read_only_note": ("只读汇总：回流**不写任何表**，也不是结论 —— "
+                           "它是给人看的待复核清单（D-31：四分类只能人工确认）"),
+    }
+
+
 # ---------- 三块合一（页面 / 报告的唯一取数入口） ----------
+
+
+def cycle_panel(conn: sqlite3.Connection, asof: str) -> dict:
+    """④ 自评估判定与熔断（P49 §1/§2/§3）—— **只读台账**，一个数都不重算。
+
+    判定行、熔断事件、轮次读数全部来自已经落库的台账（`m2_judgements` /
+    `validation_events` / `validation_rounds`）—— 页面**不触发**判定、
+    **不触发**熔断（触发只走 CLI，P49 §4）。所以这里连 `performance` 都不调：
+    显示的是「当时落库的那一份」，不是「现在重算的那一份」。
+    """
+    from stocklab.store import validation as ledger
+
+    cycles = ledger.list_cycles(conn)
+    out: list[dict] = []
+    for cycle in cycles:
+        cid = int(cycle["cycle_id"])
+        rounds = ledger.list_rounds(conn, cid)
+        events = ledger.list_events(conn, cid)
+        judgements = m2_store.list_judgements(conn, cycle_id=cid, asof=asof)
+        fused = [e for e in events if e["kind"] == "circuit_breaker"]
+        ended = [e for e in events if e["kind"] == "validation_end"]
+        out.append({
+            "cycle_id": cid, "script_id": int(cycle["script_id"]),
+            "account_id": str(cycle["account_id"]),
+            "planned_rounds": int(cycle["planned_rounds"]),
+            "planned_days": int(cycle["planned_days"]),
+            "params": json.loads(cycle["params_json"] or "{}"),
+            "criteria_text": str(cycle["criteria_text"]),
+            "start_date": str(cycle["start_date"]),
+            "n_rounds": len(rounds),
+            "latest_round": (rounds[-1] if rounds else None),
+            "rounds": rounds,
+            "events": events,
+            "judgements": judgements,
+            "latest_judgement": (judgements[-1] if judgements else None),
+            "fuse_events": fused,
+            "ended_events": ended,
+            "state": ("fused" if fused else ("ended" if ended else "open")),
+            "review": review_backlog(conn, cycle, asof),
+        })
+    return {
+        "asof": asof, "available": bool(out), "cycles": out, "n_cycles": len(out),
+        "reason": (None if out else
+                   "库里还没有验证周期 —— 开一轮：`stocklab m2 cycle start "
+                   "--script-id <N> --account-id <arm-agent-<版本>> --rounds 3 "
+                   "--days 30 --criteria-text '<判据原文>' --start-date <YYYY-MM-DD>`"),
+        # 主干边界的**只读视图**：值来自 `m2/selfeval.py` 的单一入口，
+        # 本文件不直接引用那 5 个常量名（ADR-021 结构保证 3 的扫描判据）。
+        "boundaries": dict(selfeval.BOUNDARIES),
+        "boundary_labels": dict(selfeval.BOUNDARY_LABELS),
+        "branch_labels": dict(m2_config.BRANCH_LABELS),
+        "no_write_note": ("判定与熔断**只出建议 / 只追加事件**：本页没有任何写入口，"
+                          "也不提供「触发判定」按钮 —— 触发只走 CLI（P49 §4）"),
+        "criteria_note": ("判据原文（`criteria_text`）在建周期时落库，之后**逐字节不许改**"
+                          "（D-31：事后换口径是这一站的典型作弊方式）"),
+    }
 
 
 def panel(conn: sqlite3.Connection, asof: str) -> dict:
@@ -445,4 +655,5 @@ def panel(conn: sqlite3.Connection, asof: str) -> dict:
         "three_way": three_way(conn, asof),
         "forecast": forecast_readings(conn, asof),
         "cases": miss_cases(conn, asof),
+        "cycles": cycle_panel(conn, asof),
     }

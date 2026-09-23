@@ -343,10 +343,11 @@ def test_t3_channel_b_does_not_recompute_nav_itself():
 def test_t3_no_m2_module_writes_paper_tables_itself():
     """成交与净值**只有一个写入口**（`paper/store.py`，ERROR_DIARY #61 的反面）。
 
-    `store.py` 里允许的 INSERT 是**模块2 自己的三张表**（P47 两张 + P48 的
-    校验分数表）—— 白名单只增，且不许出现任何 `paper_*` 表。
+    `store.py` 里允许的 INSERT 是**模块2 自己的四张表**（P47 两张 + P48 的
+    校验分数表 + P49 的判定建议表）—— 白名单只增，且不许出现任何 `paper_*` 表。
     """
-    m2_tables = ("{TABLE_RUNS}", "{TABLE_FORECASTS}", "{TABLE_SCORES}")
+    m2_tables = ("{TABLE_RUNS}", "{TABLE_FORECASTS}", "{TABLE_SCORES}",
+                 "{TABLE_JUDGEMENTS}")
     for path in sorted((ROOT / "stocklab/m2").glob("*.py")):
         text = path.read_text(encoding="utf-8")
         if path.name == "store.py":

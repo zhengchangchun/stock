@@ -2999,14 +2999,15 @@ EXIT_REJECTED = 4
 
 
 def _m2_conn(args):
-    """打开库并确认模块2 的三张表已前滚；返回 `(conn, None)` 或 `(None, 退出码)`。"""
+    """打开库并确认模块2 的四张表已前滚；返回 `(conn, None)` 或 `(None, 退出码)`。"""
     conn, code = _paper_conn(args)
     if conn is None:
         return None, code
     has = conn.execute(
         "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name IN"
-        " ('m2_channel_runs','m2_forecasts','m2_forecast_scores')").fetchone()[0]
-    if has < 3:
+        " ('m2_channel_runs','m2_forecasts','m2_forecast_scores','m2_judgements')"
+    ).fetchone()[0]
+    if has < 4:
         conn.close()
         print(json.dumps({"error": "模块2 的表不存在 —— 先跑 `stocklab db init` 前滚 schema"},
                          ensure_ascii=False), file=sys.stderr)
@@ -3169,6 +3170,140 @@ def _latest_session(conn) -> str | None:
     """库里出现过的最后一个交易日（只读，用于 `--asof` 的默认值）。"""
     row = conn.execute("SELECT MAX(date) AS d FROM bars_daily").fetchone()
     return None if row is None or row["d"] is None else str(row["d"])
+
+
+# ---------- 模块2 验证周期主干（P49） ----------
+#
+# 退出码语义**照抄既有惯例**，不发明新的：
+#   0 = 成功（含「已存在、未重复写」的幂等返回）；
+#   1 = 冲突（周期已存在 / 已收尾 / 轮次已有行）—— `cycle.CycleConflict`；
+#   2 = 输入不合法（越界常量、日期格式、未知分支/方向、库表缺失）。
+# 越界一律**拒绝**，绝不 clamp（D-28）。
+
+
+def _cycle_fail(exc: Exception) -> int:
+    from stocklab.m2 import cycle as m2_cycle
+
+    code = 1 if isinstance(exc, m2_cycle.CycleConflict) else 2
+    print(json.dumps({"error": str(exc), "kind": type(exc).__name__},
+                     ensure_ascii=False), file=sys.stderr)
+    return code
+
+
+def cmd_m2_cycle_start(args: argparse.Namespace) -> int:
+    """开一轮验证周期（三张台账表的唯一写入口之一；**不碰插桩状态**）。"""
+    from stocklab.m2 import cycle as m2_cycle
+
+    conn, code = _m2_conn(args)
+    if conn is None:
+        return code
+    now = args.now or datetime.now(TZ).isoformat(timespec="seconds")
+    try:
+        params = json.loads(args.params_json or "{}")
+        if not isinstance(params, dict):
+            raise ValueError("--params-json 必须是一个 JSON 对象")
+        out = m2_cycle.start_cycle(
+            conn, script_id=args.script_id, account_id=args.account_id,
+            planned_rounds=args.rounds, planned_days=args.days, params=params,
+            criteria_text=args.criteria_text, start_date=args.start_date, now=now)
+    except (ValueError, TypeError) as exc:
+        return _cycle_fail(exc)
+    finally:
+        conn.close()
+    print(json.dumps(out, ensure_ascii=False, sort_keys=True, indent=2))
+    return 0
+
+
+def cmd_m2_cycle_round(args: argparse.Namespace) -> int:
+    """落一轮读数（读数由 P41/P48 的既有取数函数算出，调用方给不了）。"""
+    from stocklab.m2 import cycle as m2_cycle
+
+    conn, code = _m2_conn(args)
+    if conn is None:
+        return code
+    now = args.now or datetime.now(TZ).isoformat(timespec="seconds")
+    try:
+        out = m2_cycle.add_round(conn, cycle_id=args.cycle, round_no=args.round_no,
+                                 asof=args.asof, now=now, note=args.note)
+    except ValueError as exc:
+        return _cycle_fail(exc)
+    finally:
+        conn.close()
+    print(json.dumps(out, ensure_ascii=False, sort_keys=True, indent=2))
+    return 0
+
+
+def cmd_m2_cycle_end(args: argparse.Namespace) -> int:
+    """周期收尾：追加一条 `validation_end`（绝不 UPDATE 既有行）。"""
+    from stocklab.m2 import cycle as m2_cycle
+
+    conn, code = _m2_conn(args)
+    if conn is None:
+        return code
+    now = args.now or datetime.now(TZ).isoformat(timespec="seconds")
+    try:
+        out = m2_cycle.end_cycle(conn, cycle_id=args.cycle, reason=args.reason, now=now)
+    except ValueError as exc:
+        return _cycle_fail(exc)
+    finally:
+        conn.close()
+    print(json.dumps(out, ensure_ascii=False, sort_keys=True, indent=2))
+    return 0
+
+
+def cmd_m2_cycle_judge(args: argparse.Namespace) -> int:
+    """三分支判定：只写**建议 + 依据**，不执行任何动作（D-44）。"""
+    from stocklab.m2 import cycle as m2_cycle
+
+    conn, code = _m2_conn(args)
+    if conn is None:
+        return code
+    now = args.now or datetime.now(TZ).isoformat(timespec="seconds")
+    try:
+        out = m2_cycle.judge(
+            conn, cycle_id=args.cycle, asof=args.asof, fix_kind=args.fix_kind,
+            freeze_days=args.freeze_days, now=now)
+    except ValueError as exc:
+        return _cycle_fail(exc)
+    finally:
+        conn.close()
+    print(json.dumps(out, ensure_ascii=False, sort_keys=True, indent=2))
+    return 0
+
+
+def cmd_m2_cycle_fuse_check(args: argparse.Namespace) -> int:
+    """提前熔断检查（D-27）：只追加事件、可复现、`(周期, 日)` 幂等。"""
+    from stocklab.m2 import cycle as m2_cycle
+
+    conn, code = _m2_conn(args)
+    if conn is None:
+        return code
+    now = args.now or datetime.now(TZ).isoformat(timespec="seconds")
+    try:
+        out = m2_cycle.fuse_check(conn, cycle_id=args.cycle, asof=args.asof, now=now)
+    except ValueError as exc:
+        return _cycle_fail(exc)
+    finally:
+        conn.close()
+    print(json.dumps(out, ensure_ascii=False, sort_keys=True, indent=2))
+    return 0
+
+
+def cmd_m2_cycle_status(args: argparse.Namespace) -> int:
+    """周期现状（只读）：轮次 / 事件 / 判定。"""
+    from stocklab.m2 import cycle as m2_cycle
+
+    conn, code = _m2_conn(args)
+    if conn is None:
+        return code
+    try:
+        out = m2_cycle.status(conn, cycle_id=args.cycle)
+    except ValueError as exc:
+        return _cycle_fail(exc)
+    finally:
+        conn.close()
+    print(json.dumps(out, ensure_ascii=False, sort_keys=True, indent=2))
+    return 0
 
 
 # ---------- parser ----------
@@ -3935,6 +4070,72 @@ def build_parser() -> argparse.ArgumentParser:
     m2_report.add_argument("--json", action="store_true", help="打完整载荷（JSON）")
     m2_report.add_argument("--db")
     m2_report.set_defaults(func=cmd_m2_report)
+
+    m2_cyc = m2_sub.add_parser(
+        "cycle", help="验证周期主干（P49）：周期 / 判定 / 熔断（判定只出建议）")
+    m2_cyc_sub = m2_cyc.add_subparsers(dest="m2_cycle_action", required=True)
+
+    m2_cyc_start = m2_cyc_sub.add_parser(
+        "start", help="开一轮验证周期（越界即拒：轮次 ∉ [2,3] / 天数 > 30，不 clamp）")
+    m2_cyc_start.add_argument("--script-id", dest="script_id", type=int, required=True,
+                              help="策略版本（`plugin_scripts.script_id`）")
+    m2_cyc_start.add_argument("--account-id", dest="account_id", required=True,
+                              help="该版本对应的隔离模拟账户（D-26）")
+    m2_cyc_start.add_argument("--rounds", type=int, required=True, help="计划轮次（2–3）")
+    m2_cyc_start.add_argument("--days", type=int, required=True, help="单轮天数（1–30）")
+    m2_cyc_start.add_argument("--params-json", dest="params_json", default="{}",
+                              help="该版本生效的参数集（JSON 对象）")
+    m2_cyc_start.add_argument("--criteria-text", dest="criteria_text", required=True,
+                              help="判据**原文**（落库后逐字节不许改）")
+    m2_cyc_start.add_argument("--start-date", dest="start_date", required=True,
+                              help="起跑日 YYYY-MM-DD")
+    m2_cyc_start.add_argument("--db")
+    m2_cyc_start.add_argument("--now", help="覆盖当前时刻（测试用）")
+    m2_cyc_start.set_defaults(func=cmd_m2_cycle_start)
+
+    m2_cyc_round = m2_cyc_sub.add_parser(
+        "round", help="落一轮读数（读数由 P41/P48 既有函数算出，不由调用方给）")
+    m2_cyc_round.add_argument("--cycle", type=int, required=True)
+    m2_cyc_round.add_argument("--round-no", dest="round_no", type=int, required=True)
+    m2_cyc_round.add_argument("--asof", required=True, help="本轮截止日 YYYY-MM-DD")
+    m2_cyc_round.add_argument("--note", help="备注（可空）")
+    m2_cyc_round.add_argument("--db")
+    m2_cyc_round.add_argument("--now", help="覆盖当前时刻（测试用）")
+    m2_cyc_round.set_defaults(func=cmd_m2_cycle_round)
+
+    m2_cyc_end = m2_cyc_sub.add_parser("end", help="周期收尾（追加 validation_end）")
+    m2_cyc_end.add_argument("--cycle", type=int, required=True)
+    m2_cyc_end.add_argument("--reason", required=True, help="收尾留痕（不许为空）")
+    m2_cyc_end.add_argument("--db")
+    m2_cyc_end.add_argument("--now", help="覆盖当前时刻（测试用）")
+    m2_cyc_end.set_defaults(func=cmd_m2_cycle_end)
+
+    m2_cyc_judge = m2_cyc_sub.add_parser(
+        "judge", help="三分支判定（只写建议 + 依据，**不执行**；D-44）")
+    m2_cyc_judge.add_argument("--cycle", type=int, required=True)
+    m2_cyc_judge.add_argument("--asof", required=True, help="判定截止日 YYYY-MM-DD")
+    m2_cyc_judge.add_argument("--fix-kind", dest="fix_kind", required=True,
+                              choices=["none", "logic", "params"],
+                              help="声明的改进方向：none=无方向 / logic=改脚本逻辑 / "
+                                   "params=只动参数（D-44，判定核对它与证据是否自洽）")
+    m2_cyc_judge.add_argument("--freeze-days", dest="freeze_days", type=int,
+                              help="冻结天数（`--fix-kind none` 时必给；> 90 即拒）")
+    m2_cyc_judge.add_argument("--db")
+    m2_cyc_judge.add_argument("--now", help="覆盖当前时刻（测试用）")
+    m2_cyc_judge.set_defaults(func=cmd_m2_cycle_judge)
+
+    m2_cyc_fuse = m2_cyc_sub.add_parser(
+        "fuse-check", help="提前熔断检查（只追加事件；可复现 + 幂等；D-27）")
+    m2_cyc_fuse.add_argument("--cycle", type=int, required=True)
+    m2_cyc_fuse.add_argument("--asof", required=True, help="检查日 YYYY-MM-DD")
+    m2_cyc_fuse.add_argument("--db")
+    m2_cyc_fuse.add_argument("--now", help="覆盖当前时刻（测试用）")
+    m2_cyc_fuse.set_defaults(func=cmd_m2_cycle_fuse_check)
+
+    m2_cyc_status = m2_cyc_sub.add_parser("status", help="周期现状（只读）")
+    m2_cyc_status.add_argument("--cycle", type=int, required=True)
+    m2_cyc_status.add_argument("--db")
+    m2_cyc_status.set_defaults(func=cmd_m2_cycle_status)
 
     return parser
 

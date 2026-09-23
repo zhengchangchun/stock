@@ -179,6 +179,156 @@ def cases_block(data: Mapping) -> str:
             + "".join(rows) + '</table></div>')
 
 
+def _pct_text(value: object, *, digits: int = 2) -> str:
+    """比率 → **纯文本**百分数（`None` → 「无」）。
+
+    与 `ratio_pct` 分开是因为 `rich()` 会先把整串转义再替换标记：把
+    `ratio_pct` 生成的 `<span>` 塞进 `rich()` 就会被**原样显示成文本**
+    （`render.glance_html` 的 docstring 里记着这个坑）。
+    """
+    if value is None:
+        return "无"
+    return f"{float(value) * 100:+.{digits}f}%"
+
+
+def cycles_block(data: Mapping) -> str:
+    """④ 自评估判定与熔断（P49 §1/§2/§3）：**只读**，一个写入口都没有。
+
+    三样东西并列摆出来，谁也不替谁下结论：
+
+    1. **判定**——`m2_judgements` 里已落库的**建议 + 依据**（`insufficient` 明写
+       「证据不足」：门禁没过时不许出现结论性判定）；
+    2. **熔断事件**——`validation_events` 里 `circuit_breaker` 的 `at_value` 与
+       `threshold` **分列显示**（只留一个数，读者无法判断有没有越界）；
+    3. **待复核清单**——错判案例回流模块1 的**只读汇总**，归因列恒「空」（D-31）。
+
+    文案里不用「原因」二字：这一节的三样都是**读数与依据**，不是对判错的解释
+    （解释只能由人工在 P50 填，`tests/test_p49_selfeval.py` 逐字钉住）。
+    """
+    if not data or not data.get("available"):
+        return f'<p class="note">{rich((data or {}).get("reason") or "没有验证周期")}</p>'
+    blocks = [_cycle_card(c, data) for c in data["cycles"]]
+    lines = [data["no_write_note"], data["criteria_note"]]
+    bounds = data.get("boundaries") or {}
+    labels = data.get("boundary_labels") or {}
+    if bounds:
+        lines.append("主干边界（`config/limits.py` 单一真源，AI 不可改；越界即拒、"
+                     "**不 clamp**）：" + "；".join(
+                         f"{labels.get(k, k)} = "
+                         + (f"{float(bounds[k]) * 100:.2f}%"
+                            if k == "circuit_breaker_drawdown" else str(bounds[k]))
+                         for k in sorted(bounds)))
+    return "".join(blocks) + glance(lines)
+
+
+def _cycle_card(cycle: Mapping, data: Mapping) -> str:
+    state = {"open": "进行中", "ended": "已收尾",
+             "fused": "**已熔断（本轮验证已终止）**"}[cycle["state"]]
+    head = (f"<p class=\"note\"><b>周期 #{cycle['cycle_id']}</b> · 策略版本 "
+            f"<code>{esc(str(cycle['script_id']))}</code> · 账户 "
+            f"<code>{esc(cycle['account_id'])}</code> · 起跑 {esc(cycle['start_date'])} · "
+            f"计划 {cycle['planned_rounds']} 轮 / 单轮 {cycle['planned_days']} 天 · "
+            f"已落 {cycle['n_rounds']} 轮 · 状态 {rich(state)}</p>")
+    crit = (f"<p class=\"note\">判据**原文**（落库后逐字节不许改）："
+            f"<code>{esc(cycle['criteria_text'])}</code></p>")
+    return ("<div class=\"card\">" + head + crit
+            + _judgements_block(cycle, data) + _events_block(cycle)
+            + _review_block(cycle["review"]) + "</div>")
+
+
+def _judgements_block(cycle: Mapping, data: Mapping) -> str:
+    labels = data.get("branch_labels") or {}
+    if not cycle["judgements"]:
+        return ('<p class="note">尚无判定 —— 判定由 CLI 触发（'
+                '`stocklab m2 cycle judge --cycle '
+                f'{cycle["cycle_id"]} --asof <交易日> --fix-kind none|logic|params`）；'
+                '本页**不提供触发按钮**</p>')
+    head = '<tr><th>判定日</th><th>建议</th><th>结论性</th><th>依据摘要</th></tr>'
+    rows = []
+    for j in cycle["judgements"]:
+        ev = j["evidence"]
+        gate = ev.get("gate") or {}
+        cases = ev.get("cases") or {}
+        summary = (f"门禁 {gate.get('label', '无')}"
+                   f"（{gate.get('n_sessions')} 个交易日 / 门槛 {gate.get('threshold')}）；"
+                   f"轮次 {ev.get('n_rounds')}/{ev.get('planned_rounds')}；"
+                   f"相对基准超额 {_pct_text(ev.get('excess_vs_index_300'))}；"
+                   f"方向判错样本 {cases.get('n_cases')} 条")
+        rows.append(
+            f'<tr><td class="num">{esc(j["asof_date"])}</td>'
+            f'<td class="num"><b>{esc(labels.get(j["branch"], j["branch"]))}</b></td>'
+            f'<td class="num">{"是" if ev.get("conclusion") else "<b>否</b>（证据不足）"}</td>'
+            f'<td class="l">{rich(summary)}</td></tr>')
+    table = (f'<div class="scroll-x"><table class="tbl">{head}'
+             + "".join(rows) + '</table></div>')
+    detail = []
+    for j in cycle["judgements"]:
+        ev = j["evidence"]
+        detail.append(
+            f'<p class="note"><b>{esc(labels.get(j["branch"], j["branch"]))}</b> · '
+            f'{esc(j["asof_date"])}：{rich(ev.get("reason"))}'
+            + "".join(f'<br>建议动作：{rich(a)}' for a in (ev.get("actions") or []))
+            + "".join(f'<br>算到哪一步：{rich(s)}' for s in (ev.get("steps") or []))
+            + '</p>')
+    return (table + more("".join(detail), label="查看详细：判定依据与建议动作")
+            + '<p class="note">**建议不是执行**：这一列不改策略版本状态、不改账户、'
+              '不改参数；三个分支的落地动作一律要人 `approve`（D-1/D-24）</p>')
+
+
+def _events_block(cycle: Mapping) -> str:
+    if not cycle["events"]:
+        return '<p class="note">没有事件（未熔断、未收尾）</p>'
+    head = ('<tr><th>事件</th><th>实测值 at_value</th><th>判据阈值 threshold</th>'
+            '<th>判据原文</th><th>留痕</th></tr>')
+    kinds = {"circuit_breaker": "**熔断**（本轮策略失效、验证终止）",
+             "validation_end": "验证收尾", "freeze": "冻结", "unfreeze": "解冻"}
+    rows = []
+    for e in cycle["events"]:
+        at = (ratio_pct(e["at_value"]) if e["at_value"] is not None else NONE_MARK)
+        thr = (ratio_pct(e["threshold"]) if e["threshold"] is not None else NONE_MARK)
+        rows.append(
+            f'<tr><td class="num">{rich(kinds.get(e["kind"], e["kind"]))}</td>'
+            f'<td class="num">{at}</td><td class="num">{thr}</td>'
+            f'<td class="l"><code>{esc(str(e["criteria_text"])[:60])}</code></td>'
+            f'<td class="l">{esc(str(e["reason"]))}<div class="note">'
+            f'{esc(str(e["created_at"]))}</div></td></tr>')
+    return (f'<div class="scroll-x"><table class="tbl">{head}'
+            + "".join(rows) + '</table></div>')
+
+
+def _review_block(review: Mapping) -> str:
+    if not review or not review.get("n_cases"):
+        return ('<p class="note">待复核清单：空（本周期内没有方向判错的样本）—— '
+                '**空清单不是「没问题」的结论**，它只是一种取不到依据的状态</p>')
+    fp = review["fingerprints"]
+    rows = []
+    for g in review["codes"]:
+        items = "".join(
+            f'<div class="note">{esc(i["asof_date"])} → {esc(i["target_date"])}：'
+            f'{esc(str(i["predicted_class"]))} / {esc(str(i["actual_class"]))} · '
+            f'{esc(i["plugin_id"])} · <code>{esc(i["script_version"])}</code></div>'
+            for i in g["items"])
+        rows.append(
+            f'<tr><td class="l"><code>{esc(g["code"])}</code></td>'
+            f'<td class="num">{esc(g["window"][0])} ~ {esc(g["window"][1])}</td>'
+            f'<td class="num">{g["n"]}</td>'
+            f'<td class="l">{items}</td>'
+            f'<td class="num">{NONE_MARK}</td></tr>')
+    head = ('<tr><th>标的</th><th>区间</th><th>条数</th><th>明细</th>'
+            '<th>归因（恒空）</th></tr>')
+    table = (f'<div class="scroll-x"><table class="tbl">{head}'
+             + "".join(rows) + '</table></div>')
+    lines = [
+        f"待复核清单：{review['n_codes']} 个标的 / {review['n_cases']} 条"
+        f"（按标的聚，**只读汇总、不是结论**）",
+        f"来源指纹：脚本版本 {'、'.join(fp['script_versions'])}；"
+        f"PIT 输入 sha256 {'、'.join(s[:16] + '…' for s in fp['input_sha256'])}",
+        f"生成时间 {review['generated_at']} —— {review['generated_at_note']}",
+        review["attribution_note"], review["read_only_note"],
+    ]
+    return table + glance(lines)
+
+
 def m2_page(data: Mapping, *, base: str, built_at: str) -> str:
     """`/lab/m2`（整页，**只读**：没有任何表单，也没有写入口）。"""
     head = ['<p class="note">' + rich(
@@ -197,6 +347,11 @@ def m2_page(data: Mapping, *, base: str, built_at: str) -> str:
         section("错判案例集（P48 §2 第 5 行）", cases_summary(data["cases"]),
                 right="归因恒空（D-31）",
                 detail=more(cases_block(data["cases"]), label="查看详细：错判明细")),
+        section("自评估判定与熔断（P49）", cycles_block(data["cycles"]),
+                right="只读 · 建议≠执行",
+                note="判定的输入只有台账与既有读数函数（P41/P48 同源），"
+                     "输出只有**建议 + 依据**；熔断只**追加事件**、不改写历史行。"
+                     "两者都不在这一页触发 —— 触发只走 CLI。"),
     ]
     return layout(base=base, title="模块2", body="".join(head + body),
                   asof=data["asof"], built_at=built_at, current="/m2")
@@ -291,8 +446,53 @@ def cases_text(data: Mapping) -> str:
     return "\n".join(out) + "\n"
 
 
+def cycles_text(data: Mapping) -> str:
+    """④ 判定与熔断的文本版（`m2 report` 用；与页面**同一份**载荷）。"""
+    if not data.get("available"):
+        return f"# 自评估判定与熔断 · {data.get('asof')}\n\n{data.get('reason')}\n"
+    out = [f"# 自评估判定与熔断（P49）· {data['asof']}", ""]
+    labels = data.get("branch_labels") or {}
+    for cycle in data["cycles"]:
+        out += [f"## 周期 #{cycle['cycle_id']}（策略版本 {cycle['script_id']} / "
+                f"账户 `{cycle['account_id']}` / 状态 {cycle['state']}）", "",
+                f"- 起跑 {cycle['start_date']}，计划 {cycle['planned_rounds']} 轮 / "
+                f"单轮 {cycle['planned_days']} 天，已落 {cycle['n_rounds']} 轮",
+                f"- 判据原文：`{cycle['criteria_text']}`"]
+        if not cycle["events"]:
+            out.append("- 事件：无（未熔断、未收尾）")
+        for e in cycle["events"]:
+            out.append(f"- 事件 `{e['kind']}`：at_value={_cell(e['at_value'], kind='pct')} / "
+                       f"threshold={_cell(e['threshold'], kind='pct')}"
+                       f"（{e['reason']}）")
+        if not cycle["judgements"]:
+            out.append("- 判定：尚无（由 `m2 cycle judge` 触发）")
+        for j in cycle["judgements"]:
+            ev = j["evidence"]
+            out.append(f"- 判定 {j['asof_date']}：**{labels.get(j['branch'], j['branch'])}**"
+                       f"（结论性：{'是' if ev.get('conclusion') else '否'}）— {ev.get('reason')}")
+            out += [f"  - 建议动作：{a}" for a in (ev.get("actions") or [])]
+        review = cycle["review"]
+        out += ["", f"### 待复核清单（只读汇总、不是结论）", "",
+                f"{review['n_codes']} 个标的 / {review['n_cases']} 条；"
+                f"生成时间 {review['generated_at']}；"
+                f"指纹：脚本版本 {review['fingerprints']['script_versions']}",
+                f"> {review['attribution_note']}"]
+        for g in review["codes"]:
+            out.append(f"- `{g['code']}` {g['window'][0]} ~ {g['window'][1]}："
+                       f"{g['n']} 条")
+        out.append("")
+    out += [f"> {data['no_write_note']}", f"> {data['criteria_note']}"]
+    bounds = data.get("boundaries") or {}
+    blabels = data.get("boundary_labels") or {}
+    if bounds:
+        out.append("> 主干边界：" + "；".join(
+            f"{blabels.get(k, k)} = {bounds[k]}" for k in sorted(bounds)))
+    return "\n".join(out) + "\n"
+
+
 def m2_text(data: Mapping) -> str:
-    """`m2 report` 的全文（三段与页面**同一份** `m2_data.panel()`）。"""
+    """`m2 report` 的全文（四段与页面**同一份** `m2_data.panel()`）。"""
     return "\n".join([three_way_text(data["three_way"]),
                       forecast_text(data["forecast"]),
-                      cases_text(data["cases"])])
+                      cases_text(data["cases"]),
+                      cycles_text(data["cycles"])])

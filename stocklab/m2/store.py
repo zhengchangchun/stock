@@ -23,9 +23,11 @@ import json
 import sqlite3
 
 from stocklab.m2.config import (
+    BRANCHES,
     CHANNELS,
     STATUS_RAN,
     TABLE_FORECASTS,
+    TABLE_JUDGEMENTS,
     TABLE_RUNS,
     TABLE_SCORES,
 )
@@ -239,3 +241,62 @@ def list_scores(conn: sqlite3.Connection, *, plugin_id: str | None = None,
         sql += " WHERE " + " AND ".join(where)
     sql += " ORDER BY target_date, plugin_id, script_version, account_id, code"
     return _rows(conn, sql, tuple(args))
+
+
+# ---------- 自评估判定台账（P49） ----------
+
+
+def find_judgement(conn: sqlite3.Connection, cycle_id: int,
+                   asof: str) -> dict | None:
+    """该 `(周期, 截止日)` 是否已经判定过（幂等判据，返回既有那一条）。"""
+    row = conn.execute(
+        f"SELECT * FROM {TABLE_JUDGEMENTS} WHERE cycle_id = ? AND asof_date = ?",
+        (int(cycle_id), str(asof))).fetchone()
+    return None if row is None else _decode_judgement(dict(row))
+
+
+def insert_judgement(conn: sqlite3.Connection, *, cycle_id: int, script_id: int,
+                     asof: str, branch: str, evidence: dict, criteria_text: str,
+                     now: str, commit: bool = True) -> int:
+    """落一条**建议**（不是执行）。`branch` 不在白名单 → 拒绝。
+
+    幂等键 = `(cycle_id, asof_date)` UNIQUE。与 `insert_score` 同款：
+    **不把「先查再写」当防线** —— 走到这里还撞唯一键，说明调用方没走
+    `find_judgement` 那道判据，报出来比静默返回旧 id 好。
+    """
+    if branch not in BRANCHES:
+        raise ValueError(
+            f"未知判定分支 {branch!r} —— 必须在 m2/config.BRANCHES 与 schema.sql "
+            "的 m2_judgements.branch CHECK 里登记（不许静默忽略：分支枚举一旦与"
+            "库里的 CHECK 不一致，判定就写不进去，而调用方只看到一句外键似的错误）")
+    cur = conn.execute(
+        f"INSERT INTO {TABLE_JUDGEMENTS} (cycle_id, script_id, asof_date, branch,"
+        " evidence_json, criteria_text, created_at) VALUES (?,?,?,?,?,?,?)",
+        (int(cycle_id), int(script_id), str(asof), branch,
+         json.dumps(dict(evidence), ensure_ascii=False, sort_keys=True),
+         criteria_text, now))
+    if commit:
+        conn.commit()
+    return int(cur.lastrowid)
+
+
+def list_judgements(conn: sqlite3.Connection, *, cycle_id: int | None = None,
+                    asof: str | None = None) -> list[dict]:
+    """判定行（默认按 `asof_date` 升序 —— 同一周期的判定是一条时间线）。"""
+    sql = f"SELECT * FROM {TABLE_JUDGEMENTS}"
+    where, args = [], []
+    if cycle_id is not None:
+        where.append("cycle_id = ?")
+        args.append(int(cycle_id))
+    if asof is not None:
+        where.append("asof_date <= ?")
+        args.append(str(asof))
+    if where:
+        sql += " WHERE " + " AND ".join(where)
+    sql += " ORDER BY asof_date, judgement_id"
+    return [_decode_judgement(r) for r in _rows(conn, sql, tuple(args))]
+
+
+def _decode_judgement(row: dict) -> dict:
+    row["evidence"] = json.loads(row.pop("evidence_json") or "{}")
+    return row

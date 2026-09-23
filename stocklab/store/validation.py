@@ -72,11 +72,18 @@ def insert_round(conn: sqlite3.Connection, *, cycle_id: int, round_no: int,
 
 def insert_event(conn: sqlite3.Connection, *, cycle_id: int, script_id: int,
                  kind: str, at_value: float | None, threshold: float | None,
-                 criteria_text: str, reason: str, now: str) -> int:
+                 criteria_text: str, reason: str, now: str,
+                 commit: bool = True) -> int:
     """记一条熔断/冻结/解冻事件。`kind` 不在 `EVENT_KINDS` 里直接拒绝。
 
     写入层先拦一道、schema 的 CHECK 再拦一道：前者给出**点名**的错误，
     后者保证绕过接口也写不进去（与 ERROR_DIARY #49「别让 CHECK 兜底」同向）。
+
+    `commit=False` 供 P49 把**熔断 + 收尾两行**放进一个事务（与
+    `paper/engine.py::_step_all` 同一个理由：一次失败不得留下半截状态 ——
+    只有熔断行没有收尾行，读者会以为「触及阈值但周期还活着」）。
+    `uq_validation_events_circuit_breaker` / `uq_validation_events_end` 两条
+    部分唯一索引是幂等的**结构防线**，撞键抛 `sqlite3.IntegrityError`。
     """
     if kind not in EVENT_KINDS:
         raise ValueError(
@@ -87,8 +94,21 @@ def insert_event(conn: sqlite3.Connection, *, cycle_id: int, script_id: int,
         " threshold, criteria_text, reason, created_at) VALUES (?,?,?,?,?,?,?,?)",
         (cycle_id, script_id, kind, at_value, threshold, criteria_text, reason,
          now))
-    conn.commit()
+    if commit:
+        conn.commit()
     return int(cur.lastrowid)
+
+
+def find_event(conn: sqlite3.Connection, cycle_id: int, kind: str) -> dict | None:
+    """该周期**是否已有**这一类事件（P49 的熔断/收尾幂等判据）。
+
+    只用于返回值与状态文案：真正的幂等由部分唯一索引保证 ——
+    「先查再写」如果被当成防线，它就是一个口头约定（`m2/store.py` 同款纪律）。
+    """
+    row = conn.execute(
+        f"SELECT * FROM {TABLE_EVENTS} WHERE cycle_id = ? AND kind = ?"
+        " ORDER BY event_id LIMIT 1", (cycle_id, kind)).fetchone()
+    return None if row is None else dict(row)
 
 
 def get_cycle(conn: sqlite3.Connection, cycle_id: int) -> dict | None:

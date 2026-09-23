@@ -1073,6 +1073,19 @@ CREATE TRIGGER IF NOT EXISTS trg_validation_events_no_delete
 BEFORE DELETE ON validation_events
 BEGIN SELECT RAISE(ABORT, 'validation_events is append-only'); END;
 
+-- 熔断与收尾的**结构性幂等键**（P49 §2）：不靠「先查再写」的口头约定。
+--
+-- 熔断**一个周期至多一次** —— 触发即终止本轮验证，之后不可能再触发；所以
+-- 「同 `(cycle_id, asof)` 重放不增行」由这条更强的约束保证（同周期任何 asof 都不增）。
+-- 收尾同理：一个周期只有一条 `validation_end`，否则「这一轮什么时候结束的」
+-- 就变成了「最后一条 end 是谁写的」。`freeze` / `unfreeze` **不设**唯一 ——
+-- 冻结-解冻可以来回多次，那是正常事件流。
+CREATE UNIQUE INDEX IF NOT EXISTS uq_validation_events_circuit_breaker
+    ON validation_events (cycle_id) WHERE kind = 'circuit_breaker';
+
+CREATE UNIQUE INDEX IF NOT EXISTS uq_validation_events_end
+    ON validation_events (cycle_id) WHERE kind = 'validation_end';
+
 -- ---------- 模块2 双通路运行台账（P47，append-only）----------
 -- 一次「跑通路」= 一行：这条通路在这个账户、这个 `asof` 上**做了什么**。
 -- 三件事只有这张表回答得了：
@@ -1225,3 +1238,32 @@ BEGIN SELECT RAISE(ABORT, 'm2_forecast_scores is append-only'); END;
 CREATE TRIGGER IF NOT EXISTS trg_m2_forecast_scores_no_delete
 BEFORE DELETE ON m2_forecast_scores
 BEGIN SELECT RAISE(ABORT, 'm2_forecast_scores is append-only'); END;
+
+-- ---------- 模块2 自评估判定台账（P49，append-only）----------
+-- 口径：D-44 的三分支判定**只出建议 + 依据**，执行（改脚本/改参数/冻解冻）一律
+-- 走人工 `approve`（D-1/D-24）。所以这张表存的是**建议**，不是状态变更 ——
+-- 它没有 `applied` 之类的列：一行判定永远只意味着「当时这些读数支持这个建议」。
+--
+-- 幂等键 = `(cycle_id, asof_date)` UNIQUE：判定是**输入的函数**（同一周期、
+-- 同一截止日 ⇒ 同一份读数 ⇒ 同一条建议），重放不该产出第二行。
+-- 与熔断不同：熔断**一个周期至多一次**（触发即终止），判定可以随 asof 推进重做。
+CREATE TABLE IF NOT EXISTS m2_judgements (
+    judgement_id  INTEGER PRIMARY KEY AUTOINCREMENT,
+    cycle_id      INTEGER NOT NULL,
+    script_id     INTEGER NOT NULL,
+    asof_date     TEXT NOT NULL,               -- 判定所依据的截止日（PIT，不读墙上时钟）
+    branch        TEXT NOT NULL CHECK (branch IN
+                    ('freeze','optimize','tune','insufficient')),
+    evidence_json TEXT NOT NULL,               -- 依据清单：读数 / 案例 / 算到哪一步
+    criteria_text TEXT NOT NULL,               -- 判据**原文**（照抄周期，不许事后改写）
+    created_at    TEXT NOT NULL,
+    UNIQUE (cycle_id, asof_date)
+);
+
+CREATE TRIGGER IF NOT EXISTS trg_m2_judgements_no_update
+BEFORE UPDATE ON m2_judgements
+BEGIN SELECT RAISE(ABORT, 'm2_judgements is append-only'); END;
+
+CREATE TRIGGER IF NOT EXISTS trg_m2_judgements_no_delete
+BEFORE DELETE ON m2_judgements
+BEGIN SELECT RAISE(ABORT, 'm2_judgements is append-only'); END;

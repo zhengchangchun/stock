@@ -124,6 +124,49 @@ REASON_NO_DIRECTION: str = "NO_DIRECTION"
 #: 最有利的』筛选参数」，所以它只能是一个常量：要列就按时间倒序取最近 N 条。
 CASE_LIMIT: int = 50
 
+# ---------- 自评估三分支与熔断（P49 / D-44 / D-27） ----------
+
+#: 三分支的枚举值。**与 `schema.sql` 的 `m2_judgements.branch` CHECK 逐字相同**
+#: （由 `tests/test_p49_selfeval.py` 钉住）—— 枚举字符串漂一个字，判定行就写不进去。
+BRANCH_FREEZE: str = "freeze"        # 读数未达标且无可归因方向 ⇒ 停用该版本（≤90 天）
+BRANCH_OPTIMIZE: str = "optimize"    # 有方向且需改脚本逻辑 ⇒ 新 script 版本 + 新账户
+BRANCH_TUNE: str = "tune"            # 只动参数、不动逻辑 ⇒ 同版本新参数集 + **新周期**
+#: **不是第四个分支**，而是「判不了」：样本不足 120 交易日时只给读数（CLAUDE.md 度量纪律 3）。
+#: 它必须与三个分支同为**枚举值**而不是 `None` —— 否则「没判定」与「判定为冻结」
+#: 在库里的形状会撞在一起。
+BRANCH_INSUFFICIENT: str = "insufficient"
+
+BRANCHES: tuple[str, ...] = (BRANCH_FREEZE, BRANCH_OPTIMIZE, BRANCH_TUNE,
+                             BRANCH_INSUFFICIENT)
+
+BRANCH_LABELS: dict[str, str] = {
+    BRANCH_FREEZE: "冻结",
+    BRANCH_OPTIMIZE: "优化",
+    BRANCH_TUNE: "微调",
+    BRANCH_INSUFFICIENT: "证据不足",
+}
+
+#: 调用方声明的**改进方向性质**。三分支里唯一无法从读数推出的一格：
+#: 「要不要改脚本逻辑」是**提案的属性**，不是数据的属性（D-44 ②/③）。
+#: `none` = 声明「没有可归因的方向」—— 冻结的前提。
+FIX_NONE: str = "none"
+FIX_LOGIC: str = "logic"
+FIX_PARAMS: str = "params"
+FIX_KINDS: tuple[str, ...] = (FIX_NONE, FIX_LOGIC, FIX_PARAMS)
+
+#: 熔断判据**原文**（D-27）。落进 `validation_events.criteria_text` —— 事后换口径
+#: 是这一站的典型作弊方式，所以判据在这里只写一次，写库时**照抄**这一个常量。
+CIRCUIT_CRITERIA_TEXT: str = (
+    "验证期内账户净值自峰值回撤 ≥ CIRCUIT_BREAKER_DRAWDOWN（0.10）⇒ "
+    "立即标记本轮策略失效、终止本轮验证（D-27 / D-4）")
+
+#: 判定台账表名（P49 新增）。归 `m2/` 家族，因为存的是 m2 的建议而不是验证台账事实。
+TABLE_JUDGEMENTS: str = "m2_judgements"
+
+#: 待复核清单（P49 §3）里**恒空**的归因字段名 —— 结构位留给 P50 的人工确认（D-31）。
+#: 只读汇总里出现这个键、值恒 `None`，是为了让「忘了填」与「不许填」在形状上分得开。
+ATTRIBUTION_FIELD: str = "attribution"
+
 # ---------- 运行状态 ----------
 
 STATUS_RAN: str = "ran"
