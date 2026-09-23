@@ -193,6 +193,9 @@ stocklab portfolio show --asof 2026-09-15 --json     # P13 消费的稳定接口
   — 让读数**自己长**：新增单一入口 `m2 daily`，`ops close` 里加一步（`paper_step` 后、`doctor` 前）；
   通路 B 总跑、通路 A 遍历「在飞版本」（0 个 ⇒ **skipped 不是失败**）；只有 `rejected` 报红（exit 4）；
   定型闸门复用 P46 那道「当天 K 线定型了吗」；**不在 patrol 里补 m2**；
+  **已交付**（12→13 步、plist 逐字节不变、真库零写入；实施记录见任务书 §实施记录。
+  ⚠️ 真库 `m2_a1`/`m2_b1` 尚无 active 版本 ⇒ `m2_daily` 会 exit 4、收盘链会停在它 ——
+  需人工 `approve` 四支插桩后才会恢复全绿），
   [`p55` 中证500 接入](tasks/2026-09-23-p55-中证500接入.md)
   — 04 §P1-1「多指数对标」的另一半：先**只读探针**证明 `sh000905` 拿得到，再走既有采集路径落
   `bars_daily`（`adj_mode='none'`）并把 `DEFERRED_BENCHMARKS` 翻进 `BENCHMARKS`；拿不到就**明文写代价**、

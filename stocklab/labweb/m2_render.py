@@ -24,6 +24,7 @@ from collections.abc import Mapping
 from stocklab.labweb.render import (esc, glance, layout, more, num, ratio_pct,
                                      rich, section)
 from stocklab.labweb.m2_data import METRIC_LABELS
+from stocklab.m2 import daily as m2_daily
 
 #: 缺值的标记（P48 §3 原文：写「无」，不写 0）。样式沿用既有 `.s-unknown`。
 NONE_MARK = '<span class="s-unknown">无</span>'
@@ -339,13 +340,35 @@ def _review_block(review: Mapping) -> str:
     return table + glance(lines)
 
 
+def last_run_line(last: Mapping | None) -> str:
+    """`/lab/m2` 顶部那一句：**上次通路运行**（P54 §1.6）。
+
+    只读台账里最后一行（`m2/daily.py::last_run`）—— 页面不推算「今天跑没跑」，
+    也**没有任何触发按钮**（触发只走 CLI 与收盘链）。
+    没跑过写「从未」：写 0、或写一个今天的日期，都会让「没跑」看起来像「跑了」。
+
+    日期与状态**不加标记**（不用 `<code>` / `<b>`）：这一句的读者要的是一句人话，
+    而 `rich()` 的标签会把「`日期` / `状态`」切碎（任务书 §1.6 给的就是这个形状）。
+    """
+    if not last:
+        return '<p class="note">' + rich(
+            f"{m2_daily.LAST_RUN_LABEL}：从未（`m2_channel_runs` 一行都没有）"
+            "—— 跑过 `ops close`（链上 `m2_daily` 一步）或手工 "
+            "`stocklab m2 daily --asof <交易日>` 之后这里才有读数") + '</p>'
+    return '<p class="note">' + rich(
+        f"{m2_daily.LAST_RUN_LABEL}：{last['asof']} / {last['status']}"
+        f"（通路 {last['channel']} · {last['account_id']}）"
+        "—— 读的是 `m2_channel_runs` 的最后一行，本页不重算") + '</p>'
+
+
 def m2_page(data: Mapping, *, base: str, built_at: str) -> str:
     """`/lab/m2`（整页，**只读**：没有任何表单，也没有写入口）。"""
     head = ['<p class="note">' + rich(
         "模块2 对标与校验：**AI 模拟（通路 A） vs 人工镜像 vs 市场基准**，"
         "外加 A3 / B1 插桩预测的事后校验。指标与门禁**全部复用模块2 §4 的既有实现**"
         "（`paper metrics` / `/lab/paper` 同一份代码）—— 本页一个数都不重算。"
-        "样本不足时只给读数，不下结论。") + '</p>']
+        "样本不足时只给读数，不下结论。") + '</p>',
+        last_run_line(data.get("last_run"))]
     body = [
         section("三方对标（P48 §1）", three_way_block(data["three_way"]),
                 right="并列，不排名",

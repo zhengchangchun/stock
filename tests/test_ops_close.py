@@ -390,7 +390,9 @@ def test_summary_line_is_one_line(tmp_path, monkeypatch):
                               report_dir=tmp_path / "reports")
     line = chain.summary_line(payload)
     assert "\n" not in line
-    assert line.startswith("close: exit=0") and "steps=12/12" in line
+    # 步数**从被测模块取**（P54 加了 `m2_daily` 一步：写死 12 的那份当场过期）
+    total = len(CLOSE_STEP_ORDER)
+    assert line.startswith("close: exit=0") and f"steps={total}/{total}" in line
 
 
 # ---------- CLI ----------

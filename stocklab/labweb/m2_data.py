@@ -44,6 +44,7 @@ from stocklab.m2 import attribution as m2_attr
 from stocklab.m2 import bypass as m2_bypass
 from stocklab.m2 import config as m2_config
 from stocklab.m2 import config_view
+from stocklab.m2 import daily as m2_daily
 from stocklab.m2 import selfeval
 from stocklab.m2 import store as m2_store
 from stocklab.paper import store as paper_store
@@ -666,6 +667,9 @@ def panel(conn: sqlite3.Connection, asof: str) -> dict:
         "charts": m2_charts.chart_panel(conn, asof),
         "config": config_view.items(conn),
         "bypass": bypass_readings(conn, asof),
+        # P54：日报跑过没有 —— **读台账那一行**（`m2/daily.py::last_run`），
+        # 页面不自己比「今天跑没跑」（多一处推算就多一个会漂的读数）。
+        "last_run": m2_daily.last_run(conn),
     }
 
 

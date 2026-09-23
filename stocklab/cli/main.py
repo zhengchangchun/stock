@@ -2897,7 +2897,7 @@ def _print_ops_payload(payload: dict, summary_fn) -> int:
 
 
 def cmd_ops_close(args: argparse.Namespace) -> int:
-    """收盘链（ADR-020）：库备份 → 12 步（asof = **运行当天**）→ 事后体检。
+    """收盘链（ADR-020）：库备份 → 13 步（asof = **运行当天**）→ 事后体检。
 
     退出码：0 全绿（含非交易日跳过）/ 1 链跑完但有异常 / 2 断链或**还没收盘**。
     收盘前拒绝执行是硬约束：半截 bar 与当日 LIVE 预测都是 append-only。
@@ -3125,6 +3125,89 @@ def cmd_m2_score(args: argparse.Namespace) -> int:
         conn.close()
     print(json.dumps(out, ensure_ascii=False, sort_keys=True, indent=2))
     return 0
+
+
+def cmd_m2_daily(args: argparse.Namespace) -> int:
+    """模块2 一天（P54）：通路 B → 通路 A（遍历在飞版本）→ 事后打分。
+
+    ## 为什么是**一个**入口
+
+    `ops close` 的 `CLOSE_STEPS` 是**静态元组**，而「这一轮要跑哪几个策略版本」
+    只有运行期才知道。把遍历写进链的步骤表，步数就会跟着库的状态变 ——
+    链的顺序语义与页面「一行一步」的读法都建立在「计划是固定的」上。
+    所以链上只加一步 `m2_daily`，遍历留在这里（口径与理由见 `m2/daily.py`）。
+
+    ## 退出码（沿用既有语义，**不发明新的**）
+
+    - `0` 全跑完（含 `already` 幂等、含「没有在飞版本」的 skipped）；
+    - `2` 当日 K 线未定型 / 库不可用 / 输入不合法（`--asof` 不是交易日）；
+    - `4` 有通路 `rejected`（配置了却坏了 ⇒ 链上必须报红，不许静默）。
+
+    ## 定型闸门复用 P46，不另写判据
+
+    `asof == 今天` 且当天 K 线未定型 ⇒ **exit 2、一行都不写** —— 与
+    `predict run --asof 今天` 同款 fail-closed：`m2_forecasts` 也是 append-only，
+    基于半截 bar 写进去就退不回来（ERROR_DIARY #60）。
+    判据是 `session/close.py::bars_finalized_on`（**不读墙上时钟**），本站只调用它。
+    """
+    from stocklab.calendar.trading_calendar import Calendar
+    from stocklab.m2 import config as m2_config
+    from stocklab.m2 import daily as m2_daily
+    from stocklab.predict.service import NotASession, assert_session
+    from stocklab.session import close as close_mod
+
+    asof = _canonical_day(args.asof)
+    if asof is None:
+        print(json.dumps(
+            {"error": f"--asof {args.asof!r} 不是规范日期（要 YYYY-MM-DD）"},
+            ensure_ascii=False), file=sys.stderr)
+        return 2
+    now = args.now or datetime.now(TZ).isoformat(timespec="seconds")
+    try:
+        today = datetime.fromisoformat(now).date().isoformat()
+    except ValueError:
+        print(json.dumps({"error": f"--now {now!r} 不是合法时刻"},
+                         ensure_ascii=False), file=sys.stderr)
+        return 2
+
+    conn, code = _m2_conn(args)
+    if conn is None:
+        return code
+    try:
+        # 定型闸门（**复用** P46 那一道，见 docstring）。在任何写入之前判掉。
+        if asof == today:
+            finalized, why = close_mod.bars_finalized_on(conn, asof)
+            if not finalized:
+                print(f"❌ 当日数据未定型，拒绝跑模块2（asof={asof}）：{why}"
+                      "；通路与打分都读收盘价，等收盘链把当天 K 线刷成终值再跑"
+                      "（`ops close` 15:30，或手工 `ingest bars` 之后重跑本命令）",
+                      file=sys.stderr)
+                return 2
+        # 输入不合法（`--asof` 不是交易日）：与 `predict run` 同一判据
+        # （日历 ∩ 行情轴），不另造一份交易日判定。
+        try:
+            assert_session(conn, Calendar.load(conn), asof)
+        except NotASession as exc:
+            print(f"❌ {exc}", file=sys.stderr)
+            return 2
+        out = m2_daily.run_daily(conn, asof=asof, now=now)
+    finally:
+        conn.close()
+    print(json.dumps(out, ensure_ascii=False, sort_keys=True, indent=2))
+    return EXIT_REJECTED if out["status"] == m2_config.STATUS_REJECTED else 0
+
+
+def _canonical_day(value: str) -> str | None:
+    """`YYYY-MM-DD` 的**规范**写法 → 原串；别的写法（`2026-9-2`）→ `None`。
+
+    非规范写法会让日期在字符串比较里静默失配（`'2026-9-2' > '2026-09-10'` 为真），
+    而这里的日期会进台账、进回执、进链的 argv —— 口径标识符必须可比较。
+    """
+    try:
+        day = date.fromisoformat(str(value))
+    except ValueError:
+        return None
+    return day.isoformat() if day.isoformat() == str(value) else None
 
 
 def cmd_m2_report(args: argparse.Namespace) -> int:
@@ -3917,7 +4000,7 @@ def build_parser() -> argparse.ArgumentParser:
     ops_patrol.set_defaults(func=cmd_ops_patrol)
 
     ops_close = ops_sub.add_parser(
-        "close", help="收盘链（ADR-020）：库备份 → 12 步 → 事后体检；asof = 运行当天")
+        "close", help="收盘链（ADR-020）：库备份 → 13 步 → 事后体检；asof = 运行当天")
     ops_close.add_argument("--db", help="数据库路径（默认 data/stocklab.db）")
     ops_close.add_argument("--now", help="覆盖当前时刻（ISO8601；仅供测试/补跑）")
     ops_close.add_argument(
@@ -4137,6 +4220,16 @@ def build_parser() -> argparse.ArgumentParser:
     m2_score.add_argument("--db")
     m2_score.add_argument("--now", help="覆盖当前时刻（测试用）")
     m2_score.set_defaults(func=cmd_m2_score)
+
+    m2_daily_p = m2_sub.add_parser(
+        "daily",
+        help="跑模块2 的一天：通路 B → 通路 A（遍历在飞版本）→ 事后打分（P54；"
+             "`ops close` 的 m2_daily 一步就是它）")
+    m2_daily_p.add_argument("--asof", required=True,
+                            help="交易日 YYYY-MM-DD（`asof == 今天` 时先判 K 线定型）")
+    m2_daily_p.add_argument("--db")
+    m2_daily_p.add_argument("--now", help="覆盖当前时刻（测试/补录用）")
+    m2_daily_p.set_defaults(func=cmd_m2_daily)
 
     m2_report = m2_sub.add_parser(
         "report", help="三方对标 + 预测校验读数（只读；与 `/lab/m2` 同源）")

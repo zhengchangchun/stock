@@ -102,6 +102,10 @@ CLOSE_STEPS: tuple[Step, ...] = (
          "当日复盘报告（离线只读，产出 reports/<asof>-review.md）"),
     Step("paper_step", ("paper", "step", "--asof", "{asof}"), True,
          "模拟盘按 asof 收盘推进一天（幂等：同日重跑不重复下单）"),
+    Step("m2_daily", ("m2", "daily", "--asof", "{asof}"), True,
+         "模块2 日更（P54）：通路 B → 通路 A（遍历**在飞**策略版本）→ 事后打分。"
+         "**一步**：遍历在 CLI 里，因为「这一轮跑哪些版本」只有运行期才知道"
+         "（`CLOSE_STEPS` 是静态元组）；没有在飞版本 ⇒ 记一行 `skipped`，不是失败"),
     Step("doctor", ("doctor",), False,
          "数据健康度报告（不接受任何参数；放在最后当全链的自证）"),
 )
@@ -192,7 +196,7 @@ def run_close(*, db_path: Path | str | None = None, now: str | None = None,
               runner=None, timeout_s: float = CLOSE_TIMEOUT_S,
               report_dir: Path | str | None = None,
               backup_dir: Path | str | None = None) -> dict:
-    """收盘链 = 库备份 → 12 步（**asof = 运行当天**）→ 事后体检 → 回执。
+    """收盘链 = 库备份 → 13 步（**asof = 运行当天**）→ 事后体检 → 回执。
 
     退出码：0 全绿（含非交易日跳过）/ 1 链跑完但事后体检有 `missing`/`stale` 或某步
     退出 1 / 2 断链（库不在 / 还没收盘 / 某步 ≥2 / **整轮预算用尽或单步超时** /

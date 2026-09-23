@@ -23,7 +23,7 @@ launchd 没有 cron 表达式，`StartCalendarInterval` **一次只能描述一�
 但语义与 `*/30 9-14 * * 1-5` 逐点等价，且**没有 shell 参与**。
 
 **为什么去掉 15:30**（P42）：15:30 那一槽与 `close` **撞在同一分钟**，而两个任务都会
-真起子进程写同一个 SQLite 库（`patrol --fix` 补步、`close` 跑整条 12 步链）→ 撞
+真起子进程写同一个 SQLite 库（`patrol --fix` 补步、`close` 跑整条 13 步链）→ 撞
 `database is locked` → 某步非 0 → 收盘链**断链（exit 2）**，留下最难收拾的当日半截
 状态。收盘后补缺口的职责本来就归 `close`（15:30 整条链），那一槽的巡逻是冗余的。
 `tests/test_ops_close.py::test_no_two_jobs_fire_at_the_same_moment` 把这条钉死成
@@ -128,7 +128,7 @@ JOBS: tuple[Job, ...] = (
         # （exit 0，不是异常）。文案必须说 plist 实际做的事，否则读页面的人会以为
         # 节假日不会触发（P43 §S5）。
         window="工作日 15:30（非交易日整轮跳过）",
-        why="收盘链：库备份 → 12 步（ingest→快照→预测→验证→复盘→模拟盘）→ 事后体检",
+        why="收盘链：库备份 → 13 步（ingest→快照→预测→验证→复盘→模拟盘→模块2）→ 事后体检",
         calendar=tuple({"Hour": 15, "Minute": 30, "Weekday": d} for d in WEEKDAYS),
     ),
     Job(
