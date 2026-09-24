@@ -63,16 +63,19 @@ from __future__ import annotations
 
 import json
 import sqlite3
+from typing import Mapping
 
 from stocklab.backtest import metrics as bt
 from stocklab.backtest.portfolio import NavPoint
 from stocklab.paper import agent_spec
 from stocklab.paper import store as paper_store
 from stocklab.paper.config import (ARM_AGENT, ARM_AGENT_RANDOM, ARM_KIND_AGENT,
-                                   ARM_KIND_AGENT_RANDOM, PAPER_START_DATE,
+                                   ARM_KIND_AGENT_RANDOM, EXECUTOR_KEY,
+                                   PAPER_START_DATE, PREREGISTERED_KEY,
                                    RULE_CITATIONS, RULE_CITATIONS_AGENT,
                                    RULE_CITATIONS_AGENT_DECISION)
-from stocklab.paper.engine import INDEX_300_SYMBOL, agent_block, build_report
+from stocklab.paper.engine import (INDEX_300_SYMBOL, agent_block, build_report,
+                                   live_of)
 from stocklab.plugin import lifecycle as plugin_lifecycle
 from stocklab.plugin import store as plugin_store
 from stocklab.session.review import rolling_accuracy
@@ -98,6 +101,34 @@ def _has_table(conn: sqlite3.Connection, name: str) -> bool:
     return conn.execute(
         "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name=?",
         (name,)).fetchone()[0] > 0
+
+
+def arm_descriptor(account: Mapping) -> dict:
+    """账户行 → 页面/报告要读的那几条**声明字段**（`params_json` 的原样投影）。
+
+    一处定义、多处消费（`track` 的 arms 与 `performance` 的 rows 共用），因为
+    「贴哪个标签、上哪条线」现在要按**执行者**分档（P69 §T3），而执行者写在
+    `params_json` 里。页面不许自己 `json.loads` 一遍 —— 两份投影迟早漂。
+
+    **只投影，不派生**：`executor` / `live` / `model_id` / `plugin_hooks` /
+    `strategy_version` 都是从账户行里**读出来的值**，没有一个新口径。
+    `live` 走 `engine.live_of`（缺省 `true`，写错类型点名报错）—— 与认领侧同一个判据，
+    所以「页面说它停飞了」与「`paper agent run` 不认领它」不可能分叉。
+    """
+    params = json.loads(account["params_json"] or "{}")
+    prereg = params.get(PREREGISTERED_KEY) or {}
+    model = prereg.get("model_id") if isinstance(prereg, Mapping) else None
+    return {
+        "executor": params.get(EXECUTOR_KEY),
+        "live": live_of(params),
+        "model_id": (str(model) if model else None),
+        "prompt_sha256": (str(prereg.get("prompt_sha256"))
+                          if isinstance(prereg, Mapping) and prereg.get("prompt_sha256")
+                          else None),
+        "plugin_hooks": [str(h) for h in (params.get("plugin_hooks") or [])],
+        "strategy_version": (str(params["strategy_version"])
+                             if params.get("strategy_version") else None),
+    }
 
 
 def _anchor_cum_return(account: dict) -> float | None:
@@ -453,6 +484,7 @@ def performance(conn: sqlite3.Connection, asof: str, *,
             "kind": (_ARM_HOLD if str(account["arm"]) == _ARM_HOLD
                      else "arm"),
             "etf_target_pct": account["etf_target_pct"],
+            **arm_descriptor(account),
             **{k: m[k] for k in METRIC_KEYS},
             "n_sessions": m["n_sessions"], "missing": m["missing"],
         })
@@ -603,6 +635,7 @@ def track(conn: sqlite3.Connection, asof: str) -> dict:
             "account_id": aid, "arm": str(account["arm"]),
             "etf_target_pct": (None if account["etf_target_pct"] is None
                                else float(account["etf_target_pct"])),
+            **arm_descriptor(account),
             "anchor_cum_return": anchor,
             "points": [series.get(d) for d in axis],
             "latest_nav_date": max(by_account.get(aid, {}), default=None),

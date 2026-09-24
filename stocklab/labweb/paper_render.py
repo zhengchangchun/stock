@@ -54,16 +54,36 @@ from stocklab.labweb.paper_data import INDEX_LABEL, METRIC_KEYS, METRIC_LABELS
 from stocklab.labweb.render import (cell, esc, glance, glance_html, layout, money,
                                     more, num, ratio_pct, rich, section,
                                     sign_cls)
-from stocklab.paper.config import (ARM_KIND_AGENT, ARM_KIND_AGENT_RANDOM,
-                                   NOT_COMPARABLE, RULE_CITATIONS_AGENT)
+from stocklab.paper.config import (AGENT_ARM_PREFIX, ARM_AGENT, ARM_AGENT_RANDOM,
+                                   ARM_KIND_AGENT, ARM_KIND_AGENT_RANDOM,
+                                   EXECUTOR_AGENT_DECISION, EXECUTOR_CHANNEL_A,
+                                   HALTED_LABEL, NOT_COMPARABLE,
+                                   RULE_CITATIONS_AGENT)
 
 #: 账户 → 人话。**只换标签**，不改任何数字。
+#: ⚠️ 只钉**没有执行者声明**的两条静态线（`arm-now` / `arm-hold`）—— AI 家族一律走
+#: `_agent_label`（按 `params.executor` 分档）。把 `arm-agent*` 钉在这里就是 P56 §8.4
+#: 那个错标签的成因：`arm-agent-ds-v1/-v2` 的 `arm` 也是 `agent`，按 `arm` 一刀切
+#: 会把**决策台账臂**叫成「智能体 spec 编排」。
 _LABELS: dict[str, str] = {
     "arm-now": "我 · 实盘账本镜像",
     "arm-hold": "什么都不做 · 起跑日冻结快照",
-    "arm-agent": "AI 操盘手 · 每交易日一条决策",
-    "arm-agent-random": "AI 操盘手 · 随机对照（同护栏同成本）",
 }
+
+#: AI 家族的**唯一颜色**（紫）。家族内的线型区分见 `arm_style`。
+_AGENT_COLOR = "#6a3d9a"
+#: 家族三档线型：LLM 实线 / 随机虚线 / 通路 A 点线。
+_AGENT_STYLES: dict[str, tuple[str, str, float]] = {
+    "llm": (_AGENT_COLOR, "", 2.0),
+    "random": (_AGENT_COLOR, "6 3", 1.6),
+    "channel_a": (_AGENT_COLOR, "2 3", 1.8),
+}
+
+#: 停飞（`params.live=false`）：**灰线**。与「什么都不做」的灰虚线、认不出的账户
+#: 各用一组线型分开 —— 灰是一族，线型才是身份证。
+#: ⚠️ 它不是 `_UNKNOWN_STYLE`：停飞是**已知**状态（我们认识这条臂），
+#: 认不出是**未知**状态，两件事都不许被读成对方。
+_HALTED_STYLE: tuple[str, str, float] = ("#8c98a4", "3 3", 1.4)
 
 #: 账户 → (颜色, 虚线 dash, 线宽)。我 = accent 实线最粗；大盘单列在 `_INDEX_STYLE`。
 _STYLES: dict[str, tuple[str, str, float]] = {
@@ -72,10 +92,6 @@ _STYLES: dict[str, tuple[str, str, float]] = {
     "arm-discipline-05": ("#0f6b3b", "", 1.8),
     "arm-discipline-10": ("#8a5a00", "", 1.8),
     "arm-discipline-15": ("#2a6f8f", "", 1.8),
-    # 智能体臂：紫色家族。random 用**同色虚线** —— 它们是一对（同护栏、同成本、
-    # 同候选池），线型分开只是为了让两条线叠在一起时还认得出，不是因为它「更差」。
-    "arm-agent": ("#6a3d9a", "", 2.0),
-    "arm-agent-random": ("#6a3d9a", "6 3", 1.6),
 }
 
 #: 大盘：深灰点线。与「什么都不做」的灰虚线靠**线型**分开（不只是靠颜色深浅）。
@@ -84,11 +100,23 @@ _INDEX_STYLE: tuple[str, str, float] = ("#5a6672", "2 3", 2.0)
 #: 认不出的账户：中性灰 + 短虚线（一眼看出它不是几条已知线之一）。
 _UNKNOWN_STYLE: tuple[str, str, float] = ("#5a6672", "4 3", 1.6)
 
-#: 展示顺序：**我 → 什么都不做 → AI 三档 → 智能体臂两档**。这是给读者的阅读顺序
-#: （先看自己的线），不是排名。字典里没有的账户排最后，按 id 升序。
+#: 展示顺序：**我 → 什么都不做 → AI 三档**。这是给读者的阅读顺序（先看自己的线），
+#: 不是排名。AI 家族（`arm-agent*`）紧随其后，按「在飞 → 停飞、再按 id」排 ——
+#: 家族成员**不许在这里列举**（P69 §T3）：新开一条版本账户不该要改渲染代码。
 _DISPLAY_ORDER = ("arm-now", "arm-hold", "arm-discipline-05",
-                  "arm-discipline-10", "arm-discipline-15",
-                  "arm-agent", "arm-agent-random")
+                  "arm-discipline-10", "arm-discipline-15")
+
+#: AI 家族的两条内置成员（`arm-agent` 自己**不带**前缀那个连字符，要单列）。
+_AGENT_BUILTINS = (ARM_AGENT, ARM_AGENT_RANDOM)
+
+
+def in_agent_family(account_id: str) -> bool:
+    """这个账户 id 属于 AI 操盘手家族吗（`arm-agent` / `arm-agent-*`）。
+
+    按**前缀 + 两个内置名**判定，不按枚举：新版本账户 `arm-agent-<版本>` 自动入族。
+    """
+    aid = str(account_id)
+    return aid in _AGENT_BUILTINS or aid.startswith(AGENT_ARM_PREFIX)
 
 _TABLE_HEAD = ("<tr><th>线</th><th>净值</th><th>累计收益</th><th>相对大盘</th>"
                "<th>相对我</th><th>最大回撤</th><th>累计成本</th>"
@@ -97,34 +125,116 @@ _TABLE_HEAD = ("<tr><th>线</th><th>净值</th><th>累计收益</th><th>相对�
 UNKNOWN = '<span class="s-unknown">未知</span>'
 
 
+def _is_live(arm: Mapping) -> bool:
+    """这条臂还在飞吗。**缺省 `True`**（与 `engine.live_of` 同一个默认值）。
+
+    页面读的是 `paper_data.arm_descriptor` 的投影；投影没了（老库/手工拼的 dict）
+    就按「在飞」处理 —— 那是 `params.live` 本身的缺省语义。
+    """
+    return bool(arm.get("live", True))
+
+
+def _halted_suffix(arm: Mapping) -> str:
+    """停飞标签后缀（`HALTED_LABEL` 的唯一来源，`paper agent show` 同源）。"""
+    return "" if _is_live(arm) else f' · {HALTED_LABEL}'
+
+
+def _executor_of(arm: Mapping) -> str | None:
+    value = arm.get("executor")
+    return None if value is None else str(value)
+
+
+def _family_style(arm: Mapping) -> tuple[str, str, float]:
+    """AI 家族内部的线型：LLM 实线 / 随机虚线 / 通路 A 点线；停飞一律灰。"""
+    if not _is_live(arm):
+        return _HALTED_STYLE
+    if _executor_of(arm) == EXECUTOR_CHANNEL_A:
+        return _AGENT_STYLES["channel_a"]
+    if str(arm.get("arm") or "") == ARM_KIND_AGENT_RANDOM:
+        return _AGENT_STYLES["random"]
+    return _AGENT_STYLES["llm"]
+
+
+def _family_label(arm: Mapping) -> str:
+    """AI 家族 → 人话（P69 §T3 的三档）。
+
+    - `executor=m2_channel_a` ⇒ 「通路A · 插桩脚本（`m2_a1`…）· v<策略版本>」；
+    - `executor=agent_decision` ＋ 有预注册 ⇒ 「LLM 操盘臂 · `<model_id>` · <臂名后缀>」；
+    - `arm=agent_random` ⇒ 「随机对照（同护栏同成本）」；
+    - 执行者字段缺失（手工拼的 dict / 老库）⇒ 退回按 `arm` 给一句人话，**不写「口径未知」**。
+    """
+    aid = str(arm.get("account_id"))
+    executor = _executor_of(arm)
+    kind = str(arm.get("arm") or "")
+
+    if executor == EXECUTOR_CHANNEL_A:
+        hooks = "、".join(str(h) for h in (arm.get("plugin_hooks") or [])) or "未声明插桩"
+        ver = str(arm.get("strategy_version") or "未声明版本")
+        return f"通路A · 插桩脚本（{hooks}）· {ver}"
+    if executor == EXECUTOR_AGENT_DECISION:
+        if kind == ARM_KIND_AGENT_RANDOM:
+            return "随机对照（同护栏同成本）"
+        model = arm.get("model_id")
+        if model:
+            # 臂名后缀 = 账户名去掉家族前缀（`arm-agent-ds-v2` → `ds-v2`）。
+            suffix = aid[len(AGENT_ARM_PREFIX):] if aid.startswith(AGENT_ARM_PREFIX) \
+                else aid
+            return f"LLM 操盘臂 · {model} · {suffix}"
+        return f"{aid} · 无预注册（内置占位臂）"
+    if kind == ARM_KIND_AGENT:
+        return f"{aid} · AI 操盘手（`executor` 未声明）"
+    if kind == ARM_KIND_AGENT_RANDOM:
+        return "随机对照（同护栏同成本）"
+    return f"{aid}（口径未知）"
+
+
 def arm_label(arm: Mapping) -> str:
-    """账户 → 人话。AI 纪律臂按 `etf_target_pct` 拼；认不出的显示机器名。"""
+    """账户 → 人话（P69 §T3：按 `params.executor` + 台账分档，**不再按 `arm=='agent'` 一刀切**）。
+
+    修的是 P56 §8.4 点名的错标签：`arm-agent-ds-v1/-v2` 的 `arm` 字段也是 `agent`，
+    按 `arm` 一刀切会把**决策台账臂**叫成「智能体 spec 编排」（P37 的旧文案）——
+    读表的人会误判口径。停飞臂一律加 `HALTED_LABEL`，与 `paper agent show` 同源。
+    """
     aid = str(arm.get("account_id"))
     if aid in _LABELS:
         return _LABELS[aid]
+    if in_agent_family(aid):
+        return _family_label(arm) + _halted_suffix(arm)
     kind = str(arm.get("arm") or "")
-    if kind == ARM_KIND_AGENT:
-        return f"{aid} · 智能体 spec 编排"
-    if kind == ARM_KIND_AGENT_RANDOM:
-        return f"{aid} · 随机对照（同护栏同成本）"
     if kind == "discipline" and arm.get("etf_target_pct") is not None:
         return f"AI 纪律臂 · ETF 目标 {float(arm['etf_target_pct']):.0f}%"
     return f"{aid}（口径未知）"
 
 
 def arm_style(arm: Mapping) -> tuple[str, str, float]:
+    """账户 → (颜色, 虚线, 线宽)。家族按**前缀**纳入 ⇒ 新版本账户自动上紫线。"""
     aid = str(arm.get("account_id"))
     if aid in _STYLES:
         return _STYLES[aid]
+    if in_agent_family(aid):
+        return _family_style(arm)
     return _UNKNOWN_STYLE
 
 
 def _ordered(arms: Sequence[Mapping]) -> list[Mapping]:
-    known = [a for a in arms if str(a["account_id"]) in _DISPLAY_ORDER]
-    rest = sorted((a for a in arms if str(a["account_id"]) not in _DISPLAY_ORDER),
-                  key=lambda a: str(a["account_id"]))
-    return sorted(known,
-                  key=lambda a: _DISPLAY_ORDER.index(str(a["account_id"]))) + rest
+    """阅读顺序：固定五条 → AI 家族（在飞在前、同状态按 id）→ 其余按 id。
+
+    家族**不在这里列举 id**（P69 §T3）：加一条 `arm-agent-xx-v9` 不该要改渲染代码。
+    """
+    fixed = {a_id: i for i, a_id in enumerate(_DISPLAY_ORDER)}
+    known, family, rest = [], [], []
+    for a in arms:
+        aid = str(a["account_id"])
+        if aid in fixed:
+            known.append(a)
+        elif in_agent_family(aid):
+            family.append(a)
+        else:
+            rest.append(a)
+    return (sorted(known, key=lambda a: fixed[str(a["account_id"])])
+            + sorted(family, key=lambda a: (0 if _is_live(a) else 1,
+                                            str(a["account_id"])))
+            + sorted(rest, key=lambda a: str(a["account_id"])))
 
 
 def _now_arm(data: Mapping) -> Mapping | None:

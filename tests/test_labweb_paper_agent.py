@@ -283,9 +283,15 @@ def test_trades_by_the_agent_decision_are_counted_without_polluting_unknown(tmp_
 
 
 def test_agent_arms_have_their_own_labels_and_styles(db):
+    """AI 家族：按 `params.executor` + 台账分档（P69 §T3 替掉按 `arm` 一刀切）。
+
+    ⚠️ P69 同步改写：`arm-agent` 原来是「AI 操盘手 · 每交易日一条决策」（P52 文案），
+    但它**没有预注册** ⇒ 一条决策也拿不到 ⇒ 现文案如实写成「无预注册（内置占位臂）」。
+    """
     data = _track(db)
     labels = {a["account_id"]: paper_render.arm_label(a) for a in data["arms"]}
-    assert labels[ARM_AGENT] == "AI 操盘手 · 每交易日一条决策"
+    assert "无预注册" in labels[ARM_AGENT], "占位臂不许再被叫成「每交易日一条决策」"
+    assert "智能体 spec 编排" not in labels[ARM_AGENT], "P56 §8.4 那个错标签不许回来"
     assert "随机对照" in labels[ARM_AGENT_RANDOM]
     assert "阶段 3" not in labels[ARM_AGENT_RANDOM], \
         "阶段 3 的说法已经作废（P52 起它真的下单）"
@@ -295,9 +301,18 @@ def test_agent_arms_have_their_own_labels_and_styles(db):
         "两条臂同色时必须靠线型分开（同色实线会被读成同一条）"
     assert styles[ARM_AGENT][0] == styles[ARM_AGENT_RANDOM][0]
     assert styles[ARM_AGENT_RANDOM][1] != ""      # random = 虚线
-    order = paper_render._DISPLAY_ORDER
+
+
+def test_agent_family_follows_the_disciplines_in_reading_order(db):
+    """家族排在固定五条之后、且**不靠列举 id**（P69 §T3 的 `_ordered` 契约）。"""
+    data = _track(db)
+    order = [str(a["account_id"]) for a in paper_render._ordered(data["arms"])]
     assert order.index(ARM_AGENT) > order.index("arm-discipline-15")
     assert order.index(ARM_AGENT_RANDOM) == order.index(ARM_AGENT) + 1
+    assert ARM_AGENT not in paper_render._DISPLAY_ORDER, \
+        "家族不许再列举进 `_DISPLAY_ORDER` —— 列举就等于漏了将来新开的版本账户"
+    assert paper_render.in_agent_family("arm-agent-xx-v9"), \
+        "家族按前缀纳入 ⇒ 没见过的版本账户自动算家族成员"
 
 
 def test_arm_kind_fallback_still_labels_unknown_ids(db):

@@ -25,6 +25,7 @@
 
 from __future__ import annotations
 
+import json
 import sqlite3
 from typing import Mapping
 
@@ -44,6 +45,8 @@ from stocklab.paper.config import (
     FUND_EQUAL_WEIGHT_LABEL,
     FUND_NAV_APPROX_NOTE,
     FUND_NAV_SOURCE_URL,
+    HALTED_LABEL,
+    LIVE_KEY,
     NOT_COMPARABLE,
     PAPER_START_DATE,
     SAMPLE_THRESHOLD,
@@ -88,11 +91,16 @@ def _index_series(conn: sqlite3.Connection, start: str, dates: list[str]) -> dic
 def _account_rows(conn: sqlite3.Connection, asof: str) -> list[dict]:
     rows = []
     for account in store.load_accounts(conn):
+        params = json.loads(account["params_json"] or "{}")
         rows.append({
             "account_id": str(account["account_id"]),
             "arm_kind": str(account["arm"]),
             "etf_target_pct": (None if account["etf_target_pct"] is None
                                else float(account["etf_target_pct"])),
+            "params_json": str(account["params_json"] or "{}"),
+            # P69 / T2：停飞位（缺省在飞）。**逐字读库里的键**，不在这里猜。
+            "live": params.get(LIVE_KEY) is not False,
+            "executor": params.get("executor"),
         })
     return rows
 
@@ -103,18 +111,32 @@ def _decision_state(conn: sqlite3.Connection, account: Mapping, asof: str) -> di
     """AI 操盘手（含随机对照与版本账户）在 `asof` 的决策状态；别的臂 → `None`。
 
     数字全部来自台账与账户行（`agent_decide.portfolio_decision_on`），本函数不重算。
+
+    P69 / T2：**停飞臂（`params.live=false`）不是「今日无决策」** —— 它是「不再接受
+    考核」。两者在页面上必须不同形，否则「这条臂已经停了」会被读成「它今天没决定」，
+    而后者会让人以为明天还会有。
     """
     kind = str(account["arm_kind"])
     if kind not in (ARM_KIND_AGENT, ARM_KIND_AGENT_RANDOM):
         return None
-    from stocklab.paper import agent_decide          # 懒 import：避免模块成环
+    from stocklab.paper import agent_decide, engine    # 懒 import：避免模块成环
     aid = str(account["account_id"])
+    live = engine.live_of(json.loads(account["params_json"] or "{}"))
+    if not live:
+        return {
+            "present": False, "asof": asof, "decision_id": None, "model_id": None,
+            "n_codes": 0, "cash_pct": None, "halted": True,
+            "note": (f"**{HALTED_LABEL}**：`{aid}` 已停飞"
+                     f"（`params.{LIVE_KEY}=false`）⇒ 日终不由 `paper agent run` "
+                     f"认领，**不判它缺决策**。历史台账与净值行一行未动"
+                     f"（D-48：旧账户保留不删）"),
+        }
     present = agent_decide.portfolio_decision_on(conn, aid, asof)
     if present is not None:
         payload = present.get("payload") or {}
         n_codes = len(payload.get("decisions") or [])
         return {
-            "present": True, "asof": asof,
+            "present": True, "asof": asof, "halted": False,
             "decision_id": int(present["decision_id"]),
             "model_id": str(present["model_id"]),
             "n_codes": n_codes, "cash_pct": float(payload.get("cash_pct") or 0.0),
@@ -125,7 +147,8 @@ def _decision_state(conn: sqlite3.Connection, account: Mapping, asof: str) -> di
                      f"「今日无决策」不是一件事"),
         }
     return {
-        "present": False, "asof": asof, "decision_id": None, "model_id": None,
+        "present": False, "asof": asof, "halted": False,
+        "decision_id": None, "model_id": None,
         "n_codes": 0, "cash_pct": None,
         "note": (f"**今日无决策**：`{aid}` 在 {asof} 的 `paper_agent_decisions` 里"
                  f"没有这一行 ⇒ 那天**没决定**（不是「决定不动手」）。"
@@ -151,11 +174,16 @@ def build(conn: sqlite3.Connection, asof: str) -> dict:
         aid = a["account_id"]
         pts = [series.get(aid, {}).get(d) for d in dates]
         latest = next((v for v in reversed(pts) if v is not None), None)
+        # 停飞臂：口径那句**不再按 `arm_kind` 拼**（`arm-agent` 与 `arm-agent-ds-v2`
+        # 的 kind 都是 `agent`，拼出来是同一句 —— 正是 P56 §8.4 的错标签）。
+        label = (f"`{aid}` · {HALTED_LABEL}" if not a["live"]
+                 else f"`{aid}` · {arm_target_label(a['arm_kind'], a['etf_target_pct'])}")
         arms.append({
-            "id": aid, "label": f"`{aid}` · {arm_target_label(a['arm_kind'], a['etf_target_pct'])}",
+            "id": aid, "label": label,
             "kind": "account", "tradable": True, "comparable": True,
             "has_cost": True, "is_index": False, "approximate": False,
             "points": pts, "latest": latest,
+            "live": a["live"], "executor": a["executor"],
             "note": None,
             "decision": _decision_state(conn, a, asof),
             "n_sessions": sum(1 for v in pts if v is not None),
