@@ -638,3 +638,47 @@ def test_spec_rows_cannot_be_executed_as_portfolio_decisions(db, tmp_path, capsy
     finally:
         c.close()
     assert n == 0, "spec 行不是操盘决策，不许被执行"
+
+
+def test_p65_random_payloads_can_overdraw_and_the_gate_rejects_them(db):
+    """随机对照臂的载荷按 `total_assets` 定敞口、不看存量持仓 ⇒ 有种子会透支。
+
+    P65 的资金闸门把这件事**具名**暴露出来（`CashShortfall`），而不是让它变成
+    一笔负现金的成交。这是 ERROR_DIARY #73 同型缺陷的**第二个实例**：
+    `arm-agent-random` 的起跑账户同样有 43.6% 锁在 `000333` 里。
+
+    ⚠️ 本用例只**钉住读数**，不修口径：改随机臂的载荷生成 = 改控制臂的分布，
+    那是一次独立的策略变更（要自己的任务书）。见 P65 任务书 §7 的存留项 1。
+    """
+    c = connect(db)
+    try:
+        state = paper_engine.arm_state_for(c, ARM_AGENT_RANDOM, START)
+        pool = agent_pool.pool_snapshot(c, START)
+        marks = {**paper_engine.resolve_marks(c, set(pool["codes"]), START),
+                 **state["marks"]}
+        locked = sum(float(marks[code].price) * int(qty)
+                     for code, qty in state["positions"].items() if code in marks)
+        assert locked > 0, "夹具账户必须真的握着存量持仓，否则本判据空转"
+
+        rejected = 0
+        for seed in range(40):
+            payload = agent_decide.random_payload(
+                arm=ARM_AGENT_RANDOM, asof=START, pool_codes=set(pool["codes"]),
+                held_qty=state["positions"], marks=marks,
+                total_assets=state["total_assets"], seed=seed)
+            validated = agent_decide.validate_payload(
+                asof=START, payload=payload, pool_codes=set(pool["codes"]),
+                held_qty=state["positions"], marks=marks,
+                total_assets=state["total_assets"])
+            try:
+                agent_decide.execute_decision(
+                    c, arm=ARM_AGENT_RANDOM, asof=START, decision=validated,
+                    cash=float(state["cash"]), positions=dict(state["positions"]),
+                    marks=marks, total_assets=float(state["total_assets"]))
+            except agent_decide.CashShortfall:
+                rejected += 1
+
+        assert rejected > 0, "存量持仓占了 43.6%，应当有种子会透支"
+        assert rejected < 40, "也不该每个种子都透支 —— 闸门不是恒红"
+    finally:
+        c.close()

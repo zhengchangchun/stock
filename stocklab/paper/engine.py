@@ -925,10 +925,20 @@ def _step_all(conn: sqlite3.Connection, asof: str, *, accounts: list[dict],
             # 变成写载荷那一刻的快照（那会让 ¥ 与 % 对不上）。
             payload = agent_decide.rebase_payload(payload, total_assets=total,
                                                   marks=marks, positions=positions)
-            cash, positions, orders, _evals = agent_decide.execute_decision(
-                conn, arm=account["account_id"], asof=asof, decision=payload,
-                cash=cash, positions=positions, marks=marks,
-                total_assets=total)
+            try:
+                cash, positions, orders, _evals = agent_decide.execute_decision(
+                    conn, arm=account["account_id"], asof=asof, decision=payload,
+                    cash=cash, positions=positions, marks=marks,
+                    total_assets=total)
+            except agent_decide.CashShortfall as exc:
+                # 资金闸门（Q1-A）在 `paper step` 这条路上也必须是**具名**的：
+                # 让它以 traceback 冒出去，读数上等同于崩溃（不可诊断）。转成
+                # `PaperError` ⇒ 整日事务回滚、这一天该臂**没有净值行**
+                # （可见地缺，不偷偷透支）。
+                raise PaperError(
+                    f"账户 {account['account_id']} 在 {asof} 的操盘决策要透支，"
+                    f"整日不执行：{exc.reason} —— 该臂这一天**没有净值行**"
+                    f"（缺得可见，不偷偷透支）") from exc
         elif has_rules(account):
             cash, positions, total, _evals, orders = _plan_steps(
                 conn, account, asof=asof, cash=cash, positions=positions,

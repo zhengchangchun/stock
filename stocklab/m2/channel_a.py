@@ -56,8 +56,14 @@ from stocklab.store.db import transaction
 #: 通路把「脚本自己的错」折成一次拒绝运行。**只收这一组**：
 #: `sqlite3` 的错误、`KeyError`、断言失败这些一律向上抛 ——
 #: 把未知异常也记成「脚本越界」，等于把 bug 藏进一张看起来正常的台账里。
+#:
+#: `CashShortfall`（P65 / Q1-A）也在这里：它是**执行层**的具名拒绝
+#: （`code="cash"`，成交后现金为负 / 总敞口 > 100%），与 A1 的载荷错分开读。
+#: 收进来是为了让它落成 `status='rejected'` ＋ 整日事务回滚 —— **不许**
+#: 在 channel_a 里 try/except 之后夹紧或部分成交。
 REJECTED = (config.ChannelReject, PluginContractError, NoActivePlugin,
-            agent_decide.DecisionPayloadError, engine.PaperError)
+            agent_decide.DecisionPayloadError, agent_decide.CashShortfall,
+            engine.PaperError)
 
 
 def load_account(conn: sqlite3.Connection, account_id: str) -> dict:
@@ -224,6 +230,19 @@ def _sell_items(orders: list[dict], *, positions: dict, marks: dict) -> list[dic
     return items
 
 
+def _held_out(holdings: list[dict], picks: list[dict]) -> list[dict]:
+    """**不在本轮 picks 里**的存量持仓（A1 看到的那份 ctx 里的 `holdings`）。
+
+    Q3-A：这批持仓本批不动（**谁买的谁管** —— `arm-agent-v1` 的 `000333` 是人工
+    种子，A2 只做止盈止损，不替它做减持决策），但它们**必须在报告里可见**：
+    它们既不参与本轮目标、也不被释放（既不被重算、也不被卖出）。
+    看不见的话，「A1 没选它」与「它的额度动不了」在读数上分不出来 ——
+    而这两件事对「为什么今天现金这么多/仓位这么重」的解释完全不同。
+    """
+    picked = {str(p["code"]) for p in picks}
+    return [h for h in holdings if str(h["code"]) not in picked]
+
+
 def _execute(conn: sqlite3.Connection, *, account: dict, asof: str, now: str,
              prices: dict | None) -> dict:
     """整天的写入在**一个事务**里（与 `engine.step` 同一个理由：
@@ -342,6 +361,16 @@ def _execute(conn: sqlite3.Connection, *, account: dict, asof: str, now: str,
         if fp3 is None:                    # 空仓：没有可预测的持仓
             fp3 = plugin_hooks.script_fingerprint(conn, config.PLUGIN_A3)
 
+        # Q3-A：不在本轮 picks 里的存量持仓 —— 本批不动，但**必须点名可见**。
+        # 没有它们（或全都在 picks 里）时这一段是空串 ⇒ 老 reason 逐字不变。
+        held_out = _held_out(ctx1["holdings"], a1["picks"])
+        held_out_value = round(sum(float(h["market_value"] or 0.0)
+                                   for h in held_out), 4)
+        held_out_pct = (round(held_out_value / total * 100.0, 4) if total else 0.0)
+        held_out_note = "" if not held_out_value else (
+            f"；未在库持仓 ¥{held_out_value:,.2f}（总资产 {held_out_pct:.2f}%）"
+            f"未参与本轮目标（Q3-A：谁买的谁管，A2 只做止盈止损）")
+
         m2_store.insert_run(
             conn, channel=config.CHANNEL_A, account_id=account_id, asof=asof,
             status=config.STATUS_RAN,
@@ -349,13 +378,15 @@ def _execute(conn: sqlite3.Connection, *, account: dict, asof: str, now: str,
                     f"（现金 {float(a1['cash_pct']):g}%）→ 成交 {len(orders1)} 笔；"
                     f"A2({fp2['version']}) 卖出指令 {len(a2['orders'])} 条"
                     f"→ 成交 {len(orders2)} 笔；A3 预测 {n_forecasts} 条；"
-                    f"净值 {nav:,.2f}"),
+                    f"净值 {nav:,.2f}{held_out_note}"),
             plugins={config.PLUGIN_A1: fp1, config.PLUGIN_A2: fp2,
                      config.PLUGIN_A3: fp3},
             n_orders=len(orders), now=now, commit=False,
             detail={"nav": nav, "cash": round(cash, 4),
                     "positions": {c: int(q) for c, q in sorted(positions.items())},
                     "cash_pct": float(a1["cash_pct"]),
+                    "held_out_value": held_out_value,
+                    "held_out_pct": held_out_pct,
                     "pool_codes": sorted(pool_codes),
                     "candidates_excluded": ctx1["candidates_excluded"],
                     "ctx_sha256": ctx_mod.ctx_sha256(ctx1),

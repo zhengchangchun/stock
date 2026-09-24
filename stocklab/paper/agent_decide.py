@@ -29,6 +29,11 @@ JSON，经 `paper agent decide --asof <day> --file <f>` 送进来。理由（任
 （`paper agent decide` 在写库前校验，`paper step` 只在台账里读到合法载荷时才执行）。
 `reject` 的理由必须点名**字段、值、为什么** —— 一句「参数不合法」等于没有信息。
 
+**执行层还有第二道闸门**（P65 / Q1-A）：载荷自洽（`Σw + cash == 100`）**推不出**
+「账上拿得出这笔钱」——另 42% 的钱可能锁在**不在 picks 里**的存量持仓上。
+所以 `execute_decision` 在结算后校验「成交后现金 ≥ 0」与「总敞口 ≤ 100%」，
+越界 ⇒ `CashShortfall`（`code="cash"`，与载荷错分开读）。同样不夹紧。
+
 ## 与 P37 的 spec 路径的关系
 
 P37 的 5 字段白名单**不再约束** AI 臂的决策（D-34 覆盖 D-18）：`arm-agent` 的执行
@@ -69,6 +74,30 @@ TABLE_DECISIONS = agent_spec.TABLE_DECISIONS
 SIDE_BUY = "buy"
 SIDE_SELL = "sell"
 SIDES: tuple[str, ...] = (SIDE_BUY, SIDE_SELL)
+
+#: 结算后现金允许的最小值。与 `_settle` 的 4 位小数口径一致：分币级的四舍五入
+#: 不该被当成透支，但真正的负现金（哪怕是 −¥1）必须被拦住。
+CASH_TOL = 0.005
+
+#: 总敞口（`market_value / total_assets`）允许的上限余量。这是**冗余保险**：
+#: 现金闸门成立时它必然成立（`cash_after + market_value_after == total_assets − 费用`
+#: ⇒ `cash_after ≥ 0` ⟹ `market_value_after ≤ total_assets`）。两条都写，是因为
+#: 哪天有人改了结算口径，第二条会独立地报出来。
+EXPOSURE_TOL = 1e-6
+
+
+class CashShortfall(Exception):
+    """本轮成交后现金为负 / 总敞口 > 100% —— 借钱买入，拒。
+
+    与 `DecisionPayloadError` 分开：「载荷本身合规（Σw + cash == 100）、
+    但与存量持仓叠加后透支」是**另一种**错，读数上必须能分开。
+    """
+
+    code = "cash"
+
+    def __init__(self, reason: str) -> None:
+        self.reason = reason
+        super().__init__(reason)
 
 
 class DecisionPayloadError(Exception):
@@ -620,6 +649,54 @@ def _settle(cash: float, positions: dict[str, int],
     return round(cash, 4), positions
 
 
+def _gate_cash(*, arm: str, asof: str, cash_before: float, cash_after: float,
+               positions: Mapping[str, int], marks: Mapping[str, Price],
+               total_assets: float) -> None:
+    """资金闸门（Q1-A）：**fail-closed、具名拒绝、不夹紧**。
+
+    校验两条：① 成交后 `cash >= -CASH_TOL`；② `market_value / total_assets <=
+    1.0 + EXPOSURE_TOL`。任一条越界 ⇒ `CashShortfall`，调用方一行都不落。
+
+    ## 为什么这条闸门必须在执行层，而不是靠上游口径算对
+
+    P64 的实测（ERROR_DIARY #73）：A1 按 `total_assets × w` 定目标敞口，而账户里
+    42% 的钱锁在**不在 picks 里**的存量持仓上 ⇒ 目标敞口 90% 的实际可投资金只有
+    58%，成交后现金 **−¥4,490**。更刺眼的是这个透支**一直被上一个 bug 遮蔽**：
+    v1.0.1 的「整手向下取整 ⇒ 0 股」意外当了闸门，修好「买不起一手」的当天就把
+    杠杆兑现了。⇒ 偶然的副产物不能当闸门；闸门要显式、具名、可断言。
+
+    ## 为什么不做「按可用现金等比缩小目标市值」
+
+    夹紧会把「账户只有 58% 的钱」伪装成「策略本来就想买这么多」，机制**不可见**；
+    上游任何一次口径错误都会变成一笔「看起来很合规」的成交。与 P63 同型：
+    执行层遇到越界只许拒绝，兜底（合并/缩单）比不兜底更危险。
+
+    ## 结算在内存里，此函数不写库
+
+    所以在这里抛异常 ⇒ 调用方（`m2/channel_a.py` 的整日事务、`paper/engine.py`
+    的整日事务）一行都不会落。
+    """
+    if cash_after < -CASH_TOL:
+        available = float(cash_before)
+        needed = round(cash_before - cash_after, 4)
+        overshoot = round(-cash_after, 4)
+        raise CashShortfall(
+            f"{arm} 在 {asof}：账上可用现金 ¥{available:,.2f}，本轮需要 ¥{needed:,.2f}，"
+            f"成交后现金 ¥{cash_after:,.2f}（越界 ¥{overshoot:,.2f}）—— "
+            f"这笔钱不在账上，买它就是借钱（杠杆）。**整轮拒绝、零写入**："
+            f"不夹紧、不缩单、不部分成交。code=cash")
+    if total_assets and total_assets > 0:
+        from stocklab.paper import engine      # 懒 import：避免模块成环
+        market_value, _ = engine.mark_to_market(dict(positions), dict(marks))
+        exposure = market_value / float(total_assets)
+        if exposure > 1.0 + EXPOSURE_TOL:
+            raise CashShortfall(
+                f"{arm} 在 {asof}：成交后总敞口 ¥{market_value:,.2f} / 总资产 "
+                f"¥{float(total_assets):,.2f} = {exposure * 100.0:.2f}%，越过 100% "
+                f"（超出 ¥{market_value - float(total_assets):,.2f}）—— "
+                f"杠杆，拒绝。**整轮拒绝、零写入**（不夹紧、不缩单）。code=cash")
+
+
 def execute_decision(conn: sqlite3.Connection, *, arm: str, asof: str,
                      decision: Mapping[str, object], cash: float,
                      positions: dict[str, int], marks: Mapping[str, Price],
@@ -645,13 +722,23 @@ def execute_decision(conn: sqlite3.Connection, *, arm: str, asof: str,
 
     判据是不变量（`tests/test_paper_agent_nav_settlement.py`）：**净值行 ==
     `engine._ledger_arm_state` 的重放 + `mark_to_market`**，逐日、逐字段。
+
+    ## 结算之后是资金闸门（Q1-A / P65）
+
+    `_settle` 之后、return 之前跑 `_gate_cash`：成交后现金为负或总敞口 > 100%
+    ⇒ `CashShortfall`（具名 `code="cash"`）。**不夹紧、不缩单、不部分成交** ——
+    上游口径有洞时宁可整轮不执行，也不宁可透支。载荷层的 `Σw + cash == 100`
+    管的是「载荷自洽」，管不到「与存量持仓叠加后的总敞口」（ERROR_DIARY #73）。
     """
     codes = {str(d["code"]) for d in decision["decisions"]}
     asset_classes = {c: asset_class_for(conn, c) for c in sorted(codes)}
     orders, evals = plan_orders(decision=decision, cash=cash, positions=positions,
                                marks=marks, total_assets=total_assets,
                                asset_classes=asset_classes)
+    cash_before = float(cash)
     cash, positions = _settle(cash, positions, orders)
+    _gate_cash(arm=arm, asof=asof, cash_before=cash_before, cash_after=cash,
+               positions=positions, marks=marks, total_assets=total_assets)
     if not decision["decisions"]:
         evals.append(_no_decision_hold(arm, asof))
     tag = payload_tag(decision)

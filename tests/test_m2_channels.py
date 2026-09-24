@@ -28,7 +28,7 @@ from stocklab.m2 import context as m2_context
 from stocklab.m2 import store as m2_store
 from stocklab.paper import agent_decide, engine as paper_engine
 from stocklab.paper import store as paper_store
-from stocklab.paper.config import ARM_NOW, PAPER_START_DATE
+from stocklab.paper.config import ARM_HOLD, ARM_KIND_AGENT, ARM_NOW, PAPER_START_DATE
 from stocklab.plugin import contract, lifecycle
 from stocklab.plugin import store as plugin_store
 from stocklab.portfolio.prices import Price
@@ -171,6 +171,34 @@ def conn(db):
 
 def _init_account(conn, version: str = VERSION) -> dict:
     return channel_a.create_account(conn, strategy_version=version, now=NOW)
+
+
+def _init_account_without_the_seed_holding(conn, version: str = "nohold") -> str:
+    """P65 的反例账户：**同一个起跑口径**，但那笔 `000333` 存量持仓不在账上。
+
+    照 `channel_a.create_account` 的组装（同一份 `arm-hold` 派生、同一笔本金、
+    同一个 executor），只把起跑持仓换成空、起跑现金补成起跑净值 ⇒ **总资产不变**。
+    于是「那 43.6% 锁在存量持仓里 / 它就是现金」是**唯一**的变量。
+
+    为什么不改写夹具的 `real_trades`：`paper init` 的 `_declared_seed` 会把
+    「实盘账本 ≠ 声明口径（100 股 @86.80）」判红 —— 它 fail-closed。
+    为什么不 UPDATE 现成的账户行：`paper_accounts` 是 **append-only** 的
+    （实测 `sqlite3.IntegrityError`），所以只能从 `insert_account` 建。
+    """
+    account_id = m2_config.account_id_for(version)
+    base = next(a for a in paper_store.load_accounts(conn)
+                if a["account_id"] == ARM_HOLD)
+    params = {**json.loads(base["params_json"]),
+              m2_config.EXECUTOR_KEY: m2_config.EXECUTOR_CHANNEL_A,
+              "strategy_version": version,
+              "decision_cadence": m2_config.DECISION_CADENCE,
+              "plugin_hooks": list(m2_config.CHANNEL_PLUGINS[m2_config.CHANNEL_A])}
+    paper_store.insert_account(
+        conn, account_id=account_id, arm=ARM_KIND_AGENT, etf_target_pct=None,
+        start_date=base["start_date"], initial_cash=base["initial_nav"],
+        initial_positions=[], initial_nav=base["initial_nav"], params=params,
+        now=NOW)
+    return account_id
 
 
 def _dump(conn) -> dict:
@@ -757,3 +785,83 @@ def test_p63_swapping_the_duplicate_for_a_second_name_turns_the_day_green(conn):
     assert out["status"] == m2_config.STATUS_RAN, out
     assert out["n_orders"] > 0
     assert paper_store.trades_on(conn, ACCOUNT, DAY2)
+
+
+# ══════════════════════════════════════════════════════════════════════
+# P65 —— Q3-A：「不在 picks 里的存量持仓」必须在报告里可见
+#
+# 真库形态（P64 §7.3）：账户 total_assets = 19,567，其中 ¥8,247（42.15%）是
+# `000333` 这笔**人工种子**持仓。A1 没选它（排名不够前）、A2 也不卖它（还在
+# 池内、无止损止盈）⇒ 它既不参与本轮目标、也不被释放。**本批不动**（谁买的
+# 谁管），但报告里必须点名它 —— 否则「A1 没选它」与「它的额度动不了」在读数上
+# 分不出来，而这两件事对「为什么今天现金这么多」的解释完全不同。
+# ══════════════════════════════════════════════════════════════════════
+
+#: A1 只选**没持有**的池内标的 ⇒ 账户里那笔 `000333` 存量持仓留在 picks 之外。
+A1_SKIPS_HELD = """
+def run(ctx):
+    held = {h["code"] for h in ctx["holdings"]}
+    codes = sorted({i["code"] for p in ("short", "mid", "long")
+                    for i in ctx["candidates"].get(p, [])} - held)
+    if not codes:
+        return {"picks": [], "cash_pct": 100.0, "schema_version": "t1"}
+    return {"picks": [{"code": c, "weight_pct": 5.0, "reason": "夹具：只买没持有的"}
+                      for c in codes],
+            "cash_pct": 100.0 - 5.0 * len(codes), "schema_version": "t1"}
+"""
+
+
+def _run_row(conn, account_id, asof: str = DAY2):
+    """该 `(通路, 账户, 日)` 的最后一条台账行（`ran` 分支的返回里没有 `run_id`）。"""
+    rows = m2_store.list_runs(conn, channel=m2_config.CHANNEL_A,
+                              account_id=account_id, asof=asof)
+    assert rows, f"{account_id} 在 {asof} 没有台账行"
+    return rows[-1]
+
+
+def test_p65_the_run_reason_names_the_holdings_that_are_out_of_this_round(conn):
+    """存量持仓不在 picks 里 ⇒ `reason` 点名它的金额与占比，`detail` 带两个键。"""
+    _init_account(conn)
+    _install(conn, "m2_a1", A1_SKIPS_HELD, version="p65")
+    out = channel_a.run(conn, asof=DAY2, strategy_version=VERSION, now=NOW)
+    assert out["status"] == m2_config.STATUS_RAN, out
+    run = _run_row(conn, ACCOUNT)
+    # 账户起跑即握着 `000333 ×100`；DAY2 收盘 87.60 ⇒ ¥8,760.00 没参与本轮目标。
+    assert "未在库持仓 ¥8,760.00（总资产 43.64%）未参与本轮目标" in run["reason"], \
+        run["reason"]
+    assert "（Q3-A：谁买的谁管，A2 只做止盈止损）" in run["reason"]
+    assert run["detail"]["held_out_value"] == 8760.0
+    # 8760.00 / (11314.91 现金 + 8760.00) = 43.6366%
+    assert run["detail"]["held_out_pct"] == 43.6366
+    # 那笔持仓**本批不动**（Q3-A 的第一半）：成交里没有它。
+    assert "000333" not in [t["code"] for t in paper_store.trades_on(conn, ACCOUNT, DAY2)]
+
+
+def test_p65_a_round_whose_picks_cover_every_holding_carries_no_extra_sentence(conn):
+    """**反例**：持仓全在 picks 里 ⇒ 那一段**不追加**（老 reason 逐字不变）。
+
+    夹具默认的 A1 选池内全部标的（含 `000333`）⇒ 没有任何「未在库」的持仓。
+    """
+    _init_account(conn)
+    out = channel_a.run(conn, asof=DAY2, strategy_version=VERSION, now=NOW)
+    assert out["status"] == m2_config.STATUS_RAN, out
+    run = _run_row(conn, ACCOUNT)
+    assert "未在库持仓" not in run["reason"], run["reason"]
+    assert run["detail"]["held_out_value"] == 0.0
+    assert run["detail"]["held_out_pct"] == 0.0
+    assert run["reason"].endswith(f"净值 {out['nav']:,.2f}"), run["reason"]
+
+
+def test_p65_an_account_without_seed_holdings_carries_no_extra_sentence(conn):
+    """**反例**：那个账户起跑就没有存量持仓 ⇒ 同样不追加这一段。
+
+    起跑口径与 `_init_account` 完全相同（同一份 `arm-hold` 派生、同一笔本金），
+    **唯一**的差别是 `000333` 那 100 股不在账上、那部分钱本来就是现金。
+    """
+    aid = _init_account_without_the_seed_holding(conn)
+    out = channel_a.run(conn, asof=DAY2, strategy_version="nohold", now=NOW)
+    assert out["status"] == m2_config.STATUS_RAN, out
+    run = _run_row(conn, aid)
+    assert "未在库持仓" not in run["reason"], run["reason"]
+    assert run["detail"]["held_out_value"] == 0.0
+    assert aid == m2_config.account_id_for("nohold")

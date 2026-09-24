@@ -782,3 +782,213 @@ def test_p64_t6_two_runs_on_the_affordability_ctx_are_byte_identical():
     first = json.dumps(fn(ctx), sort_keys=True, ensure_ascii=False)
     second = json.dumps(fn(ctx), sort_keys=True, ensure_ascii=False)
     assert first == second
+
+
+# ══════════════════════════════════════════════════════════════════════
+# P65 —— A1 的权重上限先扣掉「不在 picks 里的存量持仓占比」（源版本 1.0.3）
+#
+# 真库 2026-09-23 形态（P64 §7.3）：`total_assets = 19,567`，其中
+# `000333 ×100 @ ¥82.47 = ¥8,247`（**42.1475%**）是存量持仓、可用现金只有
+# ¥11,320。A1 按 `total_assets × w` 定目标敞口 ⇒ 5 × 18% = ¥17,610 > ¥11,320
+# ⇒ 成交后现金 **¥−4,490.01**（ERROR_DIARY #73）。v1.0.3 把 Σw 的上限先扣掉
+# 那 42.15%，于是总敞口自然回到 ≤ 100%。
+# ══════════════════════════════════════════════════════════════════════
+
+#: 真库 2026-09-23 的账户读数（P64 §7.3）。
+_P65_TOTAL = 19567.0
+_P65_CASH = 11320.0
+#: `000333 ×100 @ ¥82.47` ⇒ ¥8,247 / ¥19,567 = 42.1475%。
+_P65_HOLD_VALUE = 8247.0
+_P65_HOLD_PCT = 42.1475
+
+#: 真库 09-23 的 A1 排序（1.0.1 的 5 只，再接 1.0.2 补的 2 只）＋当日收盘价。
+_P65_RANKED = (("600519", 1251.24), ("603868", 31.26), ("600900", 28.08),
+               ("002415", 33.11), ("601318", 53.87), ("601398", 8.09),
+               ("002508", 16.48))
+
+
+def _p65_ctx(holdings: list | None = None, *, total=_P65_TOTAL, cash=_P65_CASH,
+             ranked=_P65_RANKED) -> dict:
+    items = [_cand_at(code, 9.0 - i, close)
+             for i, (code, close) in enumerate(ranked)]
+    return {"candidates": {"short": items}, "candidates_excluded": {},
+            "holdings": [] if holdings is None else holdings,
+            "cash": cash, "total_assets": total, "asof": DAY2, "focus": None}
+
+
+def _p65_holding(code: str = "000333", *, value=_P65_HOLD_VALUE,
+                 close: float = 82.47, qty: int = 100) -> dict:
+    """一条 ctx 形态的存量持仓（键照 `m2/context.py::holdings_ctx` 的产物）。"""
+    return {"code": code, "qty": qty, "cost_price": 86.80, "close": close,
+            "market_value": value, "pool": "long", "asof": DAY2,
+            "weight_pct": round(value / _P65_TOTAL * 100.0, 4)}
+
+
+def _p65_out(ctx: dict) -> dict:
+    return contract.validate_return("m2_a1", _fn("m2_a1")(ctx))
+
+
+def test_p65_t1_the_source_says_v103_and_points_at_the_execution_gate():
+    """T2 前半：源文本标 v1.0.3，且**写明** v1.0.2 的取整只是偶然闸门。
+
+    四个常量（`LIMIT_N` / `CAP_PCT` / `CASH_FLOOR` / `LOT`）的数值一个字都没改
+    —— 判据原文如此，任务书 §4 也把「改主干常量」列为反目标（D-34 只有用户能改）。
+    """
+    from stocklab.m2.builtin import a1_pick
+    assert (a1_pick.LIMIT_N, a1_pick.CAP_PCT, a1_pick.CASH_FLOOR, a1_pick.LOT) \
+        == (5, 25.0, 10.0, 100)
+    source = BUILTIN_PLUGINS["m2_a1"]
+    assert "源版本 v1.0.3" in source
+    assert "CashShortfall" in source and 'code="cash"' in source, \
+        "源文本必须点名取代它的那道**执行层显式闸门**"
+    assert "偶然" in source, \
+        "必须写明 v1.0.2 的「整手取整 ⇒ 0 股」只是偶然闸门（P64 §1 的教训）"
+    assert "weight_pct" in source and "_reserved_pct(" in source
+    guard.check_source(source)
+
+
+def test_p65_t2_the_locked_holding_lowers_the_weight_cap():
+    """T2 主判据：真库 09-23 形态 ⇒ `cap = 90 − 42.1475 = 47.8525`、`cash = 52.15`。
+
+    ⚠️ **实测只数不是判据里那句话的 5 只**。判据 §3.2 写「5 只各 9.57%」，
+    但同一节的步骤 2 又要求 affordability **沿用 1.0.2 的 `_affordable`**：
+    在 `w0 = 9.57%` 下，`603868`（一手 ¥3,126）、`600900`（¥2,808）、
+    `002415`（¥3,311）的目标市值只有 ¥1,872.56 ⇒ 全都买不起 ⇒ 凑不齐 5 只，
+    下降式循环一路降到 `n=3`（`w0 = 15.95%`，目标 ¥3,120.94）才凑齐。
+    两组解的 `cash_pct` **都是 52.15**（因为 `w × n` 都等于那个 47.85 的上限），
+    所以「cap / cash」这两个判据数都对得上，差别只在**只数**。
+
+    这一点如实记在任务书 §7 —— 若改成「5 只各 9.57%」= 放弃 affordability 过滤、
+    让 3 只不可执行的标的进 picks，那正是 P64 修掉的病（计划与执行长得一样）。
+    """
+    ctx = _p65_ctx([_p65_holding()])
+    out = _p65_out(ctx)
+    weights = [p["weight_pct"] for p in out["picks"]]
+    assert weights == [15.95] * 3, weights
+    assert [p["code"] for p in out["picks"]] == ["600900", "601398", "002508"]
+    assert out["cash_pct"] == 52.15
+    assert abs(sum(weights) + out["cash_pct"] - 100.0) <= 1e-9, "契约 _check_cross"
+    # 判据里的两个数：上限与现金。
+    assert round(90.0 - _P65_HOLD_PCT, 4) == 47.8525
+    assert round(sum(weights), 2) <= round(90.0 - _P65_HOLD_PCT, 4) + 1e-9
+    # 自证：w0=9.57 下真的凑不齐 5 只（否则上面那条「判据对不上」是空话）
+    assert sum(1 for _c, close in _P65_RANKED
+               if _P65_TOTAL * 9.57 / 100.0 >= close * 100) < 5
+
+
+def test_p65_t2_a_holding_inside_the_picks_is_not_reserved():
+    """细化那一步真的生效：存量持仓**就在 picks 里** ⇒ 它不占额度，权重被抬高。
+
+    `600900` 一手 ¥2,808 ⇒ 占 ¥19,567 的 14.35%。第一轮（保守，把它也当占用）
+    `w0 = round(min(25, (90 − 14.35)/4), 2) = 18.91`；细化后 `reserved1 = 0`
+    （唯一那笔存量已在 picks 里）⇒ `w1 = min(25, 90/4) = 22.5 > w0` ⇒ 用 22.5。
+    """
+    ctx = _p65_ctx([_p65_holding("600900", value=2808.0, close=28.08)])
+    out = _p65_out(ctx)
+    weights = [p["weight_pct"] for p in out["picks"]]
+    assert weights == [22.5] * 4, weights
+    assert [p["code"] for p in out["picks"]] == ["603868", "600900", "002415", "601398"]
+    assert out["cash_pct"] == 10.0
+    # 第一轮的保守解是 18.91% —— 若没有细化这一步，权重会停在那儿
+    assert round(min(25.0, (90.0 - 2808.0 / _P65_TOTAL * 100.0) / 4), 2) == 18.91
+
+
+def test_p65_t2_no_holdings_is_bit_identical_to_v101():
+    """回归钉住：`holdings` 为空 ⇒ 与 1.0.1/1.0.2 逐位相同（5 只 / 18% / 现金 10）。"""
+    ctx = _p65_ctx([])
+    out = _p65_out(ctx)
+    assert len(out["picks"]) == 5
+    assert [p["weight_pct"] for p in out["picks"]] == [18.0] * 5
+    assert out["cash_pct"] == 10.0
+    assert [p["code"] for p in out["picks"]] == \
+        ["603868", "600900", "002415", "601398", "002508"]
+
+
+def test_p65_t2_a_holding_without_weight_pct_falls_back_to_v102():
+    """退化口径：任一 holding 缺 `weight_pct` ⇒ `reserved = 0`，行为同 1.0.2。
+
+    「不知道存量占比」≠「存量把额度占满了」（与 `_affordable` 同一条规则 4）。
+    上面那条（空 holdings）是它的对照组：**同样**的一份 picks。
+    """
+    ctx = _p65_ctx([{**_p65_holding(), "weight_pct": None}])
+    out = _p65_out(ctx)
+    assert len(out["picks"]) == 5
+    assert [p["weight_pct"] for p in out["picks"]] == [18.0] * 5
+    assert out["cash_pct"] == 10.0
+
+
+def test_p65_t2_unknown_total_assets_ignores_the_reserved():
+    """`total_assets is None`（探针形状）⇒ 不过滤存量 ⇒ 与 1.0.2 逐位相同。"""
+    ctx = _p65_ctx([_p65_holding()], total=None)
+    out = _p65_out(ctx)
+    assert len(out["picks"]) == 5
+    assert [p["weight_pct"] for p in out["picks"]] == [18.0] * 5
+    assert out["cash_pct"] == 10.0
+    assert [p["code"] for p in out["picks"]] == \
+        ["600519", "603868", "600900", "002415", "601318"]
+
+
+def test_p65_t2_reserved_beyond_the_cap_means_empty_picks_and_cash_100():
+    """边界：存量占比 ≥ 90% ⇒ 上限 ≤ 0 ⇒ 空 picks ＋ `cash_pct = 100.0`。
+
+    与 1.0.2 的空仓分支同一条口径（空清单必须由 `cash_pct=100` 表达）。
+    **不许**产出负权重。
+    """
+    for pct in (90.0, 95.0):
+        ctx = _p65_ctx([{**_p65_holding(),
+                         "weight_pct": pct, "market_value": _P65_TOTAL * pct / 100.0}])
+        out = _p65_out(ctx)
+        assert out["picks"] == [], f"reserved={pct}% 时不该选出任何标的"
+        assert out["cash_pct"] == 100.0
+
+
+def test_p65_t6_two_runs_on_the_reserved_ctx_are_byte_identical():
+    """确定性：同一份带存量的 ctx 两遍逐字节相同（新分支不许引入顺序依赖）。"""
+    ctx = _p65_ctx([_p65_holding()])
+    fn = _fn("m2_a1")
+    first = json.dumps(fn(ctx), sort_keys=True, ensure_ascii=False)
+    second = json.dumps(fn(ctx), sort_keys=True, ensure_ascii=False)
+    assert first == second
+
+
+def test_p65_t4_grid_weights_stay_self_consistent_and_inside_the_cap():
+    """网格不变量：`Σw + cash_pct == 100`，且 `Σw ≤ (90 − 未在库占比)`。
+
+    扫 4 档总资产 × 4 档存量占比 × 2 个价格档（含茅台那种一手 6 位数的）。
+    只用手写单例钉不住这类性质 —— 它得在一张网格上成立才叫不变量。
+    """
+    tiers = ((31.26, 20.0, 10.0, 5.0, 3.0),
+             (1251.24, 53.87, 31.26, 20.0, 10.0))
+    for total in (5_000.0, 19_567.0, 100_000.0, 1_000_000.0):
+        for held_pct in (0.0, 10.0, 42.147, 80.0):
+            for tier in tiers:
+                ranked = tuple(("C%d" % i, close)
+                               for i, close in enumerate(tier))
+                hold_value = round(total * held_pct / 100.0, 4)
+                holdings = [] if held_pct == 0.0 else [
+                    {"code": "HOLD", "qty": 100, "cost_price": 1.0,
+                     "close": round(hold_value / 100.0, 4),
+                     "market_value": hold_value, "weight_pct": held_pct,
+                     "pool": None, "asof": DAY2}]
+                cash = round(total - hold_value, 4)
+                ctx = _p65_ctx(holdings, total=total, cash=cash, ranked=ranked)
+                out = _p65_out(ctx)
+                weights = [p["weight_pct"] for p in out["picks"]]
+                label = f"total={total} held={held_pct}% tier={tier[0]}"
+                assert abs(sum(weights) + out["cash_pct"] - 100.0) <= 1e-9, label
+                assert out["cash_pct"] == round(100.0 - sum(weights), 2), label
+                if not weights:
+                    assert out["cash_pct"] == 100.0, label
+                    continue
+                assert all(w > 0 for w in weights), f"{label}: 出现非正权重 {weights}"
+                assert all(w <= 25.0 for w in weights), label
+                # 「不杠杆」：Σw 不许越过 (90 − 未在库占比)。HOLD 不在候选池里，
+                # 所以未被 pick 时它就是「未在库」的那一笔。
+                #
+                # 允差 `0.005 × n`：权重是 `round(cap/n, 2)`，逐项四舍五入后
+                # Σw 可能比 cap 高出不到一分 —— 这是**既有**的取整口径
+                # （v1.0.2 的 `round(90/n, 2)` 同款，`n=7` 时会给出 90.02），
+                # 不是 v1.0.3 引入的，且远小于 10% 的现金下限。
+                if not any(p["code"] == "HOLD" for p in out["picks"]):
+                    assert sum(weights) <= (90.0 - held_pct + 0.005 * len(weights)
+                                            + 1e-9), label

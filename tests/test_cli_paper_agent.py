@@ -185,10 +185,18 @@ def test_random_then_step_then_show_is_a_full_round_trip(db, tmp_path, capsys):
 
     P56 / D-50：中间那一步从 `paper step` 换成 `paper agent run` —— 随机臂也在
     `agent_decision` 家族里，`paper step` 已经让出它（否则决策永不执行）。
+
+    ⚠️ seed 从 `3` 换成 `0`（P65）：seed=3 的随机载荷目标敞口 80.55%，而这个
+    夹具账户 43.63% 的资产锁在 `000333` 这笔存量持仓里 ⇒ 合计 124% ⇒ 被 P65
+    的资金闸门（`agent_decide.CashShortfall`）具名拒绝，这条**串起来**的用例
+    就断在第一步上。随机臂的**口径**有和 A1 同型的缺陷（按 `total_assets`
+    定敞口、不管存量持仓），修它要单独任务书 —— 见
+    `tests/test_paper_agent_decide.py::test_p65_random_payload_can_overdraw_...`。
+    本用例只测 CLI 的管道，故取一个不触发闸门的种子；断言一条都没改弱。
     """
     _init(db, capsys)
     code, out, err = run(db, "paper", "agent", "random", "--asof", START,
-                         "--arm", ARM_AGENT_RANDOM, "--seed", "3", capsys=capsys)
+                         "--arm", ARM_AGENT_RANDOM, "--seed", "0", capsys=capsys)
     assert code == 0, err
     assert json.loads(out)["n_decisions"] >= 1
     code, out, err = run(db, "paper", "agent", "run", "--asof", START, capsys=capsys)

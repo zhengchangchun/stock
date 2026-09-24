@@ -1,4 +1,55 @@
-"""`m2_a1`（AI 模拟选股）**源文本** —— v1.0.2（排除买不起一手的标的）。
+"""`m2_a1`（AI 模拟选股）**源文本** —— v1.0.3（扣掉「不在 picks 里的存量持仓」）。
+
+## v1.0.3 修的是什么：v1.0.2 的「买得起」按总资产算，而钱锁在存量持仓里
+
+真库 2026-09-23 的实测（P64 §7.3）：账户 `total_assets = 19,567`，其中
+**¥8,247（42.15%）是 `000333` 这笔存量持仓**，可用现金只有 ¥11,320。
+`000333` 不在 5 条 pick 里（排名不够前），A2 也不卖它（它还在池内、无止损止盈）
+⇒ 那 42% **既不被重算、也不被释放**。于是 5 只 × 18% = ¥17,610 的目标敞口
+> ¥11,320 可用现金 ⇒ 成交后 `paper_nav_daily.cash = −4,490.01`（总资产的 −23%）。
+**这就是杠杆。**
+
+修法：Σw 的上限先扣掉「**不在本轮 picks 里**的存量持仓当前占比」：
+
+```
+Σw ≤ (100 − CASH_FLOOR) − reserved        （reserved 的算法见下）
+w   = min(CAP_PCT, 该上限 / n)            等权
+cash_pct = 100 − w × len(picks)           逐位自洽
+```
+
+语义是「A1 只能部署**真正空闲的**钱」；分母仍是 `total_assets`（组合口径）——
+于是**总敞口自然回到 ≤ 100%**，同时保住组合视角（存量持仓仍计入总仓位）。
+`ctx["holdings"]` 每项已经带 `weight_pct`（`m2/context.py::holdings_ctx`）⇒
+不需要新增契约字段，直接求和就行。
+
+## ⚠️ v1.0.2 的「整手取整 ⇒ 0 股」只是**偶然**闸门，已被执行层的显式闸门取代
+
+P64 的教训（ERROR_DIARY #73）：v1.0.1 把「按目标市值算股数、整手向下取整
+⇒ 0 股」这件**副产物**当成了现金闸门（只成交 3 笔 ⇒ 现金仍 +¥2,055）。P64
+修掉「买不起一手」= **拆掉**那道偶然闸门，当天就把一个此前看不见的杠杆缺陷
+兑现成了真实持仓。⇒ 从 P65 起，资金闸门是
+`paper/agent_decide.py::CashShortfall`（**执行层**、fail-closed、具名
+`code="cash"`、整轮拒绝零写入），**不再依赖任何取整副产物**：本脚本的口径
+就算再错一次，执行层也会整轮拒绝，而不是透支。
+
+## 本版本的口径（确定性、纯函数、**至多两轮**）
+
+1. `reserved0 = Σ over ctx["holdings"] of weight_pct` —— **保守**：先把全部
+   存量当占用，于是这一步**不是循环依赖**；
+2. 对 `n` 从 `min(LIMIT_N, 去重后只数)` 往下（沿用 v1.0.2 的下降式循环）：
+   `w0 = round(min(CAP_PCT, ((100 − CASH_FLOOR) − reserved0) / n), 2)`，取在
+   `w0` 下买得起的前 `n` 只；凑不齐就继续往下试；
+3. **一次细化**：`reserved1 = Σ over holdings whose code ∉ picks`（picks 里的
+   存量**本来就持有**，不该再占它的额度）；`w1 = round(min(CAP_PCT,
+   ((100 − CASH_FLOOR) − reserved1) / n), 2)`。若 `w1 > w0` ⇒ 用 `w1` 重跑
+   一次 affordability 并取最终 `(S, w1)`（w 变大只会让更多标的买得起 ⇒
+   单调、必然收敛）；否则取 `(S, w0)`。**最多两轮，不迭代到不动点**。
+4. 退化口径：`total_assets is None`、或任一 holding 缺 `weight_pct`
+   （探针 ctx / 无 PIT 价）⇒ `reserved = 0.0`，**行为与 v1.0.2 逐位相同**；
+   `holdings` 为空 ⇒ 与 **v1.0.1** 逐位相同。
+
+`LIMIT_N` / `CAP_PCT` / `CASH_FLOOR` / `LOT` 四个常量的数值一个字都没改，
+去重（v1.0.1）也不动。
 
 ## v1.0.2 修的是什么：选出来的标的在**这个账户上做不到**
 
@@ -9,12 +60,12 @@ v1.0.1 只按 `adj_score` 选股，不看账户买不买得起。¥19,547 的模
 
 修法：按**试算权重**算目标市值，不足**一手市值**（`close × LOT`）的标的不选，
 沿去重后的排序继续往下取，只数与权重 `w = min(CAP_PCT, (100 − CASH_FLOOR)/n)`
-**自洽**（从 `n = LIMIT_N` 往下试，取最大的能凑齐 `n` 只的解）。权重公式的形态
-与 `LIMIT_N` / `CAP_PCT` / `CASH_FLOOR` 的数值一个字都没改，去重（v1.0.1）也不动。
+**自洽**（从 `n = LIMIT_N` 往下试，取最大的能凑齐 `n` 只的解）。
 
 **「不知道」≠「买不起」**：`total_assets is None`（探针 ctx）或收盘价缺失时
-**不过滤**，行为与 v1.0.1 逐位相同。被排除的标的在契约载荷里**没有位置**
-（`picks` 每条只能 `{code, weight_pct, reason}`）⇒ 只能从「只数少于 5」反推。
+**不过滤**（v1.0.3 同理：「不知道存量占比」⇒ `reserved = 0`，不当作占满）。
+被排除的标的在契约载荷里**没有位置**（`picks` 每条只能
+`{code, weight_pct, reason}`）⇒ 只能从「只数少于 5」反推。
 
 ## 为什么源码是字符串常量
 
@@ -37,8 +88,10 @@ v1.0.0 的 `run()` 把三池的排序结果打平后直接 `rows[:LIMIT_N]`：�
 
 修法只有一句：跨池排序后**同一 code 只保留第一条**（= 它排名最好的那只池），
 再取前 `LIMIT_N`。权重公式与 `LIMIT_N` / `CAP_PCT` / `CASH_FLOOR` 一个字都没改。
-真库 `script_id=12` 存的就是这份 v1.0.1 文本；下面 `SOURCE` 是 v1.0.2 的种子文本，
-**不改库** —— 上线走 `plugin submit` + 人工 `approve`（D-24）。
+真库 `script_id=12` 存的是 v1.0.1 文本（现役）；P64 的 v1.0.2（`script_id=13`）
+**只存在于副本、从未上线**（它的第四条判据实测不成立，见 P64 §7.3）。
+下面 `SOURCE` 是 **v1.0.3** 的种子文本，**不改库** —— 上线走 `plugin submit`
+＋ 人工 `approve`（D-24）。
 
 ## 为什么上限写死在源码里
 
@@ -69,11 +122,32 @@ CASH_FLOOR: float = 10.0
 LOT: int = 100
 
 SOURCE: str = '''# m2_a1 —— AI 模拟选股（模块2 通路 A 第 1 步；D-24 / D-33）
-# 本站是**源版本 v1.0.2** 的种子文本：在 v1.0.1（跨池去重）之上，只把
-# **在这个账户上按目标权重买得起一手**的标的放进 picks。
-# v1.0.1 只按分数选股 ⇒ 在 ¥19,547 的模拟盘上选了茅台（一手 ¥125,124），
-# 目标市值 ¥3,518 连一手都不够 ⇒ 0 股、无订单；「计划 5 只 18% / 现金 10%」
-# 落地成「成交 3 笔 / 现金 ~40%」—— 等权 18% × 5 只在小账户上做不到。
+# 本站是**源版本 v1.0.3** 的种子文本：在 v1.0.2（只选买得起一手的标的）之上，
+# Σw 的上限先扣掉「**不在本轮 picks 里**的存量持仓当前占比」。
+#
+# v1.0.2 按 total_assets × w 定目标敞口，而钱锁在存量持仓里：真库 2026-09-23
+# 的账户 total_assets = 19,567，其中 ¥8,247（42.15%）是 000333 这笔存量持仓、
+# 可用现金只有 ¥11,320。000333 不在 5 条 pick 里（排名不够前），A2 也不卖它
+# （它还在池内、无止损止盈）⇒ 那 42% 既不被重算、也不被释放；5 只 × 18% =
+# ¥17,610 的目标敞口 > ¥11,320 可用现金 ⇒ 成交后现金 −4,490.01（总资产 −23%）。
+# 修法：Σw ≤ (100 − CASH_FLOOR) − reserved，等权 w = min(CAP_PCT, 该上限 / n)，
+# cash_pct = 100 − w × len(picks)（逐位自洽）⇒ 总敞口自然回到 ≤ 100%。
+#
+# ⚠️ v1.0.2 的「整手取整 ⇒ 0 股」只是**偶然**闸门，已被执行层的显式闸门
+# （paper/agent_decide.py::CashShortfall，具名 code="cash"、整轮拒绝零写入）
+# 取代 —— 资金闸门不许依赖任何取整副产物（ERROR_DIARY #73：P64 拆掉那道偶然
+# 闸门，当天就把一个此前看不见的杠杆缺陷兑现成了真实持仓）。
+#
+# 存量占比的算法（确定性、纯函数、至多两轮）：
+#   reserved0 = Σ over ctx["holdings"] of weight_pct（保守：全部存量先当占用）；
+#   对 n 从 min(LIMIT_N, 去重后只数) 往下：w0 = round(min(CAP_PCT,
+#   ((100 − CASH_FLOOR) − reserved0)/n), 2)，取 w0 下买得起的前 n 只；
+#   一次细化：reserved1 = Σ over holdings whose code ∉ picks 的 weight_pct
+#   （picks 里的存量本来就持有，不占额度）⇒ w1 = round(min(CAP_PCT,
+#   ((100 − CASH_FLOOR) − reserved1)/n), 2)；若 w1 > w0 就用 w1 重跑一次
+#   affordability 取最终解。最多两轮，不迭代到不动点。
+#   退化：total_assets 为 None 或任一 holding 缺 weight_pct ⇒ reserved = 0
+#   （与 v1.0.2 逐位相同）；holdings 为空 ⇒ 与 v1.0.1 逐位相同。
 #
 # 纯函数：只读 ctx，不 import、不做 IO、不取时钟、不用随机。
 # 两遍同 ctx ⇒ 逐字节同输出（由 tests/test_m2_builtin.py T3 钉住）。
@@ -101,6 +175,24 @@ def _affordable(item, weight, total_assets):
     if close is None:
         return True
     return float(total_assets) * float(weight) / 100.0 >= float(close) * LOT
+
+
+def _reserved_pct(holdings, total_assets, exclude_codes):
+    # 「**不在** exclude_codes 里」的存量持仓占比之和（占总资产 %）。
+    # 退化口径（与 v1.0.2 逐位相同）：「账户总资产未知」或「任一 holding
+    # 缺 weight_pct」（探针 ctx / 没有 PIT 价）⇒ **0.0**，退回「存量不占额度」
+    # 的老口径 —— 「不知道」≠「存量把额度占满了」（与 _affordable 同一条规则 4）。
+    if total_assets is None:
+        return 0.0
+    total = 0.0
+    for item in holdings or []:
+        weight = item.get("weight_pct")
+        if weight is None:
+            return 0.0
+        if exclude_codes is not None and str(item.get("code")) in exclude_codes:
+            continue
+        total += float(weight)
+    return total
 
 
 def run(ctx):
@@ -137,19 +229,39 @@ def run(ctx):
     # 3) 只数与权重**自洽**：从 n = min(LIMIT_N, 去重后只数) 往下试，取**最大的、
     #    能在该 n 的等权权重下凑齐 n 只买得起的**解。n 越小 ⇒ 权重越大 ⇒ 越买得
     #    起（n=1 时权重 = CAP_PCT 是上限），所以「往下试」必然收敛。
+    #
+    #    v1.0.3 在权重上先扣掉「不在本轮 picks 里的存量持仓占比」：那些钱锁在
+    #    存量持仓里，既不被本脚本重算、也不被 A2 释放（A2 只做止盈止损），
+    #    所以 A1 **只能部署真正空闲的钱**。reserved0 保守地把全部存量当占用
+    #    （于是第一步不循环依赖），再细化一次：picks 里的存量本来就持有，
+    #    不占额度 ⇒ w 可能被抬高，此时重跑一次 affordability（单调、必然收敛）。
     #    买不起的标的在契约载荷里**没有位置**（picks 每条只能 {code, weight_pct,
     #    reason}）⇒「这只因为买不起被跳过」在报告里看不见，只能从「只数少于
     #    LIMIT_N」反推（P64 §9 存疑项 1，本站不改契约）。
     total_assets = ctx.get("total_assets")
+    holdings = ctx.get("holdings") or []
+    cap = 100.0 - CASH_FLOOR
+    reserved0 = _reserved_pct(holdings, total_assets, None)
     picked = None
     weight = None
     for n in range(min(LIMIT_N, len(deduped)), 0, -1):
-        w = round(min(CAP_PCT, (100.0 - CASH_FLOOR) / n), 2)
-        ok = [r for r in deduped if _affordable(r["item"], w, total_assets)]
-        if len(ok) >= n:
-            picked = ok[:n]
-            weight = w
-            break
+        w0 = round(min(CAP_PCT, (cap - reserved0) / n), 2)
+        if w0 <= 0.0:
+            # 上限被存量吃光（cap ≤ reserved0）⇒ 一只也不选。**不许**产出负权重。
+            continue
+        ok = [r for r in deduped if _affordable(r["item"], w0, total_assets)]
+        if len(ok) < n:
+            continue
+        picked = ok[:n]
+        weight = w0
+        reserved1 = _reserved_pct(holdings, total_assets,
+                                  {str(r["item"]["code"]) for r in picked})
+        w1 = round(min(CAP_PCT, (cap - reserved1) / n), 2)
+        if w1 > w0:
+            picked = [r for r in deduped
+                      if _affordable(r["item"], w1, total_assets)][:n]
+            weight = w1
+        break
 
     if not picked:
         # 空池 / 全都买不起（n=1 时单票权重已达 CAP_PCT 仍买不起一手）⇒ 空仓，
