@@ -3858,3 +3858,67 @@ AI 臂白白少一天。**「好多了」不是判据，「零」才是** ——
 **反向自检保留**：`test_p66_the_gate_still_rejects_an_old_cadence_payload` ——
 `_gate_cash` 一个字没改，对旧口径载荷照样拒（11/40 逐 seed 钉住）。
 
+
+---
+
+## #78 2026-09-25：插投影行时顺手写了默认 `active=1` —— 把研究池灌进了日更口径（P72）
+
+**现象**：P71 把宇宙做成显式对象（ADR-026），`universe sync` 往 `instruments` 追加新成员时
+写的是硬编码 `active=1`。在 `/tmp` 副本上跑 sync（P71 的判据 5 就是这么跑的）**看不出任何问题**
+—— 副本不跑 `ops close`、不跑 `predict`。但真库上跑一次 `universe sync csi300-500`，**当天**：
+
+- 预测标的集合 **17 → 817 条/日**（`predict/service.py` 读 `instruments.active=1` 的股票）；
+- `verify pending` / `review daily` / `session tick` / `experiments` 的标的集合同步放大；
+- `ops close` / `ops patrol` 的 `ingest bars/valuation/moneyflow/actions --days 30`
+  从 **21 只 → 821 只**（整轮预算 900 s，仅 `ingest moneyflow` 一项 ≈ 821 × 0.5 s ≈ 7 min）
+  ⇒ **日链天天 exit 2**；
+- 月度链的 `ingest_financials`（不带参数）同样放大到 817 只。
+
+**根本原因**：
+
+> `instruments.active` 在**插入时没写**，就取 schema 的 `DEFAULT 1` ——
+> 而这一列在本仓是**全局「日更口径」开关**（至少八处只读它），不是装饰位。
+
+「默认值」在一次 `INSERT` 里只是一个字面量，但它**等于一次口径决定**：决定这 800 只
+要不要进明天的预测集合、要不要进日链的采集循环。P71 的写入侧把它当成了「填个必填列」，
+而读取侧的八个消费方把它当日更口径 —— 两边对同一个字面量的**语义**理解不同，
+而差异**不可见**（副本不跑日链，sync 的 stdout 不报 active 分布，`doctor` 也不看它）。
+
+**教训**：
+
+① **插行时的默认值就是口径。** 往共享表插投影行时，凡是「另一个消费者会读」的列，
+   写值前要先**逐个消费方核**它意味着什么 —— 尤其当该列有 schema 默认值时
+   （没写 ≠ 没有决定，没写 ＝ 默认值替你做了决定）。本仓 `instruments.active` 的消费方
+   在任务书 §0.1 被逐条点名（8 处），核完才发现 sync 的这行 INSERT 是唯一漏网的**写入**方。
+
+② **「在副本上测过」不等于「在口径上测过」。** P71 §6 判据 5 在 `/tmp` 副本上
+   `sync → doctor` 全绿，但副本**不跑 `close`/`predict`**，所以日更口径这一层根本没被激活。
+   ⇒ **判据要覆盖真正的伤害路径**：「换宇宙」的伤害不在 sync 本身，而在 sync 之后
+   日链/预测集合的放大 —— 那才是要钉的对象。副本只适合验**写入语义**（幂等、只补空列）。
+
+③ **写入侧与读取侧的口径要写在同一处。** 本档的修法不是改那八处读取方（一处都不用改），
+   而是把**唯一的写入侧**改成 `active=0`（ADR-027/F1）：口径的默认方向变成「**不进日更**」，
+   要进必须**显式**改这一列（且**不提供** `--activate` 开关 —— 少一个「顺手换宇宙」的入口）。
+   ⇒ 与 ADR-026 的 D2「扩宇宙只能走显式 id、不得隐式回退」是同一条纪律的写入侧版本。
+
+④ **同一根因会在别的入口复发**（#44 / #77 同族）：`active` 的坑不止 sync 一处 ——
+   四条 `ingest` 一旦支持 `--universe`，它们原有的 `repo.upsert_instruments(conn, universe)`
+   同样会用 `DEFAULT 1` 把研究池插进 `instruments`。⇒ 显式 `--universe` 路径**不调 upsert**
+   （成员登记归 `universe sync`），并与 P71 的 `ingest financials --universe`（它本来就不 upsert）
+   对齐。**修一处 ≠ 修一类**：把「谁有权写 active」想清楚，两个入口一起堵。
+
+**已加判据**：`tests/test_universe_cli.py` 的
+`test_sync_lands_new_members_inactive_and_keeps_existing_active`（新成员全 `active=0`、
+既有行仍 `1`、`system_events.context_json.instruments_added_inactive is True`）、
+`test_sync_second_run_adds_nothing_and_keeps_active_zero`（幂等：第二次 `新增 instruments=0 只`、
+`(instruments, active=1)` 仍是 `(21, 1)`）、
+`test_doctor_exit_0_when_members_are_inactive`（覆盖判据**不看 active** ⇒ exit 0，
+且输出含 `成员 active 1 / 非 active 20`）；
+`tests/test_ingest_universe_scope.py` 的
+`test_explicit_universe_does_not_pollute_daily_scope`（`--universe` 跑完
+`instruments` 计数与 `active=1` 数**不变** —— 若 upsert 了，这一条立刻红）、
+`test_default_bars_scope_is_the_21_active_instruments`（默认路径只认 active=1，
+`active=0` 的研究池成员**不许**被采）与 `test_universe_bars_scope_is_all_800_members`
+（显式宇宙 ⇒ 800 只，含 `active=0`）。
+**反向自检保留**：`test_sync_missing_universe_file_exits_2_and_writes_nothing` 与
+`test_ingest_bars_cli_rejects_unknown_code`（fail-closed 与 `--code` 点名一个字没松）。
