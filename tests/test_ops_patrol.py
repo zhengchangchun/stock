@@ -109,12 +109,16 @@ def _db(tmp_path, *, report_dir: Path | None = None, **kw) -> Path:
     if kw.get("pit", True):
         c.execute(
             "INSERT INTO valuation_daily (code, date, source, fetched_at, created_at,"
-            " resp_sha256) VALUES ('000333',?,'eastmoney',?,'h',?)", (L, NOW, NOW))
+            " resp_sha256) VALUES ('000333',?,'eastmoney',?,'h',?)",
+            (kw.get("pit_valuation_date", L), NOW, NOW))
         c.execute(
             "INSERT INTO money_flow_daily (code, date, source, fetched_at, created_at,"
-            " resp_sha256) VALUES ('000333',?,'sina',?,'h',?)", (L, NOW, NOW))
-        c.execute("INSERT INTO adj_factors (code, date, factor, source, fetched_at)"
-                  " VALUES ('000333',?,1.0,'tencent',?)", (L, NOW))
+            " resp_sha256) VALUES ('000333',?,'sina',?,'h',?)",
+            (kw.get("pit_money_flow_date", L),
+             kw.get("pit_money_flow_fetched_at", NOW), NOW))
+        if kw.get("pit_adj_rows", 1):
+            c.execute("INSERT INTO adj_factors (code, date, factor, source, fetched_at)"
+                      " VALUES ('000333',?,1.0,'tencent',?)", (L, NOW))
     c.commit()
     c.close()
     return path
@@ -408,8 +412,119 @@ def test_stale_pit_tables_plan_the_three_ingests(tmp_path):
     item = payload["checks"]["pit_tables"]
     assert item["status"] == "stale"
     assert "valuation_daily" in item["reason"] and "adj_factors" in item["reason"]
+    assert (item["valuation_status"], item["money_flow_status"],
+            item["adj_factors_status"]) == ("stale", "stale", "stale")
     assert patrol.plan(payload)["steps"] == [
         "ingest_actions", "ingest_valuation", "ingest_moneyflow"]
+
+
+# ---------- 主张 2b：⑦ 拆子项，`lag` 不计异常但仍排补步（P67 T2） ----------
+#
+# 资金流源站是 **T-1 发布**（P67 §1①）：每天的行在**次日早间**才入账，15:30 收盘链
+# 跑时当天数据尚未发布。旧判据把它当成自己的 SLA ⇒ 每个交易日 15:35 稳定挂一条
+# `stale`，整轮 `ops patrol`/`ops close` 常年 exit 1（真警被背景噪音淹掉）。
+#
+# 三档的**证据**必须从数据里读出来，不是假设源站 T-1：
+#   `ok`    max >= required
+#   `lag`   max == required 的**前一个交易日** 且 该行首次写入时刻 > max 那天收盘
+#   `stale` 其它全部（差 ≥2 个交易日；或恰好差 1 天但源站当天就发布过 ⇒ 采集缺口）
+#
+# 这里 L = 2026-09-21，它的前一个日历交易日 = 2026-09-18。
+
+LAG_DATE = "2026-09-18"
+
+
+def test_money_flow_one_session_behind_with_next_morning_evidence_is_lag(tmp_path):
+    """`max` = 前一交易日、且该行是**次日早间**才拿到的 ⇒ `lag`：不计异常。"""
+    payload = _check(_db(tmp_path, pit_money_flow_date=LAG_DATE,
+                         pit_money_flow_fetched_at="2026-09-21T09:00:57+08:00"))
+    item = payload["checks"]["pit_tables"]
+    assert item["status"] == "lag"
+    assert (item["valuation_status"], item["money_flow_status"],
+            item["adj_factors_status"]) == ("ok", "lag", "ok")
+    assert item["money_flow_max"] == LAG_DATE
+    assert item["required"] == L
+    assert item["required_money_flow"] == LAG_DATE      # lag 时 = `max`（按源站节奏该有的那行）
+    assert item["lag_sessions"] == 1
+    assert payload["exit_code"] == 0                   # **不进 ANOMALY_STATUSES**
+    assert payload["ok"] is True
+    assert payload["anomalies"] == []
+    # 但补步照排，且**按子项**排（只有资金流落后 ⇒ 只排它）
+    assert patrol.plan(payload)["steps"] == ["ingest_moneyflow"]
+    assert "ingest_moneyflow" in patrol.plan(payload)["steps"]
+
+
+def test_lag_reason_names_the_source_cadence_and_the_exit_is_not_read_as_missing(
+        tmp_path):
+    """`lag` 的 reason 必须人话点名：点出日期、写入时刻、并写明「不算缺口，但要补」。"""
+    payload = _check(_db(tmp_path, pit_money_flow_date=LAG_DATE,
+                         pit_money_flow_fetched_at="2026-09-21T09:00:57+08:00"))
+    reason = payload["checks"]["pit_tables"]["reason"]
+    assert LAG_DATE in reason and "2026-09-21T09:00:57" in reason
+    assert "不算缺口" in reason and "要补" in reason
+    reason_plan = next(r for r in patrol.plan(payload)["reasons"] if r.startswith("⑦"))
+    assert "不算缺口" in reason_plan
+    # 摘要行把 `lag` 露出来（`⑦lag`），不是 `⑦ok`
+    line = patrol.summary_line(payload)
+    assert "⑦lag" in line and "anomalies=0" in line
+
+
+def test_money_flow_two_sessions_behind_is_stale(tmp_path):
+    """差 **≥2 个交易日** ⇒ `stale`（真缺口照旧报红，lag 只容许恰好一天）。"""
+    payload = _check(_db(tmp_path, pit_money_flow_date="2026-09-17",
+                         pit_money_flow_fetched_at="2026-09-18T09:00:57+08:00"))
+    item = payload["checks"]["pit_tables"]
+    assert item["money_flow_status"] == "stale"
+    assert item["status"] == "stale"
+    assert item["lag_sessions"] == 2
+    assert payload["exit_code"] == 1
+    assert any(a["kind"] == "check_pit_tables" for a in payload["anomalies"])
+    assert patrol.plan(payload)["steps"] == ["ingest_moneyflow"]
+
+
+def test_one_session_behind_but_source_published_same_day_is_stale(tmp_path):
+    """证据反证：恰好差 1 天，但该行是**当天收盘前**就拿到的 ⇒ 采集中断，不是 `lag`。
+
+    「源站当天就发布过」= 该行首次写入时刻 **早于** max 那天的收盘（15:00）。
+    那时就该轮到我们采 `required` 那天了 —— 拿不到是我们的缺口，不许读成源站节奏。
+    """
+    payload = _check(_db(tmp_path, pit_money_flow_date=LAG_DATE,
+                         pit_money_flow_fetched_at="2026-09-18T14:50:00+08:00"))
+    item = payload["checks"]["pit_tables"]
+    assert item["money_flow_status"] == "stale"
+    assert item["status"] == "stale"
+    assert item["lag_sessions"] == 1                    # 只差一天，但证据否掉了 lag
+    assert payload["exit_code"] == 1
+    assert patrol.plan(payload)["steps"] == ["ingest_moneyflow"]
+
+
+def test_money_flow_lag_is_not_decided_without_a_trading_calendar(tmp_path):
+    """日历没覆盖 `required` ⇒ 判不出「前一交易日」⇒ fail-closed 报 `stale`（不给绿）。"""
+    payload = _check(_db(tmp_path, calendar=False, pit_money_flow_date=LAG_DATE,
+                         pit_money_flow_fetched_at="2026-09-21T09:00:57+08:00"))
+    assert payload["checks"]["pit_tables"]["money_flow_status"] == "stale"
+
+
+def test_lag_and_stale_subitems_plan_their_own_steps(tmp_path):
+    """`valuation` 落后 + 资金流 `lag` ⇒ 各排各的步，⑦ 汇总是 `stale`（stale 压过 lag）。"""
+    payload = _check(_db(tmp_path, pit_valuation_date=LAG_DATE,
+                         pit_money_flow_date=LAG_DATE,
+                         pit_money_flow_fetched_at="2026-09-21T09:00:57+08:00"))
+    item = payload["checks"]["pit_tables"]
+    assert (item["valuation_status"], item["money_flow_status"]) == ("stale", "lag")
+    assert item["status"] == "stale"                    # 任一 stale ⇒ stale
+    assert payload["exit_code"] == 1
+    assert patrol.plan(payload)["steps"] == ["ingest_valuation", "ingest_moneyflow"]
+
+
+def test_empty_adj_factors_plans_only_ingest_actions(tmp_path):
+    """`adj_factors` 空 ⇒ 只排 `ingest_actions`（按子项排，不白跑另外两条）。"""
+    payload = _check(_db(tmp_path, pit_adj_rows=0))
+    item = payload["checks"]["pit_tables"]
+    assert (item["valuation_status"], item["money_flow_status"],
+            item["adj_factors_status"]) == ("ok", "ok", "stale")
+    assert item["status"] == "stale"
+    assert patrol.plan(payload)["steps"] == ["ingest_actions"]
 
 
 def test_stale_calendar_plans_ingest_index(tmp_path):

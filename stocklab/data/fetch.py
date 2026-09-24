@@ -319,8 +319,14 @@ def fetch_money_flow_daily(
     """抓取 `[start, end]` 的资金流（新浪），按日期升序返回。
 
     `code` 用**源站形式**（`sz000333` / `sh600690`，`daima` 口径）。
-    翻页按 `opendate` 降序（`asc=0`），翻到空页即止。**fail-closed**：
-    非末页行数 != page_size 即抛（源站截断）；翻页超上限抛（防死循环）。
+    翻页按 `opendate` 降序（`asc=0`）。**fail-closed**：非末页行数 != page_size
+    即抛（源站截断）；翻页超上限抛（防死循环）。
+
+    **翻到 `start` 边界即停**（P67 T1）：页是降序的，某页**最老一行 `<= start`**
+    时再往后翻只会拿到 `< start` 的行（最后都会被 `[start, end]` 过滤掉）——
+    立即停止，不再白翻整段历史。`min(该页日期) == start` 也算到了（该页已含
+    `start` 那天的行）。修前实测：`--days 30` 也要翻完 4019 行 / 42 页
+    （21 只 = 882 请求 / 269s），而其中 41 页的行**一条都不会返回**。
     """
     out: list[tuple[MoneyFlowDaily, str, str]] = []
     page = 1
@@ -339,6 +345,8 @@ def fetch_money_flow_daily(
         out.extend((r, sha, cache_key) for r in rows)
         if len(rows) < page_size:
             break                                  # 到头了
+        if min(r.date for r in rows) <= start:
+            break                                  # 已翻过 start，再翻只会更老
         page += 1
     else:
         raise FetchError(

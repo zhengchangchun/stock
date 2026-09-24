@@ -96,10 +96,16 @@ def test_ingest_does_not_write_bars_when_quality_fails(conn):
 
 def test_ingest_records_job_run(conn):
     ingest(conn, fetch=lambda code: good_bars(code))
-    row = conn.execute("SELECT status, detail, finished_at FROM job_runs"
+    row = conn.execute("SELECT status, detail, started_at, finished_at FROM job_runs"
                        " ORDER BY run_id DESC").fetchone()
     assert row["status"] == "ok"
-    assert row["finished_at"] == NOW
+    # `.started_at` 仍是调用方注入的那个时刻（起点不动）。
+    assert row["started_at"] == NOW
+    # `.finished_at` **不再**等于它（P67 T3）：收尾时另取一个真实墙钟时刻，否则
+    # 「这步跑了多久」在 `job_runs` 里恒为 0 —— 旧断言 `finished_at == NOW` 钉住的
+    # 正是那个假读数（真库实测 `ingest_moneyflow` 269.647s 而两字段逐字相同）。
+    assert row["finished_at"] != NOW
+    assert row["finished_at"] > NOW
 
 
 def test_ingest_marks_job_failed_when_all_fail(conn):

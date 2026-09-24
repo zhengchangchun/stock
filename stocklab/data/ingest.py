@@ -19,13 +19,17 @@ from __future__ import annotations
 
 import json
 from dataclasses import dataclass, field
+from datetime import datetime
 from typing import Callable, Sequence
+from zoneinfo import ZoneInfo
 
 from stocklab.config.universe import Instrument
 from stocklab.data import notice_date
 from stocklab.data.models import Bar
 from stocklab.quality.checks import Issue, check_bars
 from stocklab.store import repo
+
+TZ = ZoneInfo("Asia/Shanghai")
 
 #: 达到这些严重度即拒绝落库（`warn`/`info` 只记录）
 HARD_SEVERITIES = frozenset({"error"})
@@ -117,7 +121,10 @@ def ingest_daily_bars(
         report.results.append(IngestResult(inst.code, True, written, tuple(issues)))
 
     ok = report.ok_count > 0
-    repo.finish_job(conn, run_id, status="ok" if ok else "failed", finished_at=now,
+    # `finished_at` 取**收尾时刻**，不是调用方传进来的 `now`（P67 T3）：整条命令共用
+    # 一个启动时刻会让「这步跑了多久」恒为 0 —— 269s 的采集与 0.2s 的长得一样。
+    repo.finish_job(conn, run_id, status="ok" if ok else "failed",
+                    finished_at=datetime.now(TZ).isoformat(timespec="seconds"),
                     detail=f"{report.ok_count}/{len(instruments)} ok, "
                            f"{report.total_issues} issues")
     return report

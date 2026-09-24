@@ -276,7 +276,9 @@ def cmd_ingest_actions(args: argparse.Namespace) -> int:
                                now=now)
         repo.finish_job(conn, repo.record_job(conn, "ingest_actions",
                                               status="running", started_at=now),
-                        status="ok" if not failed else "failed", finished_at=now,
+                        status="ok" if not failed else "failed",
+                        # 收尾时刻另取（P67 T3）：`started_at` 不动，否则时长恒为 0
+                        finished_at=datetime.now(TZ).isoformat(timespec="seconds"),
                         detail=f"{len(universe) - len(failed)}/{len(universe)} ok")
     finally:
         conn.close()
@@ -416,7 +418,9 @@ def _cmd_ingest_series(args: argparse.Namespace, *, kind: str) -> int:
                 "fetched": len(rows),
             }
         repo.finish_job(conn, run_id, status="ok" if not failed else "failed",
-                        finished_at=now,
+                        # 收尾时刻另取（P67 T3）：真库实测这一步 269.647s 而
+                        # `finished_at == started_at` —— 时长读数恒为 0 是假读数。
+                        finished_at=datetime.now(TZ).isoformat(timespec="seconds"),
                         detail=f"{len(universe) - len(failed)}/{len(universe)} ok")
     finally:
         conn.close()

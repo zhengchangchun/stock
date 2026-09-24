@@ -64,6 +64,8 @@ MISSING = "missing"      # 该有却没有 → 计异常、排补步
 STALE = "stale"          # 在位但没跟到最新 → 计异常、排补步
 SKIPPED = "skipped"      # 本轮不该要求它（非交易日 / 未 paper init）→ **不计异常**
 UNKNOWN = "unknown"      # **判不了**（证据不足）→ 只在点名的地方计异常，见 verdict()
+LAG = "lag"              # 落后**恰好一个交易日**且有「源站 T-1 发布」的证据
+                         # （P67 T2）→ **不计异常**，但补步照排。刻意不在下面那个集合里。
 
 ANOMALY_STATUSES = frozenset({MISSING, STALE})
 
@@ -168,6 +170,74 @@ def session_day(when: datetime, cal, hol) -> dict:
 
 
 # ---------- 体检（**只读**） ----------
+
+def _fetched_after_close(fetched_at: str | None, day: str) -> bool:
+    """该行是否**在 `day` 这天收盘（15:00）之后**才写进库。
+
+    这是「源站当天没发布它」的**证据**（P67 T2），不是对源站节奏的假设。
+    实测（真库 2026-09-24 只读）：`money_flow_daily` 里 `date=2026-09-23` 的 21 行
+    `MIN(fetched_at) = 2026-09-24T09:00:57` —— 次日早间才拿到，与「源站 T-1 发布」
+    一致。反之若这一行是**当天收盘前**就拿到的，说明源站当天就发布 ⇒ 我们采集中断。
+    """
+    if not fetched_at:
+        return False
+    try:
+        close_dt = datetime.fromisoformat(f"{day}T15:00:00").replace(tzinfo=TZ)
+        return _as_datetime(fetched_at) > close_dt
+    except ValueError:                          # 时刻格式坏 → 不算证据（fail-closed 见下）
+        return False
+
+
+def _money_flow_verdict(conn: sqlite3.Connection, cal, mf: str | None,
+                        latest: str) -> dict:
+    """资金流子项的**三档**（P67 T2）+ 证据。**只读**。
+
+    - `ok`：`max >= required`；
+    - `lag`：`max` 恰好是 `required` 的前一个交易日，**且**那一行的首次写入时刻
+      `>` 它的收盘 —— 源站按同一个节奏在下一交易日早间补落，不是我们的缺口；
+    - `stale`：其它**全部**情形（差 ≥2 个交易日；或恰好差 1 天但源站当天就发布过
+      ⇒ 那是我们采集中断，不许读成 `lag`；或日历没覆盖 ⇒ 判不出前一交易日）。
+
+    `lag` 只容许**恰好一个交易日**，且必须**从数据里读出**证据 —— 这条不许放宽，
+    否则「采集中断」会被一起放行（§3 反目标最后一条）。
+    """
+    if mf is not None and mf >= latest:
+        return {"status": OK, "reason": None, "required_money_flow": latest,
+                "lag_sessions": 0, "money_flow_fetched_at": None}
+
+    fetched = (_one(conn, "SELECT MIN(fetched_at) FROM money_flow_daily WHERE date=?",
+                    (mf,), default=None) if mf else None)
+    lag_sessions = None
+    if mf and cal.is_open(mf) and cal.is_open(latest):
+        lag_sessions = max(len(cal.sessions(mf, latest)) - 1, 0)
+
+    prev = None
+    if cal.is_open(latest):
+        try:
+            prev = cal.prev_trading_day(latest)
+        except IndexError:                      # 日历开头就没有前一交易日 → 判不出
+            prev = None
+
+    if prev is not None and mf == prev and _fetched_after_close(fetched, mf):
+        return {
+            "status": LAG,
+            "reason": (f"资金流源站 T-1 发布：最近一行 {mf}（{fetched} 写入），"
+                       f"{latest} 的行按同一节奏在下一交易日早间补落 —— "
+                       f"**不算缺口，但要补**"),
+            "required_money_flow": mf, "lag_sessions": 1,
+            "money_flow_fetched_at": fetched,
+        }
+
+    if mf is None:
+        reason = f"money_flow_daily max={mf}"
+    elif prev is not None and mf == prev:
+        reason = (f"money_flow_daily max={mf}（该行 {fetched} 写入，早于 {mf} 收盘 ——"
+                  f"源站当天就发布过 ⇒ {latest} 的行本该已经采到，是我们采集中断）")
+    else:
+        reason = f"money_flow_daily max={mf}（落后 {latest} {lag_sessions} 个交易日）"
+    return {"status": STALE, "reason": reason, "required_money_flow": latest,
+            "lag_sessions": lag_sessions, "money_flow_fetched_at": fetched}
+
 
 def check_chain(conn: sqlite3.Connection, now: str, *, report_dir: Path | str | None = None,
                 model_version: str = MODEL_VERSION) -> dict:
@@ -331,24 +401,45 @@ def check_chain(conn: sqlite3.Connection, now: str, *, report_dir: Path | str | 
             reason=reason)
 
     # ⑦ 三张 PIT 表 ------------------------------------------------------------
+    # P67 T2：三件事各自有状态。旧版把它们压成一个 `status` —— 于是资金流源站的
+    # **T-1 发布节奏**被当成了我们自己的 SLA，每天 15:35 稳定挂一条 stale。
     val = _one(conn, "SELECT MAX(date) FROM valuation_daily", default=None)
     mf = _one(conn, "SELECT MAX(date) FROM money_flow_daily", default=None)
     adj = _one(conn, "SELECT COUNT(*) FROM adj_factors", default=None)
     if latest is None:
         checks["pit_tables"] = _item(UNKNOWN, valuation_max=val, money_flow_max=mf,
                                      adj_factors_rows=adj, required=None,
+                                     valuation_status=None, money_flow_status=None,
+                                     adj_factors_status=None, required_money_flow=None,
+                                     lag_sessions=None, money_flow_fetched_at=None,
                                      reason="最新已收盘交易日判不出")
     else:
-        bad: list[str] = []
-        if val is None or val < latest:
-            bad.append(f"valuation_daily max={val}")
-        if mf is None or mf < latest:
-            bad.append(f"money_flow_daily max={mf}")
-        if not adj:
-            bad.append(f"adj_factors={adj} 行")
+        val_ok = val is not None and val >= latest
+        adj_ok = bool(adj)
+        mf_v = _money_flow_verdict(conn, cal, mf, latest)
+        reasons: list[str] = []
+        if not val_ok:
+            reasons.append(f"valuation_daily max={val}")
+        if mf_v["reason"]:
+            reasons.append(mf_v["reason"])
+        if not adj_ok:
+            reasons.append(f"adj_factors={adj} 行")
+        if mf_v["status"] == STALE or not val_ok or not adj_ok:
+            status = STALE                       # 任一子项 stale ⇒ stale（压过 lag）
+        elif mf_v["status"] == LAG:
+            status = LAG
+        else:
+            status = OK
         checks["pit_tables"] = _item(
-            STALE if bad else OK, valuation_max=val, money_flow_max=mf,
-            adj_factors_rows=adj, required=latest, reason="；".join(bad) or None)
+            status, valuation_max=val, money_flow_max=mf, adj_factors_rows=adj,
+            required=latest,
+            valuation_status=OK if val_ok else STALE,
+            money_flow_status=mf_v["status"],
+            adj_factors_status=OK if adj_ok else STALE,
+            required_money_flow=mf_v["required_money_flow"],
+            lag_sessions=mf_v["lag_sessions"],
+            money_flow_fetched_at=mf_v["money_flow_fetched_at"],
+            reason="；".join(reasons) or None)
 
     # 日历经（第 8 项）：它不在 cron 点名的 7 项里，但它是「`ingest index` 跑了没」
     # 的**唯一**可观测量（日历由指数日线生成），缺了它就找不到该补哪一步。
@@ -497,9 +588,21 @@ def plan(snap: dict) -> dict:
         wanted.append("ingest_index")
         reasons.append("日历没跟到最新已收盘交易日（`ingest index` 是它唯一的来源）")
 
-    if checks["pit_tables"]["status"] == STALE:
-        wanted += ["ingest_actions", "ingest_valuation", "ingest_moneyflow"]
-        reasons.append(f"⑦ {checks['pit_tables'].get('reason')}")
+    # ⑦ **按子项**排步（P67 T2）：资金流落后 ⇒ 采资金流；估值落后 ⇒ 采估值；
+    #    复权因子空 ⇒ 采除权事件。旧版是一条汇总 stale 就三样全排 —— 白跑。
+    #    `lag` 也排（那行确实还没落库），但它本身不算异常。
+    pit = checks["pit_tables"]
+    pit_wanted: list[str] = []
+    if pit.get("adj_factors_status") in ANOMALY_STATUSES:
+        pit_wanted.append("ingest_actions")
+    if pit.get("valuation_status") in ANOMALY_STATUSES:
+        pit_wanted.append("ingest_valuation")
+    if (pit.get("money_flow_status") in ANOMALY_STATUSES
+            or pit.get("money_flow_status") == LAG):
+        pit_wanted.append("ingest_moneyflow")
+    if pit_wanted:
+        wanted += pit_wanted
+        reasons.append(f"⑦ {pit.get('reason')}")
 
     if checks["snapshot"]["status"] in (MISSING, UNKNOWN):
         wanted.append("session_tick")
