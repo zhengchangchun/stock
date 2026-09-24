@@ -30,6 +30,7 @@ from zoneinfo import ZoneInfo
 from stocklab.config import paths
 from stocklab.config.settings import load_settings
 from stocklab.config.universe import DEFAULT_UNIVERSE
+from stocklab.config.universes import SOURCE_IDS
 from stocklab.data.fetch import EARLIEST as EARLIEST_ACTION_START
 from stocklab.store import repo
 from stocklab.store.db import connect
@@ -44,6 +45,8 @@ from stocklab.cli.plugin import (cmd_plugin_approve, cmd_plugin_list,
                                  cmd_plugin_submit)
 from stocklab.cli.candidate import cmd_candidate_review, cmd_candidate_run
 from stocklab.cli.research import cmd_research_xsec_topn
+from stocklab.cli.universe import (cmd_universe_build, cmd_universe_doctor,
+                                   cmd_universe_sync)
 
 TZ = ZoneInfo("Asia/Shanghai")
 
@@ -446,25 +449,37 @@ def cmd_ingest_financials(args) -> int:
     幂等：`(code, report_date, notice_date)` 已存在即跳过。
     首写保留：同键重采值变了 → 保留旧值 + `conflicts` 计数，不覆盖。
     会计恒等式与量级异常**只记 issue，不拒写**（留痕不丢数据）。
+
+    `--universe <id>`：取数范围（默认 `None` ⇒ `SEED_UNIVERSE` 21 只，**逐位不变**）。
+    扩池宇宙的成员 `org_type` 未知 ⇒ `None` ⇒ `fetch_financial_reports` **显式跳过
+    F10 公告日**、退回法定披露截止日（§9 裁决 3：不许拿 `"通用"` 兜底）。
     """
     from datetime import date, datetime, timezone
 
-    from stocklab.candidate.seeds import SEED_UNIVERSE
+    from stocklab.config.universes import UniverseError, resolve_universe
     from stocklab.data.fetch import fetch_financial_reports
     from stocklab.data.http import HttpClient
     from stocklab.data.ingest import ingest_financial_reports
     from stocklab.store.migrate import ensure_schema
 
+    try:
+        # 先解析宇宙**再**碰库：用法错误必须零写入（`ensure_schema` 会写库）。
+        universe_id, members, _sha = resolve_universe(getattr(args, "universe", None))
+    except UniverseError as exc:
+        print(f"❌ --universe：{exc}", file=sys.stderr)
+        return 2
+
     db_path = Path(args.db) if args.db else paths.DB_PATH
     ensure_schema(db_path)
     now = datetime.now(timezone.utc).isoformat()
     fetched_date = args.fetched_date or date.today().isoformat()
-    wanted = set(args.code) if args.code else {i.code for i in SEED_UNIVERSE}
+    wanted = set(args.code) if args.code else {i.code for i in members}
     client = HttpClient()
     conn = connect(db_path)
     written = conflicts = failed = 0
+    print(f"宇宙={universe_id}（{len(members)} 只；取数集合 {len(wanted)} 只）")
     try:
-        for inst in SEED_UNIVERSE:
+        for inst in members:
             if inst.code not in wanted:
                 continue
             try:
@@ -3715,6 +3730,8 @@ def build_parser() -> argparse.ArgumentParser:
     ing_fin.add_argument("--code", action="append", default=None,
                          help="只采指定代码，可重复；默认全部种子标的")
     ing_fin.add_argument("--fetched-date", help="采集日 YYYY-MM-DD（默认今天）")
+    ing_fin.add_argument("--universe", default=None,
+                         help="取数宇宙 id（默认 None ⇒ 21 只种子；扩池用 csi300-500）")
     ing_fin.add_argument("--db")
     ing_fin.set_defaults(func=cmd_ingest_financials)
 
@@ -4396,6 +4413,9 @@ def build_parser() -> argparse.ArgumentParser:
     cand_run.add_argument("--run-kind", default="weekly",
                           choices=["light", "weekly", "quarterly"])
     cand_run.add_argument("--out", help="报告路径（默认 reports/candidate/<asof>-<kind>.md）")
+    cand_run.add_argument("--universe", default=None,
+                          help="扫描宇宙 id（默认 None ⇒ seed21 主干常量）；"
+                               "缺省行为与显式 seed21 逐位相同")
     cand_run.add_argument("--now", help="覆盖当前时刻（测试用）")
     cand_run.add_argument("--db")
     cand_run.set_defaults(func=cmd_candidate_run)
@@ -4593,8 +4613,36 @@ def build_parser() -> argparse.ArgumentParser:
                          help="产物目录（默认：reports/research/）")
     rsrch_x.add_argument("--arm", default="both", choices=("all", "topn", "both"),
                          help="跑哪一臂（默认 both）")
+    rsrch_x.add_argument("--universe", default=None,
+                         help="宇宙 id（默认 None ⇒ seed21 主干常量）；"
+                              "带 `universe` 字段的预注册必须与它逐字一致，否则 exit 2")
     rsrch_x.add_argument("--db")
     rsrch_x.set_defaults(func=cmd_research_xsec_topn)
+
+    uni = sub.add_parser(
+        "universe", help="宇宙（ADR-026：repo 文件＝真源、universe_memberships 表＝投影）")
+    uni_sub = uni.add_subparsers(dest="universe_action", required=True)
+
+    uni_build = uni_sub.add_parser(
+        "build", help="抓成分 ⇒ 写 config/universes/<id>.{csv,meta.json}（联网）")
+    uni_build.add_argument("--source", required=True,
+                           choices=sorted(SOURCE_IDS),
+                           help="成分来源：seed21（离线派生）| csi300+csi500（联网）")
+    uni_build.add_argument("--out", default=None,
+                           help="输出目录（默认 config/universes/）")
+    uni_build.set_defaults(func=cmd_universe_build)
+
+    uni_sync = uni_sub.add_parser(
+        "sync", help="把宇宙文件投影进 DB（写真库；幂等；既有 instruments 行只补空列）")
+    uni_sync.add_argument("--universe", required=True, help="宇宙 id，如 seed21 / csi300-500")
+    uni_sync.add_argument("--db")
+    uni_sync.set_defaults(func=cmd_universe_sync)
+
+    uni_doc = uni_sub.add_parser(
+        "doctor", help="只读对账：文件 sha vs 表投影 sha ＋ instruments 覆盖（不一致 exit 2）")
+    uni_doc.add_argument("--universe", required=True, help="宇宙 id，如 seed21 / csi300-500")
+    uni_doc.add_argument("--db")
+    uni_doc.set_defaults(func=cmd_universe_doctor)
 
     return parser
 

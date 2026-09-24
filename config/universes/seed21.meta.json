@@ -1,0 +1,8 @@
+{
+  "built_at": "2026-09-24T15:04:56.953364+00:00",
+  "members_sha256": "b77cd49ebee8e0b74fd7114ce47b3efe081e6168598aee379825966c45f330f3",
+  "n_members": 21,
+  "pit": false,
+  "probe_sha256": null,
+  "source": "seed21：由 stocklab/candidate/seeds.py::SEED_UNIVERSE 离线派生"
+}

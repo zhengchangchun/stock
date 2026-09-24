@@ -92,10 +92,16 @@ def _load_bars(conn: sqlite3.Connection, code: str, *, asof: str) -> list[Bar]:
     return [Bar(**dict(r)) for r in rows]
 
 
-def _cross_section_map(conn, *, asof: str) -> dict:
-    """每轮算一次横截面分位，避免对每个标的重复计算全样本。"""
+def _cross_section_map(conn, *, asof: str, universe=None) -> dict:
+    """每轮算一次横截面分位，避免对每个标的重复计算全样本。
+
+    `universe`：扫描宇宙（`Instrument` 序列）。`None` ⇒ `SEED_UNIVERSE`（D2：默认
+    路径一字不动）。**必须与 `score_pipeline` 的主循环用同一个集合** —— 分位是相对量，
+    集合不同则分位口径与池宽不匹配（P70 设计稿 §4 #1）。
+    """
+    members = SEED_UNIVERSE if universe is None else universe
     rows = {}
-    for inst in SEED_UNIVERSE:
+    for inst in members:
         rows[inst.code] = indicators.factors(
             score.load_financials(conn, inst.code, asof=asof))
     return cross_section.build(rows, asof=asof)
@@ -115,7 +121,9 @@ def recommend_optimization(result: RunResult) -> bool:
 
 
 def score_pipeline(conn: sqlite3.Connection, *, asof: str,
-                   plugin_overrides: dict[str, int] | None = None
+                   plugin_overrides: dict[str, int] | None = None,
+                   universe=None, universe_id: str | None = None,
+                   members_sha256: str | None = None
                    ) -> PipelineResult:
     """跑一遍候选池打分（步骤 3–8），**只返回、不写库**。
 
@@ -125,14 +133,28 @@ def score_pipeline(conn: sqlite3.Connection, *, asof: str,
 
     `plugin_overrides`：`{plugin_id: script_id}`，用于沙盒的单变量对比
     （只换被比较的那个插件，其余仍解析 active）。
+
+    `universe`：扫描宇宙（`Instrument` 序列）。`None` ⇒ `SEED_UNIVERSE`（**默认路径
+    逐位不变**，D2）。横截面分位与主循环用**同一个**集合。
+    `universe_id` / `members_sha256`：写进快照 `params_json` 的**口径增量**
+    （老键 `seed_count` / `topn` 一字不动）。`None` ⇒ 按 `seed21` 派生 ——
+    这样「默认路径」与「显式 `--universe seed21`」的快照参数**逐位相同**。
     """
+    if universe_id is None:
+        from stocklab.config.universes import SEED21_UNIVERSE_ID
+        universe_id = SEED21_UNIVERSE_ID
+    if members_sha256 is None:
+        from stocklab.config.universes import seed21_sha256
+        members_sha256 = seed21_sha256()
+
     members: list[snapshot.MemberRow] = []
     rejects: list[snapshot.RejectRow] = []
     scored: dict[str, list[dict]] = {p: [] for p in pools.ALL_POOLS}
 
-    xsec = _cross_section_map(conn, asof=asof)
+    scan = SEED_UNIVERSE if universe is None else universe
+    xsec = _cross_section_map(conn, asof=asof, universe=scan)
 
-    for inst in SEED_UNIVERSE:
+    for inst in scan:
         bars = _load_bars(conn, inst.code, asof=asof)
 
         verdict = screen.screen(inst, bars, asof=asof)
@@ -185,12 +207,15 @@ def score_pipeline(conn: sqlite3.Connection, *, asof: str,
 
     return PipelineResult(members=members, rejects=rejects,
                           eligible=eligible,
-                          params={"seed_count": len(SEED_UNIVERSE),
+                          params={"seed_count": len(scan),
+                                  "universe_id": universe_id,
+                                  "members_sha256": members_sha256,
                                   "topn": dict(pools.POOL_TOPN)})
 
 
 def run_candidate(conn: sqlite3.Connection, *, asof: str, run_kind: str,
-                  now: str) -> RunResult:
+                  now: str, universe=None, universe_id: str | None = None,
+                  members_sha256: str | None = None) -> RunResult:
     if run_kind not in RUN_KINDS:
         raise ValueError(f"未知 run_kind {run_kind!r}；已知：{list(RUN_KINDS)}")
 
@@ -205,7 +230,8 @@ def run_candidate(conn: sqlite3.Connection, *, asof: str, run_kind: str,
                          report_md=md, skipped=True,
                          params=loaded["snapshot"]["params"])
 
-    pipe = score_pipeline(conn, asof=asof)
+    pipe = score_pipeline(conn, asof=asof, universe=universe,
+                          universe_id=universe_id, members_sha256=members_sha256)
     snapshot_id = snapshot.write_snapshot(
         conn, asof=asof, run_kind=run_kind, params=pipe.params,
         members=pipe.members, rejects=pipe.rejects, now=now)

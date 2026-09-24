@@ -257,6 +257,35 @@ def test_score_pipeline_writes_nothing(tmp_db):
     assert isinstance(result, PipelineResult)
 
 
+def test_explicit_seed21_matches_default_path_bytewise(tmp_db):
+    """P71 §6 判据 4：`--universe seed21` 与**不传参数**逐位对账。
+
+    老键（`seed_count` / `topn`）逐位相同；新键（`universe_id` /
+    `members_sha256`）也相同 —— 因为 `None` 在 `score_pipeline` 里按 `seed21`
+    派生，两条路径产出**同一份 `params`**；扫描成员集合与淘汰集合逐位相同。
+
+    Falsifiability：把 `score_pipeline` 里 `universe_id is None` 那次派生改成
+    写死 `"default"` ⇒ 第一条新键断言即红（这正是「默认路径」与「显式 seed21」
+    分叉的那个口子）。
+    """
+    from stocklab.config.universes import resolve_universe
+
+    conn = _seed_db(tmp_db)
+    default = score_pipeline(conn, asof=ASOF)
+    uid, members, sha = resolve_universe("seed21")
+    explicit = score_pipeline(conn, asof=ASOF, universe=members,
+                              universe_id=uid, members_sha256=sha)
+
+    old = ("universe_id", "members_sha256")
+    assert ({k: v for k, v in default.params.items() if k not in old}
+            == {k: v for k, v in explicit.params.items() if k not in old})
+    assert default.params["universe_id"] == "seed21"
+    assert explicit.params["universe_id"] == "seed21"
+    assert default.params["members_sha256"] == explicit.params["members_sha256"]
+    assert [m.code for m in default.members] == [m.code for m in explicit.members]
+    assert [r.code for r in default.rejects] == [r.code for r in explicit.rejects]
+
+
 def test_score_pipeline_matches_run_candidate_members(tmp_db):
     """回放内核与生产主流程在同一 asof 上必须选出完全相同的池成员。
 

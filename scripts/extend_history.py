@@ -1,6 +1,6 @@
 """把种子标的的日K 分页回溯到**上市首日**（联网，手工运行，不属于测试）。
 
-    .venv/bin/python scripts/extend_history.py [--db data/stocklab.db]
+    .venv/bin/python scripts/extend_history.py [--db data/stocklab.db] [--universe csi300-500]
 
 ## 为什么要往更早拉
 
@@ -34,6 +34,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from stocklab.candidate.seeds import SEED_UNIVERSE        # noqa: E402
 from stocklab.config import paths                         # noqa: E402
+from stocklab.config.universes import (UniverseError,     # noqa: E402
+                                       resolve_universe)
 from stocklab.data.fetch import fetch_daily_bars          # noqa: E402
 from stocklab.data.ingest import ingest_daily_bars        # noqa: E402
 from stocklab.store.db import connect                     # noqa: E402
@@ -43,7 +45,7 @@ from stocklab.store.migrate import init_db                # noqa: E402
 EARLIEST_START = "1990-01-01"
 
 
-def extend_one(conn, client, code: str, *, now: str) -> tuple[str, int]:
+def extend_one(conn, client, code: str, *, now: str, universe=None) -> tuple[str, int]:
     """把一只标的的历史拉到最早可得，返回 `(最早期, 新增行数)`。
 
     分页能力**已内置**在 `data/fetch.py::fetch_daily_bars`（docstring：
@@ -58,11 +60,14 @@ def extend_one(conn, client, code: str, *, now: str) -> tuple[str, int]:
     ----
     conn    : 已打开的 SQLite 连接（instruments 表必须已有该 code）。
     client  : get_text 接口的实现（生产用 HttpClient，测试注入假 client）。
-    code    : 6 位代码（如 "000333"）；必须在 SEED_UNIVERSE 里，否则抛 StopIteration。
+    code    : 6 位代码（如 "000333"）；必须在扫描宇宙里，否则抛 StopIteration。
     now     : ISO 8601 时间戳字符串，用作入库的 created_at / fetched_at。
+    universe: 扫描宇宙（`Instrument` 序列）。`None` ⇒ `SEED_UNIVERSE`
+              （**默认路径逐位不变，含 StopIteration 语义**，D2）。
     """
     # StopIteration 向外传播：unknown code 是调用方错误，不应静默
-    inst = next(i for i in SEED_UNIVERSE if i.code == code)
+    scan = SEED_UNIVERSE if universe is None else universe
+    inst = next(i for i in scan if i.code == code)
 
     # end 取 now 的日期部分（YYYY-MM-DD）
     end_date = now[:10]
@@ -102,7 +107,15 @@ def main(argv=None) -> int:
     ap = argparse.ArgumentParser(
         description="把种子标的日K 分页回溯到上市首日（联网，手工运行）")
     ap.add_argument("--db", default=str(paths.DB_PATH))
+    ap.add_argument("--universe", default=None,
+                    help="扫描宇宙 id（默认 None ⇒ 21 只种子；扩池用 csi300-500）")
     args = ap.parse_args(argv)
+
+    try:
+        universe_id, scan, _sha = resolve_universe(args.universe)
+    except UniverseError as exc:
+        print(f"❌ --universe：{exc}", file=sys.stderr)
+        return 2
 
     db_path = Path(args.db)
     if not db_path.exists():
@@ -113,13 +126,15 @@ def main(argv=None) -> int:
 
     client = HttpClient()
     now = _today() + "T00:00:00+08:00"
+    print(f"宇宙={universe_id}（{len(scan)} 只）")
 
     results: list[tuple[str, str, int]] = []
     errors: list[tuple[str, Exception]] = []
 
-    for inst in SEED_UNIVERSE:
+    for inst in scan:
         try:
-            earliest, written = extend_one(conn, client, inst.code, now=now)
+            earliest, written = extend_one(conn, client, inst.code, now=now,
+                                           universe=scan)
             results.append((inst.code, earliest, written))
             print(f"  {inst.code} {inst.name}: earliest={earliest}, written={written}")
         except Exception as exc:                       # noqa: BLE001

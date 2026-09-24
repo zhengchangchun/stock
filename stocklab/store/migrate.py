@@ -933,6 +933,64 @@ def _key(row) -> tuple[str, str]:
     return (str(row["account_id"]), str(row["date"]))
 
 
+# ---------------------------------------------------------------------------
+# P71：宇宙成员表 `universe_memberships`（**新表**，ADR-026 的「表＝投影」那一半）。
+#
+# 与 P58 同款：新表**不需要数据迁移** —— `schema.sql` 的 `CREATE TABLE IF NOT EXISTS`
+# 会在下一次 `init_db` / `ensure_schema` 时把它建出来（老库与新库走同一条路径）。
+# 本函数只在**结构漂移**时动手：表在、但唯一索引不见了（被人手工 DROP 过）。
+#
+# 判据刻意**不含「表不存在」**：按既有约定「表不存在 ⇒ 按新 shape 建出，无需迁移、
+# 无需备份，不算 pending」（见 `_pending_column_migrations` 的 docstring）。
+# 因此本迁移**不登记进** `_pending_column_migrations` / `_apply_schema`（那会让每一次
+# 写库入口都给老库做一次备份），只登记进 `_KNOWN_MARKERS` 供 doctor 只读报告。
+#
+# ⚠️ DDL 与 `schema.sql` 里那一段 **同文**（改一处须同步另一处）。
+# ⚠️ 这张表**刻意不挂 append-only 触发器**：`universe sync` 按 `universe_id`
+#    **整体重写**该 id 的行（幂等），可追溯性由 repo 文件 ＋ `git log` 提供。
+# ---------------------------------------------------------------------------
+
+_P71_TABLE = "universe_memberships"
+
+_P71_DDL = (
+    "CREATE TABLE IF NOT EXISTS universe_memberships (\n"
+    "    universe_id      TEXT NOT NULL,\n"
+    "    code             TEXT NOT NULL,\n"
+    "    members_sha256   TEXT NOT NULL,\n"
+    "    sector           TEXT,\n"
+    "    index_membership TEXT,\n"
+    "    synced_at        TEXT NOT NULL,\n"
+    "    PRIMARY KEY (universe_id, code)\n"
+    ")"
+)
+
+_P71_INDEX = ("CREATE INDEX IF NOT EXISTS idx_universe_memberships_code"
+              " ON universe_memberships (code)")
+
+_P71_INDEX_NAME = "idx_universe_memberships_code"
+
+
+def universe_memberships_needs_p71(conn) -> bool:
+    """宇宙成员表在、但唯一索引缺席吗？（只读探测，供 doctor 用）
+
+    表**不存在**时返回 False —— 那不是「待迁移」，是「等着被建出来」。
+    """
+    if not _table_exists(conn, _P71_TABLE):
+        return False
+    return not conn.execute(
+        "SELECT COUNT(*) FROM sqlite_master WHERE type='index' AND name=?",
+        (_P71_INDEX_NAME,)).fetchone()[0]
+
+
+def migrate_p71_universe_memberships(conn) -> list[str]:
+    """建/补齐宇宙成员表与它的索引（P71）。**可重入**、老库上零数据动作。"""
+    if not universe_memberships_needs_p71(conn):
+        return []
+    conn.execute(_P71_DDL)
+    conn.execute(_P71_INDEX)
+    return [f"{_P71_TABLE}.index"]
+
+
 #: 已知迁移 marker 清单：doctor 逐个报告在位与否（只读，不迁移）。#: (name, table, 判据)。判据是列名（str）或一个只读探测函数。
 #: 新增迁移时必须在这里登记，否则 doctor 看不出来。
 _KNOWN_MARKERS: list[tuple[str, str, object]] = [
@@ -961,6 +1019,11 @@ _KNOWN_MARKERS: list[tuple[str, str, object]] = [
     # `migrate_p69_agent_arms_live`（§5 的备份 → 副本 → 核对纪律）。
     ("p69_agent_arms_live", "paper_accounts",
      lambda conn: not agent_arms_need_p69_live(conn)),
+    # P71 是**新表**（宇宙成员投影），按既有约定不挂 `_pending_column_migrations`
+    # / `_apply_schema`：表不存在 ⇒ executescript 直接建出，无需备份。
+    # 这里只让 doctor 只读报告「投影表与它的索引还在不在」。
+    ("p71_universe_memberships", "universe_memberships",
+     lambda conn: not universe_memberships_needs_p71(conn)),
 ]
 
 

@@ -47,6 +47,7 @@ from stocklab.candidate import pools as candidate_pools
 from stocklab.candidate import replay
 from stocklab.plugin import sandbox
 from stocklab.config import paths
+from stocklab.config.universes import UniverseError, resolve_universe
 
 #: 实验短名。与预注册 json 的 `experiment` 字段逐字相同。
 EXPERIMENT = "xsec-topn"
@@ -70,9 +71,23 @@ HOLD_CONTROL = "all-eligible"
 BENCHMARK = replay.BENCHMARK_CODE
 
 #: 预注册 json 的**必填字段**。少一个即 exit 2 —— 缺字段的预注册不构成预注册。
+#: `universe` 在**清单里**（D7：要能钉住「跑的是哪个宇宙」，否则同一份预注册换宇宙
+#: 能跑出两个结论 = 静默换宇宙）但**不在「缺即拒」那一档**，理由见
+#: `PREREG_OPTIONAL_FIELDS`。
 PREREG_FIELDS: tuple[str, ...] = (
-    "experiment", "pool", "start", "topn", "hold_arm", "hold_control",
+    "experiment", "pool", "start", "universe", "topn", "hold_arm", "hold_control",
     "min_periods", "bootstrap_n", "bootstrap_seed", "benchmark", "rule")
+
+#: 允许**缺席**的预注册字段（缺席有明确语义，不是「没预注册」）。
+#: 老预注册 `docs/experiments/2026-09-24-xsec-topn.md` 是 append-only 的台账，
+#: **一字不许改**（P70 设计稿 §7.1）⇒ 它必然缺 `universe`。按 nanobot 的兼容裁决，
+#: 缺席 ⇒ 语义视为 `seed21`（见 `DEFAULT_PREREG_UNIVERSE`）。**这不等于放行**：
+#: `validate_prereg` 仍拿命令行实参去比对，所以「预注册推得 seed21、命令行传
+#: csi300-500」照样 exit 2 —— 堵的正是「静默换宇宙」那类错误。
+PREREG_OPTIONAL_FIELDS: tuple[str, ...] = ("universe",)
+
+#: `universe` 字段缺席时的语义（nanobot 兼容裁决）。写进报告一行，让读者看得见。
+DEFAULT_PREREG_UNIVERSE = "seed21"
 
 _JSON_FENCE = re.compile(r"```json[ \t]*\r?\n(.*?)```", re.S)
 
@@ -107,9 +122,49 @@ SELECTION_BIAS_SENTENCE = (
     "不能说「选股有效」。"
 )
 
+#: §3 里那句「种子只有 21 只」。**对默认路径（`seed21`）逐字不变**；
+#: 扩池后「种子」不再成立 ⇒ 按实际扫描宇宙陈述（见 `_seed_scope_note`）。
+SEED_SCOPE_NOTE = "种子只有 21 只"
+
+
+def _seed_scope_note(universe_id: str, n: int) -> str:
+    """§3 的扫描范围陈述。宇宙不是 `seed21` 时按实参写 —— 否则报告会把
+    800 只的扫描说成「只有 21 只」，与实参直接矛盾（那正是 D7 要堵的那类错）。"""
+    if universe_id == DEFAULT_PREREG_UNIVERSE:
+        return SEED_SCOPE_NOTE
+    return f"扫描宇宙 `{universe_id}` 只有 {n} 只"
+
+
+def _selection_bias_note(universe_id: str, n: int) -> str:
+    """选择偏差限定句。`seed21` ⇒ 逐字用 `SELECTION_BIAS_SENTENCE`；
+    扩池 ⇒ 把「这 21 只」换成实际宇宙（限定的是**同一个意思**，不是放宽口径）。"""
+    if universe_id == DEFAULT_PREREG_UNIVERSE:
+        return SELECTION_BIAS_SENTENCE
+    return (f"选择偏差：Δ 为正也只能说「**在 `{universe_id}` 这 {n} 只、"
+            "这段历史上成立**」，不能说「选股有效」。")
+
 WINDOW_IS_CONCLUSION_NOTE = (
     "窗口即结论：同一个 `short` 池 11 年窗（2015-01-01 起）+1.10%/期、"
     "3 年窗（2023-09-24 起）−0.27%/期 ⇒ 窗口必须先预注册，跑完不许改。"
+)
+
+#: D1 的限定句：本档的宇宙**只有现成分**，报告一律打 `non_pit=true` 并逐条写出 N1/N2/N3。
+#: ⚠️ 这三条**不与** `NON_PIT_ITEMS`（种子宇宙那三条）合并 —— 那三条是「21 只是事后挑选
+#: 的白马蓝筹」，这三条是「成员表只有今天这一份」。扩池换掉的是偏差的**类型**，
+#: 不是「有没有偏差」。
+NON_PIT_UNIVERSE_ITEMS: tuple[str, ...] = (
+    "non_pit=true（宇宙层面）：成员表是**今天**（`MAXTRADEDATE` 只有一天）的名单。"
+    "N1 **双向**生存偏差：① 当时在指数里、现在已被剔除的标的**不在名单里**（取不到）；"
+    "② 今天的成员被**回溯地**当成早年就在池里（名单里就有上市晚于窗口起点的次新股）。"
+    "两个方向相反、**不会互相抵消**。",
+    "N2 退市股缺席：退市**名单**拿不到（退市股 K 线技术上采得到 —— 缺的是名单，"
+    "不是数据源能力）。",
+    "N3 无历史成分：`RPT_INDEX_CONSTITUENT.TRADE_DATE` 只给「今天仍在成分里的成员"
+    "各自的入选日」，给不出「剔除日」⇒ **没有 `asof` 切片**，不许假装有。",
+    "N4 指数只到 800 只：中证800（沪深300 ∪ 中证500）之外，东财**同一个报表**还有"
+    "更大的集合（`TYPE=7` / `TYPE=13` 等），但那些 `TYPE` 的**指数名未核实** ⇒ "
+    "不许按行数把它们推断成某个更大的宽基指数名当事实用。本档不含，留接口、不预支"
+    "（设计稿 §2.2 N4）。",
 )
 
 
@@ -120,8 +175,11 @@ WINDOW_IS_CONCLUSION_NOTE = (
 def load_prereg(path: Path) -> tuple[dict, str]:
     """读出预注册 json 与整份文件的 sha256。
 
-    文件缺失 / 读不出 / 没有 ```json``` 块 / json 非法 / 缺必填字段 → `PreregError`
+    文件缺失 / 读不出 / 没有 ```json``` 块 / json 非法 / 缺**必填**字段 → `PreregError`
     （fail-closed：宁可跑不起来，也不要在「没预注册」的状态下跑出一个结论）。
+
+    `PREREG_OPTIONAL_FIELDS` 里的字段（目前只有 `universe`）**允许缺席**，返回的
+    `data` 原样不含它 —— 不注入、不补默认值（补了会让「这份预注册写过什么」失真）。
     """
     try:
         raw = path.read_bytes()
@@ -139,20 +197,25 @@ def load_prereg(path: Path) -> tuple[dict, str]:
         raise PreregError(f"预注册 json 解析失败：{exc}") from exc
     if not isinstance(data, dict):
         raise PreregError("预注册 json 不是对象")
-    missing = [f for f in PREREG_FIELDS if f not in data]
+    missing = [f for f in PREREG_FIELDS
+               if f not in data and f not in PREREG_OPTIONAL_FIELDS]
     if missing:
         raise PreregError(f"预注册 json 缺字段：{missing}")
     return data, hashlib.sha256(raw).hexdigest()
 
 
 def validate_prereg(data: Mapping, *, pool: str, start: str,
-                    topn: int) -> None:
+                    topn: int, universe: str | None = None) -> None:
     """命令行实参 vs 预注册：**任一不一致即拒跑**（硬约束 T2）。
 
     `topn` 由调用方从 `POOL_TOPN` **读出**后传入（不许手抄）；这里同时钉住
     「预注册写的 N 就是代码要跑的 N」和「判定规则常量与预注册一致」——
     后者是**加强**：只比对 pool/start/topn 的话，预注册可以把 `min_periods`
     写成 30 而代码仍按 120 判，报告读起来却是「已预注册」。
+
+    `universe`：预注册**没写**该字段 ⇒ 按 `DEFAULT_PREREG_UNIVERSE`（`seed21`）
+    解释，再与命令行实参比对 —— 于是「老预注册（seed21 语义）+ 命令行
+    `--universe csi300-500`」**拒跑**（exit 2），「静默换宇宙」被堵死。
     """
     def _mismatch(field: str, got, want) -> "PreregError":
         return PreregError(
@@ -165,6 +228,14 @@ def validate_prereg(data: Mapping, *, pool: str, start: str,
         raise _mismatch("pool", pool, data["pool"])
     if data["start"] != start:
         raise _mismatch("start", start, data["start"])
+    want_universe = data.get("universe", DEFAULT_PREREG_UNIVERSE)
+    got_universe = universe or DEFAULT_PREREG_UNIVERSE
+    if want_universe != got_universe:
+        raise PreregError(
+            f"预注册不一致：universe 预注册={want_universe!r} 命令行={got_universe!r}"
+            f"（预注册没写该字段时语义为 {DEFAULT_PREREG_UNIVERSE!r}）"
+            f" —— exit 2，零输出、不跑回放：**换宇宙必须新预注册**，"
+            "否则同一份预注册能跑出两个结论（静默换宇宙）")
     if data["topn"] != topn:
         raise _mismatch("topn", topn, data["topn"])
     if data["hold_arm"] != HOLD_ARM:
@@ -188,18 +259,22 @@ def validate_prereg(data: Mapping, *, pool: str, start: str,
 # ---------------------------------------------------------------------------
 
 def _scan_holds(conn: sqlite3.Connection, *, marks: list[str],
-                pool: str) -> tuple[dict[str, list[str]], dict[str, list[str]]]:
+                pool: str, universe=None
+                ) -> tuple[dict[str, list[str]], dict[str, list[str]]]:
     """逐调仓日跑一次 `score_pipeline`，取两个持有集合。
 
     一次扫描同时得到两臂 —— 两臂的成员来自**同一次**打分，不存在「两臂用了
     不同时点的分数」这种口径漂移。走的是生产路径（不传任何测试接缝）。
+
+    `universe`：扫描宇宙（`Instrument` 序列）。`None` ⇒ `SEED_UNIVERSE`
+    （默认路径逐位不变）；扩池时由 `run_xsec_topn` 解析宇宙 id 后传入。
     """
     from stocklab.candidate.run import score_pipeline
 
     topn: dict[str, list[str]] = {}
     eligible: dict[str, list[str]] = {}
     for day in marks:
-        res = score_pipeline(conn, asof=day)
+        res = score_pipeline(conn, asof=day, universe=universe)
         topn[day] = sorted(m.code for m in res.members if m.pool == pool)
         eligible[day] = list(res.eligible.get(pool, []))
     return topn, eligible
@@ -242,8 +317,11 @@ def _arm_stats(series: list[float], train: list[float],
 
 def run_xsec_topn(conn: sqlite3.Connection, *, pool: str, start: str,
                   end: str, prereg_path: Path,
-                  arm: str = ARM_BOTH) -> dict:
+                  arm: str = ARM_BOTH, universe: str | None = None) -> dict:
     """跑实验，返回报告 dict（**不写任何文件**，落盘交给调用方）。
+
+    `universe`：宇宙 id（`None` ⇒ `seed21`，主干常量）。非 `seed21` 走
+    `resolve_universe`（**fail-closed**：文件缺失即抛 `PreregError`，不回退）。
 
     失败一律 `PreregError`（调用方 exit 2、零输出）。
     """
@@ -257,9 +335,15 @@ def run_xsec_topn(conn: sqlite3.Connection, *, pool: str, start: str,
     if arm not in ARM_CHOICES:
         raise PreregError(f"未知 --arm {arm!r}；已知 {list(ARM_CHOICES)}")
 
+    try:
+        universe_id, members, members_sha256 = resolve_universe(universe)
+    except UniverseError as exc:
+        raise PreregError(f"宇宙载入失败（{universe!r}）：{exc}") from exc
+
     prereg, prereg_sha = load_prereg(prereg_path)
     topn_n = candidate_pools.POOL_TOPN[pool]      # 读，不手抄
-    validate_prereg(prereg, pool=pool, start=start, topn=topn_n)
+    validate_prereg(prereg, pool=pool, start=start, topn=topn_n,
+                    universe=universe_id)
 
     marks = replay.rebalance_marks(conn, pool=pool, start=start, end=end)
     if len(marks) < 2:
@@ -268,7 +352,8 @@ def run_xsec_topn(conn: sqlite3.Connection, *, pool: str, start: str,
             f"{start}~{end}")
 
     t0 = time.time()
-    topn_holds, eligible_holds = _scan_holds(conn, marks=marks, pool=pool)
+    topn_holds, eligible_holds = _scan_holds(conn, marks=marks, pool=pool,
+                                             universe=members)
     scan_s = time.time() - t0
 
     wanted = {ARM_TOPN: (ARM_TOPN, topn_holds),
@@ -311,6 +396,11 @@ def run_xsec_topn(conn: sqlite3.Connection, *, pool: str, start: str,
         "start": start,
         "end": end,
         "arm": arm,
+        "universe": universe_id,
+        "universe_id": universe_id,
+        "universe_n": len(members),
+        "universe_members_sha256": members_sha256,
+        "prereg_universe": prereg.get("universe", DEFAULT_PREREG_UNIVERSE),
         "topn": topn_n,
         "hold_arm": HOLD_ARM,
         "hold_control": HOLD_CONTROL,
@@ -329,8 +419,15 @@ def run_xsec_topn(conn: sqlite3.Connection, *, pool: str, start: str,
         "arms": arms,
         "delta": delta,
         "non_pit_items": list(NON_PIT_ITEMS),
+        "non_pit_universe_items": list(NON_PIT_UNIVERSE_ITEMS),
+        "universe_note": (
+            f"宇宙：`{universe_id}`（{len(members)} 只，`members_sha256` "
+            f"`{members_sha256[:12]}…`）。**本 Δ 的对照臂来自 `{universe_id}`，与 "
+            f"`seed21` 版（21 只）的 Δ 不可直接比**：宇宙不同、候选池不同、"
+            "「池内全部合格」的定义域也不同（设计稿 §7.1）。"),
         "cost_caliber_note": COST_CALIBER_NOTE,
-        "selection_bias_note": SELECTION_BIAS_SENTENCE,
+        "selection_bias_note": _selection_bias_note(universe_id, len(members)),
+        "seed_scope_note": _seed_scope_note(universe_id, len(members)),
         "window_note": WINDOW_IS_CONCLUSION_NOTE,
     }
 
@@ -429,9 +526,17 @@ def render_md(report: Mapping) -> str:
     lines += [f"- {item}" for item in report["non_pit_items"]]
     lines += [f"- {report['cost_caliber_note']}", ""]
     lines += [f"- {report['selection_bias_note']}", "",
-              "> 种子只有 21 只、短池 topn 只有 "
+              f"> {report.get('seed_scope_note') or SEED_SCOPE_NOTE}、短池 topn 只有 "
               f"{report['topn']}，所以「选前 {report['topn']} vs 持全部」"
               "之间的区分度**结构性地小** —— 这是本实验的固有上限。", ""]
+
+    lines += ["## 3b. 宇宙（P71 的口径增量）", "",
+              f"- {report['universe_note']}"]
+    lines += [f"- {item}" for item in report.get("non_pit_universe_items", ())]
+    lines += ["", f"- 预注册里的 `universe` 字段 = "
+                  f"`{report.get('prereg_universe')}`"
+                  "（缺席 ⇒ 语义为 `seed21`；命令行与它不一致则 exit 2，"
+                  "**换宇宙必须新预注册**）。", ""]
 
     lines += [
         "## 4. 复现与耗时",

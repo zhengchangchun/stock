@@ -59,7 +59,8 @@ def cmd_research_xsec_topn(args) -> int:
     try:
         data, _sha = xsec.load_prereg(prereg_path)
         xsec.validate_prereg(data, pool=args.pool, start=args.start,
-                             topn=candidate_pools.POOL_TOPN[args.pool])
+                             topn=candidate_pools.POOL_TOPN[args.pool],
+                             universe=getattr(args, "universe", None))
     except xsec.PreregError as exc:
         print(f"预注册校验失败：{exc}", file=sys.stderr)
         return 2
@@ -78,7 +79,8 @@ def cmd_research_xsec_topn(args) -> int:
         try:
             report = xsec.run_xsec_topn(
                 conn, pool=args.pool, start=args.start, end=end,
-                prereg_path=prereg_path, arm=args.arm)
+                prereg_path=prereg_path, arm=args.arm,
+                universe=getattr(args, "universe", None))
         except xsec.PreregError as exc:
             print(f"预注册校验失败：{exc}", file=sys.stderr)
             return 2

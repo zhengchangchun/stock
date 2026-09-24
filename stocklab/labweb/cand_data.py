@@ -40,12 +40,14 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import Mapping
 
 from stocklab.candidate import snapshot
 from stocklab.candidate.pools import ALL_POOLS
 from stocklab.candidate.report import report_path
 from stocklab.candidate.seeds import SEED_CODES
 from stocklab.config import paths
+from stocklab.config.universes import UniverseError, resolve_universe
 from stocklab.labweb.data import TZ
 from stocklab.store.db import connect
 
@@ -77,6 +79,32 @@ def to_local(ts: str | None) -> str | None:
     if dt.tzinfo is None:
         dt = dt.replace(tzinfo=timezone.utc)
     return dt.astimezone(TZ).strftime("%Y-%m-%d %H:%M")
+
+
+def seed_scope(params: Mapping) -> tuple[tuple[str, ...], str]:
+    """快照 `params` → `(成员 code 元组, 来源说明)`（P71 口径增量）。
+
+    - 老快照**没有** `universe_id` ⇒ 走旧路径（`SEED_CODES`）并标注 —— 老快照的渲染
+      不许改版（`tests/test_labweb_candidate.py` 里那几条用例就是老 shape）。
+    - 有 `universe_id` ⇒ 按**宇宙文件**的成员算，这样「未出现（差额）」的分母是
+      当时真正被扫描的集合，而不是今天的常量（扩池后 21 会把 779 只全列成「未出现」，
+      读起来像故障 —— 那正是这项改动要挡的）。
+    - 宇宙文件读不到 / sha 与快照不符 ⇒ **如实标注**并退回 `SEED_CODES`，
+      不静默拿一个别的集合去算差额。
+    """
+    uid = params.get("universe_id")
+    sha = params.get("members_sha256")
+    if not uid:
+        return SEED_CODES, "SEED_CODES（当前常量；该快照无 universe_id 键）"
+    try:
+        _uid, members, real_sha = resolve_universe(uid)
+    except UniverseError as exc:
+        return SEED_CODES, f"SEED_CODES（当前常量；宇宙 {uid} 读不到：{exc}）"
+    codes = tuple(i.code for i in members)
+    if sha and sha != real_sha:
+        return codes, (f"universe {uid}（⚠️ 文件 sha {real_sha[:12]}… ≠ 快照记的 "
+                       f"{sha[:12]}… —— 文件被改过，差额分母可能不是当时那份）")
+    return codes, f"universe {uid}（members_sha256 {real_sha[:12]}…）"
 
 
 def risk_items(raw: str | None) -> tuple[list | None, str]:
@@ -205,8 +233,11 @@ class CandLab:
             out["n_rejects"] = len(out["rejects"])
 
             seen = {m["code"] for m in members} | {r["code"] for r in out["rejects"]}
+            scope, seed_from = seed_scope(snap["params"])
+            out["n_seed"] = len(scope)
+            out["seed_from"] = seed_from
             out["missing"] = [{"code": code, "name": names.get(code)}
-                              for code in sorted(set(SEED_CODES) - seen)]
+                              for code in sorted(set(scope) - seen)]
         return out
 
 

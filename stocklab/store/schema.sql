@@ -954,6 +954,33 @@ CREATE TRIGGER IF NOT EXISTS trg_candidate_rejects_no_delete
 BEFORE DELETE ON candidate_rejects
 BEGIN SELECT RAISE(ABORT, 'candidate_rejects is append-only'); END;
 
+-- ---------- 宇宙成员表：**投影**（P71 / ADR-026）----------
+-- 真源是 repo 文件 `config/universes/<id>.csv`（＋ `.meta.json` 的 sha），本表是它的
+-- **投影** —— 供 SQL join、供「这个 code 属于哪些宇宙」这类查询。两者的一致性由
+-- `universe doctor --universe <id>` 只读对账（D3 的代价就是这份对账）。
+--
+-- ⚠️ **刻意不挂 append-only 触发器**：`universe sync` 的语义是「按 `universe_id`
+-- **整体重写**该 id 的行」（幂等、可重入）。挂上触发器就等于让它无法重写 ——
+-- 投影与真源的漂移会变成永久性错误。可追溯性由**文件 + git log** 提供，不是这张表。
+--
+-- `members_sha256` 冗余在每一行（同一 `universe_id` 的所有行必须同值）：
+-- doctor 只靠它就能判「表里的投影还是不是文件那一版」，不必重算整份 CSV
+-- （表里没有 name/market/board/asset_type/org_type，算不出完整 canonical sha）。
+--
+-- ⚠️ 这张表的 DDL 与 `store/migrate.py` 的 `_P71_DDL` **同文**（改一处须同步另一处）。
+CREATE TABLE IF NOT EXISTS universe_memberships (
+    universe_id      TEXT NOT NULL,
+    code             TEXT NOT NULL,
+    members_sha256   TEXT NOT NULL,
+    sector           TEXT,
+    index_membership TEXT,
+    synced_at        TEXT NOT NULL,
+    PRIMARY KEY (universe_id, code)
+);
+
+CREATE INDEX IF NOT EXISTS idx_universe_memberships_code
+    ON universe_memberships (code);
+
 -- ---------- 插桩5 复盘台账（P58）----------
 -- 插桩5（定期复盘分析）的落库点。它是**台账**不是缓存：一行 = 「asof 这一天的复盘
 -- 是哪版脚本、在什么输入上跑出来的」。

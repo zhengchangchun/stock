@@ -1,15 +1,23 @@
-"""Task 8：21 只种子标的（设计文档 §2 D7）。"""
+"""Task 8：21 只种子标的（设计文档 §2 D7）。
+
+P71 起断言对象**从字面 21 改成派生量**：真源仍是 `SEED_UNIVERSE`（D2：取值/语义
+一字不动），而 `config/universes/seed21.csv` 是它的**冗余副本** —— 两者必须逐位一致，
+所以「21」这个数字由那条对账判据守，而不是由这里的字面量守。
+"""
 
 from stocklab.candidate.seeds import SEED_CODES, SEED_UNIVERSE
 from stocklab.config.universe import ASSET_ETF, ASSET_STOCK
+from stocklab.config.universes import load_universe
 
 
 def test_twentyone_instruments():
-    assert len(SEED_UNIVERSE) == 21
+    # 字面 21 → 派生量：与 `config/universes/seed21.csv`（+ meta 的 sha）逐位对账
+    universe = load_universe("seed21")
+    assert len(SEED_UNIVERSE) == len(universe.members) == len(universe.codes)
 
 
 def test_codes_are_unique_and_six_digits():
-    assert len(set(SEED_CODES)) == 21
+    assert len(set(SEED_CODES)) == len(SEED_UNIVERSE)
     assert all(len(c) == 6 and c.isdigit() for c in SEED_CODES)
 
 

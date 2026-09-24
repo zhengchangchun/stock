@@ -182,8 +182,10 @@ def _missing_block(data: Mapping) -> str:
     missing = data["missing"]
     note = ("这是**差额，不是原因**：它们既没入池、也没有淘汰记录。"
             "可能被排雷、可能打分未过但这轮没记、也可能该轮根本没覆盖 —— "
-            "**原因不在快照里**。种子清单取的是 `SEED_CODES`（当前常量），"
-            "快照时点的清单可能不同（`params_json` 只存了种子**数量**）。")
+            "**原因不在快照里**。差额的分母取的是 "
+            f"{esc(data.get('seed_from') or 'SEED_CODES（当前常量）')}"
+            "；老快照（`params_json` 里没有 `universe_id`）只能按当前常量算，"
+            "快照时点的清单可能不同。")
     if not missing:
         return section("未出现", '<p>没有 —— 每一只种子都出现在入池或淘汰里。</p>',
                        note=note)

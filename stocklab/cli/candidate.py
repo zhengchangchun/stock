@@ -9,6 +9,7 @@ from pathlib import Path
 from stocklab.candidate.report import write_report_file
 from stocklab.candidate.run import recommend_optimization, run_candidate
 from stocklab.config import paths
+from stocklab.config.universes import UniverseError, resolve_universe
 from stocklab.plugin import contract, guard, lifecycle, runtime
 from stocklab.plugin_review import run_review
 from stocklab.store.db import connect
@@ -17,12 +18,22 @@ from stocklab.store.migrate import ensure_schema
 
 def cmd_candidate_run(args) -> int:
     db_path = Path(args.db) if args.db else paths.DB_PATH
+    try:
+        # `--universe` 缺省 ⇒ seed21（主干常量）；非默认 id 走 `load_universe`（fail-closed）。
+        # 先解析宇宙**再**碰库：用法错误必须零写入（`ensure_schema` 会写库）。
+        universe_id, members, members_sha256 = resolve_universe(
+            getattr(args, "universe", None))
+    except UniverseError as exc:
+        print(f"❌ --universe：{exc}", file=sys.stderr)
+        return 2
     ensure_schema(db_path)
     conn = connect(db_path)
     try:
         now = args.now or datetime.now(timezone.utc).isoformat()
         result = run_candidate(conn, asof=args.asof, run_kind=args.run_kind,
-                               now=now)
+                               now=now, universe=members,
+                               universe_id=universe_id,
+                               members_sha256=members_sha256)
         if result.skipped:
             print(f"⏭ 快照已存在（snapshot_id={result.snapshot_id}），跳过重跑")
 

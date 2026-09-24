@@ -22,6 +22,7 @@
 from __future__ import annotations
 
 import urllib.parse
+from typing import Mapping
 from urllib.parse import urlencode
 
 from stocklab.data.models import Bar, ValuationDaily
@@ -217,3 +218,44 @@ def parse_datacenter_rows(payload: dict) -> list[dict]:
     """取 `result.data`。`result` 为 null 或缺失 → `[]`（**合法空**，ETF 如此）。"""
     result = (payload or {}).get("result") or {}
     return list(result.get("data") or [])
+
+
+# ---------- 指数成分（P71 宇宙扩容）----------
+
+#: 指数成分表名。实测（P70 §2.1）按 `TYPE` 编码指数：`TYPE=1`→沪深300 300 行、
+#: `TYPE=3`→中证500 500 行；每行带 `WEIGHT` 与 `INDUSTRY`，`MAXTRADEDATE` 只有一天
+#: ⇒ **是现成分，不是历史成分**（陷阱：`RPT_INDEX_CONSTITUENT` 看着像历史成分，其实不是）。
+INDEX_COMPONENT_REPORT = "RPT_INDEX_TS_COMPONENT"
+
+#: 成分行的**候选**列名 —— ⚠️ P70 的探测只逐条记录了 `WEIGHT` / `INDUSTRY` /
+#: `MAXTRADEDATE`，**代码/名称的列名未实测**。这里按候选键依次取，取不到就留空
+#: （`code` 取不到 ⇒ 调用方因「0 行」fail-closed 抛错，不会静默写出空宇宙）。
+_CODE_KEYS = ("SECURITY_CODE", "SECUCODE", "F12", "CODE")
+_NAME_KEYS = ("SECURITY_NAME_ABBR", "SECURITY_NAME", "F14", "NAME")
+_SECTOR_KEYS = ("INDUSTRY", "INDUSTRY_NAME", "BOARD_NAME")
+
+
+def _first(row: Mapping, keys) -> str:
+    for k in keys:
+        v = row.get(k)
+        if v not in (None, ""):
+            return str(v)
+    return ""
+
+
+def index_component_url(index_type: int, *, page: int,
+                        page_size: int = FINANCIAL_PAGE_SIZE) -> str:
+    """构造指数成分请求 URL（`filter=(TYPE="n")`，不排序 —— 源站不支持该报表按日期排）。"""
+    f = urllib.parse.quote(f'(TYPE="{index_type}")', safe="")
+    return (f"{VALUATION_URL}?reportName={INDEX_COMPONENT_REPORT}&columns=ALL&filter={f}"
+            f"&pageNumber={page}&pageSize={page_size}")
+
+
+def parse_index_components(payload: dict) -> list[dict]:
+    """成分行 → `[{"code","name","sector"}]`（规范化 SECUCODE 的 `.SH/.SZ` 后缀）。"""
+    out: list[dict] = []
+    for row in parse_datacenter_rows(payload):
+        code = _first(row, _CODE_KEYS).split(".")[0].strip()
+        out.append({"code": code, "name": _first(row, _NAME_KEYS),
+                    "sector": _first(row, _SECTOR_KEYS) or None})
+    return out

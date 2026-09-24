@@ -1,0 +1,194 @@
+"""P71 T2/T5：`universe build / sync / doctor` 三条命令的退出码与写路径。
+
+**站内一律不联网、不写真库**：`build` 只用离线 `seed21`（`csi300+csi500` 的代码
+路径由 `tests/test_universe_config.py` 用**假 fetcher** 覆盖）；`sync`/`doctor`
+只在 `tmp_db`（`tmp_path` 下的独立库）上跑。
+
+Falsifiability：
+
+- `test_sync_is_idempotent`：把 `_sync` 的 `DELETE ... WHERE universe_id=?` 删掉
+  ⇒ 第二次 sync 撞主键（或行数翻倍）即红。
+- `test_sync_never_touches_existing_columns`：把 `_sync` 改成无条件
+  `UPDATE instruments SET sector=?`（或顺手写 name/board）⇒ 那两条断言红。
+- `test_doctor_exit_2_on_corrupted_projection_sha`：把 `_doctor` 的 sha 比对删掉
+  ⇒ exit 0 即红。
+- `test_doctor_exit_2_when_table_has_no_rows`：把「表缺行」当「跳过」⇒ exit 0 即红。
+"""
+
+from __future__ import annotations
+
+import json
+import sqlite3
+
+from stocklab.cli.main import main
+from stocklab.config import universes as U
+from stocklab.store.db import connect
+from stocklab.store.migrate import init_db
+
+NOW = "2026-09-24T00:00:00+00:00"
+
+
+def _seed(db, *, sector=None):
+    init_db(db)
+    conn = connect(db)
+    conn.execute("INSERT INTO instruments (code, name, market, board, type, sector,"
+                 " added_at) VALUES ('000333','美的集团','sz','main','stock',?,?)",
+                 (sector, NOW))
+    conn.commit()
+    conn.close()
+    return db
+
+
+def _count_memberships(db):
+    conn = sqlite3.connect(db)
+    try:
+        return conn.execute("SELECT COUNT(*) FROM universe_memberships").fetchone()[0]
+    finally:
+        conn.close()
+
+
+# ---------- build ----------
+
+def test_build_seed21_writes_both_files(tmp_path, capsys):
+    rc = main(["universe", "build", "--source", "seed21", "--out", str(tmp_path)])
+    assert rc == 0
+    assert (tmp_path / "seed21.csv").is_file()
+    assert (tmp_path / "seed21.meta.json").is_file()
+    assert "source=seed21" in capsys.readouterr().out
+
+
+def test_build_bad_source_exits_2(tmp_path, capsys):
+    rc = main(["universe", "build", "--source", "sz50", "--out", str(tmp_path)])
+    assert rc == 2                       # argparse choices 拦下（用法错误）
+    assert "sz50" in capsys.readouterr().err
+
+
+# ---------- sync ----------
+
+def test_sync_projects_members_and_is_idempotent(tmp_db):
+    _seed(tmp_db)
+    assert main(["universe", "sync", "--universe", "seed21", "--db", str(tmp_db)]) == 0
+    assert _count_memberships(tmp_db) == 21
+    # 重入：行数不变（按 universe_id 整体重写，不新增）
+    assert main(["universe", "sync", "--universe", "seed21", "--db", str(tmp_db)]) == 0
+    assert _count_memberships(tmp_db) == 21
+    conn = sqlite3.connect(tmp_db)
+    try:
+        shas = {r[0] for r in conn.execute(
+            "SELECT members_sha256 FROM universe_memberships")}
+        assert shas == {U.seed21_sha256()}
+    finally:
+        conn.close()
+
+
+def test_sync_never_touches_existing_columns(tmp_db):
+    """既有 `instruments` 行：只允许**补空列**，name/market/board/type 一个字不许改。"""
+    _seed(tmp_db, sector="既有值")
+    conn = connect(tmp_db)
+    conn.execute("UPDATE instruments SET name='人工改名', board='main'"
+                 " WHERE code='000333'")
+    conn.commit()
+    before = dict(conn.execute("SELECT * FROM instruments WHERE code='000333'")
+                  .fetchone())
+    conn.close()
+    assert main(["universe", "sync", "--universe", "seed21", "--db", str(tmp_db)]) == 0
+    conn = sqlite3.connect(tmp_db)
+    conn.row_factory = sqlite3.Row
+    try:
+        after = dict(conn.execute("SELECT * FROM instruments WHERE code='000333'")
+                     .fetchone())
+    finally:
+        conn.close()
+    assert after == before, "sync 动了既有行（只许补空 sector）"
+
+
+def test_sync_adds_missing_instruments_rows(tmp_db):
+    _seed(tmp_db)
+    assert main(["universe", "sync", "--universe", "seed21", "--db", str(tmp_db)]) == 0
+    conn = sqlite3.connect(tmp_db)
+    try:
+        n = conn.execute("SELECT COUNT(*) FROM instruments").fetchone()[0]
+        row = conn.execute("SELECT name, market, board, type FROM instruments"
+                           " WHERE code='300750'").fetchone()
+    finally:
+        conn.close()
+    assert n == 21
+    assert row == ("宁德时代", "sz", "gem", "stock")
+
+
+def test_sync_missing_universe_file_exits_2_and_writes_nothing(tmp_db):
+    _seed(tmp_db)
+    rc = main(["universe", "sync", "--universe", "csi300-500", "--db", str(tmp_db)])
+    assert rc == 2
+    conn = sqlite3.connect(tmp_db)
+    try:
+        assert conn.execute(
+            "SELECT COUNT(*) FROM universe_memberships").fetchone()[0] == 0
+    finally:
+        conn.close()
+
+
+# ---------- doctor ----------
+
+def test_doctor_exit_0_after_sync(tmp_db, capsys):
+    _seed(tmp_db)
+    main(["universe", "sync", "--universe", "seed21", "--db", str(tmp_db)])
+    capsys.readouterr()
+    assert main(["universe", "doctor", "--universe", "seed21", "--db", str(tmp_db)]) == 0
+    out = capsys.readouterr().out
+    assert "表投影行=21" in out and "sector 非空 0/21" in out
+
+
+def test_doctor_exit_2_on_corrupted_projection_sha(tmp_db, capsys):
+    _seed(tmp_db)
+    main(["universe", "sync", "--universe", "seed21", "--db", str(tmp_db)])
+    conn = sqlite3.connect(tmp_db)
+    conn.execute("UPDATE universe_memberships SET members_sha256='deadbeef'"
+                 " WHERE code='000333'")
+    conn.commit()
+    conn.close()
+    capsys.readouterr()
+    rc = main(["universe", "doctor", "--universe", "seed21", "--db", str(tmp_db)])
+    assert rc == 2
+    assert "表投影 sha" in capsys.readouterr().out
+
+
+def test_doctor_exit_2_when_table_has_no_rows(tmp_db, capsys):
+    """**表缺行也是 exit 2**，不是「跳过」（§9 裁决 4）。"""
+    _seed(tmp_db)
+    assert main(["universe", "doctor", "--universe", "seed21", "--db", str(tmp_db)]) == 2
+    assert "没有 universe_id" in capsys.readouterr().out
+
+
+def test_doctor_exit_2_when_members_missing_from_instruments(tmp_db, capsys):
+    _seed(tmp_db)
+    main(["universe", "sync", "--universe", "seed21", "--db", str(tmp_db)])
+    conn = sqlite3.connect(tmp_db)
+    conn.execute("DELETE FROM instruments WHERE code='600519'")   # 不返序列，能删
+    conn.commit()
+    conn.close()
+    capsys.readouterr()
+    rc = main(["universe", "doctor", "--universe", "seed21", "--db", str(tmp_db)])
+    assert rc == 2
+    assert "instruments 缺 1 只" in capsys.readouterr().out
+
+
+def test_doctor_is_read_only(tmp_db):
+    """doctor 跑完，库的字节不许变（只读姿势 `mode=ro&immutable=1`）。"""
+    import hashlib
+    _seed(tmp_db)
+    main(["universe", "sync", "--universe", "seed21", "--db", str(tmp_db)])
+    before = hashlib.sha256(tmp_db.read_bytes()).hexdigest()
+    assert main(["universe", "doctor", "--universe", "seed21", "--db", str(tmp_db)]) == 0
+    assert hashlib.sha256(tmp_db.read_bytes()).hexdigest() == before
+
+
+def test_doctor_missing_db_exits_2(tmp_path, capsys):
+    rc = main(["universe", "doctor", "--universe", "seed21",
+               "--db", str(tmp_path / "absent.db")])
+    assert rc == 2
+    assert "打不开库" in capsys.readouterr().err
+
+
+def test_universe_group_requires_a_subcommand(capsys):
+    assert main(["universe"]) == 2       # argparse required=True ⇒ 用法错误

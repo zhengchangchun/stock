@@ -434,7 +434,7 @@ def _fetch_datacenter(client, report_name: str, *, secucode: str,
     return out
 
 
-def fetch_financial_reports(client, *, code: str, org_type: str,
+def fetch_financial_reports(client, *, code: str, org_type: str | None,
                             fetched_date: str
                             ) -> tuple[list[FinancialReport], list[dict]]:
     """抓一只标的的全部历史财报，返回 `(报告列表, raw_refs)`。
@@ -442,6 +442,11 @@ def fetch_financial_reports(client, *, code: str, org_type: str,
     - 数值来自 DMSK 三表；公告日与归母权益来自 F10 三变体（按 `org_type` 选）
     - **`result=null` 是合法空**（ETF 如此），不是抓取失败
     - 公告日走 `notice_date.resolve` 的三级回退
+    - **`org_type=None` ⇒ 显式跳过整个 F10 段**（P71 §9 裁决 3）：公告日退回法定披露
+      截止日（`notice_date.resolve(None, ...)`），`parent_equity` 留空。**不传 None
+      给 `f10_report_name`** —— 它会把未知类型回退成 `G`（通用），于是扩池标的的
+      公告日会被一个**未经确认**的报表名悄悄锚定（症状是零：财报能拿到，只是 PIT
+      锚点来源不对）。`org_type` 只有 `seeds.py` 人工点名的 21 只才是已知的。
     """
     secucode = f"{code}.{'SH' if code.startswith(('6', '5')) else 'SZ'}"
     refs: list[dict] = []
@@ -463,17 +468,18 @@ def fetch_financial_reports(client, *, code: str, org_type: str,
     # 迭代顺序**刻意固定**为 BALANCE → INCOME → CASHFLOW：
     # 对同一 report_date，第一张表提供非空 NOTICE_DATE 即胜出（`rd not in f10_notice` 守卫），
     # 后续表的日期被静默忽略——这决定了 PIT 锚点来自哪张表。改变顺序即改变锚点来源。
-    for statement in ("BALANCE", "INCOME", "CASHFLOW"):
-        name = eastmoney.f10_report_name(org_type, statement)
-        for row in _fetch_datacenter(client, name, secucode=secucode,
-                                     fetched_date=fetched_date, refs=refs):
-            rd = (row.get("REPORT_DATE") or "")[:10]
-            if not rd:
-                continue
-            if row.get("NOTICE_DATE") and rd not in f10_notice:
-                f10_notice[rd] = row["NOTICE_DATE"][:10]
-            if row.get("TOTAL_PARENT_EQUITY") is not None:
-                f10_parent.setdefault(rd, row["TOTAL_PARENT_EQUITY"])
+    if org_type is not None:
+        for statement in ("BALANCE", "INCOME", "CASHFLOW"):
+            name = eastmoney.f10_report_name(org_type, statement)
+            for row in _fetch_datacenter(client, name, secucode=secucode,
+                                         fetched_date=fetched_date, refs=refs):
+                rd = (row.get("REPORT_DATE") or "")[:10]
+                if not rd:
+                    continue
+                if row.get("NOTICE_DATE") and rd not in f10_notice:
+                    f10_notice[rd] = row["NOTICE_DATE"][:10]
+                if row.get("TOTAL_PARENT_EQUITY") is not None:
+                    f10_parent.setdefault(rd, row["TOTAL_PARENT_EQUITY"])
 
     out: list[FinancialReport] = []
     for rd, slot in acc.items():
@@ -486,4 +492,55 @@ def fetch_financial_reports(client, *, code: str, org_type: str,
             parent_equity=f10_parent.get(rd),
             notice_date_suspect=(fallback_kind == "implausible"), **slot))
     out.sort(key=lambda r: r.report_date)
+    return out, refs
+
+
+# ---------- P71：指数成分（宇宙扩容的成员表来源）----------
+
+def fetch_index_components(client, *, index_type: int,
+                           page_size: int = eastmoney.FINANCIAL_PAGE_SIZE,
+                           max_pages: int = MAX_PAGES
+                           ) -> tuple[list[dict], list[dict]]:
+    """抓一个指数页的全部成分，返回 `([{"code","name","sector"}], raw_refs)`。
+
+    `index_type` 是东财 `RPT_INDEX_TS_COMPONENT` 的 `TYPE` 编码（实测 `1`→沪深300、
+    `3`→中证500，P70 设计稿 §2.1）。**抓的是现成分**（`MAXTRADEDATE` 只有一天）
+    ⇒ 报告必须打 `non_pit=true`（D1）。
+
+    **fail-closed**：非末页行数 != page_size ⇒ 抛 `FetchError`（源站截断＝半截名单，
+    比「没有名单」更危险：它会静默产出一个**偏小的宇宙**）；翻页超上限 ⇒ 抛。
+
+    ⚠️ 列的**真实名字**未在本站逐列实测（P70 只记录了 `WEIGHT`/`INDUSTRY`/
+    `MAXTRADEDATE`），`parse_index_components` 按候选键取；取不到 code ⇒ 行被丢，
+    调用方 `build_universe` 会因「0 行」抛错（**不会静默写出空宇宙**）。
+    """
+    out: list[dict] = []
+    refs: list[dict] = []
+    total_pages: int | None = None
+    page = 1
+    while page <= max_pages:
+        url = eastmoney.index_component_url(index_type, page=page, page_size=page_size)
+        cache_key = f"indexcomp:{index_type}:{page}:{page_size}"
+        text = client.get_text(url, headers=eastmoney.DATACENTER_HEADERS,
+                               source="eastmoney", cache_key=cache_key)
+        payload = _loads(text)
+        result = (payload or {}).get("result") or {}
+        if total_pages is None:
+            total_pages = int(result.get("pages") or 0)
+        rows = eastmoney.parse_index_components(payload)
+        if total_pages and page < total_pages and len(rows) != page_size:
+            raise FetchError(
+                f"指数 TYPE={index_type} 第 {page}/{total_pages} 页仅 {len(rows)} 行"
+                f"（期望 {page_size}）—— 源站截断，拒绝把半截名单当宇宙")
+        refs.append({"endpoint": eastmoney.INDEX_COMPONENT_REPORT,
+                     "index_type": index_type, "resp_sha256": _resp_sha256(text),
+                     "cache_key": cache_key, "page": page})
+        out.extend(r for r in rows if r.get("code"))
+        if not total_pages or page >= total_pages or not rows:
+            break
+        page += 1
+    else:
+        raise FetchError(
+            f"指数 TYPE={index_type} 翻页超过 {max_pages} 页仍未取完 ——"
+            "拒绝返回不完整的名单")
     return out, refs
