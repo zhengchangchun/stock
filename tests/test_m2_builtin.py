@@ -828,8 +828,8 @@ def _p65_out(ctx: dict) -> dict:
     return contract.validate_return("m2_a1", _fn("m2_a1")(ctx))
 
 
-def test_p65_t1_the_source_says_v103_and_points_at_the_execution_gate():
-    """T2 前半：源文本标 v1.0.3，且**写明** v1.0.2 的取整只是偶然闸门。
+def test_p65_t1_the_source_says_v104_and_points_at_the_execution_gate():
+    """T2 前半：源文本标 **v1.0.4**，且**写明** v1.0.2 的取整只是偶然闸门。
 
     四个常量（`LIMIT_N` / `CAP_PCT` / `CASH_FLOOR` / `LOT`）的数值一个字都没改
     —— 判据原文如此，任务书 §4 也把「改主干常量」列为反目标（D-34 只有用户能改）。
@@ -838,12 +838,17 @@ def test_p65_t1_the_source_says_v103_and_points_at_the_execution_gate():
     assert (a1_pick.LIMIT_N, a1_pick.CAP_PCT, a1_pick.CASH_FLOOR, a1_pick.LOT) \
         == (5, 25.0, 10.0, 100)
     source = BUILTIN_PLUGINS["m2_a1"]
-    assert "源版本 v1.0.3" in source
+    assert "源版本 v1.0.4" in source
     assert "CashShortfall" in source and 'code="cash"' in source, \
         "源文本必须点名取代它的那道**执行层显式闸门**"
     assert "偶然" in source, \
         "必须写明 v1.0.2 的「整手取整 ⇒ 0 股」只是偶然闸门（P64 §1 的教训）"
     assert "weight_pct" in source and "_reserved_pct(" in source
+    # P68：细化那一步（`reserved1` / `w1`）必须**整段删掉**，连注释一起 ——
+    # 留着一段「解释为什么排除 picks 里的存量」的文字会让人以为它还在。
+    assert "reserved1" not in source, "v1.0.3 的细化必须整段删掉"
+    assert "exclude_codes" not in source, \
+        "恒不被使用的参数不许留（`tests/test_source_no_dead_code.py` 的教训）"
     guard.check_source(source)
 
 
@@ -876,20 +881,29 @@ def test_p65_t2_the_locked_holding_lowers_the_weight_cap():
                if _P65_TOTAL * 9.57 / 100.0 >= close * 100) < 5
 
 
-def test_p65_t2_a_holding_inside_the_picks_is_not_reserved():
-    """细化那一步真的生效：存量持仓**就在 picks 里** ⇒ 它不占额度，权重被抬高。
+def test_p68_t2_a_holding_inside_the_picks_is_still_reserved():
+    """**判据 3 的纯函数面（P68 反转了 T2 的这个分支）**：存量持仓**在 picks 里**
+    也照样占额度 —— 细化那一步被删掉之后，权重**不再**被抬高。
 
-    `600900` 一手 ¥2,808 ⇒ 占 ¥19,567 的 14.35%。第一轮（保守，把它也当占用）
-    `w0 = round(min(25, (90 − 14.35)/4), 2) = 18.91`；细化后 `reserved1 = 0`
-    （唯一那笔存量已在 picks 里）⇒ `w1 = min(25, 90/4) = 22.5 > w0` ⇒ 用 22.5。
+    `600900` 一手 ¥2,808 ⇒ 占 ¥19,567 的 **14.3539%**。v1.0.4：
+    `w = round(min(25, (90 − 14.3539)/4), 2) = 18.91`（`n=5` 时 15.13 凑不齐
+    5 只买得起的，降到 `n=4`）。`cash_pct = 100 − 18.91 × 4 = 24.36`。
+
+    ⚠️ **v1.0.3 在同一输入上给的是 22.5%**（`reserved1 = 0`，因为唯一那笔存量
+    已在 picks 里 ⇒ `w1 = min(25, 90/4) = 22.5 > w0`）—— 这正是本站删掉的那一步，
+    也正是 `reserved` 会漏算的那 14.3539%。删掉的理由：执行层的卖出是**整手**的，
+    「picks 里的存量会通过卖出释放现金」这句话在差额 < 1 手时不成立。
     """
     ctx = _p65_ctx([_p65_holding("600900", value=2808.0, close=28.08)])
     out = _p65_out(ctx)
     weights = [p["weight_pct"] for p in out["picks"]]
-    assert weights == [22.5] * 4, weights
-    assert [p["code"] for p in out["picks"]] == ["603868", "600900", "002415", "601398"]
-    assert out["cash_pct"] == 10.0
-    # 第一轮的保守解是 18.91% —— 若没有细化这一步，权重会停在那儿
+    assert weights == [18.91] * 4, weights
+    assert [p["code"] for p in out["picks"]] == \
+        ["603868", "600900", "002415", "601398"]
+    assert out["cash_pct"] == 24.36
+    assert abs(sum(weights) + out["cash_pct"] - 100.0) <= 1e-9, "契约 _check_cross"
+    # 上限确实是「90 − 全部存量」：把存量票排除掉会得到 v1.0.3 的 22.5。
+    assert round(min(25.0, 90.0 / 4), 2) == 22.5, "v1.0.3 那一支的读数（对照）"
     assert round(min(25.0, (90.0 - 2808.0 / _P65_TOTAL * 100.0) / 4), 2) == 18.91
 
 
@@ -992,3 +1006,290 @@ def test_p65_t4_grid_weights_stay_self_consistent_and_inside_the_cap():
                 if not any(p["code"] == "HOLD" for p in out["picks"]):
                     assert sum(weights) <= (90.0 - held_pct + 0.005 * len(weights)
                                             + 1e-9), label
+
+
+# ══════════════════════════════════════════════════════════════════════
+# P68 —— **判据 3**：A1 v1.0.4 的反例钉住（picks 含存量票 ⇒ 按全部存量算）
+#
+# 两条臂同型的那条错假设：把「在 picks 里、但目标市值低于现市值」的存量持仓
+# 当成「一减仓就变成现金」。执行层是**整手**的（差额 < 1 手 ⇒ hold）⇒ 那句
+# 假设不成立。v1.0.4 删掉细化 ⇒ `reserved` 一律 = 全部存量占比之和。
+# ══════════════════════════════════════════════════════════════════════
+
+#: 真库 `arm-agent-v1` @ **2026-09-24** 的账户形态（只读 `engine.arm_state_for`）：
+#: `000333 ×100 ＋ 3 笔新仓`、现金 ¥2,925.72、总资产 ¥19,565.72。
+_P68_TOTAL = 19565.72
+_P68_CASH = 2925.72
+_P68_POS = {"000333": 100, "603868": 100, "600900": 100, "601398": 300}
+_P68_CLOSES = {"000333": 82.65, "603868": 31.0, "600900": 28.36, "601398": 8.13,
+               "000651": 38.36, "002508": 16.48, "600519": 1251.24,
+               "600036": 40.6, "601318": 53.87, "002415": 33.11, "002032": 39.1}
+#: A1 看到的排序（`adj_score` 递减）—— 存量票 `000333` 刻意排第一。
+_P68_ORDER = ("000333", "601398", "000651", "002508", "002415", "600036",
+              "601318", "002032", "600900", "603868", "600519")
+
+
+def _p68_ctx(pos=None, *, total=_P68_TOTAL, cash=_P68_CASH,
+             order=_P68_ORDER, closes=None) -> dict:
+    """按真库 09-24 的形态造 ctx（holdings 的 `weight_pct` 从收盘价算，不手抄）。"""
+    pos = _P68_POS if pos is None else pos
+    closes = _P68_CLOSES if closes is None else closes
+    holdings = [{"code": c, "qty": q, "close": closes[c],
+                 "market_value": round(closes[c] * q, 4),
+                 "weight_pct": round(closes[c] * q / total * 100.0, 4)}
+                for c, q in pos.items()]
+    cands = [_cand(c, 9.0 - i * 0.5) | {"close": closes[c]}
+             for i, c in enumerate(order)]
+    return {"candidates": {"short": cands}, "candidates_excluded": {},
+            "holdings": holdings, "cash": cash, "total_assets": total,
+            "asof": DAY2, "focus": None}
+
+
+def _p68_reserved_of(ctx) -> float:
+    """ctx 里**全部**存量持仓占比之和（判据 3 要对的那个数）。"""
+    return round(sum(float(h["weight_pct"]) for h in ctx["holdings"]), 4)
+
+
+def _p68_v103_run(ctx) -> dict:
+    """**v1.0.3** 的 `run()` —— 改动前 `SOURCE` 里那段的一字不改副本。
+
+    与 v1.0.4 唯一的差别就是 step 3 那段（`reserved1` / `w1` 细化）。
+    这里**不能**调用 `BUILTIN_PLUGINS["m2_a1"]`：反向对照要证明的是
+    「v1.0.3 会产出什么」，而不是「新实现会产出什么」（后者是同义反复）。
+    """
+    LIMIT_N, CAP_PCT, CASH_FLOOR, LOT = 5, 25.0, 10.0, 100
+    PLABEL = {"short": "短期", "mid": "中期", "long": "长期"}
+
+    def _aff(item, w, ta):
+        if ta is None:
+            return True
+        close = item.get("close")
+        if close is None:
+            return True
+        return float(ta) * float(w) / 100.0 >= float(close) * LOT
+
+    def _res(holdings, ta, exclude):
+        if ta is None:
+            return 0.0
+        total = 0.0
+        for item in holdings or []:
+            w = item.get("weight_pct")
+            if w is None:
+                return 0.0
+            if exclude is not None and str(item.get("code")) in exclude:
+                continue
+            total += float(w)
+        return total
+
+    rows = []
+    for pool in ("short", "mid", "long"):
+        ranked = sorted(ctx["candidates"].get(pool) or [],
+                        key=lambda x: (-float(x["adj_score"]), str(x["code"])))
+        for i, item in enumerate(ranked):
+            rows.append({"pool": pool, "rank": i + 1, "item": item})
+    rows.sort(key=lambda r: (-float(r["item"]["adj_score"]),
+                             str(r["item"]["code"])))
+    seen, deduped = set(), []
+    for r in rows:
+        code = str(r["item"]["code"])
+        if code in seen:
+            continue
+        seen.add(code)
+        deduped.append(r)
+
+    ta = ctx.get("total_assets")
+    holdings = ctx.get("holdings") or []
+    cap = 100.0 - CASH_FLOOR
+    reserved0 = _res(holdings, ta, None)
+    picked = weight = None
+    for n in range(min(LIMIT_N, len(deduped)), 0, -1):
+        w0 = round(min(CAP_PCT, (cap - reserved0) / n), 2)
+        if w0 <= 0.0:
+            continue
+        ok = [r for r in deduped if _aff(r["item"], w0, ta)]
+        if len(ok) < n:
+            continue
+        picked, weight = ok[:n], w0
+        reserved1 = _res(holdings, ta, {str(r["item"]["code"]) for r in picked})
+        w1 = round(min(CAP_PCT, (cap - reserved1) / n), 2)
+        if w1 > w0:
+            picked = [r for r in deduped if _aff(r["item"], w1, ta)][:n]
+            weight = w1
+        break
+    if not picked:
+        return {"picks": [], "cash_pct": 100.0, "schema_version": "1.0.0"}
+    picks = [{"code": str(r["item"]["code"]), "weight_pct": weight,
+              "reason": "%s池第 %d 名" % (PLABEL[r["pool"]], r["rank"])}
+             for r in picked]
+    return {"picks": picks, "cash_pct": round(100.0 - weight * len(picks), 2),
+            "schema_version": "1.0.0"}
+
+
+@pytest.fixture
+def p68_db(tmp_path):
+    """只为 `execute_decision` 的 `asset_class_for` 准备一张库（登记标的类型）。"""
+    from stocklab.store.migrate import init_db
+    path = tmp_path / "p68.db"
+    init_db(path)
+    c = connect(path)
+    c.executemany(
+        "INSERT OR IGNORE INTO instruments (code, name, market, board, type,"
+        " added_at) VALUES (?,?, 'sz','main','stock',?)",
+        [(code, code, NOW) for code in
+         tuple(_P68_CLOSES) + ("C00", "C01", "C02", "C03", "C04", "C05")])
+    c.commit()
+    c.close()
+    return path
+
+
+def _p68_marks(closes=None) -> dict:
+    from stocklab.portfolio.prices import Price
+    closes = _P68_CLOSES if closes is None else closes
+    return {code: Price(code=code, price=price, source="bars_daily",
+                        price_asof=DAY2, detail="P68 夹具")
+            for code, price in closes.items()}
+
+
+def _p68_execute(c, out: dict, *, ctx, marks) -> float:
+    """A1 的 `picks` → 载荷 → `plan_orders` + `execute_decision`（信道 A 的等价路径）。
+
+    只走这两步：`channel_a._weights_items` 的转换在下面逐字照抄。
+    """
+    from stocklab.paper import agent_decide
+    total = float(ctx["total_assets"])
+    positions = {h["code"]: int(h["qty"]) for h in ctx["holdings"]}
+    items = []
+    for pick in out["picks"]:
+        code = str(pick["code"])
+        price = float(marks[code].price)
+        cur = round(price * positions.get(code, 0), 4)
+        tgt = round(total * float(pick["weight_pct"]) / 100.0, 4)
+        items.append({
+            "code": code, "target_weight_pct": float(pick["weight_pct"]),
+            "side": agent_decide.side_for(target_value=tgt,
+                                          current_value=cur) or "buy",
+            "reason": str(pick["reason"]), "target_value": tgt, "price": price,
+            "price_asof": DAY2, "price_source": "bars_daily",
+            "current_qty": positions.get(code, 0), "current_value": cur,
+        })
+    payload = {"asof": DAY2, "cash_pct": float(out["cash_pct"]),
+               "decisions": items, "total_assets": total, "rationale": "P68 夹具"}
+    cash_after, _pos, _orders, _evals = agent_decide.execute_decision(
+        c, arm=ACCOUNT, asof=DAY2, decision=payload, cash=float(ctx["cash"]),
+        positions=dict(positions), marks=marks, total_assets=total)
+    return cash_after
+
+
+def test_p68_t3_a1_v104_reserves_every_holding_on_the_real_0924_shape(p68_db):
+    """**判据 3a**：真库 `arm-agent-v1` @ 2026-09-24 的账户形态。
+
+    只读 `engine.arm_state_for` 取出的原文：
+    `cash=2925.72 positions={'000333':100,'603868':100,'600900':100,
+    '601398':300} mv=16640.0 total=19565.72` —— 与任务书 §3 判据 3 逐字相同。
+
+    v1.0.4：`reserved = Σ 全部存量 = 85.0466` ⇒ `cap = 4.9534` ⇒ `n=1` 时
+    `w = min(25, 4.9534) = 4.95`（`n=5` 起每一档都凑不齐买得起的一手，
+    一路降到 `n=1`）⇒ `picks = [601398 × 4.95%]`、`cash_pct = 95.05`。
+
+    ## ⚠️ 如实记录：`000333` **不可能**进 picks（与判据字面不同）
+
+    判据 3 的原文是「令 `picks` 含 `000333`」。在本账户上这**做不到**：
+    `_affordable` 要求 `目标市值 ≥ 一手市值`，`000333` 一手 = ¥8,265，
+    即 `w ≥ 42.2422%`；而 `w ≤ min(CAP_PCT, cap/n) ≤ CAP_PCT = 25%`
+    ⇒ 上限 ¥4,891.43 < ¥8,265 ⇒ **任何 `n` 都选不中它**。
+    「进了 picks 的存量票」在这个账户上是 `601398`（占 12.4657%，见下），
+    机制完全一样 —— 所以下面用 v1.0.3 的冻结副本把那一枪的读数钉住。
+    """
+    from stocklab.paper import agent_decide
+
+    ctx = _p68_ctx()
+    assert (_P68_TOTAL, _P68_CASH) == (19565.72, 2925.72)
+    assert _p68_reserved_of(ctx) == 85.0466, _p68_reserved_of(ctx)
+
+    # ---------- v1.0.4（现役） ----------
+    out4 = contract.validate_return("m2_a1", _fn("m2_a1")(ctx))
+    assert [p["code"] for p in out4["picks"]] == ["601398"]
+    assert [p["weight_pct"] for p in out4["picks"]] == [4.95]
+    assert out4["cash_pct"] == 95.05
+    assert round(min(25.0, (90.0 - 85.0466) / 1), 2) == 4.95
+
+    # ---------- v1.0.3（冻结副本）：细化把 picks 里的存量票排除掉 ----------
+    out3 = _p68_v103_run(ctx)
+    assert [p["code"] for p in out3["picks"]] == ["601398"]
+    assert [p["weight_pct"] for p in out3["picks"]] == [17.42], \
+        "v1.0.3 的细化：reserved1 = 85.0466 − 12.4657 = 72.5809 ⇒ w1 = 17.42"
+    assert out3["cash_pct"] == 82.58
+    # 「越界载荷」：Σw 17.42% > 可用现金（100 − 85.0466 = 14.9534%）
+    assert round(min(25.0, (90.0 - (85.0466 - 12.4657)) / 1), 2) == 17.42
+    assert 17.42 > 100.0 - 85.0466, "v1.0.3 的载荷就是「越界」的那种形状"
+
+    # ---------- 两版各自走执行层 ----------
+    marks = _p68_marks()
+    c = connect(p68_db)
+    try:
+        cash4 = _p68_execute(c, out4, ctx=ctx, marks=marks)
+        assert cash4 >= 0.0
+        # v1.0.3 的那份越界载荷：**在这一形态上没有真的透支** —— 因为 601398
+        # 是加仓（目标 ¥3,408.14 > 现市值 ¥2,439.00），执行层只买增量一手。
+        # 如实钉住：这一枪在 09-24 这个形态上**还没响**（§1③ 的说法逐字成立）。
+        cash3 = _p68_execute(c, out3, ctx=ctx, marks=marks)
+        assert cash3 >= 0.0, f"09-24 形态上 v1.0.3 也未真透支：{cash3}"
+    finally:
+        c.close()
+    # 反向自检：对**越界**的载荷闸门仍是活的（不许把 `CashShortfall` 改弱）。
+    with pytest.raises(agent_decide.CashShortfall):
+        agent_decide._gate_cash(
+            arm=ACCOUNT, asof=DAY2, cash_before=_P68_CASH, cash_after=-1.0,
+            positions=_P68_POS, marks=_p68_marks(), total_assets=_P68_TOTAL)
+
+
+def test_p68_t3_a1_v104_prevents_the_overdraw_v103_produces(p68_db):
+    """**判据 3b**：v1.0.3 真的越界、v1.0.4 不越界的那个形状。
+
+    判据 3a 用的是真库 09-24 的账户，而那个账户上 v1.0.3 的越界**被加仓增量
+    吸收了**（没有真的透支）。所以这里用一张把它兑现的形状：
+    总资产 ¥40,000、存量 `C05 ×400 @29.26（29.26%）` ＋ `C01 ×500 @15.74（19.675%）`
+    ⇒ 可用现金 ¥20,426.00（51.065%）。
+
+    - **v1.0.3**：`reserved0 = 48.935` ⇒ `w0 = 8.21`（`n=5`，picks 含两笔存量）
+      ⇒ `reserved1 = 0`（两笔存量都在 picks 里）⇒ `w1 = min(25, 90/5) = 18`
+      ⇒ **`Σw = 90%`**，而账上只有 51.065% 现金 ⇒ 买单一共 ¥21,678.05 > ¥20,426
+      ⇒ 执行层 `CashShortfall`（越界 ¥1,252.05）。这就是「那一枪响了」的样子。
+    - **v1.0.4**：`reserved = 48.935` ⇒ `cap = 41.065` ⇒ `w = 8.21`
+      ⇒ `Σw = 41.05%` ≤ 现金 51.065% ⇒ 无 `CashShortfall`。
+
+    ⚠️ v1.0.3 的 `w1` 那一支还有个更细的错：重跑 affordability 时用的是
+    **新的** picks（可以直接把原来的存量票挤出名单），而 `reserved1` 是对
+    **旧** picks 算的 —— 两处不一致，正是这条形状里 `reserved1 = 0` 的来源。
+    """
+    from stocklab.paper import agent_decide
+
+    total, cash = 40000.0, 20426.0
+    closes = {"C00": 25.12, "C01": 15.74, "C02": 37.26, "C03": 3.60,
+              "C04": 20.19, "C05": 29.26}
+    pos = {"C05": 400, "C01": 500}
+    ctx = _p68_ctx(pos, total=total, cash=cash, order=tuple(sorted(closes)),
+                   closes=closes)
+    assert _p68_reserved_of(ctx) == 48.935, _p68_reserved_of(ctx)
+
+    out4 = contract.validate_return("m2_a1", _fn("m2_a1")(ctx))
+    assert [p["weight_pct"] for p in out4["picks"]] == [8.21] * 5
+    assert round(sum(p["weight_pct"] for p in out4["picks"]), 2) == 41.05
+    assert out4["cash_pct"] == 58.95
+
+    out3 = _p68_v103_run(ctx)
+    assert [p["weight_pct"] for p in out3["picks"]] == [18.0] * 5
+    assert out3["cash_pct"] == 10.0
+    assert round(sum(p["weight_pct"] for p in out3["picks"]), 2) == 90.0
+    assert 90.0 > 100.0 - 48.935, "v1.0.3 的 Σw 越过了可用现金（51.065%）"
+
+    marks = _p68_marks(closes)
+    c = connect(p68_db)
+    try:
+        assert _p68_execute(c, out4, ctx=ctx, marks=marks) == \
+            pytest.approx(20426.0 - 7789.97 + 8980.92, abs=0.05)
+        with pytest.raises(agent_decide.CashShortfall) as exc:
+            _p68_execute(c, out3, ctx=ctx, marks=marks)
+        assert exc.value.code == "cash", "读数上必须能与载荷错分开"
+    finally:
+        c.close()

@@ -2779,7 +2779,10 @@ def cmd_paper_agent_random(args: argparse.Namespace) -> int:
         "cash_pct": validated["cash_pct"],
         "payload_sha256": agent_decide.payload_sha256(validated),
         "context_sha256": context_sha256,
-        "note": "随机对照臂：同护栏、同成本，标的与权重由固定种子决定"},
+        "note": ("随机对照臂：同护栏、同成本，标的与权重由固定种子决定；"
+                 "敞口上界 **口径 v3（P68）** = (100 − 现金下限 10) − **全部**"
+                 "存量持仓占比（不因 picks 而减免 —— v2 只扣了「不在 picks 里的」"
+                 "那一半，而「在 picks 里但整手减不动」的存量不会释放现金）")},
         ensure_ascii=False, sort_keys=True, indent=2))
     return 0
 
