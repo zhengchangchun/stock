@@ -18,8 +18,10 @@ import pytest
 
 from stocklab.cli.main import main
 from stocklab.fund import nav as fund_nav
-from stocklab.paper import agent_decide
-from stocklab.paper.config import ARM_AGENT, ARM_AGENT_RANDOM
+from stocklab.paper import agent_decide, agent_pool, agent_spec
+from stocklab.paper import engine as paper_engine
+from stocklab.paper import store as paper_store
+from stocklab.paper.config import ARM_AGENT, ARM_AGENT_RANDOM, RANDOM_MODEL_ID
 from stocklab.store.db import connect
 from stocklab.store.migrate import init_db
 
@@ -218,6 +220,65 @@ def test_random_then_step_then_show_is_a_full_round_trip(db, tmp_path, capsys):
     assert codes == sorted(codes), "池子要稳定排序（可重放）"
     assert set(codes) == {"000333", "510300", "510880"}
     assert got["guardrails"], "护栏清单必须随 `show` 一起给出来"
+
+
+def test_agent_run_exits_2_with_code_cash_when_a_payload_overdraws(db, capsys):
+    """`paper agent run` 的退出码 2 有**两种**成因 —— 这是第二种（P66 / T4）。
+
+    P65 的资金闸门整轮拒 ⇒ `engine._step_all` 转成具名 `PaperError` ⇒
+    **该臂当天没有净值行**；`run` 以 **2** 退出、stderr 里带 `code=cash`。
+    `docs/ops/2026-09-23-AI操盘手-日更循环.md` §1 的退出码表与 §3 的失败处置表
+    写的就是这条读数 —— 本用例让它由**代码**兜住，而不是只由那份文档承诺。
+
+    载荷用**旧口径**（`uniform(0, 100)`，seed 3 ⇒ 敞口 88.08%）硬写进台账：
+    口径 v2 之后这条路**已经不可构造**（`cap ≈ 46.5`），所以它是
+    「库里的历史行仍被闸门拦住」这个读数的天然夹具（append-only 的台账里
+    旧口径的行本来就会长期存在）。
+    """
+    _init(db, capsys)
+    c = connect(db)
+    try:
+        state = paper_engine.arm_state_for(c, ARM_AGENT_RANDOM, START)
+        pool = agent_pool.pool_snapshot(c, START)
+        marks = {**paper_engine.resolve_marks(c, set(pool["codes"]), START),
+                 **state["marks"]}
+        total = float(state["total_assets"])
+        weights = {"000333": 29.36, "510300": 29.36, "510880": 29.36}
+        payload = {
+            "asof": START,
+            "cash_pct": round(100.0 - sum(weights.values()), 2),
+            "rationale": "夹具：**旧口径**（uniform(0, 100)）的 seed=3 载荷",
+            "decisions": [
+                {"code": code, "target_weight_pct": w,
+                 "side": agent_decide.side_for(
+                     target_value=round(total * w / 100.0, 4),
+                     current_value=round(float(marks[code].price)
+                                         * int(state["positions"].get(code, 0)), 4))
+                 or agent_decide.SIDE_BUY,
+                 "reason": f"夹具：旧口径抽中 {code}"}
+                for code, w in weights.items()],
+        }
+        agent_decide.record_portfolio_decision(
+            c, arm=ARM_AGENT_RANDOM, asof=START, payload=payload, pool=pool,
+            agent_kind=agent_spec.AGENT_KIND_RANDOM, model_id=RANDOM_MODEL_ID,
+            prompt_sha256=agent_decide.random_prompt_sha256(), seed=3,
+            context_sha256="c" * 64, now=NOW)
+    finally:
+        c.close()
+
+    code, out, err = run(db, "paper", "agent", "run", "--asof", START, capsys=capsys)
+    assert code == 2, err
+    assert "code=cash" in err, err
+    assert "没有净值行" in err, err
+
+    c = connect(db)
+    try:
+        assert paper_store.nav_exists(c, ARM_AGENT_RANDOM, START) is False, \
+            "整轮拒绝 ⇒ 该臂当天**没有净值行**（缺得可见，不偷偷透支）"
+        assert paper_store.trades_on(c, ARM_AGENT_RANDOM, START) == [], \
+            "整轮拒绝 ⇒ 一笔都不许落"
+    finally:
+        c.close()
 
 
 def test_show_reports_the_audit_of_the_ledger(db, tmp_path, capsys):

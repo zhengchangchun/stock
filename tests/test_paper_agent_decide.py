@@ -17,6 +17,8 @@ from __future__ import annotations
 
 import ast
 import json
+import random
+import re
 from pathlib import Path
 
 import pytest
@@ -27,7 +29,9 @@ from stocklab.paper import agent_context, agent_decide, agent_pool, agent_spec
 from stocklab.paper import engine as paper_engine
 from stocklab.paper import rules as paper_rules
 from stocklab.paper.config import (ARM_AGENT, ARM_AGENT_RANDOM, NO_SHORT_SIDE_MSG,
-                                   PAPER_START_DATE, RULE_CITATIONS_AGENT_DECISION)
+                                   PAPER_START_DATE, RANDOM_CASH_FLOOR,
+                                   RANDOM_N_CODES, RULE_CITATIONS_AGENT_DECISION)
+from stocklab.portfolio.prices import Price
 from stocklab.store.db import connect
 from stocklab.store.migrate import init_db
 
@@ -641,14 +645,22 @@ def test_spec_rows_cannot_be_executed_as_portfolio_decisions(db, tmp_path, capsy
 
 
 def test_p65_random_payloads_can_overdraw_and_the_gate_rejects_them(db):
-    """随机对照臂的载荷按 `total_assets` 定敞口、不看存量持仓 ⇒ 有种子会透支。
+    """**P65 的读数已由 P66 取代** —— 本用例现在钉住口径 v2 **没修掉的那一种**透支。
 
-    P65 的资金闸门把这件事**具名**暴露出来（`CashShortfall`），而不是让它变成
-    一笔负现金的成交。这是 ERROR_DIARY #73 同型缺陷的**第二个实例**：
-    `arm-agent-random` 的起跑账户同样有 43.6% 锁在 `000333` 里。
+    历史：P65 时本用例断言「随机臂会透支、闸门会拒」（旧口径 `uniform(0, 100)`，
+    不看存量持仓）。P66 把敞口上界改成 `(100 − RANDOM_CASH_FLOOR) − reserved`
+    之后，透支**大幅收窄**（真库形态 200 种子：31 → 1），但**没有归零** ——
+    所以「不再有可构造的透支载荷」这条对偶断言**写不出来**（写了就是假的）。
 
-    ⚠️ 本用例只**钉住读数**，不修口径：改随机臂的载荷生成 = 改控制臂的分布，
-    那是一次独立的策略变更（要自己的任务书）。见 P65 任务书 §7 的存留项 1。
+    **仅存的那一种**（真读数，见 `test_p66_..._residual_...`）：抽中的存量票
+    `000333` 的目标市值在「0 与一手之间」⇒ 执行层按整手向下取整
+    **一股都卖不出去**（1 手 = ¥8,247 ≈ 总资产的 42%）⇒ 那份「卖出会释放现金」
+    的假设落空 ⇒ 其余标的的买入超出账上现金。**这不是本站改出来的**：
+    `plan_target_weight` 的整手口径（P64 定的）一个字没动，且 A1 v1.0.3
+    用的是同一条上界公式 ⇒ **两条臂同型**（这正是「同护栏」的含义）。
+
+    ⇒ 本用例保留原名与「闸门是活的」这条断言：**有种子仍会透支**这件事今天依然
+    为真，它现在钉住的是上面那条**共享**的残余缺陷，而不是旧口径。
     """
     c = connect(db)
     try:
@@ -660,7 +672,7 @@ def test_p65_random_payloads_can_overdraw_and_the_gate_rejects_them(db):
                      for code, qty in state["positions"].items() if code in marks)
         assert locked > 0, "夹具账户必须真的握着存量持仓，否则本判据空转"
 
-        rejected = 0
+        rejected: list[int] = []
         for seed in range(40):
             payload = agent_decide.random_payload(
                 arm=ARM_AGENT_RANDOM, asof=START, pool_codes=set(pool["codes"]),
@@ -676,9 +688,383 @@ def test_p65_random_payloads_can_overdraw_and_the_gate_rejects_them(db):
                     cash=float(state["cash"]), positions=dict(state["positions"]),
                     marks=marks, total_assets=float(state["total_assets"]))
             except agent_decide.CashShortfall:
-                rejected += 1
+                rejected.append(seed)
 
-        assert rejected > 0, "存量持仓占了 43.6%，应当有种子会透支"
-        assert rejected < 40, "也不该每个种子都透支 —— 闸门不是恒红"
+        assert rejected, "闸门必须是活的（否则本用例与它的对偶都会空转）"
+        assert rejected != list(range(40)), "也不该每个种子都透支 —— 闸门不是恒红"
+        # P65 时（旧口径）是 11/40；口径 v2 之后只剩下面这几个 —— 全部是
+        # 「存量票被抽中」的种子。
+        assert rejected == P66_FIXTURE_RESIDUAL_SEEDS, (
+            f"残余透支的种子变了（{rejected}）：口径或整手规则被动过？")
     finally:
         c.close()
+
+
+# ══════════════════════════════════════════════════════════════════════
+# P66：随机对照臂的敞口上界（口径 v2，扣掉「不在本轮 picks 里的存量持仓」）
+# ══════════════════════════════════════════════════════════════════════
+
+#: 真库 `arm-agent-random` 在 2026-09-23 的读数（只读探针）：总资产 ¥19,567，
+#: 其中 `000333 ×100 @ ¥82.47 = ¥8,247`（**42.1475%**）是存量持仓。
+#: 口径 v2 的判据直接钉在这组真数字上，而不是钉在一个凑出来的整数上。
+P66_TOTAL = 19567.0
+P66_HELD = {"000333": 100}
+P66_CLOSES = {"000333": 82.47, "510300": 4.031, "510880": 3.155,
+              "600900": 28.08, "601398": 7.16}
+P66_POOL = tuple(P66_CLOSES)
+P66_ASOF = "2026-09-23"       # 只进 `_seed_material`（种子材料），不查库
+P66_RESERVED = 42.1475        # = round(8247 / 19567 × 100, 4)
+P66_CAP = round((100.0 - 10.0) - P66_RESERVED, 2)     # 47.85
+
+#: 夹具 `db`（`arm-agent-random` 起跑账户：现金 ¥11,314.91 ＋ `000333 ×100`）
+#: 上 seed 0..39 的**残余**透支种子。旧口径是 11/40（见
+#: `P66_OLD_CADENCE_REJECTED_IN_40`）；口径 v2 之后是这 4 个，且每一个都是
+#: 「存量票 `000333` 被抽中」的种子（见上面那条用例的说明）。
+#: 钉死它们是为了：**残余变小这件事本身有读数**，而不是一句「好多了」。
+P66_FIXTURE_RESIDUAL_SEEDS = [3, 17, 30, 32]
+
+
+def _p66_marks() -> dict:
+    return {code: Price(code=code, price=price, source="bars_daily",
+                        price_asof=P66_ASOF, detail="P66 夹具")
+            for code, price in P66_CLOSES.items()}
+
+
+def _p66_payload(seed: int, *, held_qty=None, total_assets=P66_TOTAL) -> dict:
+    return agent_decide.random_payload(
+        arm=ARM_AGENT_RANDOM, asof=P66_ASOF, pool_codes=set(P66_POOL),
+        held_qty=P66_HELD if held_qty is None else held_qty,
+        marks=_p66_marks(), total_assets=total_assets, seed=seed)
+
+
+def _p66_number(payload: dict, key: str) -> float:
+    """从 `rationale` 里读回 `reserved` / `cap` 的**实际取值**。
+
+    为什么从文本里读而不是从返回值里读：口径切换必须**在台账上可见**
+    （`paper_agent_decisions.rationale` 是事后唯一能读的东西，而载荷本身
+    只许有 `DECISION_PAYLOAD_KEYS` 那几个键 —— 加一个 `_debug_*` 会被
+    写入口的未知字段闸门拒掉）。所以本用例顺带钉住「这两个数真的写下来了」。
+    """
+    m = re.search(rf"{key}=(-?[0-9.]+)%", str(payload["rationale"]))
+    assert m, f"rationale 里没有 {key} 的实际取值：{payload['rationale']}"
+    return float(m.group(1))
+
+
+def test_p66_the_cap_mirrors_a1_and_deducts_the_locked_holdings_outside_picks():
+    """口径 v2：`cap = (100 − RANDOM_CASH_FLOOR) − reserved`，与 A1 v1.0.3 同一条。
+
+    「同护栏」这句形容词由**同一个数**兑现：`RANDOM_CASH_FLOOR` 必须等于
+    `m2_a1` 的 `CASH_FLOOR`（对拍，不 import m2 —— 方向是 m2 → paper）。
+    """
+    from stocklab.m2.builtin import a1_pick
+
+    assert RANDOM_CASH_FLOOR == a1_pick.CASH_FLOOR == 10.0
+
+    drawn: set[float] = set()
+    for seed in range(50):
+        payload = _p66_payload(seed)
+        reserved = _p66_number(payload, "reserved")
+        cap = _p66_number(payload, "cap")
+        # 存量票 `000333`（42.1475%）要么在 picks 里（reserved=0、cap=90），
+        # 要么不在（reserved=42.1475、cap=47.85）—— 没有第三种。
+        assert reserved in (0.0, P66_RESERVED), reserved
+        assert cap == (round((100.0 - RANDOM_CASH_FLOOR) - reserved, 2))
+        assert "口径 v2（P66）" in payload["rationale"], "口径标识必须写在台账上"
+        exposure = round(100.0 - float(payload["cash_pct"]), 2)
+        assert exposure <= cap + 1e-9, (seed, exposure, cap)
+        assert 0.0 <= exposure <= 100.0, "敞口不可能为负，也不可能超过 100"
+        drawn.add(exposure)
+    assert len(drawn) > 1, "50 个种子的敞口全一样 ⇒ 抽取区间没在被使用"
+
+
+def test_p66_the_locked_code_inside_picks_is_not_reserved():
+    """`reserved` 只算**不在本轮 picks 里**的存量持仓（口径 v2 的字面定义）。"""
+    marks, held = _p66_marks(), P66_HELD
+    assert agent_decide._reserved_pct(picks=["510300"], held_qty=held,
+                                      marks=marks,
+                                      total_assets=P66_TOTAL) == P66_RESERVED
+    assert agent_decide._reserved_pct(picks=["000333", "510300"], held_qty=held,
+                                      marks=marks, total_assets=P66_TOTAL) == 0.0
+
+
+def test_p66_the_draw_sequence_is_unchanged_from_the_old_cadence():
+    """只有**抽取区间**变了：`k` 只数、`picks` 名单与旧口径逐位相同。
+
+    黄金表取自改动前的实现（`git show HEAD:stocklab/paper/agent_decide.py`
+    在同一个 ctx 上跑出来的 `k` / `codes`）。「其余一个字不改」这句话只能靠
+    这张表兑现 —— 它一红就说明 `rng` 的**调用顺序**被动过（那会让台账里
+    同一个种子对不上净值）。
+    """
+    golden = {0: (4, ["000333", "510880", "600900", "601398"]),
+              1: (1, ["510880"]),
+              2: (4, ["000333", "510300", "510880", "601398"]),
+              3: (2, ["510300", "600900"]),
+              4: (1, ["600900"]),
+              5: (2, ["510880", "601398"]),
+              6: (4, ["000333", "510300", "510880", "601398"]),
+              7: (3, ["000333", "510300", "600900"]),
+              8: (4, ["510300", "510880", "600900", "601398"]),
+              9: (2, ["510880", "600900"])}
+    #: 旧口径（`uniform(0, 100)`）在**无持仓**（reserved=0 ⇒ cap=90）时的敞口，
+    #: 与**本站**在同一个 ctx 上的敞口。新值 ≈ 旧值的 0.9 倍（区间只缩了 10 个点），
+    #: 但**不是**逐位相等：`round(0.9 × round(100u, 2), 2)` 与 `round(90u, 2)`
+    #: 会差一分（seed 7 就是 8.23 vs 8.22）—— 两次取整的地方不同，别把
+    #: 「≈0.9 倍」当成可以逐位对上的恒等式。
+    old_exposure = {0: 66.18, 1: 83.19, 2: 78.99, 3: 51.74, 4: 25.78,
+                    5: 97.0, 6: 1.11, 7: 9.14, 8: 90.23, 9: 62.87}
+    new_exposure = {0: 59.56, 1: 74.87, 2: 71.09, 3: 46.57, 4: 23.2,
+                    5: 87.3, 6: 1.0, 7: 8.22, 8: 81.21, 9: 56.58}
+    for seed, (k, codes) in golden.items():
+        payload = _p66_payload(seed, held_qty={})
+        assert len(payload["decisions"]) == k, seed
+        assert [d["code"] for d in payload["decisions"]] == codes, seed
+        exposure = round(100.0 - float(payload["cash_pct"]), 2)
+        assert exposure == new_exposure[seed], seed
+        assert abs(exposure - 0.9 * old_exposure[seed]) <= 0.01, seed
+
+
+def test_p66_same_seed_twice_is_byte_identical():
+    """逐字节可复现是硬要求：同 `(arm, asof, seed)` 两遍必须同 `canonical_payload`。"""
+    for seed in (0, 7, 97):
+        first = agent_decide.canonical_payload(_p66_payload(seed))
+        second = agent_decide.canonical_payload(_p66_payload(seed))
+        assert first == second, seed
+
+
+def test_p66_the_degenerate_paths_are_pinned_to_the_old_bytes():
+    """退化路径：**能逐位相同的那一条必须逐位相同**，其余如实说明。
+
+    - 池内没有可定价标的 ⇒ 仍走**全现金早退**（在抽 rng 之前就返回）⇒
+      与旧口径**逐字节相同**（下面钉的是改动前跑出来的原文）；
+    - 无持仓 / `total_assets` 缺失或 ≤ 0 ⇒ `reserved = 0`（`_reserved_pct`
+      的退化口径，与 A1 同款）⇒ `cap = 90`。
+      ⚠️ **这一条与旧口径不是逐位相同**：旧口径的区间是 `uniform(0, 100)`，
+      没有 10% 现金下限，所以同一个 seed 的敞口是 `1/0.9` 倍。
+      任务书 §2 的括注「必须与旧版逐位相同」在这里**不成立**（它是从
+      P65 §3.2 步骤 4 抄过来的，那句在 A1 上为真：1.0.2 的上限也是 90）。
+      本条如实钉住差异，不把括注当判据（ERROR_DIARY #74 的同型）。
+    """
+    empty = {"asof": P66_ASOF, "decisions": [], "cash_pct": 100.0,
+             "rationale": f"随机对照臂：{P66_ASOF} 没有可定价的池内标的 → 全现金"}
+    got = agent_decide.random_payload(
+        arm=ARM_AGENT_RANDOM, asof=P66_ASOF, pool_codes=set(P66_POOL), marks={},
+        held_qty=P66_HELD, total_assets=P66_TOTAL, seed=0)
+    assert agent_decide.canonical_payload(got) == agent_decide.canonical_payload(empty)
+
+    for total in (None, 0.0, -1.0):
+        assert agent_decide._reserved_pct(picks=["510300"], held_qty=P66_HELD,
+                                          marks=_p66_marks(),
+                                          total_assets=total) == 0.0
+    assert agent_decide._reserved_pct(picks=[], held_qty={}, marks=_p66_marks(),
+                                      total_assets=P66_TOTAL) == 0.0
+    assert _p66_number(_p66_payload(0, held_qty={}), "cap") == 90.0
+    # `total_assets=None` 在旧口径下就是**崩**的（TypeError，`None × weight`），
+    # 本站一个字没动那条路径 ⇒ 它今天照样崩。不许把「本来就没有的路径」修成
+    # 一条新路径（那会悄悄多出「没有总资产也能下单」这个状态）。
+    with pytest.raises(TypeError):
+        _p66_payload(0, total_assets=None)
+
+
+def test_p66_a_cap_at_or_below_zero_lands_on_all_cash_without_negative_weights():
+    """`reserved` 吃到 ≥ 90% ⇒ `cap ≤ 0` ⇒ 敞口 0、全现金，**不许**出现负权重。
+
+    seed 1 抽中的是 `[510880]`（见上一条的黄金表）⇒ 两笔存量票都不在 picks 里：
+    `42.1475 + 400 × 28.08 / 19567 × 100 = 99.5487` ⇒ `cap = −9.55`。
+    """
+    payload = _p66_payload(1, held_qty={"000333": 100, "600900": 400})
+    assert _p66_number(payload, "cap") <= 0.0
+    assert payload["decisions"] == []
+    assert payload["cash_pct"] == 100.0
+
+
+def test_p66_the_residual_overdraw_is_only_the_unsellable_locked_code(db):
+    """**对偶断言**：口径 v2 之后，剩下的透支**只有**「存量票抽中且一手卖不出」这一种。
+
+    为什么不能写成「零透支」：实测**不是零**（真库形态 1/200、夹具 8/200）。
+    真实的原因在执行层的**整手粒度**（`plan_target_weight` 对卖出也整手向下取整），
+    而那一层本站一个字都不许动（任务书 §4）。⇒ 本条把「剩余的是哪一种」
+    钉死，而不是把「零」写成结论。
+
+    判据分两半：
+    1. `reserved > 0`（存量票**没**被抽中）的种子 ⇒ **一个都不许被拒**，
+       且成交后现金 ≥ 10% 总资产（口径 v2 真正管住的那一支）；
+    2. `reserved == 0`（存量票被抽中）的种子 ⇒ 被拒者必须是
+       「目标敞口 > 可用现金」且**卖单一股都没成交**的那一类。
+    """
+    c = connect(db)
+    try:
+        state = paper_engine.arm_state_for(c, ARM_AGENT_RANDOM, START)
+        pool = agent_pool.pool_snapshot(c, START)
+        marks = {**paper_engine.resolve_marks(c, set(pool["codes"]), START),
+                 **state["marks"]}
+        cash0 = float(state["cash"])
+        total0 = float(state["total_assets"])
+        floor = total0 * RANDOM_CASH_FLOOR / 100.0
+
+        free_rejected, locked_rejected, locked_rejected_unsellable = [], [], []
+        free_ok = 0
+        for seed in range(200):
+            payload = agent_decide.random_payload(
+                arm=ARM_AGENT_RANDOM, asof=START, pool_codes=set(pool["codes"]),
+                held_qty=state["positions"], marks=marks,
+                total_assets=total0, seed=seed)
+            held_picked = _p66_number(payload, "reserved") == 0.0
+            validated = agent_decide.validate_payload(
+                asof=START, payload=payload, pool_codes=set(pool["codes"]),
+                held_qty=state["positions"], marks=marks, total_assets=total0)
+            rebased = agent_decide.rebase_payload(
+                validated, total_assets=total0, marks=marks,
+                positions=state["positions"])
+            ac = {code: agent_decide.asset_class_for(c, code)
+                  for code in sorted({str(d["code"]) for d in rebased["decisions"]})}
+            orders, _evals = agent_decide.plan_orders(
+                decision=rebased, cash=cash0, positions=dict(state["positions"]),
+                marks=marks, total_assets=total0, asset_classes=ac)
+            try:
+                cash_after, _pos, _o, _e = agent_decide.execute_decision(
+                    c, arm=ARM_AGENT_RANDOM, asof=START, decision=rebased,
+                    cash=cash0, positions=dict(state["positions"]), marks=marks,
+                    total_assets=total0)
+            except agent_decide.CashShortfall:
+                (locked_rejected if held_picked else free_rejected).append(seed)
+                if held_picked and not [d for d in orders
+                                        if d.action == agent_decide.SIDE_SELL]:
+                    locked_rejected_unsellable.append(seed)
+                continue
+            if not held_picked:
+                free_ok += 1
+                assert cash_after >= floor - 1.0, (seed, cash_after, floor)
+        assert not free_rejected, (
+            f"存量票没被抽中的种子被拒了（{free_rejected}）："
+            f"口径 v2 的上界没生效")
+        assert free_ok >= 50, (
+            f"存量票没被抽中的种子只有 {free_ok} 个 ⇒ 上面那条断言空转")
+        assert locked_rejected, "存量票被抽中时应当仍有一种卖不出去的情形"
+        assert locked_rejected_unsellable == locked_rejected, (
+            "残余透支里出现了「卖单成交了却仍透支」的种子 ⇒ 原因不是整手粒度，"
+            f"是别的东西：{locked_rejected}")
+    finally:
+        c.close()
+
+
+def _p66_old_cadence_payload(seed: int, *, pool_codes, held_qty, marks,
+                             total_assets) -> dict:
+    """**旧口径（v1）** 的载荷：`exposure = rng.uniform(0.0, 100.0)`。
+
+    这是 `git show HEAD:stocklab/paper/agent_decide.py` 里那段抽样的**冻结副本**
+    —— 一字不改地抄过来。本站删掉的正是这个区间，所以这里**不能**调用
+    `random_payload`：反向自检要证明的是「**闸门**没被顺手改弱」，
+    而不是「新口径的载荷会被拒」（后者是同义反复）。
+    """
+    rng = random.Random(agent_decide._seed_material(ARM_AGENT_RANDOM, START, seed))
+    usable = sorted(c for c in pool_codes if c in marks)
+    lo, hi = RANDOM_N_CODES
+    k = max(1, min(len(usable), rng.randint(lo, hi)))
+    picks = sorted(rng.sample(usable, k))
+    exposure = round(rng.uniform(0.0, 100.0), 2)              # ← v1 的区间
+    raw = [rng.random() for _ in picks]
+    total = sum(raw)
+    weights = [round(exposure * w / total, 2) for w in raw] if total else \
+        [0.0 for _ in picks]
+    drift = round(exposure - sum(weights), 2)
+    weights[-1] = round(weights[-1] + drift, 2)
+    items: list[dict] = []
+    for code, weight in zip(picks, weights):
+        if weight <= 0:
+            continue
+        qty = int(held_qty.get(code, 0) or 0)
+        price = float(marks[code].price)
+        target_value = round(total_assets * weight / 100.0, 4)
+        items.append({
+            "code": code, "target_weight_pct": weight,
+            "side": agent_decide.side_for(
+                target_value=target_value,
+                current_value=round(price * qty, 4)) or agent_decide.SIDE_BUY,
+            "reason": f"夹具：旧口径（v1）抽中 {code}"})
+    return {"asof": START, "decisions": items,
+            "cash_pct": round(100.0 - sum(d["target_weight_pct"] for d in items), 2),
+            "rationale": f"夹具：**旧口径（v1）** uniform(0, 100)，seed={seed}"}
+
+
+#: 旧口径（v1）在夹具账户上 seed 0..39 的被拒种子（**改动前实测 11/40**，
+#: 与 P65 任务书 §7.7-1 的「40 个种子粒度上实测 11/40」逐位相同）。
+P66_OLD_CADENCE_REJECTED_IN_40 = [3, 8, 12, 14, 17, 26, 27, 29, 30, 32, 38]
+
+
+def test_p66_the_gate_still_rejects_an_old_cadence_payload(db):
+    """**反向自检**：手工构造**旧口径**（`uniform(0, 100)`）的载荷 ⇒ 必须仍被拒。
+
+    本站修的是**口径**（`random_payload` 的抽取区间），不是闸门。把闸门顺手删掉
+    或改弱（「只记日志不拒」/「按可用现金缩单」）的那一刻，这条用例必须判红。
+
+    seed 8 是刻意挑的：那份旧载荷的 picks 是 `['510300']`（**不**含存量票），
+    敞口 98.51% ⇒ 拒绝的理由是「目标敞口 > 可用现金」，与「整手卖不出存量票」
+    那条残余缺陷**无关** ⇒ 它单独证明闸门对**本站已经不可能再产出的那种载荷**
+    依然是活的（口径 v2 的 `cap ≤ 46.47` 让它不可构造）。
+    """
+    c = connect(db)
+    try:
+        state = paper_engine.arm_state_for(c, ARM_AGENT_RANDOM, START)
+        pool = agent_pool.pool_snapshot(c, START)
+        marks = {**paper_engine.resolve_marks(c, set(pool["codes"]), START),
+                 **state["marks"]}
+        cash0 = float(state["cash"])
+        total0 = float(state["total_assets"])
+        pos0 = dict(state["positions"])
+
+        def run(payload):
+            validated = agent_decide.validate_payload(
+                asof=START, payload=payload, pool_codes=set(pool["codes"]),
+                held_qty=pos0, marks=marks, total_assets=total0)
+            rebased = agent_decide.rebase_payload(
+                validated, total_assets=total0, marks=marks, positions=pos0)
+            return agent_decide.execute_decision(
+                c, arm=ARM_AGENT_RANDOM, asof=START, decision=rebased, cash=cash0,
+                positions=dict(pos0), marks=marks, total_assets=total0)
+
+        old_payload = _p66_old_cadence_payload(
+            8, pool_codes=set(pool["codes"]), held_qty=pos0, marks=marks,
+            total_assets=total0)
+        assert round(sum(d["target_weight_pct"] for d in old_payload["decisions"])
+                     + old_payload["cash_pct"], 6) == 100.0, \
+            "载荷本身合规 —— 下面那次拒绝不可能来自载荷层那道闸门"
+        assert "000333" not in [d["code"] for d in old_payload["decisions"]], \
+            "seed 8 的旧载荷刻意不含存量票（见 docstring）"
+        assert round(100.0 - old_payload["cash_pct"], 2) > _p66_number(
+            _p66_payload(8, held_qty=pos0), "cap"), \
+            "口径 v2 的 cap 必须让这种载荷不可构造，否则本用例没在测「已删掉的那条路」"
+        with pytest.raises(agent_decide.CashShortfall) as exc:
+            run(old_payload)
+        assert exc.value.code == "cash", "读数上必须能与载荷错分开"
+
+        # 同一条读数逐 seed 钉住：旧口径 11/40、新口径 4/40（都是实测）。
+        old_rejected = [s for s in range(40)
+                        if _p66_is_rejected(run, _p66_old_cadence_payload(
+                            s, pool_codes=set(pool["codes"]), held_qty=pos0,
+                            marks=marks, total_assets=total0))]
+        new_rejected = [s for s in range(40)
+                        if _p66_is_rejected(run, agent_decide.random_payload(
+                            arm=ARM_AGENT_RANDOM, asof=START,
+                            pool_codes=set(pool["codes"]), held_qty=pos0,
+                            marks=marks, total_assets=total0, seed=s))]
+        assert old_rejected == P66_OLD_CADENCE_REJECTED_IN_40, old_rejected
+        assert new_rejected == P66_FIXTURE_RESIDUAL_SEEDS, new_rejected
+        assert set(new_rejected) < set(old_rejected), \
+            "新口径的被拒集合必须是旧口径的**真子集**（口径只收紧了上界）"
+
+        # 直接喂闸门：结算后的现金为负 ⇒ 拒（不经 `plan_orders` 的独立一读）。
+        with pytest.raises(agent_decide.CashShortfall):
+            agent_decide._gate_cash(
+                arm=ARM_AGENT_RANDOM, asof=START, cash_before=cash0,
+                cash_after=-1.0, positions=pos0, marks=marks,
+                total_assets=total0)
+    finally:
+        c.close()
+
+
+def _p66_is_rejected(run, payload) -> bool:
+    try:
+        run(payload)
+    except agent_decide.CashShortfall:
+        return True
+    return False

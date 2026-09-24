@@ -61,6 +61,7 @@ from stocklab.paper.config import (
     DECISION_KIND_PORTFOLIO,
     DECISION_PAYLOAD_KEYS,
     NO_SHORT_SIDE_MSG,
+    RANDOM_CASH_FLOOR,
     RANDOM_MODEL_ID,
     RANDOM_N_CODES,
     RULE_CITATIONS_AGENT_DECISION,
@@ -325,6 +326,32 @@ def _seed_material(arm: str, asof: str, seed: int) -> int:
     return int.from_bytes(hashlib.sha256(blob).digest(), "big")
 
 
+def _reserved_pct(*, picks: Iterable[str], held_qty: Mapping[str, int],
+                  marks: Mapping[str, Price],
+                  total_assets: float | None) -> float:
+    """**不在 `picks` 里**的存量持仓当前占比之和（%，占总资产）—— 口径 v2。
+
+    与 `m2/builtin/a1_pick.py` v1.0.3 的 `_reserved_pct` 是**同一条公式**：
+    `Σ weight_pct`，其中 `weight_pct = round(qty × 收盘价 / 总资产 × 100, 4)`。
+    两条臂的护栏是同一个数，靠的是同一个算式，不是同一段形容词。
+
+    退化（与 A1 的退化口径同款）：`total_assets` 缺失 / ≤ 0 ⇒ `0.0`
+    —— 「拿不到总资产」＝「算不出占比」，此时**不扣**，而不是猜一个数。
+    缺价（`code ∉ marks`）或零股（`qty <= 0`）的持仓**跳过**：
+    既算不出占比，也不该让它把额度撑满。
+    """
+    if total_assets is None or float(total_assets) <= 0:
+        return 0.0
+    picked = set(picks)
+    total = 0.0
+    for code, qty in held_qty.items():
+        if code in picked or code not in marks or int(qty or 0) <= 0:
+            continue
+        value = float(marks[code].price) * int(qty)
+        total += round(value / float(total_assets) * 100.0, 4)
+    return total
+
+
 def random_payload(*, arm: str, asof: str, pool_codes: set[str],
                    held_qty: Mapping[str, int], marks: Mapping[str, Price],
                    total_assets: float, seed: int) -> dict:
@@ -337,6 +364,42 @@ def random_payload(*, arm: str, asof: str, pool_codes: set[str],
 
     抽到的标的若在 `asof` 取不到价会被跳过（它进不了载荷）—— 这不是静默：
     跳过的标的数会写进 `rationale`。
+
+    ## 敞口上界：口径 v2（P66）—— 先扣掉「不在本轮 picks 里的存量持仓」
+
+    ```
+    reserved = Σ weight_pct(holdings whose code ∉ picks)
+    cap      = round((100 − RANDOM_CASH_FLOOR) − reserved, 2)
+    exposure = round(rng.uniform(0.0, max(0.0, cap)), 2)
+    ```
+
+    **为什么这么选**（三条，缺一条就不必这么改）：
+
+    ① 它**逐字复刻** A1 v1.0.3 的上界公式 ⇒「同护栏」是**可验证**的（同一条算式、
+       同一个 `10.0`），而不是靠形容词；
+    ② 它保证**成交后现金 ≥ 10% × 总资产**（手续费有地方出，不会踩 `CASH_TOL`）——
+       口径 v1 的 `uniform(0, 100)` 允许敞口打到 100%，而那 42% 的钱可能锁在
+       **不在 picks 里**的存量持仓上（既不重算、也不释放），于是抽到高敞口就透支；
+    ③ 与 A1 的差别只有一处、且是**故意**的：A1 等权 `w = cap / n`，随机臂是随机
+       权重 —— 随机性必须保留，否则对照臂就不再是对照臂。
+
+    **为什么是缺陷而不只是「运气差」**（ERROR_DIARY #73 同型）：种子由
+    `(arm, asof, seed)` 决定 ⇒「哪一天被拒」是**确定的**；被拒的全是**高敞口日**
+    ⇒ 留下来的随机臂样本系统性地低敞口、低波动 ⇒ 用这种对照臂算
+    `delta_vs_random`，等于拿「被修剪过运气的对照组」比 AI 臂。
+
+    ## 口径 v2 的生效时点
+
+    自 **2026-09-24**（P66 合入日）起生效。**口径 v1 的最后一天是 2026-09-23**：
+    那天台账里 `decision_id=1`（随机臂）是旧口径的产物，**原样留着，一个字不改**
+    （append-only）。`rationale` 里的 `口径 v2（P66）` 就是为这件事——
+    读台账的人不必靠日期去猜某一行是哪条口径。
+
+    **改动的边界**：只有**抽取区间**从 `uniform(0, 100)` 变成 `uniform(0, cap)`。
+    其余一个字不改 —— `k` 只数仍取 `rng.randint(*RANDOM_N_CODES)`、`picks` 仍是
+    `sorted(rng.sample(usable, k))`、权重仍 `round(exposure × rand/Σrand, 2)`、
+    余项仍进 `cash_pct`、种子材料仍是 `sha256(f"{arm}|{asof}|{seed}")`
+    ⇒ 抽取序列与旧口径**逐位相同**，逐字节可复现仍然成立。
     """
     rng = random.Random(_seed_material(arm, asof, seed))
     usable = sorted(c for c in pool_codes if c in marks)
@@ -346,7 +409,10 @@ def random_payload(*, arm: str, asof: str, pool_codes: set[str],
     lo, hi = RANDOM_N_CODES
     k = max(1, min(len(usable), rng.randint(lo, hi)))
     picks = sorted(rng.sample(usable, k))
-    exposure = round(rng.uniform(0.0, 100.0), 2)
+    reserved = _reserved_pct(picks=picks, held_qty=held_qty, marks=marks,
+                             total_assets=total_assets)
+    cap = round((100.0 - RANDOM_CASH_FLOOR) - reserved, 2)
+    exposure = round(rng.uniform(0.0, max(0.0, cap)), 2)
     raw = [rng.random() for _ in picks]
     total = sum(raw)
     weights = [round(exposure * w / total, 2) for w in raw] if total else \
@@ -373,6 +439,9 @@ def random_payload(*, arm: str, asof: str, pool_codes: set[str],
         "asof": asof, "decisions": items, "cash_pct": cash,
         "rationale": (f"随机对照臂（model_id={RANDOM_MODEL_ID}）：从 {len(usable)} 只"
                       f"可定价池内标的里随机抽 {len(items)} 只，总敞口 {exposure:g}%，"
+                      f"**口径 v2（P66）**：reserved={reserved:g}%（不在本轮 picks 里的"
+                      f"存量持仓占比）、cap={cap:g}%（= 100 − {RANDOM_CASH_FLOOR:g} − "
+                      f"reserved），敞口在 [0, cap] 上抽。"
                       f"种子固定以便逐字节复现。它没有任何依据可自述 —— "
                       f"正因如此，AI 臂跑赢它才算「选对了」而不是「多试了几次」"),
     }

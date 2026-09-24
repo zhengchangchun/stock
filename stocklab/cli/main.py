@@ -2593,8 +2593,17 @@ def cmd_paper_agent_enroll(args: argparse.Namespace) -> int:
 def cmd_paper_agent_run(args: argparse.Namespace) -> int:
     """AI 操盘手家族的**日终**（D-50）：先要决策在台账里，再成交并写净值。
 
-    退出码：**0** = 该有的都有（或非交易日）；**1** = 交易日**缺决策**（异常，
-    不是「你给的东西不合法」）；**2** = 库的状态坏了（未知 `executor` / 没有认领账户）。
+    退出码（三栏，逐条与 `return` 对得上）：
+    **0** = 该有的都有（或非交易日）；
+    **1** = 交易日**缺决策**（异常，不是「你给的东西不合法」）；
+    **2** = **两种**成因 ——
+      ① 库的状态坏了（未知 `executor` / 没有认领账户）：fail-closed 点名报错；
+      ② **某个账户被资金闸门整轮拒**（`agent_decide.CashShortfall`，stderr 里带
+         `code=cash`）：`engine._step_all` 把它转成具名 `PaperError` ⇒ 整日事务
+         回滚 ⇒ **该臂这一天没有净值行**（缺得可见，不偷偷透支）。
+    ②**是设计，不是故障**（P65 的 Q1-A：宁可空仓，不宁可透支）。处置＝去看那条
+    臂载荷的目标敞口（`paper agent show --arm <臂>`），**不要去改执行层闸门**
+    —— 口径洞要在上游口径上修（P66 就是这么修的随机臂）。
     """
     from stocklab.paper import agent_decide, engine
 

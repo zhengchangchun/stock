@@ -185,6 +185,14 @@ RANDOM_MODEL_ID: str = "random-control"
 #: 换区间 = 换口径，必须与净值一起读。
 RANDOM_N_CODES: tuple[int, int] = (1, 4)
 
+#: 随机对照臂的**现金下限**（% 总资产）。**镜像** `m2_a1` v1.0.3 的 `CASH_FLOOR`
+#: （`m2/builtin/a1_pick.py`，同为 10.0），为了让两条臂**同护栏**：随机臂的敞口
+#: 上界也是 `(100 − 本常量) − 不在本轮 picks 里的存量持仓占比`（口径 v2 / P66）。
+#: 两条臂的 docstring 都写着「同护栏、同成本」—— 那个词只能靠**同一个数**兑现，
+#: 所以两边是同一个值由 `tests/test_paper_agent_decide.py` **对拍**钉住
+#: （不 import `m2`：方向是 m2 → paper，反向 import 会成环）。
+RANDOM_CASH_FLOOR: float = 10.0
+
 #: 决策账（`paper_agent_decisions`）里 `decision_kind` 的两个取值。
 #: `spec` = P37 的「改纪律数字」（历史行，保留不删）；`portfolio` = P52 的操盘决策。
 DECISION_KIND_SPEC: str = "spec"
