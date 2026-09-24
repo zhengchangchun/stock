@@ -31,6 +31,7 @@ from stocklab.paper import store as paper_store
 from stocklab.paper.config import ARM_NOW, PAPER_START_DATE
 from stocklab.plugin import contract, lifecycle
 from stocklab.plugin import store as plugin_store
+from stocklab.portfolio.prices import Price
 from stocklab.store.db import connect
 from stocklab.store.migrate import init_db
 
@@ -654,3 +655,105 @@ def test_cost_model_is_not_reconstructed_in_m2():
                         else getattr(node.func, "attr", None))
                 assert name != "CostModel", \
                     f"{path.name} 直接构造了 CostModel —— 费用口径只许在 paper/ 里用"
+
+
+# ══════════════════════════════════════════════════════════════════════
+# P63 —— 执行层 fail-closed：同一 code 两条 pick ⇒ 具名拒绝（不是 IntegrityError）
+# ══════════════════════════════════════════════════════════════════════
+
+#: A1 交下来的选股清单里同一个 code 出现两次（`m2_a1` v1.0.0 的真故障形态）。
+#: 两条 18% 合计 36% —— 这**正是不能合并**的那种输入：合并就把一份 36% 单票方案
+#: 伪装成合规并真的下出去（任务书 §6 的反目标）。
+#: 重复项取池内**未持有**的那一只（`codes[1]`）：夹具账户起跑就握着 `000333`，
+#: 对它下 18% 只会是「减仓」而推不出两条同向单；取未持有的才复现「两条一模一样的
+#: 买单 ⇒ 撞 append-only 唯一键」。同时它仍在池内，于是「越界引用」那条既有闸门
+#: 不会被误触 —— 唯一能拦住它的就是本条新判据。
+A1_DUPLICATE_CODE = """
+def run(ctx):
+    codes = sorted({i["code"] for p in ("short", "mid", "long")
+                    for i in ctx["candidates"].get(p, [])})
+    if not codes:
+        return {"picks": [], "cash_pct": 100.0, "schema_version": "t1"}
+    code = codes[1]
+    return {"picks": [{"code": code, "weight_pct": 18.0, "reason": "短期池第 1 名"},
+                      {"code": code, "weight_pct": 18.0, "reason": "中期池第 2 名"}],
+            "cash_pct": 64.0, "schema_version": "t1"}
+"""
+
+#: 与 `A1_DUPLICATE_CODE` **逐字相同**，只把第二条换成池内另一只 ⇒ 唯一差别是
+#: 「重复 / 不重复」。两条用例互为反例（任务书 T4 的单变量原则）。
+A1_TWO_DISTINCT_CODES = A1_DUPLICATE_CODE.replace(
+    '{"code": code, "weight_pct": 18.0, "reason": "中期池第 2 名"}',
+    '{"code": codes[2], "weight_pct": 18.0, "reason": "中期池第 2 名"}')
+
+
+def _mark(code: str, price: float):
+    return Price(code=code, price=price, source="bars", price_asof=DAY2,
+                 detail="夹具")
+
+
+def test_p63_the_two_a1_fixtures_differ_only_in_the_second_code():
+    """反向自检：反例夹具**逐字相同**、只差第二条 pick 的 code。"""
+    a = A1_DUPLICATE_CODE.splitlines()
+    b = A1_TWO_DISTINCT_CODES.splitlines()
+    assert len(a) == len(b)
+    diff = [i for i, (x, y) in enumerate(zip(a, b)) if x != y]
+    assert len(diff) == 1, diff
+    assert "codes[2]" in b[diff[0]] and '{"code": code' in a[diff[0]]
+
+
+def test_p63_weights_items_rejects_a_repeated_code_before_building_any_order():
+    """单元级：**生成条目之前**就拒 —— 消息点名重复的 code，reject 码沿用 `picks`。"""
+    picks = [{"code": "600900", "weight_pct": 18.0, "reason": "中期池第 1 名"},
+             {"code": "600900", "weight_pct": 18.0, "reason": "长期池第 2 名"}]
+    marks = {"600900": _mark("600900", 10.0)}
+    with pytest.raises(m2_config.ChannelReject) as exc:
+        channel_a._weights_items(picks, positions={}, marks=marks,
+                                 total_assets=100000.0, rationale="夹具")
+    assert exc.value.code == "picks"
+    assert "600900" in exc.value.reason
+    assert "一只 code 一条" in exc.value.reason
+
+
+def test_p63_a_repeated_code_is_not_rescued_by_merging_the_weights():
+    """**反兜底**：36% 的单票方案不许被「合并权重」糊过去（合并 = 静默越单票上限）。"""
+    picks = [{"code": "600900", "weight_pct": 18.0, "reason": "中期池第 1 名"},
+             {"code": "600900", "weight_pct": 18.0, "reason": "长期池第 2 名"}]
+    marks = {"600900": _mark("600900", 10.0)}
+    with pytest.raises(m2_config.ChannelReject):
+        channel_a._weights_items(picks, positions={}, marks=marks,
+                                 total_assets=100000.0, rationale="夹具")
+
+
+def test_p63_a_duplicate_pick_is_rejected_and_writes_nothing(conn):
+    """整链路级：A1 吐重复 code ⇒ 拒绝 + **零写入**（不是 `sqlite3.IntegrityError`）。"""
+    _init_account(conn)
+    _install(conn, "m2_a1", A1_DUPLICATE_CODE, version="dup")
+    before = _dump(conn)
+    decisions_before = conn.execute(
+        "SELECT COUNT(*) FROM paper_agent_decisions").fetchone()[0]
+    out = channel_a.run(conn, asof=DAY2, strategy_version=VERSION, now=NOW)
+    assert out["status"] == m2_config.STATUS_REJECTED
+    assert out["reject_code"] == "picks"
+    assert POOL[1] in out["reason"], out["reason"]
+    after = _dump(conn)
+    assert paper_store.trades_on(conn, ACCOUNT, DAY2) == []
+    assert _nav_row(conn, ACCOUNT, DAY2) is None
+    for table in ("paper_trades", "paper_nav_daily"):
+        assert after[table] == before[table], f"{table} 被写入了"
+    assert conn.execute(
+        "SELECT COUNT(*) FROM paper_agent_decisions").fetchone()[0] \
+        == decisions_before, "拒绝路径写下了决策行"
+
+
+def test_p63_swapping_the_duplicate_for_a_second_name_turns_the_day_green(conn):
+    """反例：**唯一**的差别是「第二条 pick 换成另一只」⇒ 同日同链跑到 `ran`。
+
+    少了这条，「拒绝」有可能来自别的闸门（越界 / 超 100）而新判据空转。
+    """
+    _init_account(conn)
+    _install(conn, "m2_a1", A1_TWO_DISTINCT_CODES, version="ok")
+    out = channel_a.run(conn, asof=DAY2, strategy_version=VERSION, now=NOW)
+    assert out["status"] == m2_config.STATUS_RAN, out
+    assert out["n_orders"] > 0
+    assert paper_store.trades_on(conn, ACCOUNT, DAY2)

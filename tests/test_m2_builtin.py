@@ -506,3 +506,92 @@ def test_t7_daily_replays_green_when_the_day_already_ran(e2e, capsys):
     assert payload["n_skipped"] == 0
     assert all(s["status"] in (m2_config.STATUS_ALREADY, m2_config.STATUS_RAN)
                for s in payload["steps"])
+
+
+# ══════════════════════════════════════════════════════════════════════
+# P63 —— A1 跨池去重（同一 code 至多一条）
+# ══════════════════════════════════════════════════════════════════════
+
+#: 真库 `agent_pool.pool_snapshot(conn, "2026-09-23")` 的池形态：long 5 ⊂ mid 8、
+#: short 6 ⇒ 19 个槽 / 11 只。分数用**真库那 5 行**的原值，其余给互不相同、
+#: 都更低的分数 —— 于是「重复项恰在前 5 行里」这件事被真形态复现出来。
+_P63_LONG = {"600519": 79.1346, "600900": 72.8846}
+_P63_MID = {"600900": 73.4135, "600519": 71.4663}
+_P63_SHORT = {"603868": 77.1352}
+
+
+def _p63_ctx() -> dict:
+    long_codes = ["600519", "600900", "002415", "601318", "603868"]
+    mid_codes = ["600900", "600519", "000651", "002032", "600036", "002415",
+                 "601318", "603868"]                 # long ⊂ mid
+    short_codes = ["603868", "000333", "002032", "002508", "600036", "601398"]
+    long_bg = [c for c in long_codes if c not in _P63_LONG]
+    mid_bg = [c for c in mid_codes if c not in _P63_MID]
+    short_bg = [c for c in short_codes if c not in _P63_SHORT]
+    return _a1_ctx({
+        "long": [_cand(c, s) for c, s in _P63_LONG.items()]
+                + [_cand(c, 70.0 - i) for i, c in enumerate(long_bg)],
+        "mid": [_cand(c, s) for c, s in _P63_MID.items()]
+               + [_cand(c, 67.0 - i) for i, c in enumerate(mid_bg)],
+        "short": [_cand(c, s) for c, s in _P63_SHORT.items()]
+                 + [_cand(c, 61.0 - i) for i, c in enumerate(short_bg)],
+    })
+
+
+def test_p63_the_fixture_really_carries_a_cross_pool_duplicate():
+    """反向自检：夹具里**确实**有同一个 code 占两个槽（否则下面三条空转）。"""
+    ctx = _p63_ctx()
+    slots = [c["code"] for items in ctx["candidates"].values() for c in items]
+    assert len(slots) == 19 and len(set(slots)) == 11, "池形态不是真库那份"
+    duplicated = sorted({c for c in slots if slots.count(c) > 1})
+    assert duplicated == ["002032", "002415", "600036", "600519", "600900", "601318",
+                          "603868"], duplicated
+    assert {c["code"] for c in ctx["candidates"]["long"]} \
+        <= {c["code"] for c in ctx["candidates"]["mid"]}, "前提：long ⊂ mid"
+
+def test_p63_a1_keeps_one_pick_per_code():
+    out = contract.validate_return("m2_a1", _fn("m2_a1")(_p63_ctx()))
+    codes = [p["code"] for p in out["picks"]]
+    assert len(codes) == len(set(codes)), f"选股清单里出现了重复 code：{codes}"
+    assert codes == ["600519", "603868", "600900", "002415", "601318"], codes
+    assert [p["weight_pct"] for p in out["picks"]] == [18.0] * 5
+    assert out["cash_pct"] == 10.0
+    assert abs(sum(p["weight_pct"] for p in out["picks"]) + out["cash_pct"] - 100.0) \
+        <= 1e-6
+
+
+def test_p63_the_dedup_happens_before_the_limit_truncation():
+    """**判据本身**：先去重再取前 N。
+
+    若写成「先取前 N 再去重」，原始前 5 行是
+    `600519, 603868, 600900, 600900, 600519` ⇒ 只剩 3 条，等权 30% 被单票上限
+    截到 25%（现金 25%）。所以「5 条 / 18% / 现金 10%」这组数字只在
+    「先去重再截断」下成立 —— 它把两种实现区分开，不是同义反复。
+    """
+    out = contract.validate_return("m2_a1", _fn("m2_a1")(_p63_ctx()))
+    assert len(out["picks"]) == 5, "去重后仍有 11 只可选，前 5 条应当取满"
+    assert [p["weight_pct"] for p in out["picks"]] == [18.0] * 5, \
+        "3 条时才该出现 25% 上限；这里 18% 说明去重发生在截断之前"
+    assert out["cash_pct"] == 10.0
+    # 同一 code 只保留它**排名最好的那只池**（600519 是长期池第 1 名，不是中期第 2 名）
+    top = out["picks"][0]
+    assert top["code"] == "600519" and "长期池第 1 名" in top["reason"], top["reason"]
+
+
+def test_p63_a1_dedup_is_byte_identical_across_two_runs():
+    """重复 code 的 ctx 上也必须两遍逐字节相同（排序键仍是全序）。"""
+    fn = _fn("m2_a1")
+    ctx = _p63_ctx()
+    first = json.dumps(fn(ctx), sort_keys=True, ensure_ascii=False)
+    second = json.dumps(fn(ctx), sort_keys=True, ensure_ascii=False)
+    assert first == second
+
+
+def test_p63_dedup_can_leave_fewer_than_five_names_and_then_the_cap_bites():
+    """去重后不足 5 只 ⇒ 条数如实变少、单票被 25% 上限截断（不补足、不凑数）。"""
+    dup = _a1_ctx({"short": [_cand("000333", 9.0), _cand("510300", 8.0)],
+                   "mid": [_cand("000333", 7.0), _cand("510300", 6.0)]})
+    out = contract.validate_return("m2_a1", _fn("m2_a1")(dup))
+    assert [p["code"] for p in out["picks"]] == ["000333", "510300"]
+    assert [p["weight_pct"] for p in out["picks"]] == [25.0, 25.0]
+    assert out["cash_pct"] == 50.0

@@ -138,7 +138,33 @@ def _weights_items(picks: list[dict], *, positions: dict, marks: dict,
 
     `side` 由「目标市值 vs 现市值」**推出**（`agent_decide.side_for`），
     与 P52 的写入口同一条规则 —— 于是「A1 说要减到 5%」不会被误读成买入。
+
+    ## 为什么在这里挡「同一 code 两条」
+
+    选股清单里一个 code 出现两次，下游会把它当**两条独立订单**：买入侧的
+    `rule_citation` 是同一个常量串 ⇒ 两条 `(code, side, qty, rule_citation)`
+    相同的成交行撞 `paper_trades` 的 append-only 唯一键，整条链以
+    `sqlite3.IntegrityError` 崩掉（P63：`m2_a1` v1.0.0 跨池不去重的真实故障）。
+
+    契约层（`plugin/contract.py`）**拦不住它**：`_check_cross` 只查
+    `Σweight_pct + cash_pct == 100`，`_check_picks` 不查 code 唯一性。
+    这条闸门是执行层自己的 fail-closed —— 且**不许兜底合并权重**：
+    把两条 18% 合成一条 36% 就把一份越单票上限的方案伪装成合规并真的下出去。
+
+    检在**生成任何条目之前**（`items` 还是空的），于是拒绝路径不产生任何
+    中间产物；整日事务由 `_execute` 兜底回滚。
     """
+    seen: set[str] = set()
+    for pick in picks:
+        code = str(pick["code"])
+        if code in seen:
+            raise config.ChannelReject(
+                "picks", f"A1 的选股清单里 {code} 出现了不止一次 —— "
+                         f"选股清单必须**一只 code 一条**（同一 code 的两条会被"
+                         f"当成两笔订单，撞 paper_trades 的唯一键）。"
+                         f"去重是 A1 的职责，执行层不做兜底合并（合并会把一份"
+                         f"越单票上限的权重伪装成合规）。{rationale}")
+        seen.add(code)
     items: list[dict] = []
     for pick in picks:
         code = str(pick["code"])
