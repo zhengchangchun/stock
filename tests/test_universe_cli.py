@@ -116,6 +116,56 @@ def test_sync_adds_missing_instruments_rows(tmp_db):
     assert row == ("宁德时代", "sz", "gem", "stock")
 
 
+# ---------- P72 T1：新成员落 active=0（研究池不进日更口径，ADR-027） ----------
+
+def test_sync_lands_new_members_inactive_and_keeps_existing_active(tmp_db, capsys):
+    """`instruments.active` 是**全局日更口径**开关：sync 只能把研究池写进表，
+    **不许**顺手把它们塞进日更口径（F1；否则日链 `ingest *` 从 21 只放大到 821 只）。
+
+    Falsifiability：把 `_sync` 的 INSERT 改回 `active=1` ⇒ 下面 `all(... == 0)` 即红。
+    """
+    _seed(tmp_db)                       # 000333：既有行，active=1（schema 默认）
+    capsys.readouterr()
+    assert main(["universe", "sync", "--universe", "seed21", "--db", str(tmp_db)]) == 0
+    out = capsys.readouterr().out
+    assert "新增 instruments=20 只" in out
+
+    conn = sqlite3.connect(tmp_db)
+    try:
+        rows = dict(conn.execute("SELECT code, active FROM instruments"))
+        ctx_raw = conn.execute(
+            "SELECT context_json FROM system_events WHERE module='universe'"
+            " ORDER BY event_id DESC LIMIT 1").fetchone()[0]
+    finally:
+        conn.close()
+
+    assert len(rows) == 21
+    assert rows["000333"] == 1, "既有行的 active 一个字不许动（只补空列）"
+    added = sorted(c for c in rows if c != "000333")
+    assert added == sorted(c for c in rows if rows[c] == 0), \
+        "新增的 20 只必须**全部**是 active=0（研究池不进日更口径）"
+    ctx = json.loads(ctx_raw)
+    assert ctx["instruments_added_inactive"] is True
+    assert sorted(ctx["instruments_added"]) == added
+
+
+def test_sync_second_run_adds_nothing_and_keeps_active_zero(tmp_db, capsys):
+    """幂等：第二次 sync `added=0`、`instruments` 行数不变、active 分布不变。"""
+    _seed(tmp_db)
+    main(["universe", "sync", "--universe", "seed21", "--db", str(tmp_db)])
+    capsys.readouterr()
+    assert main(["universe", "sync", "--universe", "seed21", "--db", str(tmp_db)]) == 0
+    assert "新增 instruments=0 只" in capsys.readouterr().out
+    conn = sqlite3.connect(tmp_db)
+    try:
+        n = conn.execute("SELECT COUNT(*) FROM instruments").fetchone()[0]
+        n_active = conn.execute(
+            "SELECT COUNT(*) FROM instruments WHERE active=1").fetchone()[0]
+    finally:
+        conn.close()
+    assert (n, n_active) == (21, 1)
+
+
 def test_sync_missing_universe_file_exits_2_and_writes_nothing(tmp_db):
     _seed(tmp_db)
     rc = main(["universe", "sync", "--universe", "csi300-500", "--db", str(tmp_db)])
@@ -137,6 +187,21 @@ def test_doctor_exit_0_after_sync(tmp_db, capsys):
     assert main(["universe", "doctor", "--universe", "seed21", "--db", str(tmp_db)]) == 0
     out = capsys.readouterr().out
     assert "表投影行=21" in out and "sector 非空 0/21" in out
+
+
+def test_doctor_exit_0_when_members_are_inactive(tmp_db, capsys):
+    """P72 T3：`instruments` 覆盖判据**不看 `active`** —— sync 之后成员全是 `active=0`
+    也是**一致**（exit 0），且输出把 active 分布逐条报出来。
+
+    Falsifiability：把 `_doctor` 的覆盖判据改成「只数 active=1」⇒ 这里 exit 2 即红。
+    """
+    _seed(tmp_db)                        # 000333 active=1，其余 20 只由 sync 落 active=0
+    main(["universe", "sync", "--universe", "seed21", "--db", str(tmp_db)])
+    capsys.readouterr()
+    assert main(["universe", "doctor", "--universe", "seed21", "--db", str(tmp_db)]) == 0
+    out = capsys.readouterr().out
+    assert "instruments 覆盖 21/21" in out
+    assert "成员 active 1 / 非 active 20" in out
 
 
 def test_doctor_exit_2_on_corrupted_projection_sha(tmp_db, capsys):

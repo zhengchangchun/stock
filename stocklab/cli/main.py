@@ -30,7 +30,7 @@ from zoneinfo import ZoneInfo
 from stocklab.config import paths
 from stocklab.config.settings import load_settings
 from stocklab.config.universe import DEFAULT_UNIVERSE
-from stocklab.config.universes import SOURCE_IDS
+from stocklab.config.universes import SOURCE_IDS, UniverseError, resolve_universe
 from stocklab.data.fetch import EARLIEST as EARLIEST_ACTION_START
 from stocklab.store import repo
 from stocklab.store.db import connect
@@ -127,13 +127,20 @@ def cmd_ingest_bars(args: argparse.Namespace) -> int:
     东财在本环境不可达（ADR-003 实测），且 qfq 不得落库（铁律①），
     故这里**没有**降级到 qfq 的分支 —— 宁可失败留痕，也不写口径错误的数据。
 
-    标的集合取自**库里的 `instruments`**（股票 + ETF，见 `_bars_universe`）；`--code` 里出现
-    库里没有的代码时**不静默跳过**：print 到 stderr 并退出 1（ERROR_DIARY #44）。
+    标的集合：不带 `--universe` ⇒ 取自**库里的 `instruments`**（股票 + ETF，见
+    `_bars_universe`，逐位不变）；带 `--universe <id>` ⇒ 该宇宙**全部成员**（含
+    `active=0` 的研究池，**ETF 也照采**，见 `_explicit_universe`）。
+    `--code` 里出现集合外的代码时**不静默跳过**：print 到 stderr 并退出 1（ERROR_DIARY #44）。
     """
     from stocklab.data.fetch import fetch_daily_bars, policy_from_settings
     from stocklab.data.http import HttpClient
     from stocklab.data.ingest import ingest_daily_bars
     from stocklab.data.raw_cache import RawCache
+
+    # 先解析宇宙（用法错误必须**零写入**：`ensure_schema` 会写库）。
+    scoped, err = _explicit_universe(args)
+    if err is not None:
+        return err
 
     paths.ensure_dirs()
     settings = load_settings()
@@ -144,7 +151,7 @@ def cmd_ingest_bars(args: argparse.Namespace) -> int:
     ensure_schema(paths.DB_PATH)   # 写库入口前滚（P33）：链路上任一步都不许在旧 schema 上写
     conn = connect(paths.DB_PATH)
     try:
-        universe = _bars_universe(conn)
+        universe = scoped if scoped is not None else _bars_universe(conn)
         if args.code:
             known = {i.code for i in universe}
             unknown = [c for c in dict.fromkeys(args.code) if c not in known]
@@ -162,7 +169,12 @@ def cmd_ingest_bars(args: argparse.Namespace) -> int:
             inst = next(i for i in universe if i.code == code)
             return fetch_daily_bars(client, code=inst.tencent_code, start=start, end=end)
 
-        repo.upsert_instruments(conn, universe, now=now)
+        # ⚠️ `--universe` 路径**不调** `upsert_instruments`：它会把库里还没有的成员
+        # 按 schema 默认值 `active=1` 插进 `instruments` ⇒ 顺手把研究池灌进日更口径，
+        # 正是 F2 禁止的。成员登记是 `universe sync` 的事（ADR-026/027）；这一条与
+        # P71 的 `ingest financials --universe` 同形（它也不 upsert）。
+        if scoped is None:
+            repo.upsert_instruments(conn, universe, now=now)
         report = ingest_daily_bars(conn, client, cache, universe,
                                    start=start, end=end, now=now, fetch=fetch)
     finally:
@@ -208,6 +220,33 @@ def _reject_unknown_codes(universe, codes, *, cmd: str):
     return True
 
 
+#: 四条 `ingest`（bars/valuation/moneyflow/actions）与 `ingest financials` 的
+#: `--universe` **同一文案**（P72 T2）。
+UNIVERSE_SCOPE_HELP = (
+    "取数宇宙 id（显式指定 ⇒ 该宇宙**全部成员**，含 `active=0`；不带 ⇒ 走本命令的"
+    "既有默认集合）")
+
+
+def _explicit_universe(args):
+    """`--universe <id>` **显式**给定 → `(成员元组, None)`；未给 → `(None, None)`。
+
+    未给 ⇒ `(None, None)`：调用方走**既有**集合函数（`_bars_universe` / `_stock_universe` …），
+    默认路径逐位不变（F2）。
+    显式 ⇒ `resolve_universe(id)`（fail-closed，F3）：文件缺失/坏 → 打印并返回
+    `(None, 2)`，调用方必须**零写入**地退出 —— 故本函数一律在 `ensure_schema` **之前**调用
+    （`ensure_schema` 会写库；P71 §7.7 偏离 6 的同一纪律）。
+    """
+    uid = getattr(args, "universe", None)
+    if uid is None:
+        return None, None
+    try:
+        _uid, members, _sha = resolve_universe(uid)
+    except UniverseError as exc:
+        print(f"❌ --universe：{exc}", file=sys.stderr)
+        return None, 2
+    return tuple(members), None
+
+
 # ---------- ingest actions（除权事件 + 因子链） ----------
 
 def cmd_ingest_actions(args: argparse.Namespace) -> int:
@@ -219,11 +258,20 @@ def cmd_ingest_actions(args: argparse.Namespace) -> int:
     事件默认取**全历史**（`--start` 可覆盖）：`corp_actions` 里缺一条事件与
     「该事件不存在」在库中无法区分，因子链会把缺席的事件当成没有，
     于是那之后的整段复权价都错且无任何报错（ADR-004 §后果）。
+
+    标的集合：不带 `--universe` ⇒ 库里 active **股票**（`_stock_universe`，逐位不变）；
+    带 `--universe <id>` ⇒ 该宇宙成员（含 `active=0`）**再过一道 `is_stock`** ——
+    ADR-008「ETF 不进复权链」在显式路径上同样成立（`assert_adjustable` 会对 ETF 抛错）。
     """
     from stocklab.data import adjust
     from stocklab.data.fetch import fetch_corp_actions, policy_from_settings
     from stocklab.data.http import HttpClient
     from stocklab.data.raw_cache import RawCache
+
+    # 先解析宇宙（用法错误必须**零写入**）。
+    scoped, err = _explicit_universe(args)
+    if err is not None:
+        return err
 
     paths.ensure_dirs()
     settings = load_settings()
@@ -233,7 +281,10 @@ def cmd_ingest_actions(args: argparse.Namespace) -> int:
     ensure_schema(paths.DB_PATH)   # 写库入口前滚（P33）
     conn = connect(paths.DB_PATH)
     try:
-        universe = _stock_universe(conn)
+        if scoped is None:
+            universe = _stock_universe(conn)
+        else:
+            universe = tuple(i for i in scoped if i.is_stock)
         if not _reject_unknown_codes(universe, args.code, cmd="ingest actions"):
             return 1
         if args.code:
@@ -245,7 +296,10 @@ def cmd_ingest_actions(args: argparse.Namespace) -> int:
         out: dict = {"end": end, "start": args.start, "codes": {}}
         failed: list[str] = []
 
-        repo.upsert_instruments(conn, universe, now=now)
+        # `--universe` 路径不 upsert（同 `ingest bars`：不让 schema 默认的 active=1 灌进
+        # 日更口径；成员登记归 `universe sync`）。
+        if scoped is None:
+            repo.upsert_instruments(conn, universe, now=now)
         for inst in universe:
             code = inst.code
             try:
@@ -352,11 +406,19 @@ def _cmd_ingest_series(args: argparse.Namespace, *, kind: str) -> int:
 
     幂等：同 (code,date) 首写保留，重跑 → `rows=0`（验收 d）。源站重算历史 →
     `restated` 计数 + warn 留痕（不覆盖，非 PIT 对策，见 P28 计划 §4）。
+
+    标的集合：不带 `--universe` ⇒ 库内 active `instruments`（股票 + ETF，
+    `_bars_universe`，逐位不变）；带 `--universe <id>` ⇒ 该宇宙全部成员（含 `active=0`）。
     """
     from stocklab.data.fetch import (fetch_money_flow_daily,
                                      fetch_valuation_daily, policy_from_settings)
     from stocklab.data.http import HttpClient
     from stocklab.data.raw_cache import RawCache
+
+    # 先解析宇宙（用法错误必须**零写入**：`ensure_schema` 会写库）。
+    scoped, err = _explicit_universe(args)
+    if err is not None:
+        return err
 
     paths.ensure_dirs()
     settings = load_settings()
@@ -373,14 +435,16 @@ def _cmd_ingest_series(args: argparse.Namespace, *, kind: str) -> int:
     out: dict = {"kind": kind, "start": start, "end": end, "codes": {}}
     failed: list[str] = []
     try:
-        universe = _bars_universe(conn)
+        universe = scoped if scoped is not None else _bars_universe(conn)
         if not _reject_unknown_codes(universe, args.code, cmd=f"ingest {kind}"):
             return 1
         if args.code:
             wanted = set(args.code)
             universe = tuple(i for i in universe if i.code in wanted)
 
-        repo.upsert_instruments(conn, universe, now=now)
+        # `--universe` 路径不 upsert（同 `ingest bars`/`actions`）。
+        if scoped is None:
+            repo.upsert_instruments(conn, universe, now=now)
         run_id = repo.record_job(conn, f"ingest_{kind}", status="running",
                                  started_at=now)
         for inst in universe:
@@ -3683,12 +3747,14 @@ def build_parser() -> argparse.ArgumentParser:
                           help="回补的日历天数（默认 1200）")
     ing_bars.add_argument("--code", action="append", default=None,
                           help="只采指定代码，可重复；默认全集")
+    ing_bars.add_argument("--universe", default=None, help=UNIVERSE_SCOPE_HELP)
     ing_bars.set_defaults(func=cmd_ingest_bars)
 
     ing_act = ing_sub.add_parser(
         "actions", help="采集除权除息事件并重建复权因子链（腾讯不复权 + 全历史）")
     ing_act.add_argument("--code", action="append", default=None,
                          help="只采指定代码，可重复；默认全集")
+    ing_act.add_argument("--universe", default=None, help=UNIVERSE_SCOPE_HELP)
     ing_act.add_argument("--start", default=EARLIEST_ACTION_START,
                          help=f"事件回补起点（默认 {EARLIEST_ACTION_START} = 全历史）")
     ing_act.set_defaults(func=cmd_ingest_actions)
@@ -3712,6 +3778,7 @@ def build_parser() -> argparse.ArgumentParser:
                               "源站决定实际深度）")
     ing_val.add_argument("--start", default=None, help="起始日期 YYYY-MM-DD")
     ing_val.add_argument("--end", default=None, help="结束日期 YYYY-MM-DD")
+    ing_val.add_argument("--universe", default=None, help=UNIVERSE_SCOPE_HELP)
     ing_val.set_defaults(func=cmd_ingest_valuation)
 
     ing_mf = ing_sub.add_parser(
@@ -3723,6 +3790,7 @@ def build_parser() -> argparse.ArgumentParser:
                              " 2013-09-18）")
     ing_mf.add_argument("--start", default=None, help="起始日期 YYYY-MM-DD")
     ing_mf.add_argument("--end", default=None, help="结束日期 YYYY-MM-DD")
+    ing_mf.add_argument("--universe", default=None, help=UNIVERSE_SCOPE_HELP)
     ing_mf.set_defaults(func=cmd_ingest_moneyflow)
 
     ing_fin = ing_sub.add_parser(
@@ -3730,8 +3798,7 @@ def build_parser() -> argparse.ArgumentParser:
     ing_fin.add_argument("--code", action="append", default=None,
                          help="只采指定代码，可重复；默认全部种子标的")
     ing_fin.add_argument("--fetched-date", help="采集日 YYYY-MM-DD（默认今天）")
-    ing_fin.add_argument("--universe", default=None,
-                         help="取数宇宙 id（默认 None ⇒ 21 只种子；扩池用 csi300-500）")
+    ing_fin.add_argument("--universe", default=None, help=UNIVERSE_SCOPE_HELP)
     ing_fin.add_argument("--db")
     ing_fin.set_defaults(func=cmd_ingest_financials)
 
