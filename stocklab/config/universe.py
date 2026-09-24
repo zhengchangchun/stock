@@ -14,6 +14,12 @@ ALLOWED_HOSTS: frozenset[str] = frozenset(
         "vip.stock.finance.sina.com.cn",      # P28：资金流（MoneyFlow）
         "www.sse.com.cn",                     # P30：休市安排公告（年度通知 + 单节公告）
         "fund.eastmoney.com",                 # P52：基金日净值（pingzhongdata，**非官方**接口）
+        # P74a 新增：日K 源的**同构镜像**（`tencent.KLINE_MIRROR_URLS`）——
+        # 首选 `web.ifzq.gtimg.cn` 被腾讯 WAF 拦成 HTTP 501 时的回退 host，
+        # 同一 param 下响应体逐字节相同。**有意**扩白名单：本断言仍是精确相等，
+        # 改它必须留下痕迹（见 ADR-028）。
+        "ifzq.gtimg.cn",
+        "proxy.finance.qq.com",
     }
 )
 

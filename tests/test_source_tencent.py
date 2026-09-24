@@ -183,6 +183,40 @@ def test_kline_url_uses_allowed_host():
     assert "320" in url
 
 
+# ---------- 镜像 host 回退链（P74a / ADR-028） ----------
+
+def test_kline_urls_chain_keeps_the_original_host_first():
+    """F1：首选一字不改地排在链首 —— WAF 拦截恢复后自动回到原路径。"""
+    assert tencent.KLINE_URL == "https://web.ifzq.gtimg.cn/appstock/app/fqkline/get"
+    assert tencent.KLINE_MIRROR_URLS == (
+        "https://ifzq.gtimg.cn/appstock/app/fqkline/get",
+        "https://proxy.finance.qq.com/ifzqgtimg/appstock/app/fqkline/get",
+    )
+    assert tencent.KLINE_URLS == (tencent.KLINE_URL, *tencent.KLINE_MIRROR_URLS)
+    assert tencent.KLINE_URL not in tencent.KLINE_MIRROR_URLS
+
+
+def test_kline_url_is_byte_identical_to_kline_url_on_the_preferred_base():
+    """`kline_url` 只是 `kline_url_on(KLINE_URL, …)` 的壳：签名与返回逐字节不变。"""
+    cases = [
+        (("sz000333", 320), {}),
+        (("sh600519", 900), {"adj": "qfq"}),
+        (("sz000001", 2000), {"beg": "20100101", "end": "2026-09-25"}),
+    ]
+    for args, kw in cases:
+        assert tencent.kline_url(*args, **kw) == tencent.kline_url_on(
+            tencent.KLINE_URL, *args, **kw)
+
+
+def test_mirror_url_differs_from_the_preferred_only_in_the_base():
+    """同构 = 除 base 之外**一个字符都不差**（路径、query 全同）。"""
+    kw = dict(count=900, adj="qfq", beg="", end="2025-06-08")
+    preferred = tencent.kline_url("sh600519", **kw)
+    tail = preferred[len(tencent.KLINE_URL):]
+    for base in tencent.KLINE_MIRROR_URLS:
+        assert tencent.kline_url_on(base, "sh600519", **kw) == base + tail
+
+
 def test_parse_kline_row_order_is_open_close_high_low(kline_payload, kline_meta):
     """关键坑：腾讯日K 每行是 [日期,开,收,最高,最低,量]，不是 OHLC。"""
     bars = tencent.parse_kline(kline_payload, "000333", adj_mode="qfq")

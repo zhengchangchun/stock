@@ -19,6 +19,27 @@ from stocklab.data.sources._common import LOT, WAN, YI, to_float
 
 QUOTE_URL = "https://qt.gtimg.cn/q="
 KLINE_URL = "https://web.ifzq.gtimg.cn/appstock/app/fqkline/get"
+
+#: 日K 的**同构镜像** base（**不含**首选，见 `KLINE_URLS`）：同一 `param` 下
+#: 三者的响应体逐字节相同，故换 host 不涉及任何解析或口径变化。
+#:
+#: 为什么需要镜像（2026-09-25 现场）：`web.ifzq.gtimg.cn` 被腾讯 WAF 拦下，
+#: **所有**请求一律返回 `HTTP 501` 的 `waf.tencent.com/501page.html` 跳转脚本
+#: （326 B、非 JSON）；补 `Referer`/`Origin`/UA 等完整浏览器头**仍是 501**
+#: —— 不是缺头，是这个 host 本身被拦。而 `http.py` 对 5xx 会退避重试 4 次再抛
+#: `FetchError`，于是每只标的白跑 ~6-8 s，批量采集大面积失败（P74 现场：800 只
+#: 里 570 只无 bars，且「重试注定再失败」）。镜像 host 让「源站换了个域名」
+#: 不再等于「取数链断了」。
+KLINE_MIRROR_URLS: tuple[str, ...] = (
+    "https://ifzq.gtimg.cn/appstock/app/fqkline/get",
+    "https://proxy.finance.qq.com/ifzqgtimg/appstock/app/fqkline/get",
+)
+
+#: 日K 取数的**回退链**：按序尝试，首个成功者用于本页。
+#: **首选在前**：WAF 拦截可能只是临时的，首选一旦恢复，URL / 请求序列 / 缓存键
+#: 就自动回到原状（逐位不变，见 `kline_url`）。
+KLINE_URLS: tuple[str, ...] = (KLINE_URL, *KLINE_MIRROR_URLS)
+
 # 事件是 kline 行上多出来的第 7 个元素（dict），不是独立的顶层字段
 _EVENT_INDEX = 6
 
@@ -44,8 +65,22 @@ def kline_url(code: str, count: int = 320, adj: str = "", *,
     见 ADR-003。`count` 上限 `MAX_COUNT`。
 
     注意：qfq 请求仅限「取除权事件 / 交叉校验」用途。
+
+    **恒用首选 base**（`KLINE_URL`）：回退链只发生在 `fetch.py` 的取数层，
+    这里产出的 URL 逐字节不变（镜像 URL 由 `kline_url_on` 构造）。
     """
-    return f"{KLINE_URL}?param={code},day,{beg},{end},{count},{adj}"
+    return kline_url_on(KLINE_URL, code, count, adj, beg=beg, end=end)
+
+
+def kline_url_on(base: str, code: str, count: int = 320, adj: str = "", *,
+                 beg: str = "", end: str = "") -> str:
+    """在**指定 base** 上构造日K URL（回退链专用）。
+
+    `base` 取自 `KLINE_URLS`。把 base 拆出来是为了让回退链能复用同一套参数
+    拼装（而不是在 `fetch.py` 里重写一遍格式串 —— 那样两处一旦漂移，镜像 URL
+    就会与首选 URL 不同构，「换 host 不改语义」的前提当场失效）。
+    """
+    return f"{base}?param={code},day,{beg},{end},{count},{adj}"
 
 
 def quote_url(codes: list[str]) -> str:

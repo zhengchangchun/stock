@@ -19,10 +19,11 @@ import hashlib
 import re
 from dataclasses import replace
 from datetime import date, timedelta
+from urllib.parse import urlparse
 
 from stocklab.config.settings import Settings
 from stocklab.data import notice_date
-from stocklab.data.errors import FetchError
+from stocklab.data.errors import FetchError, HostNotAllowed
 from stocklab.data.http import RetryPolicy
 from stocklab.data.models import Bar, CorpAction, FinancialReport, MoneyFlowDaily, Quote, ValuationDaily
 from stocklab.data.sources import eastmoney, sina, sse, tencent
@@ -62,6 +63,66 @@ def _validate(page: int, adj: str) -> None:
         )
 
 
+#: `http.py` 对 4xx（非 429）**不重试**、直接抛的 `FetchError` 文案里的标记。
+#: 认文案而非异常类型：本轮 `http.py` 零改动（F6），而「4xx 不重试」的语义只在
+#: 那一条分支上表达。标记若消失，行为退化成「4xx 也换 host 重放」（多打两次错请求），
+#: **不会**静默取到错数据。
+_NO_RETRY_MARK = "（不重试）"
+
+
+def _host_of(base: str) -> str:
+    return urlparse(base).hostname or base
+
+
+def _kline_page(client, *, code: str, count: int, adj: str, anchor: str,
+                key_prefix: str, key_rest: str) -> dict:
+    """按 `tencent.KLINE_URLS` 顺序取**一页**日K，返回解析后的 JSON。
+
+    换 host 的触发条件严格限定为「这个 base 抛了 `FetchError`」（F2）：
+      - HTTP 5xx / 连接异常 / 空响应（`http.py` 退避重试耗尽后的 `FetchError` /
+        `RateLimited`）；
+      - 正文不是合法 JSON（拦页若以 200 返回 HTML，由 `_loads` 抛出）；
+      - 「翻页到上限」由外层 `for…else` 抛出，说的是「整段历史没取完」、
+        与用哪个 host 无关，故**不在**这里。
+
+    两类**不换 host**：
+      - **4xx（非 429）**：`http.py` 对它们不重试就抛 —— 那句话说的是「我请求错了」，
+        不是「源坏了」。换 host 重放只会把同一个错再犯两次，还掩盖真正的参数问题；
+      - **`HostNotAllowed`**：白名单是本站自己的闸门（R13）。拿镜像 host 掩盖它，
+        会让「白名单漏配」永远不可见 ⇒ 必须响亮地失败。
+
+    `key_prefix` / `key_rest` 由调用方给：首选 base 的键 = `{key_prefix}:{key_rest}`
+    （与被替换的旧实现**逐字节相同** ⇒ 既有 raw_cache 照旧命中），镜像 base 的键 =
+    `{key_prefix}@{host}:{key_rest}`（只影响镜像那一份，见 F3）。
+
+    优先顺序 = `KLINE_URLS` 的顺序。**每个 base 内部照旧**走 `HttpClient` 自己的
+    重试/限流，本层只加「host 级」回退一层，HTTP 层保持 host 无关。
+    """
+    last: FetchError | None = None
+    tried: list[str] = []
+    for base in tencent.KLINE_URLS:
+        host = _host_of(base)
+        tried.append(host)
+        try:
+            text = client.get_text(
+                tencent.kline_url_on(base, code, count, adj, end=anchor),
+                source="tencent",
+                cache_key=(f"{key_prefix}:{key_rest}" if base == tencent.KLINE_URL
+                           else f"{key_prefix}@{host}:{key_rest}"),
+            )
+            return _loads(text)
+        except HostNotAllowed:
+            raise
+        except FetchError as exc:
+            if _NO_RETRY_MARK in str(exc):
+                raise
+            last = exc
+    raise FetchError(
+        f"{code} 日K 取数失败：{' → '.join(tried)} 共 {len(tried)} 个 host 全部失败；"
+        f"最后一个异常：{last}"
+    ) from last
+
+
 def fetch_daily_bars(
     client,
     *,
@@ -84,10 +145,10 @@ def fetch_daily_bars(
     collected: dict[str, Bar] = {}
 
     for _ in range(max_pages):
-        url = tencent.kline_url(code, page, adj, end=anchor)
-        text = client.get_text(url, source="tencent",
-                               cache_key=f"kline:{code}:{anchor}:{page}:{adj}")
-        bars = tencent.parse_kline(_loads(text), code[2:], adj_mode=adj or "none")
+        payload = _kline_page(client, code=code, count=page, adj=adj,
+                              anchor=anchor, key_prefix="kline",
+                              key_rest=f"{code}:{anchor}:{page}:{adj}")
+        bars = tencent.parse_kline(payload, code[2:], adj_mode=adj or "none")
         if not bars:
             break                                    # 到头了（上市首日之前）
         first = bars[0].date
@@ -211,10 +272,9 @@ def fetch_corp_actions(
     collected: dict[str, CorpAction] = {}
 
     for _ in range(max_pages):
-        url = tencent.kline_url(code, page, "", end=anchor)
-        text = client.get_text(url, source="tencent",
-                               cache_key=f"actions:{code}:{anchor}:{page}")
-        payload = _loads(text)
+        payload = _kline_page(client, code=code, count=page, adj="",
+                              anchor=anchor, key_prefix="actions",
+                              key_rest=f"{code}:{anchor}:{page}")
         events = tencent.parse_corp_actions(payload, code[2:], adj_mode="none")
         rows = tencent.parse_kline(payload, code[2:], adj_mode="none")
         if not rows:

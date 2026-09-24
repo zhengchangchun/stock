@@ -45,8 +45,34 @@ def test_whitelist_is_exact():
             # P52 新增：基金日净值源（fund.eastmoney.com/pingzhongdata，**非官方**接口）——
             # 同样是**有意**扩白名单：D-36 的第三条对照臂要读它的净值序列。
             "fund.eastmoney.com",
+            # P74a 新增：日K 源的同构镜像（腾讯）—— 首选 web.ifzq.gtimg.cn 被 WAF
+            # 拦成 HTTP 501 时的回退 host，同一 param 下响应体逐字节相同。
+            # 仍然**有意**扩白名单，不是偷偷加：本断言是精确相等，改它必留痕迹。
+            "ifzq.gtimg.cn",
+            "proxy.finance.qq.com",
         }
     )
+
+
+def test_mirror_hosts_pass_the_gate_and_numeric_subdomains_still_fail():
+    """两个镜像 host 必须**真能出网**（否则回退链只是把 501 换成 HostNotAllowed）。
+
+    同时守住 `test_p28_hosts_do_not_open_subdomain_wildcard` 的性质：新增的是
+    **精确主机名**，不是 `*ifzq.gtimg.cn` 这种后缀 —— 数字子域仍旧被拒。
+    """
+    from stocklab.data.sources import tencent
+
+    for base in tencent.KLINE_MIRROR_URLS:
+        assert_host_allowed(base + "?param=sz000333,day,,,320,")
+
+    for url in (
+        "https://1.ifzq.gtimg.cn/appstock/app/fqkline/get",
+        "https://ifzq.gtimg.cn.evil.com/appstock/app/fqkline/get",
+        "https://stock.ifzq.gtimg.cn/appstock/app/fqkline/get",
+        "https://proxy.finance.qq.com.evil.com/x",
+    ):
+        with pytest.raises(HostNotAllowed):
+            assert_host_allowed(url)
 
 
 def test_p28_hosts_do_not_open_subdomain_wildcard():
