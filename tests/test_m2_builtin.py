@@ -595,3 +595,190 @@ def test_p63_dedup_can_leave_fewer_than_five_names_and_then_the_cap_bites():
     assert [p["code"] for p in out["picks"]] == ["000333", "510300"]
     assert [p["weight_pct"] for p in out["picks"]] == [25.0, 25.0]
     assert out["cash_pct"] == 50.0
+
+
+# ══════════════════════════════════════════════════════════════════════
+# P64 —— A1 排除「按目标权重连一手都买不起」的标的（源版本 1.0.2）
+#
+# 真库读数（P63 T6，`asof=2026-09-23`，`total_assets ≈ 19,547`）：v1.0.1 选了
+# 5 只各 18%，其中茅台（一手 ¥125,124）与 601318（一手 ¥5,387）的目标市值
+# ¥3,518.51 连一手都不够 ⇒ 0 股、无订单 ⇒ 成交 3 笔、现金 ~40%。
+# 判据里的数字一律取自这份真库读数，不另编一套。
+# ══════════════════════════════════════════════════════════════════════
+
+#: 真库 2026-09-23 的账户总资产（P63 §1 的读数）。
+_P64_TOTAL = 19547.0
+
+
+def _cand_at(code: str, adj_score: float, close: float) -> dict:
+    """带指定 PIT 收盘价的候选池成员（`close` 是 `candidates_ctx` 的成品字段）。"""
+    item = _cand(code, adj_score)
+    item["close"] = close
+    return item
+
+
+def _a1_ctx_at(per_pool: dict, total_assets) -> dict:
+    """照 `_a1_ctx`，但总资产可给 `None`（= 账户数据未知，探针形状）。"""
+    ctx = _a1_ctx(per_pool)
+    ctx["total_assets"] = total_assets
+    return ctx
+
+
+def test_p64_t1_lot_is_100_and_points_at_the_account_side_convention():
+    """T1：`LOT` 写死在源文本里，且注释点名它与账户参数是同一条约定。"""
+    from stocklab.m2.builtin import a1_pick
+    assert a1_pick.LOT == 100
+    source = BUILTIN_PLUGINS["m2_a1"]
+    assert re.search(r"^LOT = 100\b", source, re.M), "源文本里没有 LOT = 100"
+    assert "params_json.lot" in source, "注释没说清 LOT 与账户参数的耦合"
+    guard.check_source(source)          # 静态预检过（T1 判据的后半句）
+
+
+def test_p64_t2_maotai_is_unaffordable_at_every_weight_up_to_the_cap():
+    """T2：`total_assets=19547` / `close=1251.24` ⇒ 任何 `w ≤ 25` 都买不起。
+
+    `n=1` 时权重已经顶到 `CAP_PCT=25`（目标市值 ¥4,886.75），连一手
+    ¥125,124 的零头都不够 —— 所以「往下试」试到底也不能选它。
+    """
+    ctx = _a1_ctx_at({"short": [_cand_at("600519", 9.0, 1251.24)]}, _P64_TOTAL)
+    out = contract.validate_return("m2_a1", _fn("m2_a1")(ctx))
+    assert out["picks"] == []
+    assert out["cash_pct"] == 100.0
+    # 判据自证：不是「恰好没选」，而是**每个** n 的权重都不够一手
+    for n in range(1, 6):
+        w = min(25.0, (100.0 - 10.0) / n)
+        assert _P64_TOTAL * w / 100.0 < 1251.24 * 100, f"n={n} 竟然买得起"
+
+
+def test_p64_t2_a_mid_priced_name_is_excluded_even_at_the_cap():
+    """T2：`close=53.87`（601318）连 `w=25` 都买不起（¥5,387 > ¥4,886.75）。"""
+    ctx = _a1_ctx_at({"short": [_cand_at("601318", 9.0, 53.87)]}, _P64_TOTAL)
+    out = contract.validate_return("m2_a1", _fn("m2_a1")(ctx))
+    assert out["picks"] == []
+    assert out["cash_pct"] == 100.0
+    assert _P64_TOTAL * 25.0 / 100.0 < 53.87 * 100, "前提：w=25 也不够一手"
+
+
+def test_p64_t2_a_cheap_name_is_affordable_at_eighteen_percent():
+    """T2：`close=31.26` ⇒ `w=18` 下目标市值 ¥3,518.46 ≥ 一手 ¥3,126，**可买**。
+
+    与上面两条构成对照：同一账户、同一权重，只差一个价格。
+    """
+    ctx = _a1_ctx_at({"short": [_cand_at("C%d" % i, 9.0 - i, 31.26)
+                                for i in range(5)]}, _P64_TOTAL)
+    out = contract.validate_return("m2_a1", _fn("m2_a1")(ctx))
+    assert len(out["picks"]) == 5
+    assert [p["weight_pct"] for p in out["picks"]] == [18.0] * 5
+    assert out["cash_pct"] == 10.0
+    assert _P64_TOTAL * 18.0 / 100.0 >= 31.26 * 100, "前提：w=18 买得起一手"
+
+
+def test_p64_t2_unaffordable_names_are_skipped_and_the_rest_fill_the_list():
+    """真库那份 5 只的镜像：贵的被跳过，剩下的按排序补齐（只数如实变少）。"""
+    ctx = _a1_ctx_at({"short": [
+        _cand_at("600519", 9.0, 1251.24),      # 一手 ¥125,124 ⇒ 任何权重都不行
+        _cand_at("601318", 8.0, 53.87),        # 一手 ¥5,387 ⇒ w≤25 都不行
+        _cand_at("603868", 7.0, 31.26),        # 一手 ¥3,126 ⇒ w=18 可行
+        _cand_at("600900", 6.0, 20.0),
+        _cand_at("002415", 5.0, 10.0),
+    ]}, _P64_TOTAL)
+    out = contract.validate_return("m2_a1", _fn("m2_a1")(ctx))
+    codes = [p["code"] for p in out["picks"]]
+    # n=5（w=18）只剩 3 只买得起 ⇒ 依次下探 n=4（w=22.5）、n=3（w=25）都还是 3 只
+    assert codes == ["603868", "600900", "002415"], codes
+    assert [p["weight_pct"] for p in out["picks"]] == [25.0] * 3
+    assert out["cash_pct"] == 25.0
+    assert abs(sum(p["weight_pct"] for p in out["picks"]) + out["cash_pct"] - 100.0) <= 1e-6
+
+
+def test_p64_t3_the_largest_feasible_n_wins():
+    """T3：`w=18` 下只有 3 只可买，但 `w=22.5` 下能凑到 4 只 ⇒ 选 **n=4**。
+
+    构造：一手 ≤ ¥3,518.46 的 3 只（`close=30`）＋ 只在 `w=22.5`
+    （¥4,398.08）下够得着的 1 只（`close=40`）＋ 谁都够不着的 1 只（`close=100`）。
+    若实现写成「先按 `w=18` 定死只数」，结果会是 n=3 / w=25 / 现金 25 —— 与
+    判据的 n=4 / w=22.5 / 现金 10 不同，所以这组数字把两种实现区分开。
+    """
+    ctx = _a1_ctx_at({"short": [
+        _cand_at("A%d" % i, 9.0 - i, 30.0) for i in range(3)
+    ] + [_cand_at("B", 5.0, 40.0), _cand_at("C", 4.0, 100.0)]}, _P64_TOTAL)
+    out = contract.validate_return("m2_a1", _fn("m2_a1")(ctx))
+    assert len(out["picks"]) == 4, "更大的 n 优先"
+    assert [p["code"] for p in out["picks"]] == ["A0", "A1", "A2", "B"]
+    assert [p["weight_pct"] for p in out["picks"]] == [22.5] * 4
+    assert out["cash_pct"] == 10.0
+    # 判据自证：这一组在 w=18 下确实只有 3 只可买、在 w=22.5 下正好 4 只
+    assert sum(1 for c in (30.0, 30.0, 30.0, 40.0, 100.0)
+               if _P64_TOTAL * 18.0 / 100.0 >= c * 100) == 3
+    assert sum(1 for c in (30.0, 30.0, 30.0, 40.0, 100.0)
+               if _P64_TOTAL * 22.5 / 100.0 >= c * 100) == 4
+
+
+def test_p64_t3_five_affordable_names_are_bit_identical_to_v101():
+    """T3 后半：名单里 5 只都买得起 ⇒ n=5 / w=18 / 现金 10（与 1.0.1 逐位相同）。"""
+    ctx = _a1_ctx_at({"short": [_cand_at("C%d" % i, 9.0 - i, 31.26)
+                                for i in range(5)]}, _P64_TOTAL)
+    out = contract.validate_return("m2_a1", _fn("m2_a1")(ctx))
+    assert len(out["picks"]) == 5
+    assert [p["weight_pct"] for p in out["picks"]] == [18.0] * 5
+    assert out["cash_pct"] == 10.0
+
+
+def test_p64_t3_n_and_weight_are_self_consistent_across_the_grid():
+    """T3 不变量：`n` 只 ⇒ `w == min(CAP_PCT, 90/n)`、`cash == 100 − w×n`。
+
+    在一组价格/总资产网格上扫一遍 —— 手写单例只能钉住某一个点。
+    """
+    closes = (5.0, 20.0, 31.26, 53.87, 1251.24)
+    for total in (1000.0, 19547.0, 50000.0, 1000000.0):
+        ctx = _a1_ctx_at({"short": [_cand_at("C%d" % i, 9.0 - i, c)
+                                    for i, c in enumerate(closes)]}, total)
+        out = contract.validate_return("m2_a1", _fn("m2_a1")(ctx))
+        n = len(out["picks"])
+        if n == 0:
+            assert out["cash_pct"] == 100.0
+            continue
+        w = min(25.0, (100.0 - 10.0) / n)
+        assert [p["weight_pct"] for p in out["picks"]] == [round(w, 2)] * n
+        assert out["cash_pct"] == round(100.0 - round(w, 2) * n, 2)
+
+
+def test_p64_t4_nothing_affordable_means_empty_picks_and_cash_100():
+    """T4：全买不起 ⇒ 空仓由 `cash_pct=100.0` 表达（与空池同一条口径）。"""
+    ctx = _a1_ctx_at({"short": [_cand_at("C%d" % i, 9.0 - i, 10.0)
+                                for i in range(5)]}, 1000.0)
+    out = contract.validate_return("m2_a1", _fn("m2_a1")(ctx))
+    assert out["picks"] == [], "1000 元连一手 10 元的标的都买不起"
+    assert out["cash_pct"] == 100.0
+    assert 1000.0 * 25.0 / 100.0 < 10.0 * 100, "前提：n=1 时也不够一手"
+
+
+def test_p64_t5_unknown_total_assets_never_filters():
+    """T5：`total_assets is None`（账户数据未知）⇒ 跳过过滤，行为同 1.0.1。
+
+    「不知道」≠「买不起」（规则 4）：探针形状的 ctx 上选茅台仍然选得出来。
+    """
+    ctx = _a1_ctx_at({"short": [_cand_at("600519", 9.0, 1251.24)]}, None)
+    out = contract.validate_return("m2_a1", _fn("m2_a1")(ctx))
+    assert out["picks"] and out["picks"][0]["code"] == "600519"
+    assert out["picks"][0]["weight_pct"] == 25.0
+    assert out["cash_pct"] == 75.0
+
+
+def test_p64_t5_the_probe_ctx_still_runs_green():
+    """T5：契约探针（`total_assets=None`）不崩且合契约 —— 过滤不许把它弄红。"""
+    out = contract.validate_return("m2_a1", _fn("m2_a1")(dict(contract.PROBE_CTX)))
+    assert out["picks"] == []
+    assert out["cash_pct"] == 100.0
+
+
+def test_p64_t6_two_runs_on_the_affordability_ctx_are_byte_identical():
+    """T6：同一 ctx 两遍逐字节相同（新分支不许引入顺序依赖）。"""
+    ctx = _a1_ctx_at({"short": [
+        _cand_at("600519", 9.0, 1251.24), _cand_at("601318", 8.0, 53.87),
+        _cand_at("603868", 7.0, 31.26), _cand_at("600900", 6.0, 20.0),
+    ]}, _P64_TOTAL)
+    fn = _fn("m2_a1")
+    first = json.dumps(fn(ctx), sort_keys=True, ensure_ascii=False)
+    second = json.dumps(fn(ctx), sort_keys=True, ensure_ascii=False)
+    assert first == second
