@@ -227,9 +227,12 @@ def parse_datacenter_rows(payload: dict) -> list[dict]:
 #: ⇒ **是现成分，不是历史成分**（陷阱：`RPT_INDEX_CONSTITUENT` 看着像历史成分，其实不是）。
 INDEX_COMPONENT_REPORT = "RPT_INDEX_TS_COMPONENT"
 
-#: 成分行的**候选**列名 —— ⚠️ P70 的探测只逐条记录了 `WEIGHT` / `INDUSTRY` /
-#: `MAXTRADEDATE`，**代码/名称的列名未实测**。这里按候选键依次取，取不到就留空
-#: （`code` 取不到 ⇒ 调用方因「0 行」fail-closed 抛错，不会静默写出空宇宙）。
+#: 成分行的**候选**列名 —— 依次取第一个非空值。**已实测有效**（P73，2026-09-25 只读抓取
+#: `TYPE=1,3` 两页 800 行）：`code` 与 `name` **800/800 行全非空**、`code` 0 行空
+#: ⇒ 真源的列名就落在候选集里（P70 当时只逐条记录了 `WEIGHT` / `INDUSTRY` / `MAXTRADEDATE`，
+#: 代码/名称的列名未实测 —— 这条口子由 P73 消掉）。
+#: ⚠️ 仍未实测的是**命中的是哪一候选键**（P73 只拿到解析后的名单，没留原始响应可比对）；
+#: 这不影响 fail-closed 语义：列名真变了 ⇒ `code` 取不到 ⇒ 调用方因「0 行」抛错。
 _CODE_KEYS = ("SECURITY_CODE", "SECUCODE", "F12", "CODE")
 _NAME_KEYS = ("SECURITY_NAME_ABBR", "SECURITY_NAME", "F14", "NAME")
 _SECTOR_KEYS = ("INDUSTRY", "INDUSTRY_NAME", "BOARD_NAME")

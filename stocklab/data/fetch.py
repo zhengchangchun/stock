@@ -507,12 +507,14 @@ def fetch_index_components(client, *, index_type: int,
     `3`→中证500，P70 设计稿 §2.1）。**抓的是现成分**（`MAXTRADEDATE` 只有一天）
     ⇒ 报告必须打 `non_pit=true`（D1）。
 
-    **fail-closed**：非末页行数 != page_size ⇒ 抛 `FetchError`（源站截断＝半截名单，
-    比「没有名单」更危险：它会静默产出一个**偏小的宇宙**）；翻页超上限 ⇒ 抛。
+    **已实测**（P73，2026-09-25 只读抓取两页）：`TYPE=1` 300 行、`TYPE=3` 500 行、
+    `code`/`name` 800/800 非空、两页无交集（去重后 800）⇒ 列名候选键有效、
+    抓取与解析都通；仓内 `tests/fixtures/csi800_rows.json` 就是这一次的名单。
 
-    ⚠️ 列的**真实名字**未在本站逐列实测（P70 只记录了 `WEIGHT`/`INDUSTRY`/
-    `MAXTRADEDATE`），`parse_index_components` 按候选键取；取不到 code ⇒ 行被丢，
-    调用方 `build_universe` 会因「0 行」抛错（**不会静默写出空宇宙**）。
+    **fail-closed**：非末页行数 != page_size ⇒ 抛 `FetchError`（源站截断＝半截名单，
+    比「没有名单」更危险：它会静默产出一个**偏小的宇宙**）；翻页超上限 ⇒ 抛；
+    列名变了 ⇒ `code` 取不到 ⇒ 行被丢，调用方 `build_universe` 因「0 行」抛错
+    （**不会静默写出空宇宙**）。
     """
     out: list[dict] = []
     refs: list[dict] = []
