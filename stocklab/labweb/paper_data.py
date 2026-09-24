@@ -67,12 +67,15 @@ from typing import Mapping
 
 from stocklab.backtest import metrics as bt
 from stocklab.backtest.portfolio import NavPoint
+from stocklab.paper import agent_decide
 from stocklab.paper import agent_spec
 from stocklab.paper import store as paper_store
 from stocklab.paper.config import (ARM_AGENT, ARM_AGENT_RANDOM, ARM_KIND_AGENT,
-                                   ARM_KIND_AGENT_RANDOM, EXECUTOR_KEY,
-                                   PAPER_START_DATE, PREREGISTERED_KEY,
-                                   RULE_CITATIONS, RULE_CITATIONS_AGENT,
+                                   ARM_KIND_AGENT_RANDOM, DECISION_KIND_SPEC,
+                                   EXECUTOR_AGENT_DECISION, EXECUTOR_CHANNEL_A,
+                                   EXECUTOR_KEY, LIVE_KEY, PAPER_START_DATE,
+                                   PREREGISTERED_KEY, RULE_CITATIONS,
+                                   RULE_CITATIONS_AGENT,
                                    RULE_CITATIONS_AGENT_DECISION)
 from stocklab.paper.engine import (INDEX_300_SYMBOL, agent_block, build_report,
                                    live_of)
@@ -310,6 +313,9 @@ def _empty(asof: str, start: str, *, db_missing: bool = False,
             "real_trades_after_start": None, "paper_trades": [],
             "ai": ai or {}, "agent": agent or {},
             "performance": _empty_performance(asof, start=start),
+            # P69 §T4：空库也要有这个键（缺键与「没有 AI 臂」长得一样，不是一回事）。
+            "agent_ops": {"asof": asof, "arms": [], "records": [], "caliber": {},
+                          "notes": []},
             "disclosure": [], "disclaimer": "", "sample_note": ""}
 
 
@@ -587,6 +593,235 @@ def agent_track(conn: sqlite3.Connection, asof: str) -> dict:
     return block
 
 
+def agent_ops(conn: sqlite3.Connection, asof: str, *, accounts: list[dict],
+              arms: list[dict], performance: dict,
+              paper_trades: list[dict]) -> dict:
+    """「**AI 操盘手专节**」的取数（P69 §T4 的三块）。
+
+    | 块 | 回答 | 读数来自 |
+    |---|---|---|
+    | `records` | 逐日：谁产出了什么、成交几笔、当天净值多少、有没有缺决策 | `paper_agent_decisions` ＋ `paper_nav_daily`（`store.load_nav`）＋ `paper_trades` |
+    | `arms` | 每臂：净值 / 累计收益 / 相对大盘 / 相对「不动」/ 回撤 / 持仓 / 成本 / **Δ vs 随机** | **入参** `arms` / `performance`（`track` 已建好的那两块） |
+    | `caliber` | 口径史：哪条臂的口径哪天变过、改成什么 | 账户行的预注册 ＋ `plugin_scripts`/`plugin_audit` ＋ spec 台账 |
+
+    ## 入参为什么是「已建好的」而不是自己再查一遍
+
+    `arms` / `performance` 由 `track` **先**算好再传进来：页面上同一个数只能有一份来源。
+    自己再查一遍 `paper_nav_daily` 会造出第二个「累计收益」——ADR-023 修正段（D-37）就是
+    因为同一页上两个「总收益」差一个常数才被拍板改口径的。所以本函数**一列新口径都不造**：
+    - 净值 / 累计收益 / 回撤 / 成本 / 持仓 / 相对大盘 → 入参 `arms`（= `build_report`）；
+    - 相对「不动」→ 入参 `performance`（`excess_vs_hold`）；
+    - **`delta_vs_random`** → 两条 `cum_return` **相减**（一次减法，与 `excess_vs_hold`
+      同一个形状；不是新指标），随机臂自身写 `None` + 「基准自身」；
+    - 逐日净值 / 累计收益 → `store.load_nav`（**读库里的列**，不重算）；
+    - 决策摘要 → `payload_json` **原样读**（方向 / 标的 / 目标权重 / 理由）；
+    - 成交笔数 → 入参 `paper_trades`（`track` 已按 `date <= asof` 取好）；
+    - 「有没有缺决策」→ `engine.is_trading_day` ＋ 台账有没有那一行（**不新建判据**）；
+    - 通路 A 的版本链 → `plugin_store.list_scripts` / `list_audit` ＋ `script_state`。
+    """
+    ai_accounts = [a for a in accounts if account_params(a)]
+    ai_ids = [str(a["account_id"]) for a in ai_accounts]
+    arm_by_id = {str(a["account_id"]): a for a in arms}
+    #: 相对「不动」在 `performance` 的**顶层**（一次减法，键 = account_id）。
+    hold_excess = performance.get("excess_vs_hold") or {}
+    random_id = ARM_AGENT_RANDOM
+    random_ret = (arm_by_id.get(random_id) or {}).get("cum_return")
+    # 交易日判据每天只算一次（`is_trading_day` 要 load 一遍日历，逐行调会白跑）。
+    trading_cache: dict[str, bool] = {}
+
+    def trading_on(date: str) -> bool:
+        if date not in trading_cache:
+            trading_cache[date] = engine_is_trading_day(conn, date)
+        return trading_cache[date]
+
+    rows: list[dict] = []
+    for account in ai_accounts:
+        aid = str(account["account_id"])
+        nav = paper_store.load_nav(conn, aid, asof=asof)
+        nav_by_date = {str(r["date"]): r for r in nav}
+        decisions = {str(d["asof"]): d for d in agent_decide.load_decisions(conn, aid)}
+        trades_by_date: dict[str, int] = {}
+        for t in paper_trades:
+            if str(t["account_id"]) == aid:
+                trades_by_date[str(t["date"])] = trades_by_date.get(str(t["date"]), 0) + 1
+        live = (arm_by_id.get(aid) or {}).get("live", True)
+        # 「缺决策」只对**台账驱动**的臂成立（`executor=agent_decision`）：通路 A 的
+        # 决策不在 `paper_agent_decisions` 里（它在 m2 通路的池子/预测表）。拿台账那条
+        # 判据去量通路 A 是**口径错配**，会凭空多报一条「缺决策」。
+        ledger_driven = (arm_by_id.get(aid) or {}).get("executor") \
+            == EXECUTOR_AGENT_DECISION
+        for date in sorted({*nav_by_date, *decisions}, reverse=True):
+            if date > asof:
+                continue
+            decision = decisions.get(date)
+            payload = (decision or {}).get("payload") or {}
+            in_flight = bool(live) and date >= str(account["start_date"])
+            missing = (ledger_driven and in_flight and date not in decisions
+                       and trading_on(date))
+            nav_row = nav_by_date.get(date) or {}
+            rows.append({
+                "date": date, "account_id": aid, "live": bool(live),
+                "executor": (arm_by_id.get(aid) or {}).get("executor"),
+                "ledger_driven": ledger_driven,
+                "producer": (None if decision is None else str(decision["model_id"])),
+                "agent_kind": (None if decision is None else str(decision["agent_kind"])),
+                "decision_id": (None if decision is None
+                                else int(decision["decision_id"])),
+                "cash_pct": (None if not payload
+                             else float(payload.get("cash_pct") or 0.0)),
+                "weights": [{"code": str(d["code"]), "side": str(d["side"]),
+                             "target_weight_pct": float(d["target_weight_pct"]),
+                             "reason": str(d.get("reason") or "")}
+                            for d in (payload.get("decisions") or [])],
+                "rationale": str(payload.get("rationale") or ""),
+                "n_trades": trades_by_date.get(date, 0),
+                "nav": nav_row.get("nav"),
+                "cum_return": nav_row.get("cum_return"),
+                "has_nav": date in nav_by_date,
+                # `None` = 这条臂**不适用**台账那条判据（通路 A），不是「没有缺」。
+                # 「不适用」与「缺」写同一种值就是口径错配。
+                "missing_decision": (bool(missing) if ledger_driven else None),
+            })
+
+    table: list[dict] = []
+    for account in ai_accounts:
+        aid = str(account["account_id"])
+        arm = arm_by_id.get(aid) or {}
+        cum = arm.get("cum_return")
+        delta = (None if aid == random_id or cum is None or random_ret is None
+                 else round(cum - random_ret, 6))
+        table.append({
+            "account_id": aid, "arm": arm.get("arm"), "live": arm.get("live", True),
+            "executor": arm.get("executor"), "model_id": arm.get("model_id"),
+            "prompt_sha256": arm.get("prompt_sha256"),
+            "plugin_hooks": arm.get("plugin_hooks") or [],
+            "strategy_version": arm.get("strategy_version"),
+            "nav": arm.get("nav"), "cum_return": cum,
+            "cum_cost": arm.get("cum_cost"), "max_drawdown": arm.get("max_drawdown"),
+            "n_positions": arm.get("n_positions"),
+            "latest_nav_date": arm.get("latest_nav_date"),
+            "excess_vs_index_300": arm.get("excess_vs_index_300"),
+            "excess_vs_hold": hold_excess.get(aid),
+            "delta_vs_random": delta,
+            "delta_vs_random_note": (
+                "基准自身（随机对照臂）" if aid == random_id else
+                (None if delta is not None else
+                 f"差分**不存在**（不是 0）：`{random_id}` 或这条臂还没有累计收益 —— "
+                 f"缺它的时候「选对了」与「多试了几次」分不开（P52 / D-19）")),
+        })
+
+    return {
+        "asof": asof,
+        "arms": table,
+        "records": rows,
+        "caliber": _caliber(conn, ai_accounts, asof),
+        "notes": [
+            "三块都**只读**：净值/盈亏读 `paper_nav_daily` 的列或复用 `build_report`，"
+            "决策摘要读 `payload_json` 原样 —— 本页不重算任何口径、不给它编理由。",
+            "`Δ(AI 臂 − 随机对照)` 是一次**减法**（两个累计收益相减），与「相对大盘」"
+            "「相对不动」同款；它不是新指标，也不是成绩单。",
+            "样本不足 120 交易日 ⇒ 这些数只是**读数**，不能当结论、更不能据此选臂。",
+        ],
+    }
+
+
+def account_params(account: Mapping) -> str | None:
+    """账户行的 `params.executor`（**声明字段**原样读，不做任何推断）。"""
+    return json.loads(account["params_json"] or "{}").get(EXECUTOR_KEY)
+
+
+def engine_is_trading_day(conn: sqlite3.Connection, date: str) -> bool:
+    """`date` 是不是交易日（`engine.is_trading_day` 的布尔化；判不出 ⇒ `False`）。
+
+    「判不出」不当成缺决策：`is_trading_day` 返回 `None` 时这里给 `False`，
+    页面就不会把「日历没覆盖」显示成「那天该有决策却没有」（P56 §2 的原文纪律）。
+    """
+    from stocklab.paper.engine import is_trading_day
+
+    return bool((is_trading_day(conn, date) or {}).get("is_trading_day"))
+
+
+def _caliber(conn: sqlite3.Connection, ai_accounts: list[dict],
+             asof: str) -> dict:
+    """「哪条臂的口径哪天变过、改成什么」（P69 §T4 第三块）。
+
+    三档**并列不合并**，因为它们是三种不同的变更：
+    - `llm_versions`：LLM 臂换模型 / 换提示词 ⇒ **开新版本账户**（D-48），
+      所以「变过」＝账户行的预注册不同（`model_id` / `prompt_sha256`）；
+    - `channel_a_versions`：通路 A 的插桩脚本版本链（`plugin_scripts` ＋
+      `plugin_audit` 的 submit / sandbox_pass / approve）；
+    - `spec_diffs`：`arm-agent` 家族的 spec 台账（`spec_before → spec_after`
+      **逐键对照**）——它是「改纪律数字」，与上面两条不是一回事。
+    """
+    llm: list[dict] = []
+    for account in ai_accounts:
+        aid = str(account["account_id"])
+        params = json.loads(account["params_json"] or "{}")
+        prereg = params.get(PREREGISTERED_KEY) or {}
+        if account_params(account) != EXECUTOR_AGENT_DECISION or not prereg:
+            continue
+        portfolio = agent_decide.portfolio_decisions_only(
+            agent_decide.load_decisions(conn, aid))
+        llm.append({
+            "account_id": aid,
+            "model_id": str(prereg.get("model_id") or ""),
+            "prompt_sha256": str(prereg.get("prompt_sha256") or ""),
+            "created_at": str(account.get("created_at") or ""),
+            "live": live_of(params),
+            "n_decisions": len(portfolio),
+            "first_asof": (str(portfolio[0]["asof"]) if portfolio else None),
+            "last_asof": (str(portfolio[-1]["asof"]) if portfolio else None),
+        })
+    llm.sort(key=lambda r: (r["created_at"], r["account_id"]))
+
+    channel: list[dict] = []
+    for account in ai_accounts:
+        if account_params(account) != EXECUTOR_CHANNEL_A:
+            continue
+        aid = str(account["account_id"])
+        params = json.loads(account["params_json"] or "{}")
+        for hook in (params.get("plugin_hooks") or []):
+            versions = []
+            for s in plugin_store.list_scripts(conn, plugin_id=str(hook)):
+                sid = int(s["script_id"])
+                versions.append({
+                    "script_id": sid, "version": str(s["version"]),
+                    "created_at": str(s["created_at"]),
+                    "note": str(s["note"] or ""),
+                    "state": plugin_lifecycle.script_state(conn, sid),
+                    "events": [{"action": str(e["action"]), "actor": str(e["actor"]),
+                                "reason": str(e["reason"] or ""),
+                                "created_at": str(e["created_at"])}
+                               for e in plugin_store.list_audit(conn, script_id=sid)],
+                })
+            channel.append({"account_id": aid, "hook": str(hook),
+                            "strategy_version": params.get("strategy_version"),
+                            "active_script_id": plugin_lifecycle.active_script_id(
+                                conn, str(hook)),
+                            "versions": versions})
+
+    spec_diffs: list[dict] = []
+    for account in ai_accounts:
+        aid = str(account["account_id"])
+        for d in agent_decide.load_decisions(conn, aid):
+            if str(d.get("decision_kind") or "") != DECISION_KIND_SPEC:
+                continue
+            before, after = d.get("spec_before") or {}, d.get("spec_after") or {}
+            changes = [{"key": k, "before": before.get(k), "after": after.get(k)}
+                       for k in sorted({*before, *after})
+                       if before.get(k) != after.get(k)]
+            spec_diffs.append({
+                "account_id": aid, "asof": str(d["asof"]),
+                "decision_id": int(d["decision_id"]),
+                "agent_kind": str(d["agent_kind"]), "model_id": str(d["model_id"]),
+                "changes": changes, "rationale": str(d.get("rationale") or ""),
+            })
+    spec_diffs.sort(key=lambda r: (r["asof"], r["account_id"]))
+
+    return {"llm_versions": llm, "channel_a_versions": channel,
+            "spec_diffs": spec_diffs}
+
+
 def track(conn: sqlite3.Connection, asof: str) -> dict:
     """对照页的全部取数。同一库 + 同一 asof → 同一结果（不含生成时刻）。"""
     accounts = paper_store.load_accounts(conn)
@@ -679,6 +914,8 @@ def track(conn: sqlite3.Connection, asof: str) -> dict:
     }
 
     real_trades = _real_trades(conn, asof)
+    paper_trades = _paper_trades(conn, asof)
+    perf = performance(conn, asof)
     return {
         "asof": asof, "available": True, "db_missing": False,
         "start_date": start, "date": display_date,
@@ -693,10 +930,14 @@ def track(conn: sqlite3.Connection, asof: str) -> dict:
         "real_trades": real_trades,
         "real_trades_after_start": sum(1 for t in real_trades
                                        if str(t["date"]) > start),
-        "paper_trades": _paper_trades(conn, asof),
+        "paper_trades": paper_trades,
         "ai": ai,
         "agent": agent,
-        "performance": performance(conn, asof),
+        "performance": perf,
+        # P69 §T4：AI 操盘手专节。**吃的就是上面这几块已经算好的东西** ——
+        # 再查一遍库里同样的列会在同一页造出第二个「累计收益」（ADR-023 D-37）。
+        "agent_ops": agent_ops(conn, asof, accounts=accounts, arms=arms,
+                              performance=perf, paper_trades=paper_trades),
         "disclosure": list(report.get("disclosure") or []),
         "disclaimer": report.get("disclaimer", ""),
         "sample_note": report.get("sample_note", ""),

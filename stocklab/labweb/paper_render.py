@@ -18,9 +18,19 @@
 
 我 = accent 深蓝实线（最粗）；什么都不做 = 灰虚线；AI 三档 = 绿 / 琥珀 / 青
 （同一规则、不同参数，色相分开是为了在图上分得清，**不是**区分好坏）；
-智能体臂 = 紫（`arm-agent` 实线、`arm-agent-random` 同色虚线 —— **同护栏、同成本、
-同候选池**的对照臂，线型分开只是为了让两条叠在一起的线还认得出）；
-大盘 = 深灰点线。颜色不是唯一信号：图下每条线都有色块 + 文字 + 最新值。
+**AI 操盘手家族 = 紫**（P69 §T3：家族按**前缀** `arm-agent*` 纳入，不列举 id）——
+家族内靠**线型**分档：LLM 臂实线、随机对照虚线、通路 A 点线；
+`params.live=false`（已停飞）一律灰线。大盘 = 深灰点线。
+颜色不是唯一信号：图下每条线都有色块 + 文字 + 最新值。
+
+## 「智能体臂」与「AI 操盘手」两节
+
+- 「智能体臂（P52）」答的是**台账那一侧**：当前 spec、试错计数、复现性
+  （`paper.engine.agent_block`，与 `paper show` 同源）。
+- 「AI 操盘手」（P69 §T4）答的是用户问的那三件事：**操盘记录 / 盈利净值 / 口径史**。
+  三块的数都从 `paper_data.track` 已经算好的 `arms` / `performance` /
+  `paper_agent_decisions` 拿（见 `paper_data.agent_ops` 的 docstring）——
+  一列新口径都不造，同一个数在页面上只有一个来源。
 
 ## 「智能体臂」这一节
 
@@ -485,9 +495,10 @@ def _why(data: Mapping) -> list[str]:
         '「AI 纪律臂」= <code>arm-discipline-05/10/15</code>：三条<b>同一套写死条文</b>的账户',
         '（止损 + 单票 ≤40% + ETF 分散），只差「ETF 目标占比」这一个数 —— '
         '单变量对照，<b>不含任何模型方向预测</b>。',
-        '「AI 操盘手」= <code>arm-agent</code>：<b>每交易日一条决策</b>'
+        '「AI 操盘手」= <code>arm-agent*</code> 家族（P69 起按 `params.executor` 分档，'
+        '见本页「AI 操盘手」专节）：<b>每交易日一条决策</b>'
         '（方向 ＋ 仓位 ＋ 池内选标的），落在 <code>paper_agent_decisions</code>；'
-        '<code>arm-agent-random</code> 是它的随机对照 —— <b>同护栏、同成本、同候选池</b>，'
+        '<code>arm-agent-random</code> 是随机对照 —— <b>同护栏、同成本、同候选池</b>，'
         '只是标的与权重随机抽。两条都<b>不用模型做方向预测</b>：载荷在项目外产出，'
         '本页只报「按台账执行了几笔」。',
         f'「相对我」= 该线累计收益 − 我（<code>{esc(data.get("now_account_id"))}</code>）'
@@ -950,6 +961,262 @@ def ai_block(ev: Mapping) -> str:
         label="查看详细：产出清单与消费明细")
 
 
+# ---------- AI 操盘手专节（P69 / T4） ----------
+
+#: 权重的方向 → 人话。**只换标签**，权重数字原样来自台账载荷。
+_SIDE_LABELS = {"buy": "买", "sell": "卖", "hold": "不动"}
+
+
+def _side_label(side: Any) -> str:
+    return _SIDE_LABELS.get(str(side), str(side))
+
+
+def _weights_line(weights: Sequence[Mapping]) -> str:
+    """决策载荷里的标的 → 一行（方向 ＋ 代码 ＋ 目标权重%）。"""
+    if not weights:
+        return '<span class="mut">（没有标的）</span>'
+    return "、".join(
+        f'{_side_label(w.get("side"))} <code>{esc(str(w.get("code")))}</code> '
+        f'{num(w.get("target_weight_pct"), 2)}%' for w in weights)
+
+
+def _ops_arms_table(ops: Mapping) -> str:
+    """「盈利 / 净值」表：每臂一行（**数字全部来自 `track` 已算好的 `arms`**）。"""
+    rows = ops.get("arms") or []
+    if not rows:
+        return '<p class="note">没有 `params.executor` 非空的账户 —— 现在没有在跑的 AI 臂。</p>'
+    head = ("<tr><th>臂</th><th>净值</th><th>累计收益</th><th>相对大盘</th>"
+            "<th>相对「不动」</th><th>最大回撤</th><th>持仓</th><th>累计成本</th>"
+            "<th>Δ vs 随机</th></tr>")
+    body = []
+    for a in rows:
+        color, dash, _ = arm_style(a)
+        note = f'<div class="note"><code>{esc(str(a["account_id"]))}</code>'
+        if a.get("model_id"):
+            note += f'　模型 <code>{esc(str(a["model_id"]))}</code>'
+        if a.get("latest_nav_date") and a["latest_nav_date"] != ops.get("asof"):
+            note += (f'　<span class="s-warn">当日无净值；最后一行 '
+                     f'{esc(str(a["latest_nav_date"]))}</span>')
+        note += "</div>"
+        d = a.get("delta_vs_random")
+        if d is None:
+            delta_html = (f'<span class="mut">{rich(str(a.get("delta_vs_random_note") or ""))}</span>'
+                          if str(a["account_id"]) == ARM_AGENT_RANDOM
+                          else f'<span class="s-warn">{UNKNOWN}</span>')
+        else:
+            delta_html = f'<span class="{sign_cls(d)}">{ratio_pct(d)}</span>'
+        body.append(
+            f'<tr><td class="l">{_swatch(color, dash)}'
+            f'<b>{esc(arm_label(a))}</b>{note}</td>'
+            f'<td class="num">{money(a.get("nav"))}</td>'
+            f'<td class="num {sign_cls(a.get("cum_return"))}">'
+            f'{ratio_pct(a.get("cum_return"))}</td>'
+            f'<td class="num">{ratio_pct(a.get("excess_vs_index_300"))}</td>'
+            f'<td class="num">{ratio_pct(a.get("excess_vs_hold"))}</td>'
+            f'<td class="num">{ratio_pct(a.get("max_drawdown"))}</td>'
+            f'<td class="num">{_count(a.get("n_positions"))}</td>'
+            f'<td class="num">{money(a.get("cum_cost"))}</td>'
+            f'<td class="num">{delta_html}</td></tr>')
+    return (f'<div class="scroll-x"><table class="tbl">{head}{"".join(body)}</table></div>'
+            + '<p class="note">数字**全部**来自 `paper.engine.build_report`（同一份实现），'
+              '本页不重算；「相对大盘 / 相对不动 / Δ vs 随机」都是**一次减法**。'
+              '`Δ` 为 `未知` = 那条臂或随机对照还没有累计收益 ⇒ **差分不存在，不是 0**。</p>')
+
+
+def _decision_state_cell(row: Mapping) -> str:
+    """「今天有没有决策」一格。四种状态**开头就不同形**（P56 §2 的既有纪律）。"""
+    if row.get("ledger_driven") is False:
+        return '<span class="mut">不适用</span><div class="note">该臂的决策不走台账</div>'
+    if row.get("decision_id") is not None:
+        return '<span class="mut">有决策</span>'
+    if row.get("missing_decision"):
+        return '<span class="s-warn">**缺决策**</span><div class="note">交易日没决定</div>'
+    return ('<span class="mut">无决策</span>'
+            '<div class="note">非交易日或该臂还没起跑</div>')
+
+
+def _ops_records_table(ops: Mapping) -> str:
+    """「操盘记录」表：逐日一行（台账 ＋ 当日成交 ＋ 当日净值）。"""
+    rows = ops.get("records") or []
+    if not rows:
+        return ('<p class="note">AI 臂的台账与净值都还是空的 —— '
+                '**不是「没亏损」**，是还没有记录。</p>')
+    label_of = {str(a["account_id"]): a for a in (ops.get("arms") or [])}
+    head = ("<tr><th>日期</th><th>臂</th><th>产出者</th><th>决策摘要</th>"
+            "<th>成交</th><th>净值</th><th>累计收益</th><th>决策</th></tr>")
+    body = []
+    for r in rows:
+        aid = str(r["account_id"])
+        arm = label_of.get(aid) or {"account_id": aid,
+                                    "arm": None, "live": r.get("live", True)}
+        producer = (f'<code>{esc(str(r["producer"]))}</code>'
+                    if r.get("producer") else '<span class="mut">—</span>')
+        body.append(
+            f'<tr><td>{esc(str(r["date"]))}</td>'
+            f'<td class="l"><b>{esc(arm_label(arm))}</b>'
+            f'<div class="note"><code>{esc(aid)}</code></div></td>'
+            f'<td>{producer}</td>'
+            f'<td class="l">{_weights_line(r.get("weights") or [])}</td>'
+            f'<td class="num">{_count(r.get("n_trades"))}</td>'
+            f'<td class="num">{money(r.get("nav"))}</td>'
+            f'<td class="num {sign_cls(r.get("cum_return"))}">'
+            f'{ratio_pct(r.get("cum_return"))}</td>'
+            f'<td>{_decision_state_cell(r)}</td></tr>')
+    detail = []
+    for r in rows:
+        if not r.get("weights") and not r.get("rationale"):
+            continue
+        items = "".join(
+            f'<li><code>{esc(str(w["code"]))}</code> · {_side_label(w.get("side"))} · '
+            f'目标 {num(w.get("target_weight_pct"), 2)}%　'
+            f'{rich(str(w.get("reason") or ""))}</li>' for w in (r.get("weights") or []))
+        detail.append(
+            f'<p class="note"><b>{esc(str(r["date"]))}　{esc(str(r["account_id"]))}</b>'
+            + (f'　现金 {num(r.get("cash_pct"), 2)}%' if r.get("cash_pct") is not None else "")
+            + '</p>'
+            + (f'<p class="note">{rich(str(r["rationale"]))}</p>' if r.get("rationale") else "")
+            + (f'<ul class="list">{items}</ul>' if items else ""))
+    return (f'<div class="scroll-x"><table class="tbl">{head}{"".join(body)}</table></div>'
+            + more("".join(detail), label="展开：逐条决策原文（方向 / 标的 / 目标权重 / 理由）")
+            + '<p class="note">「产出者」是台账里的 `model_id` **原样字面量**'
+              '（随机对照臂是 `random-control`，它不是模型）。'
+              '成交笔数是**当日由这条决策执行出来的**笔数 ——'
+              '「有决策但一笔没成交」与「没有决策」不是一件事。</p>')
+
+
+def _caliber_llm_table(cal: Mapping) -> str:
+    rows = cal.get("llm_versions") or []
+    if not rows:
+        return '<p class="note">没有任何**预注册**的 LLM 版本账户（`D-48`）。</p>'
+    head = ("<tr><th>账户</th><th>model_id（原样字面量）</th><th>prompt_sha256</th>"
+            "<th>建账时刻</th><th>状态</th><th>决策数</th><th>首 / 末决策日</th></tr>")
+    body = "".join(
+        f'<tr><td class="l"><code>{esc(r["account_id"])}</code></td>'
+        f'<td><code>{esc(r["model_id"])}</code></td>'
+        f'<td><code>{esc(r["prompt_sha256"][:12])}</code></td>'
+        f'<td>{esc(r["created_at"][:19])}</td>'
+        f'<td>{esc("在飞" if r["live"] else HALTED_LABEL)}</td>'
+        f'<td class="num">{int(r["n_decisions"])}</td>'
+        f'<td>{esc(str(r["first_asof"] or "—"))} ~ {esc(str(r["last_asof"] or "—"))}</td></tr>'
+        for r in rows)
+    return (f'<div class="scroll-x"><table class="tbl">{head}{body}</table></div>'
+            + '<p class="note">换模型 / 换提示词 = **开新版本账户**（D-48），'
+              '所以「哪天变过口径」在这一列上看得见；旧账户**保留不删**、台账不重写 ——'
+              '这条纪律只挡一件事：换到好看为止。</p>')
+
+
+def _caliber_channel_table(cal: Mapping) -> str:
+    chains = cal.get("channel_a_versions") or []
+    if not chains:
+        return '<p class="note">没有通路 A 的账户（`params.executor = m2_channel_a`）。</p>'
+    blocks = []
+    for ch in chains:
+        active = ch.get("active_script_id")
+        head = ("<tr><th>脚本</th><th>版本</th><th>状态</th><th>入库时刻</th>"
+                "<th>备注</th><th>审核链（submit / sandbox / approve）</th></tr>")
+        body = []
+        for v in ch.get("versions") or []:
+            mark = " <b>（现行）</b>" if v["script_id"] == active else ""
+            events = "、".join(
+                f'{esc(e["action"])}@{esc(e["created_at"][:10])}'
+                + (f'（{esc(e["actor"])}）' if e.get("actor") else "")
+                for e in (v.get("events") or [])) or '<span class="mut">没有审核事件</span>'
+            body.append(
+                f'<tr><td class="num">{int(v["script_id"])}{mark}</td>'
+                f'<td><code>{esc(v["version"])}</code></td>'
+                f'<td>{esc(v["state"])}</td>'
+                f'<td>{esc(v["created_at"][:19])}</td>'
+                f'<td class="l">{esc(v["note"])}</td>'
+                f'<td class="l">{events}</td></tr>')
+        blocks.append(
+            f'<p class="note"><code>{esc(ch["account_id"])}</code> 的插桩 '
+            f'<code>{esc(ch["hook"])}</code>（策略版本 '
+            f'<code>{esc(str(ch.get("strategy_version") or "未声明"))}</code>，'
+            f'现行 script id = <code>{esc(str(active))}</code>）：</p>'
+            f'<div class="scroll-x"><table class="tbl">{head}{"".join(body)}</table></div>')
+    return "".join(blocks) + (
+        '<p class="note">现行版本走 `plugin.lifecycle.active_script_id`'
+        '（与打分内核**同一个函数**）—— 页面不自己判断哪版生效。</p>')
+
+
+def _caliber_spec_table(cal: Mapping) -> str:
+    rows = cal.get("spec_diffs") or []
+    if not rows:
+        return ('<p class="note">spec 台账里还没有任何一行 ——'
+                '`arm-agent` 家族的 spec 由人手写或人工复核后落库，'
+                '它不是模型自动改的（D-34 起这条臂也不再用 spec 下单）。</p>')
+    head = ("<tr><th>@asof</th><th>账户</th><th>来源</th><th>改了哪几个键</th>"
+            "<th>为什么改</th></tr>")
+    body = []
+    for r in rows:
+        changes = "、".join(
+            f'<code>{esc(c["key"])}</code> {esc(str(c["before"]))} → '
+            f'<b>{esc(str(c["after"]))}</b>' for c in (r.get("changes") or [])) \
+            or '<span class="mut">（逐键相同）</span>'
+        body.append(
+            f'<tr><td>{esc(r["asof"])}</td>'
+            f'<td><code>{esc(r["account_id"])}</code></td>'
+            f'<td><code>{esc(r["agent_kind"])}</code> / '
+            f'<code>{esc(r["model_id"])}</code></td>'
+            f'<td class="l">{changes}</td>'
+            f'<td class="l">{esc(r["rationale"] or "（未写理由）")}</td></tr>')
+    return (f'<div class="scroll-x"><table class="tbl">{head}{"".join(body)}</table></div>'
+            + '<p class="note">只做 `spec_before → spec_after` 的**逐键对照**，'
+              '不重算、不改值。</p>')
+
+
+def ai_operator_block(data: Mapping) -> str:
+    """「AI 操盘手」专节（P69 §T4）：**操盘记录 / 盈利净值 / 口径史** 三块。
+
+    三块回答的是用户那句话的三半 ——
+    「看不到模拟操盘记录」「看不到盈利」「看不到策略调整」。
+
+    首屏只放读数（谁在跑、跑了几天、赚了多少、Δ vs 随机），细节进 `more()`：
+    本页**不做排名、不给买卖建议、不推荐某一条臂**（`paper/config.py` 的禁令词
+    用例把这一段一起扫）。
+    """
+    ops = data.get("agent_ops") or {}
+    if not ops:
+        return '<p class="note">这一段没取到数据 —— 本页不编数。</p>'
+    arms = ops.get("arms") or []
+    records = ops.get("records") or []
+    live = [a for a in arms if a.get("live", True)]
+    with_decision = sum(1 for r in records if r.get("decision_id") is not None)
+    missing = sum(1 for r in records if r.get("missing_decision"))
+
+    lines = [
+        f'**谁在跑**：{len(live)} 条在飞（'
+        + ("、".join(f'<b>{esc(arm_label(a))}</b>' for a in live) or "<span class=\"s-warn\">一条都没有</span>")
+        + f'）'
+        + (f'；另有 {len(arms) - len(live)} 条{HALTED_LABEL}' if len(arms) > len(live)
+           else ""),
+        f'**跑了多少**：台账里 {esc(with_decision)} 条决策（下表的「操盘记录」逐日一行）；'
+        f'其中 {esc(missing)} 天是**缺决策**（交易日没决定，不是「决定不动手」）。',
+        '**赚了多少**：见下表 —— 净值与累计收益**原样读库**，'
+        'Δ(AI − 随机对照) 是一次减法；**样本远不足 120 交易日 ⇒ 只是读数，不是结论**。',
+    ]
+    gate = ((data.get("performance") or {}).get("sample_gate") or {})
+    if gate and not gate.get("meets", True):
+        lines.append(f'样本门禁：`{esc(gate.get("label"))}`'
+                     f'（{esc(gate.get("n_sessions"))} / {esc(gate.get("threshold"))} 个交易日）'
+                     f'—— 不据此选臂、不改口径。')
+
+    return (glance_html(lines)
+            + section("操盘记录（逐日：谁产出了什么、成交几笔）",
+                      _ops_records_table(ops),
+                      right="台账 append-only，不截断")
+            + section("盈利 / 净值（每臂一行）", _ops_arms_table(ops),
+                      right="净值读库里的列，不重算")
+            + section("策略调整史（口径哪天变过）",
+                      glance([HALTED_LABEL + "的臂仍列在此处：历史口径保留，"
+                              "只是不再认领日终。"]),
+                      detail=more(_caliber_llm_table(ops.get("caliber") or {})
+                                  + _caliber_channel_table(ops.get("caliber") or {})
+                                  + _caliber_spec_table(ops.get("caliber") or {}),
+                                  label="查看详细：LLM 版本 / 通路 A 插桩版本 / spec 台账"),
+                      right="换模型 = 开新版本账户"))
+
+
 # ---------- 绩效对比（模块2 §4） ----------
 
 #: 「已算出的比率」与「一个比值」两种数在页面上不能长得一样：
@@ -1095,6 +1362,7 @@ def _empty_body(data: Mapping) -> str:
               right="并列，不排名；缺数据写「不可比」")
     + section("智能体臂（P52）：AI 操盘手", agent_arm_block(data),
               right="台账里的决策，不是模型信号")
+    + ai_operator_block(data)
     + section("绩效对比（模块2 §4）", performance_block(data.get("performance") or {}),
               right="五个指标 + 样本量门禁")
     + section("AI 自己编排的东西，用上了没有", ai_block(data.get("ai") or {}),
@@ -1159,6 +1427,7 @@ def paper_page(data: Mapping, *, base: str, built_at: str) -> str:
                 right="并列，不排名；缺数据写「不可比」"),
         section("智能体臂（P52）：AI 操盘手", agent_arm_block(data),
                 right="台账里的决策，不是模型信号"),
+        ai_operator_block(data),
         section("绩效对比（模块2 §4）",
                 performance_block(data.get("performance") or {}),
                 right="五个指标 + 样本量门禁"),
