@@ -53,11 +53,18 @@ class RunResult:
 
 @dataclass(frozen=True)
 class PipelineResult:
-    """打分内核的产物。**只读** —— 不含任何落库副作用。"""
+    """打分内核的产物。**只读** —— 不含任何落库副作用。
+
+    `eligible`：每池在 `select_top` **截断之前**的合格 code（升序）。
+    `members` 已经是「前 N 只」，截断前的集合在别处拿不到，而横截面实验的
+    对照臂（持有集合 = 池内全部合格标的）需要它。这是**只增字段**：
+    `members` / `rejects` / `params` 的取值与顺序一字未变。
+    """
 
     members: list
     rejects: list
     params: dict
+    eligible: dict[str, list[str]] = field(default_factory=dict)
 
 
 def _hydrate(loaded: dict) -> tuple[list[snapshot.MemberRow], list[snapshot.RejectRow]]:
@@ -170,11 +177,14 @@ def score_pipeline(conn: sqlite3.Connection, *, asof: str,
                 "risk_json": json.dumps(
                     [*industry["risk_note"], *risks], ensure_ascii=False)})
 
+    eligible = {p: sorted(r["code"] for r in scored[p])
+                for p in pools.ALL_POOLS}
     for pool in pools.ALL_POOLS:
         for row in pools.select_top(scored[pool], pool):
             members.append(snapshot.MemberRow(**row))
 
     return PipelineResult(members=members, rejects=rejects,
+                          eligible=eligible,
                           params={"seed_count": len(SEED_UNIVERSE),
                                   "topn": dict(pools.POOL_TOPN)})
 

@@ -35,6 +35,7 @@
 from __future__ import annotations
 
 import sqlite3
+from typing import Mapping, Sequence
 
 from stocklab.backtest.portfolio import BoardUnknown, LIMIT_BY_BOARD, LIMIT_TOLERANCE
 from stocklab.config.costs import CostModel
@@ -64,12 +65,35 @@ def rebalance_dates(trading_days: list[str], *, period: int, start: str,
     return [d for d in out if d <= end]
 
 
-def _board_of(conn: sqlite3.Connection, code: str) -> str:
-    row = conn.execute("SELECT board FROM instruments WHERE code = ?",
+def _instrument(conn: sqlite3.Connection, code: str) -> tuple[str, str]:
+    """`(board, asset_type)` —— 一次查询取齐两项口径，避免逐项各查一次。"""
+    row = conn.execute("SELECT board, type FROM instruments WHERE code = ?",
                        (code,)).fetchone()
     if row is None:
         raise BoardUnknown(f"{code} 不在 instruments 表里，无法判定板别")
-    return str(row["board"])
+    return str(row["board"]), str(row["type"])
+
+
+def _board_of(conn: sqlite3.Connection, code: str) -> str:
+    return _instrument(conn, code)[0]
+
+
+def _costs_for(conn: sqlite3.Connection, code: str,
+               costs: CostModel | None) -> CostModel:
+    """该标的的 `CostModel`。
+
+    调用方**显式**传了 `costs`（含「压零成本」的测试）→ 一律用它，不做口径分支。
+    未传（`None`）→ 按 `instruments.type` **逐标的**取口径（ADR-008 / 设计稿 §Q4）。
+
+    为什么必须逐标的：原来无条件用单一 stock 口径，理由是「ETF 只 4/21 且不进
+    短期动量池」；横截面实验把持有集合换成「池内全部合格标的」后，ETF 可能真的
+    进池，该理由不再成立，多扣的印花税/过户费就不再是「Δ 两端抵消」的中性项。
+    `CostModel` 对未知口径抛 `ValueError`（`config/costs.py:69-74`）—— 保留，
+    不降级成「默认股票成本」：口径错的方向是让回测好看，必须响。
+    """
+    if costs is not None:
+        return costs
+    return CostModel(asset_class=_instrument(conn, code)[1])
 
 
 def _limit_hit(prev_close: float, close: float, board: str) -> str | None:
@@ -85,11 +109,51 @@ def _limit_hit(prev_close: float, close: float, board: str) -> str | None:
     return None
 
 
-def _close_on(conn: sqlite3.Connection, code: str, date: str) -> float | None:
+def _close_dated(conn: sqlite3.Connection, code: str,
+                 date: str) -> tuple[str, float] | None:
+    """`(该收盘价实际所属的日期, 收盘价)`。取不到返回 `None`。
+
+    返回**真实日期**而不是查询用的日期，是为了让价格侧 PIT 守卫
+    （`guard_pit_prices`）能看见「这个价到底属于哪一天」，而不是自证。
+    """
     row = conn.execute(
-        "SELECT close FROM bars_daily WHERE code = ? AND date = ?",
+        "SELECT date, close FROM bars_daily WHERE code = ? AND date = ?",
         (code, date)).fetchone()
-    return None if row is None else float(row["close"])
+    if row is None:
+        return None
+    return str(row["date"]), float(row["close"])
+
+
+def _close_on(conn: sqlite3.Connection, code: str, date: str) -> float | None:
+    got = _close_dated(conn, code, date)
+    return None if got is None else got[1]
+
+
+def guard_pit_prices(*, asof: str,
+                     rows: Mapping[str, tuple[str, float] | None]) -> None:
+    """价格侧 PIT 守卫：决策日 `asof` 用到的价只能来自 ≤ `asof` 的 bar。
+
+    硬约束 5 / 设计稿 §Q3 的落法：把 `_close_on` 的取值包装成
+    `paper.engine.pit_close` 已经在用的那个 `Price(price_asof=...)` 形状，
+    再调 `paper.rules.check_no_lookahead` —— **复用同一个函数**，不另写一份守卫
+    （`m2/context.py:251` 也是同一个函数在两个入口各跑一遍）。
+
+    这里传的是**bar 的真实日期**（`_close_dated` 的返回），所以守卫不是自证：
+    若将来有人把 `_close_dated` 改成取「下一根」或 `>= date`，守卫立刻抛
+    `LookaheadError`。缺失（`None`）的标的不进 marks —— 缺价是「不可交易」，
+    不是「用了未来价」。
+    """
+    from stocklab.paper.rules import check_no_lookahead
+    from stocklab.portfolio.prices import Price
+
+    marks: dict[str, Price] = {}
+    for code, got in rows.items():
+        if got is None:
+            continue
+        d, px = got
+        marks[code] = Price(code=code, price=px, source="bars",
+                            price_asof=d, detail=d)
+    check_no_lookahead(asof, marks)
 
 
 def _prev_close(conn: sqlite3.Connection, code: str, date: str) -> float | None:
@@ -113,6 +177,7 @@ def _qty_for(px: float) -> int:
 def period_returns(conn: sqlite3.Connection, *, asof_dates: list[str],
                    pool: str, plugin_overrides: dict[str, int] | None = None,
                    costs: CostModel | None = None,
+                   hold_override: Mapping[str, Sequence[str]] | None = None,
                    _pools_for_test: dict[str, list[str]] | None = None
                    ) -> list[float]:
     """逐周期收益序列（每个调仓周期一个观测）。
@@ -143,31 +208,50 @@ def period_returns(conn: sqlite3.Connection, *, asof_dates: list[str],
     `_pools_for_test`：**测试接缝**，`{调仓日: [code, ...]}`。生产路径不传，
     此时池成员由 `score_pipeline` 现算。接缝只控制**池成员**；调仓日序列
     一律由 `asof_dates` 参数传入，两者职责不混。
+
+    ## `hold_override`（P60 横截面实验的**唯一**产品参数）
+
+    `{调仓日: [code, ...]}` —— **显式指定**每个调仓日的持有集合，给了就**只**用它
+    （不再调 `score_pipeline`）。缺省 `None` ⇒ **逐位走现状**（与加这个参数之前
+    完全相同的代码路径），所以既有调用方的结果逐位不变。
+
+    为什么是 `{日期: [code,...]}` 而不是一个扁平的 `list[str]`：对照臂是「该池
+    **全部合格标的**」，这个集合**逐调仓日不同**（合格与否取决于当日已公告的
+    财报与 K 线）。扁平列表无法表达「d0 的合格集 ≠ d1 的合格集」，而两者不等
+    正是成本项（调仓账单）的来源 —— 传同一个集合会让两期持仓恒等 ⇒ 换手恒为 0
+    ⇒ **成本被悄悄抹掉**。
+
+    与 `_pools_for_test` **同时**传 → 抛 `ValueError`：两条路都声称自己决定池成员，
+    静默取其一就会得到一个「说不清用哪套成员」的读数。生产路径两个都不传。
     """
+    if hold_override is not None and _pools_for_test is not None:
+        raise ValueError(
+            "hold_override 与 _pools_for_test 不能同时传 —— 两者都决定持有集合，"
+            "静默取其一会让读数说不清用的是哪一套成员")
     effective_dates = list(asof_dates)
 
     if len(effective_dates) < 2:
         return []
 
     # ADR-008 记：ETF 与 stock 印花税/过户费口径不同，混用会算错成本方向。
-    # 这里保留**单一 stock 口径 CostModel**（默认 `CostModel()`），理由如下：
-    # 1) 本函数只跑一次，两版本调用两次；由于两次都用同一 `costs`，Δ 抵消
-    #    了绝对成本水平——即使把 ETF 按 stock 费率计（多算了印花税/过户费），
-    #    这多算的部分在 candidate 与 baseline 上完全相同，对 Δ 无影响；
-    # 2) `benchmark_excess` 打印的是相对基准的**报告数**，不进 verdict；
-    #    此时 stock 口径给 ETF 略高的成本，会让「候选/基线相对基准的超额」
-    #    略小一点点——方向偏保守，不会让一个真实劣于基准的池看起来好；
-    # 3) 逐标的按 `instruments.type` 选口径需要在费用循环里读库；本模块的
-    #    调用频率是 O(N_periods × N_pool) ≈ 每次沙盒回放几千次，值得记
-    #    这笔账，但目前 SEED_UNIVERSE 里 ETF 只 4/21，且都不参与短期动量池
-    #    的实际选中（见 `stocklab.candidate.seeds` 注释），保守单口径是
-    #    「简单且不会撬动结论」的合理默认。如果将来把 ETF 作为分散工具真的
-    #    大量入池，应改为逐标的按 `asset_class` 取 CostModel（见 ADR-008）。
-    costs = costs or CostModel()
+    #
+    # P60 之前本函数无条件用**单一 stock 口径**（`CostModel()`），当时的理由之三是
+    # 「SEED_UNIVERSE 里 ETF 只 4/21，且都不参与短期动量池的实际选中」。
+    # 横截面实验（持有集合 = 池内**全部合格标的**）把这条理由作废了 ⇒ 默认改为
+    # **逐标的按 `instruments.type` 取口径**（`_costs_for`）。前两条理由（Δ 两端
+    # 同口径 ⇒ 绝对水平抵消；方向保守）在新口径下**依然成立**，只是不再需要它们
+    # 兜底：两臂仍用同一套口径，所以 Δ 仍是单变量比较。
+    #
+    # 调用方显式传 `costs`（如「压零成本」的测试）时不做口径分支，一律用它 ——
+    # 否则「显式指定」会被静默覆盖成按标的取。
+    base_slippage_bps = (costs.slippage_bps if costs is not None
+                         else CostModel().slippage_bps)
 
     from stocklab.candidate.run import score_pipeline  # 延迟 import，避免环
 
     def _members_on(day: str) -> list[str]:
+        if hold_override is not None:
+            return sorted(set(hold_override.get(day, ())))
         if _pools_for_test is not None:
             return list(_pools_for_test.get(day, []))
         res = score_pipeline(conn, asof=day, plugin_overrides=plugin_overrides)
@@ -184,8 +268,13 @@ def period_returns(conn: sqlite3.Connection, *, asof_dates: list[str],
         # 每只 c ∈ hold 需要通过 d0 的可交易性检查：涨停买不进的标的等价于
         # 「无法在 d0 建仓 → [d0,d1] 期间不持有它 → 不产生该只的收益」。
         # `hold - tradable_at_d0` 的部分等价于持现金（该只贡献 0，但仍摊薄 n）。
-        p0 = {c: _close_on(conn, c, d0) for c in set(hold) | set(nxt)}
-        p1 = {c: _close_on(conn, c, d1) for c in set(hold) | set(nxt)}
+        codes = set(hold) | set(nxt)
+        p0_rows = {c: _close_dated(conn, c, d0) for c in codes}
+        p0 = {c: (g[1] if g is not None else None) for c, g in p0_rows.items()}
+        p1 = {c: _close_on(conn, c, d1) for c in codes}
+        # 价格侧 PIT 守卫（硬约束 5）：**决策日** d0 用的价只能属于 ≤ d0 的 bar。
+        # d1 的价属于结算日，本身合法，所以只在 d0 这一侧设卡。
+        guard_pit_prices(asof=d0, rows=p0_rows)
 
         # 计算 d0 的可交易过滤（涨停不可买 → 该只从 hold 剔除，不进 gross）
         tradable_hold: list[str] = []
@@ -230,7 +319,8 @@ def period_returns(conn: sqlite3.Connection, *, asof_dates: list[str],
             if _limit_hit(prev if prev is not None else px, px, board) == "down":
                 continue  # d1 跌停卖不出（免费用）
             qty = _qty_for(px)
-            fee_ratio += costs.fees("sell", px, qty) / (px * qty) / n_hold
+            fee_ratio += (_costs_for(conn, c, costs).fees("sell", px, qty)
+                          / (px * qty) / n_hold)
             n_filled += 1
 
         for c in new:
@@ -242,14 +332,16 @@ def period_returns(conn: sqlite3.Connection, *, asof_dates: list[str],
             if _limit_hit(prev if prev is not None else px, px, board) == "up":
                 continue  # d1 涨停买不进（免费用，且该只不会进下一期 gross）
             qty = _qty_for(px)
-            fee_ratio += costs.fees("buy", px, qty) / (px * qty) / n_hold
+            fee_ratio += (_costs_for(conn, c, costs).fees("buy", px, qty)
+                          / (px * qty) / n_hold)
             n_filled += 1
 
         # 滑点（ADR-017 D-14）：铁律 4 要求滑点必须进净值曲线。
         # 等权下每只占 1/n_hold，所以一条腿的滑点 = slippage_bps × (1/n_hold)。
         # 旧实现把 `costs.total()` 的第一个返回值（滑点价）丢掉 → **等于没算滑点**：
         # 滑点只让费用基数大了 5bp，对 0.025% 的佣金可忽略。
-        slippage_ratio = (costs.slippage_bps / 10_000.0) * n_filled / n_hold
+        # 滑点按**调用方口径**取（stock / ETF 的滑点都是 5 bps，逐标的取也一样）。
+        slippage_ratio = base_slippage_bps / 10_000.0 * n_filled / n_hold
 
         out.append(gross - fee_ratio - slippage_ratio)
     return out
@@ -348,7 +440,9 @@ BENCHMARK_CODE = "sh000300"
 def benchmark_excess(conn: sqlite3.Connection, *, asof_dates: list[str],
                      pool: str, plugin_overrides: dict[str, int] | None = None,
                      benchmark: str = BENCHMARK_CODE,
-                     costs: CostModel | None = None) -> float:
+                     costs: CostModel | None = None,
+                     hold_override: Mapping[str, Sequence[str]] | None = None
+                     ) -> float:
     """候选池相对基准指数的**超额收益**（同区间、同调仓日）。
 
     铁律要求「任何策略必须与 index_300 比较，跑不赢就明说」—— 所以这个
@@ -365,11 +459,16 @@ def benchmark_excess(conn: sqlite3.Connection, *, asof_dates: list[str],
 
     该数仅进入报告 `detail`（打印给用户看的行），**不进 verdict**——
     verdict 只看 Δ 序列。所以此处的口径选择不会撬动结论。
+
+    `hold_override`：**透传**给内部的 `period_returns`（同一个变量，不是第二个
+    变量）。没有它，对照臂（持有集合 = 全部合格标的）就没法算与它同口径的超额 ——
+    要么另写一份对齐逻辑（= 第二份口径），要么把对照臂的超额报成现状臂的。
     """
     if len(asof_dates) < 2:
         return 0.0
     pool_r_all = period_returns(conn, asof_dates=asof_dates, pool=pool,
-                                plugin_overrides=plugin_overrides, costs=costs)
+                                plugin_overrides=plugin_overrides, costs=costs,
+                                hold_override=hold_override)
     # 同区间对齐：pool_r_all 的第 i 项对应 (asof_dates[i], asof_dates[i+1])。
     # 缺基准 bar 的周期，池收益侧与基准侧同步跳过（不零填充）。
     aligned_pool: list[float] = []

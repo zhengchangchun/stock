@@ -43,6 +43,7 @@ from stocklab.cli.plugin import (cmd_plugin_approve, cmd_plugin_list,
                                  cmd_plugin_reject, cmd_plugin_sandbox,
                                  cmd_plugin_submit)
 from stocklab.cli.candidate import cmd_candidate_review, cmd_candidate_run
+from stocklab.cli.research import cmd_research_xsec_topn
 
 TZ = ZoneInfo("Asia/Shanghai")
 
@@ -4571,6 +4572,29 @@ def build_parser() -> argparse.ArgumentParser:
     m2_bypass_scan.add_argument("--db")
     m2_bypass_scan.add_argument("--now", help="覆盖当前时刻（测试用）")
     m2_bypass_scan.set_defaults(func=cmd_m2_bypass_scan)
+
+    rsrch = sub.add_parser(
+        "research",
+        help="研究命令（离线只读：不写任何表、不进 ops close、不进红线基线）")
+    rsrch_sub = rsrch.add_subparsers(dest="research_action", required=True)
+    rsrch_x = rsrch_sub.add_parser(
+        "xsec-topn",
+        help="横截面单变量：持有集合「前 N」vs「池内全部合格」（离线只读；"
+             "需 --prereg 预注册，fail-closed）")
+    rsrch_x.add_argument("--pool", default="short",
+                         help="候选池（本实验只支持 short；其余 exit 2）")
+    rsrch_x.add_argument("--start", required=True,
+                         help="窗口起点 YYYY-MM-DD（必填；< 2015-01-01 exit 2）")
+    rsrch_x.add_argument("--end", default=None,
+                         help="窗口终点 YYYY-MM-DD（默认：今天）")
+    rsrch_x.add_argument("--prereg", required=True,
+                         help="预注册 md 路径（必填；内含 ```json 块，逐字段比对）")
+    rsrch_x.add_argument("--out", default=None,
+                         help="产物目录（默认：reports/research/）")
+    rsrch_x.add_argument("--arm", default="both", choices=("all", "topn", "both"),
+                         help="跑哪一臂（默认 both）")
+    rsrch_x.add_argument("--db")
+    rsrch_x.set_defaults(func=cmd_research_xsec_topn)
 
     return parser
 
