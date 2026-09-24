@@ -3786,7 +3786,7 @@ A1 v1.0.3 同型（同一公式、同一整手粒度）⇒ 只在随机臂上补
 注意**时间戳只到秒**：假采集 `sleep` 必须 > 1s，而秒级**截断**会让观测差值比 `sleep`
 小最多 1s ⇒ 断言下界要取 `floor(sleep) + 1`，否则用例会随机红。
 
-**已加判据**：`tests/test_data_fetch_p28.py` 的 7 个（对拍／边界／请求数／`--days 30` ≤21）；
+**已加判据**：`tests/test_data_fetch_p28.py` 的 8 个（对拍／边界／请求数／`--days 30` ≤21）；
 `tests/test_ops_patrol.py` 的 7 个（`lag`×2、差 2 天 stale、当天发布证据 ⇒ stale、
 日历缺失 fail-closed、按子项排步、`adj_factors` 空只排一条）；
 `tests/test_job_runs_timing.py` 5 个（bars/actions/valuation/moneyflow 三处收尾时刻）。
