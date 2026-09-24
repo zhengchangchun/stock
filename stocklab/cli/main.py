@@ -38,7 +38,7 @@ from stocklab.store.migrate import ensure_schema, init_db
 # 这样 `SPEC_ARMS` 不需要在自己内部再抄一遍臂名字面量。
 from stocklab.paper.config import (ARM_AGENT, ARM_AGENT_RANDOM,
                                   EXECUTOR_AGENT_DECISION, EXECUTOR_KEY,
-                                  RANDOM_MODEL_ID)
+                                  HALTED_LABEL, LIVE_KEY, RANDOM_MODEL_ID)
 from stocklab.cli.plugin import (cmd_plugin_approve, cmd_plugin_list,
                                  cmd_plugin_reject, cmd_plugin_sandbox,
                                  cmd_plugin_submit)
@@ -2617,7 +2617,8 @@ def cmd_paper_agent_run(args: argparse.Namespace) -> int:
     try:
         payload = engine.agent_run(
             conn, args.asof,
-            now=args.now or datetime.now(TZ).isoformat(timespec="seconds"))
+            now=args.now or datetime.now(TZ).isoformat(timespec="seconds"),
+            arms=getattr(args, "arms", None))
     except agent_decide.DecisionPayloadError as exc:
         conn.close()
         return _paper_fail(exc)
@@ -2816,10 +2817,14 @@ def cmd_paper_agent_show(args: argparse.Namespace) -> int:
             expectation = engine.decision_expectation(conn, account=account,
                                                       asof=asof)
         prereg = None if account is None else engine.preregistration(account)
+        live = True if account is None else engine.is_live(account)
         payload = {
             "arm": args.arm,
             "asof": asof,
             "account_exists": account is not None,
+            # P69 / T2：这条臂还在飞吗（`params.live`，缺省 true）。停飞 ⇒ 页面与回执
+            # 都**不把它读成缺决策** —— 它不是「今天没决定」，是「不再接受考核」。
+            "live": live,
             "n_rows": len(rows),
             "n_decisions": len(portfolio),
             "decision_on_asof": decision_on_asof,
@@ -2836,7 +2841,12 @@ def cmd_paper_agent_show(args: argparse.Namespace) -> int:
                 **expectation,
                 "present": decision_on_asof is not None,
                 "note": (None if decision_on_asof is not None else
-                         ("**今日无决策**：`paper_agent_decisions` 里没有这一行 ⇒ "
+                         (HALTED_LABEL + "：这条臂已停飞（"
+                          f"`params.{LIVE_KEY}=false`），日终不由 `paper agent run` 认领，"
+                          "**不判它缺决策** —— 与「交易日没决定」不是一件事。"
+                          "历史台账与净值行一行未动（D-48：旧账户保留不删）"
+                          if not live else
+                          "**今日无决策**：`paper_agent_decisions` 里没有这一行 ⇒ "
                           "本日不下单（净值行走 `paper agent run` 的平盘分支）。"
                           "与「有决策但不动手」不同形 —— 不补造默认决策"
                           if expectation["expected"] else
@@ -4121,6 +4131,10 @@ def build_parser() -> argparse.ArgumentParser:
     ppa_run = pp_agent_sub.add_parser(
         "run", help="AI 操盘手的**日终**（D-50）：先有决策，再成交并写净值（幂等）")
     ppa_run.add_argument("--asof", required=True, help="交易日 YYYY-MM-DD")
+    ppa_run.add_argument(
+        "--arm", action="append", dest="arms", default=None,
+        help="只认领点名的臂（可重复）。不传 = 认领全部（逐字段保持现状）；"
+             "点名了但不在认领范围 ⇒ 退出码 2、零写入（fail-closed）")
     ppa_run.add_argument("--db")
     ppa_run.add_argument("--now", help="覆盖当前时刻（测试/补录用）")
     ppa_run.set_defaults(func=cmd_paper_agent_run)

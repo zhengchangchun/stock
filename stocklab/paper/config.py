@@ -102,6 +102,28 @@ EXECUTOR_CHANNEL_A: str = "m2_channel_a"
 #: 那条策略悄悄不下单，而症状只会在净值表上出现。
 KNOWN_EXECUTORS: tuple[str, ...] = (EXECUTOR_CHANNEL_A, EXECUTOR_AGENT_DECISION)
 
+# ---------- P69：在飞 / 停飞（T2） ----------
+
+#: `paper_accounts.params_json` 里的「这条臂还在飞吗」（P69 / T2）。**缺省 `true`** ——
+#: 老账户不加这个键也照跑（`engine.live_of` 的默认值就是它）。
+#:
+#: 为什么要有它：「停飞」此前只能靠**账户名**猜（`arm-agent` 是占位、`arm-agent-ds-v1`
+#: 是坏提示词的旧版），而名字猜法有两个后果 —— ① 占位臂 `arm-agent` 每天被
+#: `paper agent run` 认领，它**按定义不可能有决策**（无预注册）⇒ 交易日恒报一条
+#: `missing_decision` ⇒ **日更退出码恒 1**；② 停飞的旧版在页面上仍画成一条平线。
+#: 所以把「在飞/历史」变成**显式字段**：`agent_claim_accounts` 跳过 `live=false`，
+#: `decision_expectation` 对它的 `expected` 恒为 `False`（「历史版本」不是「缺决策」）。
+#:
+#: ⚠️ 语义边界：它**只管「还认不认领日终」**，不改任何账本/决策/成本/PIT 口径；
+#: 停飞臂的历史台账与净值行**一行都不动**（D-48：旧账户保留不删）。
+LIVE_KEY: str = "live"
+
+#: 停飞臂在 `paper agent show` 与页面上的**唯一**措辞（一处定义、两处消费）。
+#: 与 `NOT_COMPARABLE` 同款：措辞写两遍迟早漂成两句，而这两句必须能被读成同一件事。
+#: ⚠️ 只用 Markdown 反引号 / 纯文本，**不写 HTML 标签** —— 它同时进 CLI 的 JSON、
+#: Markdown 报告与网页（网页那边 `rich()` 会把反引号变成 `<code>`）。
+HALTED_LABEL: str = "历史版本（已停飞）"
+
 # ---------- P56：预注册（D-48） ----------
 
 #: AI 操盘手的**版本账户**前缀（D-48：`arm-agent-<版本>`）。

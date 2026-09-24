@@ -549,6 +549,99 @@ _P56_TRIGGER_NO_UPDATE = (
 
 
 # ---------------------------------------------------------------------------
+# P69：把两条臂**显式停飞**（`params.live = false`）。
+#
+# 为什么是**逐条点名**而不是按 kind 批量：停飞是**每一条臂的账** —— 「这条臂还有没有
+# 产出决策的通路」。`arm-agent` 是 P52 的占位臂（无预注册 ⇒ `paper agent decide`
+# 按定义拒收它 ⇒ 永远不会有决策），`arm-agent-ds-v1` 的提示词 v1 有整手 bug
+# （四个买入权重折成 99.x 股 ⇒ 一手都没买到），已被 v2 取代（D-48：保留不删）。
+# 两条都**不再认领日终**，但历史台账与净值行一行不动。
+#
+# 只加一个键（`live`），其余键值逐字不变；可重入；行数与「没被点名的账户」都核对。
+
+_P69_LIVE_KEY = "live"
+
+#: 要停飞的两条臂（P69 §T2 拍板点 2 / 3）。**必须是显式名字** ——
+#: 这里多一条就少一条在飞的臂，改这份清单要同时改任务书。
+_P69_HALTED_ARMS: tuple[str, ...] = ("arm-agent", "arm-agent-ds-v1")
+
+
+def agent_arms_need_p69_live(conn) -> list[str]:
+    """只读探测：哪些**点名要停飞的**臂还没有 `params.live == false`。**不写任何东西**。
+
+    表不存在 → `[]`。账户不在库里 → 跳过（这条臂还没建出来，没什么可停的）。
+    """
+    if not _table_exists(conn, "paper_accounts"):
+        return []
+    out: list[str] = []
+    for row in conn.execute(
+            "SELECT account_id, params_json FROM paper_accounts ORDER BY account_id"):
+        aid = str(row["account_id"])
+        if aid not in _P69_HALTED_ARMS:
+            continue
+        try:
+            params = json.loads(row["params_json"] or "{}")
+        except ValueError:
+            params = None
+        if not isinstance(params, dict) or params.get(_P69_LIVE_KEY) is not False:
+            out.append(aid)
+    return out
+
+
+def migrate_p69_agent_arms_live(conn) -> list[str]:
+    """给点名那两条臂补 `params.live = false`（P69 / T2）。
+
+    **可重入**：跑第二次返回 `[]`（键已在位即跳过）。
+    **只加一个键**：其余键值逐字不变，行数不变，别的账户逐字节不变；
+    不符就回滚报错。返回 `["<account_id>: live -> False", ...]`。
+    """
+    targets = agent_arms_need_p69_live(conn)
+    if not targets:
+        return []
+    rows = [dict(r) for r in conn.execute(
+        "SELECT account_id, arm, params_json FROM paper_accounts ORDER BY account_id")]
+    before = {str(r["account_id"]): str(r["params_json"]) for r in rows}
+    n_before = len(rows)
+    conn.execute("BEGIN")
+    try:
+        conn.execute("DROP TRIGGER IF EXISTS trg_paper_accounts_no_update")
+        for r in rows:
+            if str(r["account_id"]) not in targets:
+                continue
+            params = json.loads(r["params_json"] or "{}")
+            params[_P69_LIVE_KEY] = False
+            conn.execute("UPDATE paper_accounts SET params_json = ? WHERE account_id = ?",
+                         (json.dumps(params, ensure_ascii=False, sort_keys=True),
+                          str(r["account_id"])))
+        conn.execute(_P56_TRIGGER_NO_UPDATE)
+        after = [dict(r) for r in conn.execute(
+            "SELECT account_id, arm, params_json FROM paper_accounts ORDER BY account_id")]
+        if len(after) != n_before:
+            raise RuntimeError(
+                f"paper_accounts 行数变了（{n_before} → {len(after)}）—— 已回滚")
+        for r in after:
+            aid = str(r["account_id"])
+            if aid not in targets:
+                if str(r["params_json"]) != before[aid]:
+                    raise RuntimeError(
+                        f"迁移动了不该动的账户 {aid} —— 已回滚（只许给点名的两条加 live 键）")
+                continue
+            old = json.loads(before[aid] or "{}")
+            new = json.loads(r["params_json"] or "{}")
+            old.pop(_P69_LIVE_KEY, None)
+            if new.pop(_P69_LIVE_KEY, None) is not False:
+                raise RuntimeError(f"账户 {aid} 的 live 没写成 false —— 已回滚")
+            if old != new:
+                raise RuntimeError(
+                    f"账户 {aid} 除 live 外的键值被改动了 —— 已回滚")
+        conn.commit()
+    except BaseException:
+        conn.rollback()
+        raise
+    return [f"{aid}: {_P69_LIVE_KEY} -> False" for aid in targets]
+
+
+# ---------------------------------------------------------------------------
 # P58：插桩5 复盘台账 `plugin_reviews`（**新表**）。
 #
 # 新表**不需要数据迁移**：`schema.sql` 的 `CREATE TABLE IF NOT EXISTS` 会在下一次
@@ -861,6 +954,13 @@ _KNOWN_MARKERS: list[tuple[str, str, object]] = [
     # 只读报告「还有没有与重放对不上的 AI 臂净值行」。
     ("p62_agent_nav_settled", "paper_nav_daily",
      lambda conn: not p62_defective_agent_nav_rows(conn)["defective"]),
+    # P69 是**显式停飞**（数据变更），与 P62 同理**不挂** `_pending_column_migrations`
+    # / `_apply_schema`：挂上去等于让任一写库入口（`paper init` / `db init`）
+    # 顺手停飞两条臂，而「停飞哪几条」是要拍板的账。这里只让 doctor 只读报告
+    # 「点名的那两条臂停飞了没有」。真库落位由 nanobot 显式调
+    # `migrate_p69_agent_arms_live`（§5 的备份 → 副本 → 核对纪律）。
+    ("p69_agent_arms_live", "paper_accounts",
+     lambda conn: not agent_arms_need_p69_live(conn)),
 ]
 
 

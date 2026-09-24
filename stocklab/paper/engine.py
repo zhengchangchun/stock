@@ -45,7 +45,7 @@ import json
 import re
 import sqlite3
 from dataclasses import replace
-from typing import Mapping
+from typing import Mapping, Sequence
 
 from stocklab.calendar.trading_calendar import Calendar
 from stocklab.config.costs import ASSET_ETF, ASSET_STOCK, CostModel
@@ -74,6 +74,7 @@ from stocklab.paper.config import (
     HOLD_QTY,
     INITIAL_CAPITAL,
     KNOWN_EXECUTORS,
+    LIVE_KEY,
     LOT,
     NOT_COMPARABLE,
     PAPER_START_DATE,
@@ -343,6 +344,32 @@ def external_executor(account: dict) -> str | None:
     return executor_kind(account)
 
 
+# ---------- P69：在飞 / 停飞（T2） ----------
+
+def live_of(params: Mapping) -> bool:
+    """`params.live` → 这条臂还在飞吗。**缺省 `True`**（老账户不加键也照跑）。
+
+    非布尔值**点名报错**（fail-closed）：写成字符串 `"false"` 是真值 ⇒ 「停飞」会被
+    读成「在飞」，而症状正好是这条字段要消掉的那个假警的背面 —— **漏报**。
+    与 `executor_kind` 同一个理由：一个「看得出来是坏的」值不该被静默按默认值处理。
+    """
+    value = params.get(LIVE_KEY)
+    if value is None:
+        return True
+    if not isinstance(value, bool):
+        raise PaperError(
+            f"params.{LIVE_KEY} 必须是布尔（现在 {value!r}，类型 "
+            f"{type(value).__name__}）—— 写错会让「停飞」被读成「在飞」，"
+            f"这条臂就会继续每天报一条**假警**；反过来漏报更糟。"
+            f"要停飞写 `false`（JSON 布尔），在飞写 `true` 或干脆不写")
+    return value
+
+
+def is_live(account: Mapping) -> bool:
+    """账户行（`paper_accounts` 的一行）→ 还在飞吗。见 `live_of`。"""
+    return live_of(json.loads(account["params_json"]) or {})
+
+
 # ---------- P56：预注册（D-48） ----------
 
 def preregistration(account: dict) -> dict | None:
@@ -415,13 +442,16 @@ def decision_expectation(conn: sqlite3.Connection, *, account: dict,
     """「`(这条臂, 这一天)` 本该有决策吗」——三字段，`show` 与 `run` **共用**。
 
     - `is_trading_day`：交易日历说了算（`None` = 判不了）；
+    - `live`：这条臂**还在飞吗**（P69 / T2；`params.live`，缺省 `true`）；
     - `account_in_flight`：这条账户在 `asof` 时**已经在飞**（不早于起跑日）——
-      还没起跑的账户不该有决策，那不是缺；
+      还没起跑的账户不该有决策，那不是缺。**停飞臂恒为 `False`**：它不该有决策；
     - `expected`：两者都成立 ⇒ 缺决策就是**异常**（不是「这天不用决策」）。
+      停飞臂的 `expected` 恒 `False` ⇒ 页面/回执都**不把它读成缺决策**。
     """
     day = is_trading_day(conn, asof)
-    in_flight = asof >= str(account["start_date"])
-    return {"asof": asof, **day, "account_in_flight": in_flight,
+    live = is_live(account)
+    in_flight = live and asof >= str(account["start_date"])
+    return {"asof": asof, **day, "live": live, "account_in_flight": in_flight,
             "expected": bool(day["is_trading_day"]) and in_flight}
 
 
@@ -994,6 +1024,9 @@ def _account_entry(conn: sqlite3.Connection, account: dict, asof: str,
     return {
         "account_id": account["account_id"], "arm": account["arm"],
         "etf_target_pct": account["etf_target_pct"], "date": nav_row["date"],
+        # P69 / T2：这条臂还在飞吗。净值行读得出来 ⇒ 这条账户有历史；
+        # `live` 说的是「**还认不认领日终**」，两件事都要能同时看见。
+        "live": is_live(account),
         "cash": nav_row["cash"], "positions": positions,
         "market_value": nav_row["market_value"], "nav": nav_row["nav"],
         "drawdown": nav_row["drawdown"], "cum_cost": nav_row["cum_cost"],
@@ -1074,16 +1107,21 @@ def _trade_json(t: dict) -> dict:
 # ---------- P56：AI 操盘手的日终（D-50） ----------
 
 def agent_claim_accounts(conn: sqlite3.Connection) -> list[dict]:
-    """`executor == 'agent_decision'` 的那些账户（`paper agent run` 的认领范围）。
+    """`executor == 'agent_decision'` 的**在飞**账户（`paper agent run` 的认领范围）。
 
     遍历全部账户并逐个走 `executor_kind` ⇒ **未知 `executor` 在这里就报错**（fail-closed），
     而不是被悄悄地漏掉。范围按**字段**判定，不按账户名前缀猜。
+
+    P69 / T2 起再排除 `params.live == false` 的账户：停飞臂的日终**不由本命令落**
+    （它已经没有产决策的通路了），所以不该被认领、更不该被记成「缺决策」。
+    历史台账与净值行**一行不动** —— 停飞是「不再认领」，不是「删掉」。
     """
     return [a for a in store.load_accounts(conn)
-            if executor_kind(a) == EXECUTOR_AGENT_DECISION]
+            if executor_kind(a) == EXECUTOR_AGENT_DECISION and is_live(a)]
 
 
-def agent_run(conn: sqlite3.Connection, asof: str, *, now: str) -> dict:
+def agent_run(conn: sqlite3.Connection, asof: str, *, now: str,
+              arms: Sequence[str] | None = None) -> dict:
     """AI 操盘手家族的**日终**：先要决策在台账里，再按当日收盘价成交并写净值。
 
     ## 为什么这条命令必须存在（D-50，写进注释与 runbook）
@@ -1102,8 +1140,36 @@ def agent_run(conn: sqlite3.Connection, asof: str, *, now: str) -> dict:
       `anomaly.missing_decision` —— 交易日 ⇒ 退出码 1，非交易日 ⇒ 0。
       **不补造默认决策**：那会把「没决定」显示成「决定按默认纪律办」。
     - **重跑**：当日净值行已存在 ⇒ `already`，**一行都不写**、不会有第二笔成交。
+
+    ## `arms`（P69 / T1）：认领范围可指定
+
+    不传 = 认领全部（**逐字段保持现状**）。传了 = **只认领点名的臂**：其余账户不写
+    平盘净值行、不进 `anomaly.missing_decision`、不进 `n_claimed`，也不会因为
+    「当日净值行已存在」而回一条 `already`（它们压根不在遍历里）。
+
+    为什么需要它：内置的 `arm-agent`（P52 占位臂）没有预注册 ⇒ **按定义不可能有决策**，
+    却每天被认领 ⇒ 交易日恒报一条 `missing_decision` ⇒ 日更**退出码恒 1**，页面上还多
+    一条死平线。驱动侧显式点名在飞的两条臂，这条假警就没有了（P69 §T1）。
+
+    **fail-closed**：点名的账户不在认领范围（名字不存在 / 已停飞 / 是别的执行者如通路 A）
+    ⇒ **点名报错**（`PaperError` ⇒ CLI 退出码 2），**零写入**。静默跳过 = 驱动以为那天
+    落了日终，而净值表上什么都没有。
     """
     claim = agent_claim_accounts(conn)
+    if arms:
+        # 可重复传参 ⇒ 去重保序（`--arm A --arm A` 不该算两条）
+        wanted = list(dict.fromkeys(str(a) for a in arms))
+        known = {str(a["account_id"]) for a in claim}
+        unknown = [a for a in wanted if a not in known]
+        if unknown:
+            raise PaperError(
+                f"--arm 点名的账户不在本命令的认领范围：{unknown}。"
+                f"`{EXECUTOR_KEY}={EXECUTOR_AGENT_DECISION}` 的账户只有 "
+                f"{sorted(known)} —— 名字不存在、已停飞（params.{LIVE_KEY}=false）、"
+                f"或是别的执行者（如通路 A）的账户都不由本命令落日终。"
+                f"**不静默跳过**：跳过会让驱动以为那天落了日终")
+        keep = set(wanted)
+        claim = [a for a in claim if str(a["account_id"]) in keep]
     if not claim:
         raise PaperError(
             f"没有 `{EXECUTOR_KEY}={EXECUTOR_AGENT_DECISION}` 的账户 —— "
@@ -1423,6 +1489,7 @@ def build_report(conn: sqlite3.Connection, asof: str) -> dict:
                 mdd = max(mdd, (peak - v) / peak)
         per_account.append({
             **{k: e[k] for k in ("account_id", "arm", "etf_target_pct", "date",
+                                 "live",
                                  "cash", "positions", "market_value", "nav",
                                  "cum_cost", "cum_return", "net_deposits",
                                  "drawdown", "discipline")},
