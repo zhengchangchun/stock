@@ -167,8 +167,13 @@ def test_sync_second_run_adds_nothing_and_keeps_active_zero(tmp_db, capsys):
 
 
 def test_sync_missing_universe_file_exits_2_and_writes_nothing(tmp_db):
+    """文件缺失 ⇒ exit 2 且零写入。
+
+    注意：`csi300-500` 文件已于 2026-09-25 纳管进仓（`af41b05`），**不能**再当
+    「不存在」的样例 —— 这里用一个仓里必然没有的 id，判据本身逐字不变。
+    """
     _seed(tmp_db)
-    rc = main(["universe", "sync", "--universe", "csi300-500", "--db", str(tmp_db)])
+    rc = main(["universe", "sync", "--universe", "no-such-universe", "--db", str(tmp_db)])
     assert rc == 2
     conn = sqlite3.connect(tmp_db)
     try:

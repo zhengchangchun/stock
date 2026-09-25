@@ -16,9 +16,10 @@ Falsifiability：
 - 若 `--universe` 路径仍调 `upsert_instruments` ⇒ 库里多出 800 行 `active=1`
   （schema 默认）⇒ `test_explicit_universe_does_not_pollute_daily_scope` 红。
 
-真源文件（`config/universes/csi300-500.*`）**不进仓**（联网 build 是 nanobot 的事，
-P71 §0.5.1）：这里用假 fetcher 现建到 `tmp_path`，并把 `resolve_universe` 的 `root`
-指过去 —— **repo 的 `config/universes/` 一字不碰**。
+真源文件的**联网 build** 是 nanobot 的事（P71 §0.5.1）：这里用假 fetcher 现建到
+`tmp_path`，并把 `resolve_universe` 的 `root` 指过去 —— **repo 的
+`config/universes/` 一字不碰**。（`csi300-500.*` 已于 2026-09-25 纳管进仓，
+`af41b05`；用例不读它，故与仓内有没有该文件无关。）
 """
 
 from __future__ import annotations
