@@ -1,0 +1,8 @@
+{
+  "built_at": "2026-09-24T17:32:41.560941+00:00",
+  "members_sha256": "eff7b478ea9a812fff152e4e8d87a2ff345963fdf30532492a124b14096ec302",
+  "n_members": 800,
+  "pit": false,
+  "probe_sha256": "9d945c7724e90b7f67a785c62ed4df90b6afa179c8f168957d5fbe21c84ab745",
+  "source": "eastmoney:RPT_INDEX_TS_COMPONENT TYPE=1,3（沪深300 ∪ 中证500，现成分，非 PIT；800 行去重前）"
+}
