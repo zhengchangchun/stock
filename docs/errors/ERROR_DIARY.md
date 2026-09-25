@@ -4115,3 +4115,99 @@ SELECT * FROM corp_actions WHERE code='600602' AND cqr='1992-03-09';
 真样本改前/改后（真库 `mode=ro` 复核，见任务书 §7.4）：
 改前 `RAISED AdjustError: 复权系数越界：pre_close=9.35 cash=10.0 share_ratio=0.0 → k=-0.0695…`，
 改后 `OK events=24 unusable=['1992-03-09','1999-12-02'] usable_from=1999-12-02 holes=False`。
+
+## #82 2026-09-25：同一族的三条路只修了一条 —— adj rebuild / features build 的 per-code 边界（P76）
+
+**现象**（P75 只修了 `ingest actions` 一条；同族另两条当时留在任务书 §7.7 未动）：
+
+① `cmd_adj_rebuild`（`cli/main.py`）的 per-code 循环体（`load_chain` → `insert_adj_factors`）
+   **一行 try 都没有**，且收尾恒 `return 0`。
+② `cmd_features_build`（`cli/main.py`）的 `load_chain` 站在 `try` **外面**，
+   那个 `try` 只包 `adjust_bars` ⇒ docstring 里写好的「复权链不可用 → 计 skipped + warn 事件」
+   在一半的情况下**根本走不到那个 except**。
+
+真库副本实测（`/tmp` 副本、改前版本，`data/stocklab.db` 全程只读）：
+
+| 命令 | 改前读数 |
+|---|---|
+| `features build --date 2026-09-24` | **100% ABORT**：`active=1 ORDER BY code` 的 21 只里前 7 只是股票、**第 8 只就是 `510300`** ⇒ `EtfChainUnsupported` 穿出 ⇒ 整轮 abort，只落 7 行（`000333…300750`）。顺序 head＝`[000333, 000651, 000858, 002032, 002415, 002508, 300750, 510300, 510880, …]` |
+| `adj rebuild`（全量） | 默认清单＝`bars_daily` 的 6 位 GLOB ＝ **805 只**，**ETF 挡不住**（ETF 的 code 也是 6 位数字）⇒ `510300` 在排序里是**第 332 只**，64.1 s 后 ABORT。`adj_factors` 前后同为 2,140,016 行 / 468 code（前 331 只早已被 ingest 覆盖，唯一的新情况就是 510300） |
+
+**根本原因**：
+
+> **保护边界的画法与「跑不完」的代价不匹配：两处都把「per-code」写成了「整轮」。**
+
+- 这两处的语义**本来就是对的**（`features build` 的 docstring 明写「缺失：…或复权链不可用 →
+  计 `skipped` + warn 事件（不写假快照）」），坏的只是**边界落点** ——
+  一处把 `load_chain` 留在 try 外，一处连 try 都没有。所以 #77 的判据在这里的形态是：
+  **别问「有没有 try」，要问「这一族失败能不能走到那个 except」**。
+- 而 `EtfChainUnsupported` 是 **ADR-008 的设计**（ETF 的除权事件不在数据源里，
+  写 `factor=1.0` 就是拿未复权价冒充复权价），**不是故障**。
+
+**「设计如此」与「真故障」必须分档**（本条要立住的正面纪律）：
+
+| 档 | 触发 | 处置 |
+|---|---|---|
+| 设计如此 | `EtfChainUnsupported`（ETF / 未登记到 `instruments` 的 code） | 记 `skipped` 键 ＋ **warn** 事件 ＋ **不算失败** ⇒ 退出码**不受**它影响 |
+| 真故障 | `MissingFactor` / `StaleFactorTable` / 裸 `AdjustError`（P75 保留的 `k > 1`、`pre_close ≤ 0`） | 记 `error` 键 ＋ **error** 事件点名 ＋ 进 `failed` ⇒ **退出码非零** |
+
+两档都 `continue` 下一只：**不中断，但一个也不静默。**
+第一档「不算失败」是刻意的：4 只 ETF 恒在默认清单里，把它们算红会让 `adj rebuild`
+在真库上**永远报红** —— 那是「把红报绿」的镜像病（#54 的反面：**恒红与恒绿一样让退出码
+失去信息量**）。但「不算失败」≠「可以不见」：`skipped` 键 + warn 事件必须让它们显式露面。
+
+**审出第三个暴露点（#77 的要求：修一处 ≠ 修一类）**：T0 把
+`load_chain` / `load_bars_adjusted` / `adjust_bars` 的**全部**调用点列成了表
+（任务书 §7.0，共 13 个调用点），逐点标注保护边界后审出第三条：
+`experiments/residuals.py::fit_residual_distribution` 的 per-code 循环
+`except (UnusableWindow, DegenerateInput)` **漏了 `AdjustError`** ——
+同族的另两个循环（`predict/service.py`、`experiments/runner.py`）catch 的本来就是
+`(adjust.AdjustError, UnusableWindow)`。于是 `experiment run --code 510300`（或库里一张
+与链不同源的 blackout 表）能让整个实验在**拟合阶段** abort。已按同一档修齐
+（记名 `{code}@fit` ＋ 不中断，原因随 `ResidualFit.as_report_block` 出报告）。
+
+**教训**：
+
+- **`EtfChainUnsupported` 是 `AdjustError` 的子类 —— 但画边界时要问的是「这一类失败还有
+  哪些」，不是「我 catch 了哪些子类」。** 这是 #81 的同一条，第 3 次撞上。
+  （例外恰恰是上面那张分档表：**「设计如此」与「真故障」要分档**，
+  而分档的判据是**语义**，不是异常树的层级。）
+- **`chain = None` 必须写在循环开头。** `except` 里的 `context` 若直接读
+  `chain.usable_from`：未绑定只是 `NameError`（会炸、可见），**上一轮的脏值**却会安静地
+  撒谎（让「这一轮到底有没有链」说谎）。**未绑定是可见的，脏值是隐形的** ——
+  只有后者需要显式预初始化。
+- **默认清单宁可让不该处理的 code 走 `skipped` 显式露面，也不要 JOIN 静默收窄。**
+  给 `adj rebuild` 的 WHERE 加 `JOIN instruments` 能「顺手」把 ETF 滤掉，但也会悄悄丢掉
+  「`bars_daily` 有行、`instruments` 无行（或 `type` 为 NULL）」的 code ——
+  判断依据是**审计可见性**，不是查询优雅度。
+- **改「恒 0」退出码前，先核对既有用例有没有把恒 0 当契约。** 本例 3 条既有 `adj rebuild`
+  用例都是「显式 `--code` + 正常数据」⇒ 改后仍返回 0，无契约冲突（这也正是 #54 要求
+  「主动核对」而不是「顺手加个 return」的原因）。
+
+**已加判据**（六条，改前**全红**、改后全绿；红的证明用
+`git stash push -- stocklab/cli/main.py` / `-- stocklab/experiments/residuals.py` 分别跑过）：
+
+- `tests/test_cli_backtest.py::test_p76_adj_rebuild_etf_skipped_not_failed`
+  （`EtfChainUnsupported` ⇒ `skipped`、warn 事件、不进 failed、其余照跑、**返回 0**）
+- `test_p76_adj_rebuild_real_failure_is_named_and_nonzero`
+  （裸 `AdjustError` ⇒ `error`、error 事件点名 `510300`、**返回 1**、其余照跑）
+- `test_p76_adj_rebuild_never_joins_instruments`
+  （`bars_daily` 有行、`instruments` 无行 ⇒ 必须出现在输出里，不许被 JOIN 丢掉）
+- `tests/test_cli_features.py::test_p76_features_build_etf_does_not_abort_the_batch`
+  （真 `510300` **走真口径不打桩** ⇒ 进 `skipped`、其余 17 只照跑、返回 0；
+  并断言 `context.usable_from is None` —— 这一条专钉「循环开头没清 chain」的脏值）
+- `test_p76_features_build_bare_adjust_error_does_not_abort_the_batch`
+- `tests/test_experiments_residuals.py::test_p76_one_bad_chain_does_not_abort_the_fit`
+  （`EtfChainUnsupported` / `StaleFactorTable` / 裸 `AdjustError` 三参数：
+  记 `{code}@fit`、另一只照跑，池子**只少了坏的那一只**）
+
+真样本改前/改后（真库副本，读数见任务书 §7.3；真库 sha256 前后同值）：
+
+- `features build --date 2026-09-24`：改前 `ABORTED EtfChainUnsupported @第8只 510300`，
+  只落 7 行；改后 `return 0 / written=17 / conflicts=[] / skipped=[510300,510880,512890,518880]`，
+  重跑 `written=0 / identical=17`（幂等仍成立）。
+- `adj rebuild`（全量）：改前 `ABORTED @第332只 510300`（64.1 s）；改后 `return 0`、
+  **805 只跑完**、`skipped=4`（正是那 4 只 ETF）、`error=0`，`adj_factors`
+  2,140,016 → 3,120,921 行；`600602` 8,373 行因子 / `unusable=2` / `usable_from=1999-12-02`
+  （P75 的口径保持不动）。
+
