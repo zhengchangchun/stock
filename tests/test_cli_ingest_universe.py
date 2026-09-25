@@ -140,3 +140,72 @@ def test_ingest_valuation_rejects_unknown_code(db, capsys):
     args = build_parser().parse_args(["ingest", "valuation", "--code", "999999"])
     assert cmd_ingest_valuation(args) == 1
     assert "999999" in capsys.readouterr().err
+
+
+# ---------- P75：采集循环按 code 容错（一只坏码不拖垮整批） ----------
+
+def _stub_fetch(monkeypatch):
+    """除权事件采集永远成功、零事件（本站只关心**建链段**的容错）。"""
+    import stocklab.data.fetch as fetch_mod
+    monkeypatch.setattr(fetch_mod, "fetch_corp_actions",
+                        lambda client, *, code, start, end, **kw: [])
+
+
+def test_p75_one_bad_chain_does_not_abort_the_batch(db, monkeypatch, capsys):
+    """一只 code 的 `load_chain` 抛 `AdjustError` ⇒ 其余照跑、点名、返回 1。
+
+    **回归**（真库现场）：800 只采集跑到第 600 只时 600602 的脏条款算得 `k ≤ 0`，
+    异常穿出 `load_chain` 并穿过采集循环（那只 `try` 只包了 `fetch_corp_actions`）
+    ⇒ **整批 800 只 abort**。修后：单只失败进 `out["codes"][code]["error"]`、
+    落 `system_events`、计入 `failed`，循环继续；收尾 `status="failed"` 且 **exit 1**。
+    """
+    from stocklab.data import adjust as adjust_mod
+
+    repo.upsert_instruments(db, OUTSIDE, now=NOW)
+    _stub_fetch(monkeypatch)
+
+    real_load_chain = adjust_mod.load_chain
+
+    def _flaky(conn, code):
+        if code == "000651":
+            raise adjust_mod.AdjustError(
+                "复权系数越界：pre_close=9.35 cash=10.0 share_ratio=0.0 → k=-0.0695")
+        return real_load_chain(conn, code)
+
+    monkeypatch.setattr(adjust_mod, "load_chain", _flaky)
+
+    args = build_parser().parse_args(
+        ["ingest", "actions", "--code", "000651", "--code", "600519"])
+    assert cmd_ingest_actions(args) == 1                  # 容错 ≠ 吞错：必须非零退出
+    out = json.loads(capsys.readouterr().out)
+
+    assert "复权链构建失败" in out["codes"]["000651"]["error"]
+    assert "k=-0.0695" in out["codes"]["000651"]["error"]
+    assert "error" not in out["codes"]["600519"]          # 坏码之后的 code 照跑
+    assert out["codes"]["600519"]["factor_rows"] == 0
+
+    # 失败必须**可见**：system_events 点名 + job_runs 记 failed
+    events = db.execute("SELECT message FROM system_events WHERE level='error'"
+                        ).fetchall()
+    assert any("000651" in r[0] and "复权链构建失败" in r[0] for r in events)
+    status = db.execute("SELECT status, detail FROM job_runs ORDER BY run_id DESC"
+                        ).fetchone()
+    assert status[0] == "failed"
+    assert status[1] == "1/2 ok"
+
+
+def test_p75_all_chains_ok_returns_zero_without_error_keys(db, monkeypatch, capsys):
+    """全部成功 ⇒ 返回 0、`out["codes"]` 里**没有** `error` 键、收尾 `status="ok"`。"""
+    repo.upsert_instruments(db, OUTSIDE, now=NOW)
+    _stub_fetch(monkeypatch)
+
+    args = build_parser().parse_args(
+        ["ingest", "actions", "--code", "000651", "--code", "600519"])
+    assert cmd_ingest_actions(args) == 0
+    out = json.loads(capsys.readouterr().out)
+
+    assert set(out["codes"]) == {"000651", "600519"}
+    assert all("error" not in v for v in out["codes"].values())
+    status = db.execute("SELECT status, detail FROM job_runs ORDER BY run_id DESC"
+                        ).fetchone()
+    assert (status[0], status[1]) == ("ok", "2/2 ok")

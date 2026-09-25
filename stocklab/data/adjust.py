@@ -41,7 +41,14 @@ class AdjustError(ValueError):
 
 
 class UnpriceableTerms(AdjustError):
-    """事件的条款解析不出来（无原文 / 原文里没有可识别条款 / 含配股）。"""
+    """事件**不可定价**（无原文 / 原文里没有可识别条款 / 含配股 / 条款数理上荒谬）。
+
+    最后一类是本档的扩容（P75）：源站偶尔把数量级写错（真库 `600602` 的
+    `1992-03-09`「10派100元」，每股现金 10 元 ≥ 除权前收盘 9.35 元 ⇒ `k ≤ 0`）。
+    它与前几类**同性质** —— 条款不可信 ⇒ 该事件算不出系数 ⇒ 逐日假跌幅留在序列里，
+    于是走同一条路：记进 `chain.unusable`、把 `usable_from` 推后、由 `adjust_bars`
+    拒绝跨越它的窗口。**不改口径、不夹紧、不静默丢行**（行原样留在 `corp_actions`）。
+    """
 
 
 class MissingFactor(AdjustError):
@@ -150,15 +157,23 @@ def event_factor(pre_close: float, terms: Terms) -> float:
     送转必须进公式：000333 的 `10派20元转15股` 只扣现金会得到 k=0.957，
     正确值约 0.383（探针实测，见 ADR-004 证据表）。
 
-    返回值必须落在 `(0, 1]`：`<= 0` 说明输入荒谬（不改口径、不夹紧，直接报错）。
+    返回值必须落在 `(0, 1]`。`<= 0`（每股现金 ≥ 除权前收盘）说明**源站条款荒谬**
+    ⇒ 抛 `UnpriceableTerms`（`AdjustError` 子类）：该事件判为不可定价、进 `chain.unusable`，
+    **不改口径、不夹紧、不静默丢行**。`k > 1`（负现金 ⇒ 解析 bug）与 `pre_close <= 0`
+    则仍抛**裸 `AdjustError`** —— 那两条是数据/代码缺陷，必须炸，不许被容错档吃掉。
     """
     if not pre_close or pre_close <= 0:
         raise AdjustError(f"除权前收盘必须为正，得到 {pre_close!r}")
     k = (pre_close - terms.cash) / (pre_close * (1.0 + terms.share_ratio))
-    if not (0.0 < k <= 1.0):
+    if k <= 0.0:
+        raise UnpriceableTerms(
+            f"复权系数越界（条款疑似荒谬，按不可定价事件处理）：pre_close={pre_close} "
+            f"cash={terms.cash} share_ratio={terms.share_ratio} → k={k}"
+        )
+    if k > 1.0:
         raise AdjustError(
-            f"复权系数越界：pre_close={pre_close} cash={terms.cash} "
-            f"share_ratio={terms.share_ratio} → k={k}"
+            f"复权系数越界（k > 1：负现金 ⇒ 解析 bug，必须炸）：pre_close={pre_close} "
+            f"cash={terms.cash} share_ratio={terms.share_ratio} → k={k}"
         )
     return k
 

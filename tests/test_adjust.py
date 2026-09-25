@@ -321,6 +321,57 @@ def test_missing_factor_date_raises_instead_of_falling_back():
         chain.at("2026-03-03")
 
 
+# ---------- 源站脏条款：条款荒谬 ⇒ 不可定价（P75 / 600602 实测） ----------
+
+def test_p75_600602_absurd_terms_are_unpriceable_not_fatal():
+    """真样本回归：600602 的 `1992-03-09`「10派100元」在数理上是荒谬条款。
+
+    真库读数（只读复现）：不复权 K 线 `1992-03-02…03-06` 收盘 **9.35**、
+    `1992-03-09` 起 **9.25** ⇒ 真实跌幅只有 0.10 元/股（条款数理上应是
+    「10派1元」，源站把**数量级**写错）。按原文算
+    `k = (9.35 − 10.0) / 9.35 = −0.0695 ≤ 0` —— 该事件**不可定价**，
+    与「含配股 / 无原文」同档：不改口径、不夹紧、不静默丢行。
+
+    后半段钉住 `build_chain` 的兜底（H2 一字不改）：链本身仍建出来
+    （逐日因子齐全、无洞），不可定价只体现在 `unusable` + `usable_from`，
+    并由 `adjust_bars` 拒绝跨越该事件的窗口 —— 这才是「略过 ≠ 当成 k=1 静默略过」。
+    """
+    bars = ([_bar(f"1992-03-{d:02d}", 9.35, code="600602") for d in range(2, 7)]
+            + [_bar("1992-03-09", 9.25, code="600602"),
+               _bar("1999-12-01", 9.25, code="600602"),
+               _bar("1999-12-02", 9.25, code="600602"),
+               _bar("1999-12-03", 9.25, code="600602")])
+    events = [_action("1992-03-09", "10派100元", code="600602"),
+              _action("1999-12-02", "", code="600602")]   # 真库同 code 的空原文事件
+
+    terms = parse_terms("10派100元", code="600602", cqr="1992-03-09")
+    assert terms.cash == pytest.approx(10.0)
+    with pytest.raises(UnpriceableTerms, match="复权系数越界") as ei:
+        event_factor(9.35, terms)
+    assert isinstance(ei.value, AdjustError)          # 子类：既有捕获点天然兼容
+
+    chain = build_chain(bars, events, code="600602")
+    assert [u.cqr for u in chain.unusable] == ["1992-03-09", "1999-12-02"]
+    assert chain.usable_from == "1999-12-02"
+    assert chain.events == ()                          # 两条都不可定价 ⇒ 无可定价事件
+    assert set(chain.factors) == {b.date for b in bars}    # 逐日齐全，不许有洞
+    # 越界的 k 完全不进链（不夹紧），后果由「窗口拒绝服务」显式划出
+    with pytest.raises(MissingFactor, match="跨越了无法定价的除权事件"):
+        adjust.adjust_bars(bars, chain, "1999-12-03")
+
+
+def test_p75_k_above_one_and_non_positive_pre_close_stay_bare_adjust_error():
+    """H1b：`k > 1`（负现金＝解析 bug）与 `pre_close <= 0` 仍是**裸** `AdjustError`。
+
+    只有「每股现金 ≥ 除权前收盘」是源站条款荒谬、可判不可定价；
+    这两条是数据/代码缺陷，必须炸 —— 不许被并进 `UnpriceableTerms` 的容错档。
+    """
+    with pytest.raises(AdjustError) as ei:
+        event_factor(0.0, parse_terms("10派1元"))
+    assert not isinstance(ei.value, UnpriceableTerms)
+    assert "除权前收盘必须为正" in str(ei.value)
+
+
 # ---------- 真实响应回放：ADR-004 的两个实测结论 ----------
 
 def _load(name, code):

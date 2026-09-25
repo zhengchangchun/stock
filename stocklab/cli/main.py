@@ -319,9 +319,23 @@ def cmd_ingest_actions(args: argparse.Namespace) -> int:
                 repo.log_event(conn, "ingest", "warn",
                                f"{code} 有 {restated} 条除权事件被源站修订",
                                context={"code": code, "restated": restated}, now=now)
-            bars, chain = adjust.load_chain(conn, code)
-            n_factors = repo.insert_adj_factors(conn, code, chain, source="tencent",
-                                                now=now) if bars else 0
+            # 建链 + 落因子同样按 code 容错（ERROR_DIARY #81）：
+            # 一条源站脏条款曾让 800 只的批次整体 abort。容错**不许吞错** ——
+            # 记名（out + system_events + failed 清单）、收尾 status="failed"、exit 1。
+            try:
+                bars, chain = adjust.load_chain(conn, code)
+                n_factors = repo.insert_adj_factors(conn, code, chain,
+                                                    source="tencent",
+                                                    now=now) if bars else 0
+            except Exception as exc:                   # noqa: BLE001 — 必须留痕
+                msg = f"{type(exc).__name__}: {exc}"
+                repo.log_event(conn, "ingest", "error",
+                               f"{code} 复权链构建失败: {msg}",
+                               context={"code": code, "job": "ingest_actions"},
+                               now=now)
+                out["codes"][code] = {"error": f"复权链构建失败: {msg}"}
+                failed.append(code)
+                continue
             summary = adjust.chain_summary(chain)
             out["codes"][code] = {"events": written, "restated": restated,
                                   "factor_rows": n_factors, **summary}
