@@ -413,8 +413,8 @@ def test_cli_end_to_end_writes_reports_and_no_table(tmp_db, tmp_path):
     rc = _run_cli(tmp_db, out, PREREG)
     assert rc == 0
 
-    json_p = out / "2016-06-30-xsec-topn.json"
-    md_p = out / "2016-06-30-xsec-topn.md"
+    json_p = out / "2016-06-30-xsec-topn-seed21.json"
+    md_p = out / "2016-06-30-xsec-topn-seed21.md"
     assert json_p.is_file() and md_p.is_file()
     assert _counts(tmp_db) == before, "本命令不得写任何表"
 
@@ -440,7 +440,7 @@ def test_report_carries_required_caliber_strings(tmp_db, tmp_path):
     _seed_pipeline_db(tmp_db, n_weekdays=300)
     out = tmp_path / "out"
     assert _run_cli(tmp_db, out, PREREG) == 0
-    md = (out / "2016-06-30-xsec-topn.md").read_text(encoding="utf-8")
+    md = (out / "2016-06-30-xsec-topn-seed21.md").read_text(encoding="utf-8")
     for s in xsec.NON_PIT_ITEMS:
         assert s in md
     assert xsec.COST_CALIBER_NOTE in md
@@ -448,7 +448,7 @@ def test_report_carries_required_caliber_strings(tmp_db, tmp_path):
     assert "ST 判定" in md and "行业分类" in md and "事后挑选" in md
     # nanobot 直接贴给用户的那一行，必须是**最后一行**
     report = json.loads(
-        (out / "2016-06-30-xsec-topn.json").read_text(encoding="utf-8"))
+        (out / "2016-06-30-xsec-topn-seed21.json").read_text(encoding="utf-8"))
     last = md.rstrip().splitlines()[-1]
     assert last.startswith("summary: xsec-topn pool=short")
     assert report["delta"]["verdict"] in last
@@ -490,7 +490,7 @@ def test_cli_arm_single_reports_no_delta(tmp_db, tmp_path):
     out = tmp_path / "out"
     assert _run_cli(tmp_db, out, PREREG, "--arm", "topn") == 0
     report = json.loads(
-        (out / "2016-06-30-xsec-topn.json").read_text(encoding="utf-8"))
+        (out / "2016-06-30-xsec-topn-seed21.json").read_text(encoding="utf-8"))
     assert set(report["arms"]) == {"topn"}
     assert report["delta"] is None
     assert "单臂" in xsec.summary_line(report)

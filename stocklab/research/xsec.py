@@ -561,9 +561,15 @@ def render_md(report: Mapping) -> str:
 
 
 def write_report(report: Mapping, out_dir: Path) -> tuple[Path, Path]:
-    """落 `<out>/<end>-xsec-topn.{json,md}`，返回两个路径。"""
+    """落 `<out>/<end>-xsec-topn-<universe_id>.{json,md}`，返回两个路径。
+
+    **文件名必须带宇宙 id**（P77 T7）：不带时「换宇宙重跑同一个 end」会**覆盖**
+    上一份产物 —— 2026-09-25 的扩池重跑就是这样把 P60 的
+    `reports/research/2026-09-24-xsec-topn.{md,json}` 覆盖掉的（已不可恢复）。
+    `seed21` 也带上 id ⇒ 与旧名不同是**有意的**：旧名本身就是碰撞源。
+    """
     out_dir.mkdir(parents=True, exist_ok=True)
-    stem = f"{report['end']}-xsec-topn"
+    stem = f"{report['end']}-xsec-topn-{report['universe_id']}"
     json_path = out_dir / f"{stem}.json"
     md_path = out_dir / f"{stem}.md"
     json_path.write_text(

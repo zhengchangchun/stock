@@ -166,3 +166,27 @@ def test_seed21_default_markdown_is_byte_identical_to_the_old_wording():
     md = xsec.render_md(r)
     assert "> 种子只有 21 只、短池 topn 只有 6，" in md
     assert xsec.SELECTION_BIAS_SENTENCE in md
+
+
+def test_write_report_stem_carries_the_universe_id(tmp_path):
+    """P77 T7：产物文件名必须带宇宙 id（同一个 `end` 换宇宙重跑不许互相覆盖）。
+
+    背景：2026-09-25 的扩池重跑把 P60 的 `2026-09-24-xsec-topn.{md,json}`
+    **覆盖**了（已不可恢复）—— 老拼接式 `<end>-xsec-topn` 不含宇宙 id。
+
+    Falsifiability：把 `stem` 改回 `f"{report['end']}-xsec-topn"` ⇒ 两个名字
+    相同、第三次写入覆盖第二次 ⇒ 本用例红。
+    """
+    a_json, a_md = xsec.write_report(
+        {**_minimal_report(), "universe_id": "seed21"}, tmp_path)
+    b_json, b_md = xsec.write_report(
+        {**_minimal_report(), "universe_id": "csi300-500"}, tmp_path)
+    assert a_json.name == "2026-09-24-xsec-topn-seed21.json"
+    assert a_md.name == "2026-09-24-xsec-topn-seed21.md"
+    assert b_json.name == "2026-09-24-xsec-topn-csi300-500.json"
+    assert b_md.name == "2026-09-24-xsec-topn-csi300-500.md"
+    # 两份产物同时在盘上（第一次没被第二次覆盖）
+    assert a_json.is_file() and a_md.is_file()
+    assert b_json.is_file() and b_md.is_file()
+    assert json.loads(a_json.read_text(encoding="utf-8"))["universe_id"] == \
+        "seed21"
