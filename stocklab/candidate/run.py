@@ -34,9 +34,35 @@ from dataclasses import dataclass, field
 from stocklab.candidate import pools, report, risk_adjust, score, screen, snapshot
 from stocklab.candidate import cross_section, indicators
 from stocklab.candidate.seeds import SEED_UNIVERSE
+from stocklab.data import adjust
 from stocklab.data.models import Bar
 
 RUN_KINDS: tuple[str, ...] = ("light", "weekly", "quarterly")
+
+#: 打分侧的口径标记（D4：写进快照 `params_json`，与老快照区分）。
+#: 语义 = 因子侧（`ctx["bars"]`）用 PIT 复权价、判定侧（`screen.py`）用未复权价。
+SCORING_PRICE_MODE = "adjusted_factor_side+raw_screen"
+
+#: 回退到未复权价的原因标签（只进计数与测试，不进快照 —— D4 只增两个键）。
+FALLBACK_ETF = "etf_chain_unsupported"
+FALLBACK_EMPTY_CHAIN = "empty_chain"
+FALLBACK_UNUSABLE_EVENT = "unpriceable_event_in_window"
+FALLBACK_STALE_BLACKOUT = "stale_blackout_table"
+
+#: 「**这个标的的复权价算不出来**」这一类失败（数据侧不可用 ⇒ 回退未复权 + 计数）。
+#: 刻意不是 `AdjustError` 全体：裸 `AdjustError`（`k > 1` = 负现金解析 bug、
+#: `pre_close <= 0` = 数据坏）是**我们这边**的缺陷，必须炸出来
+#: （ERROR_DIARY #81「数据脏与代码坏要分档」「兜底 catch 的是一类，不是已枚举的子类」）。
+_ADJ_UNAVAILABLE = (adjust.EtfChainUnsupported, adjust.MissingFactor,
+                    adjust.StaleFactorTable)
+
+
+def _fallback_reason(exc: adjust.AdjustError) -> str:
+    if isinstance(exc, adjust.EtfChainUnsupported):
+        return FALLBACK_ETF
+    if isinstance(exc, adjust.MissingFactor):
+        return FALLBACK_UNUSABLE_EVENT
+    return FALLBACK_STALE_BLACKOUT
 
 
 @dataclass(frozen=True)
@@ -85,11 +111,52 @@ def _hydrate(loaded: dict) -> tuple[list[snapshot.MemberRow], list[snapshot.Reje
 
 
 def _load_bars(conn: sqlite3.Connection, code: str, *, asof: str) -> list[Bar]:
+    """未复权 K 线（`bars_daily`, `adj_mode='none'`）—— **判定侧**用。
+
+    只给 `screen.screen`（涨跌停 / 停牌判定）：涨跌停按**前收**判定，除权日的
+    自然跳空正是「跌停」与「除权」的区别 —— 换成复权价会把除权误判成跌停、
+    也会漏掉真实跌停（P77 D2，`screen.py` 一行不改）。**因子侧**另走
+    `_load_bars_adjusted`（`ctx["bars"]`）。
+    """
     rows = conn.execute(
         "SELECT code, date, open, high, low, close, volume, amount, turnover,"
         " source, adj_mode FROM bars_daily WHERE code = ? AND date <= ?"
         " ORDER BY date", (code, asof)).fetchall()
     return [Bar(**dict(r)) for r in rows]
+
+
+def _load_bars_adjusted(conn: sqlite3.Connection, code: str, *, asof: str,
+                        raw: list[Bar]) -> tuple[list[Bar], str | None]:
+    """因子侧的 **PIT 复权** K 线（`ctx["bars"]` 的输入价，P77 D1/D3）。
+
+    `as_of=asof`、**不缩窗**（`start` 不传）：成功时与同一天 `_load_bars`
+    返回的 `date` 序列**逐位相同** —— 两边都由 `bars_daily` 的 `date <= asof`
+    决定，复权层只做乘法、不增删行。
+
+    返回 `(bars, fallback)`；`fallback is None` ⇒ `bars` 是真复权价，否则是
+    回退原因标签，`bars` **原样等于调用方刚读的未复权 `raw`**（不重复读库）。
+    四类回退（D3，`n_adj_fallback` 计数，**不许静默**）：
+
+      - 复权层拒绝服务：ETF（`EtfChainUnsupported`）／窗口跨不过不可定价事件
+        （`MissingFactor`）／缺口记录过期（`StaleFactorTable`）；
+      - 复权链为空（该 code 还没采 `ingest actions`）⇒ 因子恒 1，
+        `load_bars_adjusted` 的既有语义就是「价 = 未复权价」，等价于回退。
+
+    **fail-open 的边界**：这是打分路径不是下单路径 —— 一只标的的复权链不可用
+    不该让整轮 `candidate run` 死掉（真库 `csi300-500` 实测 148/800 只会走到
+    「窗口跨不可定价事件」，整批 abort 不可接受）；但**必须可见**（计数进快照）。
+    裸 `AdjustError`（代码/数据缺陷）**不在此列**，原样抛。
+    """
+    try:
+        bars = adjust.load_bars_adjusted(conn, code, asof)
+    except _ADJ_UNAVAILABLE as exc:
+        return raw, _fallback_reason(exc)
+    if conn.execute("SELECT 1 FROM corp_actions WHERE code = ? LIMIT 1",
+                    (code,)).fetchone() is None:
+        # 无事件 ⇒ 链上因子恒 1 ⇒ 复权价逐位等于未复权价。返回 `raw` 是把
+        # 「等价」写成结构（也省掉一次浮点乘法），数值上与 `bars` 相同。
+        return raw, FALLBACK_EMPTY_CHAIN
+    return bars, None
 
 
 def _cross_section_map(conn, *, asof: str, universe=None) -> dict:
@@ -139,6 +206,10 @@ def score_pipeline(conn: sqlite3.Connection, *, asof: str,
     `universe_id` / `members_sha256`：写进快照 `params_json` 的**口径增量**
     （老键 `seed_count` / `topn` 一字不动）。`None` ⇒ 按 `seed21` 派生 ——
     这样「默认路径」与「显式 `--universe seed21`」的快照参数**逐位相同**。
+
+    `scoring_price_mode` / `n_adj_fallback`（P77 D4，同样是只增键）：因子侧
+    `ctx["bars"]` 走 PIT 复权价、判定侧（`screen`）走未复权价；后者是这一轮
+    回退到未复权价的标的数（口径见 `_load_bars_adjusted`）。
     """
     if universe_id is None:
         from stocklab.config.universes import SEED21_UNIVERSE_ID
@@ -150,19 +221,28 @@ def score_pipeline(conn: sqlite3.Connection, *, asof: str,
     members: list[snapshot.MemberRow] = []
     rejects: list[snapshot.RejectRow] = []
     scored: dict[str, list[dict]] = {p: [] for p in pools.ALL_POOLS}
+    #: 打分输入价回退到未复权价的标的数（D3：fail-open 但**可见**）。
+    #: 只统计**真正进入打分**的标的 —— `screen` 淘汰的标的从不构造 `ctx`，
+    #: 把它们算进来会让这个数随排雷结果漂移，不是「这一轮有多少只没吃到复权」。
+    n_adj_fallback = 0
 
     scan = SEED_UNIVERSE if universe is None else universe
     xsec = _cross_section_map(conn, asof=asof, universe=scan)
 
     for inst in scan:
-        bars = _load_bars(conn, inst.code, asof=asof)
+        raw_bars = _load_bars(conn, inst.code, asof=asof)
 
-        verdict = screen.screen(inst, bars, asof=asof)
+        verdict = screen.screen(inst, raw_bars, asof=asof)   # D2：判定侧吃未复权
         if not verdict.passed:
             rejects.append(snapshot.RejectRow(
                 code=inst.code, stage="pre_screen", reason=verdict.reason,
                 plugin_id=None))
             continue
+
+        bars, fallback = _load_bars_adjusted(conn, inst.code, asof=asof,
+                                             raw=raw_bars)
+        if fallback is not None:
+            n_adj_fallback += 1
 
         ctx = score.build_ctx(conn, inst, pools.POOL_SHORT, bars, asof=asof,
                               cross_section=xsec)
@@ -210,7 +290,9 @@ def score_pipeline(conn: sqlite3.Connection, *, asof: str,
                           params={"seed_count": len(scan),
                                   "universe_id": universe_id,
                                   "members_sha256": members_sha256,
-                                  "topn": dict(pools.POOL_TOPN)})
+                                  "topn": dict(pools.POOL_TOPN),
+                                  "scoring_price_mode": SCORING_PRICE_MODE,
+                                  "n_adj_fallback": n_adj_fallback})
 
 
 def run_candidate(conn: sqlite3.Connection, *, asof: str, run_kind: str,
