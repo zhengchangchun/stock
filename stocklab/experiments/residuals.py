@@ -56,6 +56,7 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import Any
 
+from stocklab.data import adjust
 from stocklab.data.models import Bar
 from stocklab.errors import DegenerateInput
 from stocklab.predict.model import WINDOW
@@ -121,7 +122,9 @@ def fit_residual_distribution(conn: sqlite3.Connection, *,
     - `asof` 处没有 K 线（停牌 / 缺口）；
     - K 线不足 `MIN_BARS`；
     - `sigma_hat <= 0`（分布退化）或非有限；
-    - 复权链在该窗口不可用（`UnusableWindow`）或价格非正（`DegenerateInput`）。
+    - 复权链在该窗口不可用（`UnusableWindow`，或读取层抛的任何其他
+      `AdjustError` —— ETF / 链缺口 / blackout 表不同源）或价格非正
+      （`DegenerateInput`）。
 
     池子不足 `RESIDUAL_MIN_SAMPLES` → `ResidualDistribution` 构造期抛
     `InsufficientResiduals`（**拒绝**给一个「看着还行、其实全是噪声」的形状）。
@@ -144,7 +147,15 @@ def fit_residual_distribution(conn: sqlite3.Connection, *,
     for code in codes:
         try:
             series[code] = load_pit_bars(conn, code, anchor, cache=cache)
-        except (UnusableWindow, DegenerateInput) as exc:
+        except (adjust.AdjustError, UnusableWindow, DegenerateInput) as exc:
+            # `AdjustError` 必须在这一档里（ERROR_DIARY #81/#82）：`load_pit_bars`
+            # 会从复权链穿出 `EtfChainUnsupported` / `StaleFactorTable` /
+            # `MissingFactor`，它们既不是 `UnusableWindow` 也不是 `DegenerateInput`
+            # —— 只枚举后两者时，一只 ETF（`--code 510300`）或一张不同源的
+            # blackout 表就能让整个实验在**拟合阶段** abort。
+            # 这里与同族的两个 per-code 循环（`predict/service.py` /
+            # `experiments/runner.py`）保持同一档：记名 + 不中断，
+            # 由 `skipped` 出报告（`ResidualFit.as_report_block`）。
             skipped[f"{code}@fit"] = f"{type(exc).__name__}: {exc}"
 
     samples: list[ResidualSample] = []

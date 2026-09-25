@@ -286,3 +286,60 @@ def test_ingest_actions_subcommand():
     assert args.command == "ingest" and args.ingest_target == "actions"
     assert args.code == ["000333"] and args.start == "1990-01-01"
     assert args.func is cmd_ingest_actions
+
+
+# ---------- P76：`load_chain` 必须与 `adjust_bars` 同一个保护边界 ----------
+
+def test_p76_features_build_etf_does_not_abort_the_batch(tmp_db, monkeypatch, capsys):
+    """真库实测：`active=1` 的 21 只里有 4 只 ETF，`load_chain` 对它们一律抛
+    `EtfChainUnsupported`（ADR-008，设计如此）⇒ 边界留在 try 外时，每次都在
+    **第 8 只**（300750 之后就是 510300）整轮 abort。
+
+    改后：那只进 `skipped` + warn 事件、其余照跑、**返回 0**（无 conflicts）。
+    这里用真 ETF（`510300`，`instruments.type='etf'`）走**真口径**，不打桩。
+    """
+    _seed(tmp_db, codes=("000333", "510300"), n=80)
+    monkeypatch.setattr(paths, "DB_PATH", tmp_db)
+    assert cmd_features_build(ASOF, None) == 0
+    out = json.loads(capsys.readouterr().out)
+    assert out["skipped"] == ["510300"]
+    assert out["written"] == 1 and out["conflicts"] == []
+
+    conn = connect(tmp_db)
+    try:
+        assert [r["code"] for r in conn.execute(
+            "SELECT code FROM features_daily")] == ["000333"]
+        ev = conn.execute("SELECT level, message, context_json FROM system_events"
+                          " ORDER BY event_id").fetchall()
+    finally:
+        conn.close()
+    assert [r["level"] for r in ev] == ["warn"]
+    assert "510300" in ev[0]["message"] and "复权链不可用" in ev[0]["message"]
+    ctx = json.loads(ev[0]["context_json"])
+    # `510300` 排在 `000333` 之后：若循环开头没把 chain 清成 None，这里读到的是
+    # **上一轮**的链 ⇒ 下面的 None 断言会红（脏值是隐形的，未绑定变量反而会 NameError）
+    assert ctx["usable_from"] is None and ctx["n_unusable"] is None
+
+
+def test_p76_features_build_bare_adjust_error_does_not_abort_the_batch(
+        tmp_db, monkeypatch, capsys):
+    """裸 `AdjustError`（P75 刻意保留的 `k > 1` / `pre_close ≤ 0` 档）同样只判这一只：
+    记 `skipped` + warn、**不中断**、返回 0（`skipped` 不是失败，是既有契约）。"""
+    _seed(tmp_db, codes=("000333", "600690"), n=80)
+    monkeypatch.setattr(paths, "DB_PATH", tmp_db)
+
+    from stocklab.data import adjust as adjust_mod
+    real = adjust_mod.load_chain
+
+    def _bad(c, code):
+        if code == "600690":
+            raise adjust_mod.AdjustError(
+                "复权系数越界：pre_close=1.0 cash=2.0 share_ratio=0.0 → k=1.5")
+        return real(c, code)
+
+    monkeypatch.setattr(adjust_mod, "load_chain", _bad)
+    assert cmd_features_build(ASOF, None) == 0
+    out = json.loads(capsys.readouterr().out)
+    assert out["skipped"] == ["600690"]
+    assert out["written"] == 1 and out["conflicts"] == []
+

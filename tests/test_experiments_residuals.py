@@ -200,6 +200,51 @@ def test_skipped_reasons_are_distinct_and_non_empty(tmp_path):
         assert reason, f"{key} 的剔除原因为空 —— 读不出为什么少了一行"
 
 
+# ---------- 3b. P76：`AdjustError` 与另两种同档（画在类别上，不是子类上） ----------
+
+@pytest.mark.parametrize("exc_cls,keyword", [
+    ("EtfChainUnsupported", "ADR-008"),        # --code 510300：ADR-008 设计如此
+    ("StaleFactorTable", "blackout"),          # 库里的缺口记录与链不同源
+    ("AdjustError", "复权系数越界"),            # P75 保留的 k>1 / pre_close<=0 档
+])
+def test_p76_one_bad_chain_does_not_abort_the_fit(tmp_path, monkeypatch,
+                                                  exc_cls, keyword):
+    """`load_pit_bars` 从复权链穿出的 `AdjustError` 必须与 `UnusableWindow` /
+    `DegenerateInput` 同档（记名 + 不中断）。
+
+    改前只枚举后两者：一只 code 的 `EtfChainUnsupported` 既不是
+    `UnusableWindow` 也不是 `DegenerateInput` ⇒ 整个实验在**拟合阶段** abort
+    （ERROR_DIARY #81/#82：边界画在子类上而不是这一类失败上）。
+    同族的另两个 per-code 循环（`predict/service.py` / `experiments/runner.py`）
+    本来就 catch 了 `adjust.AdjustError` —— 这一处是漏画。
+    """
+    from stocklab.data import adjust as adjust_mod
+    from tests.test_predict_service import bars as mk_bars, seed
+
+    rows = {c: mk_bars(code=c, n=N_BIG, base=10.0 + 0.5 * i)
+            for i, c in enumerate(CODES)}
+    conn = seed(tmp_path / f"bad_{exc_cls}.db", rows, cal_dates=_days_big())
+
+    ref = _fit(conn)                    # 打桩前：坏的那只本来贡献多少
+    real = adjust_mod.load_chain
+    exc_type = getattr(adjust_mod, exc_cls)
+
+    def _bad(c, code):
+        if code == CODE2:
+            raise exc_type(f"{code} 的链不可用：{keyword}（夹具）")
+        return real(c, code)
+
+    monkeypatch.setattr(adjust_mod, "load_chain", _bad)
+    fit = _fit(conn)                    # 改前：这里抛出去 ⇒ 整个实验 abort
+
+    assert f"{CODE2}@fit" in fit.skipped
+    assert exc_cls in fit.skipped[f"{CODE2}@fit"]
+    # 另一只 code 照跑；池子**只少了坏的那一只**（不是「一只坏码判死整轮」）
+    running = [s for s in ref.samples if s.code == CODE]
+    assert {s.code for s in fit.samples} == {CODE}
+    assert fit.distribution.n == len(running) > RESIDUAL_MIN_SAMPLES
+
+
 # ---------- 4. 池子不足即拒绝 / 确定性 ----------
 
 def test_a_pool_below_the_threshold_is_refused(tmp_path):

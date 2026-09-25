@@ -108,6 +108,101 @@ def test_adj_rebuild_records_blackout_for_unpriceable_event(tmp_db, monkeypatch,
         conn.close()
 
 
+def test_p76_adj_rebuild_etf_skipped_not_failed(tmp_db, monkeypatch, capsys):
+    """一只 code 抛 `EtfChainUnsupported`（ADR-008，**设计如此**）⇒ 记 `skipped`、
+    `system_events` 有 warn、**不进 failed**、其余 code 照跑、返回 0。
+
+    把它算红会让这条命令在真库上**永远报红**（4 只 ETF 恒在默认 6 位清单里）——
+    那是「把红报绿」的镜像病。但它必须显式露面，不许静默丢。
+    """
+    monkeypatch.setattr(paths, "DB_PATH", tmp_db)
+    _seed(tmp_db)
+    conn = connect(tmp_db)
+    repo.insert_bars(conn, _bars("600519"), now=NOW)
+    conn.close()
+
+    from stocklab.data import adjust as adjust_mod
+    real = adjust_mod.load_chain
+
+    def _etf(c, code):
+        if code == "600519":
+            raise adjust_mod.EtfChainUnsupported(f"{code} 的标的口径是 'etf'（ADR-008）")
+        return real(c, code)
+
+    monkeypatch.setattr(adjust_mod, "load_chain", _etf)
+    assert cmd_adj_rebuild(_args(code=["000333", "600519"], source="test")) == 0
+    out = json.loads(capsys.readouterr().out)
+    assert "600519" in out["codes"]["600519"]["skipped"]
+    assert "error" not in out["codes"]["600519"]
+    assert out["codes"]["000333"]["factor_rows"] == len(DATES)   # 其余照跑
+
+    conn = connect(tmp_db)
+    try:
+        assert conn.execute("SELECT COUNT(*) FROM adj_factors"
+                            " WHERE code='000333'").fetchone()[0] == len(DATES)
+        assert conn.execute("SELECT COUNT(*) FROM adj_factors"
+                            " WHERE code='600519'").fetchone()[0] == 0
+        ev = conn.execute(
+            "SELECT level, message FROM system_events"
+            " WHERE json_extract(context_json,'$.job')='adj_rebuild'").fetchall()
+    finally:
+        conn.close()
+    assert [(r["level"]) for r in ev] == ["warn"]
+    assert "600519" in ev[0]["message"] and "ADR-008" in ev[0]["message"]
+
+
+def test_p76_adj_rebuild_real_failure_is_named_and_nonzero(tmp_db, monkeypatch, capsys):
+    """裸 `AdjustError` 是真故障（不是「设计如此」）⇒ 记 `error` + error 事件点名 +
+    进 failed + **返回 1**，其余 code 仍照跑（不判死整轮）。"""
+    monkeypatch.setattr(paths, "DB_PATH", tmp_db)
+    _seed(tmp_db)
+    conn = connect(tmp_db)
+    repo.insert_bars(conn, _bars("600519"), now=NOW)
+    conn.close()
+
+    from stocklab.data import adjust as adjust_mod
+    real = adjust_mod.load_chain
+
+    def _bad(c, code):
+        if code == "600519":
+            raise adjust_mod.AdjustError(
+                "复权系数越界：pre_close=1.0 cash=2.0 share_ratio=0.0 → k=1.5")
+        return real(c, code)
+
+    monkeypatch.setattr(adjust_mod, "load_chain", _bad)
+    assert cmd_adj_rebuild(_args(code=["000333", "600519"], source="test")) == 1
+    out = json.loads(capsys.readouterr().out)
+    assert out["codes"]["600519"]["error"].startswith("AdjustError: ")
+    assert "skipped" not in out["codes"]["600519"]
+    assert out["codes"]["000333"]["factor_rows"] == len(DATES)   # 其余照跑
+
+    conn = connect(tmp_db)
+    try:
+        ev = conn.execute(
+            "SELECT level, message, json_extract(context_json,'$.code') AS code"
+            " FROM system_events WHERE level='error'").fetchall()
+    finally:
+        conn.close()
+    assert [(r["level"], r["code"]) for r in ev] == [("error", "600519")]
+    assert "复权链重算失败" in ev[0]["message"]
+
+
+def test_p76_adj_rebuild_never_joins_instruments(tmp_db, monkeypatch, capsys):
+    """`bars_daily` 有行、`instruments` 无行的 code **不得被 JOIN 静默丢掉**：
+    它必须出现在输出里（走 `skipped` 显式露面），否则「不在池里」与「跑过了」长得一样。"""
+    monkeypatch.setattr(paths, "DB_PATH", tmp_db)
+    _seed(tmp_db)
+    conn = connect(tmp_db)
+    repo.insert_bars(conn, _bars("600519"), now=NOW)     # 不登记进 instruments
+    conn.close()
+
+    assert cmd_adj_rebuild(_args(code=None, source="test")) == 0
+    out = json.loads(capsys.readouterr().out)
+    assert set(out["codes"]) == {"000333", "600519"}
+    assert "600519" in out["codes"]["600519"]["skipped"]
+    assert out["codes"]["000333"]["factor_rows"] == len(DATES)
+
+
 def test_backtest_run_refuses_stock_with_unusable_chain(tmp_db, monkeypatch, capsys):
     """跨缺口的标的**不静默回退**：整条链路拒绝，命令在输出里写明 skipped。"""
     monkeypatch.setattr(paths, "DB_PATH", tmp_db)

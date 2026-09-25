@@ -593,13 +593,27 @@ def cmd_adj_rebuild(args: argparse.Namespace) -> int:
 
     幂等且无网络：因子是纯函数（ADR-004），源站修订分红后必须能重算覆盖。
     同时重写 `adj_factor_blackout`（两者同源，缺一都会让读取层拒绝服务）。
-    只处理 6 位股票代码 —— 指数（源站符号）没有复权概念，不写因子行。
+
+    默认清单是 `bars_daily` 的 6 位代码 GLOB —— 指数（`sh000300` 之类，非 6 位）被它
+    排除，但 **ETF 挡不住**：ETF 的 code 也是 6 位数字。而 ADR-008 判 ETF 不可复权
+    （`EtfChainUnsupported`，**设计如此**，不是故障）。所以逐只分两档（ERROR_DIARY #81/#82）：
+
+    - `EtfChainUnsupported` ⇒ 记 `skipped` + warn 事件，**不算失败**（把它算红会让本
+      命令在真库上**永远报红**：那正是「把红报绿」的镜像病）；
+    - 其余异常（`MissingFactor` / `StaleFactorTable` / 裸 `AdjustError` …）⇒ 记
+      `error` + error 事件 + 计入 `failed`，**退出码非零**。
+
+    两档都 `continue` 下一只 —— 一只坏标的不判死整轮。
+    默认清单**故意不 JOIN `instruments`**：JOIN 会静默丢掉「`bars_daily` 有行、
+    `instruments` 无行（或 `type` 为 NULL）」的 code。让它们走 `skipped` 显式露面，
+    比在 WHERE 里悄悄过滤更好审计。
     """
     from stocklab.data import adjust
 
     now = datetime.now(TZ).isoformat(timespec="seconds")
     conn = connect(paths.DB_PATH)
     out: dict = {"codes": {}}
+    failed: list[str] = []
     try:
         if args.code:
             codes = list(args.code)
@@ -608,17 +622,33 @@ def cmd_adj_rebuild(args: argparse.Namespace) -> int:
                 "SELECT DISTINCT code FROM bars_daily"
                 " WHERE code GLOB '[0-9][0-9][0-9][0-9][0-9][0-9]' ORDER BY code")]
         for code in codes:
-            bars, chain = adjust.load_chain(conn, code)
-            if not bars:
-                out["codes"][code] = {"error": "bars_daily 无该标的数据"}
+            try:
+                bars, chain = adjust.load_chain(conn, code)
+                if not bars:
+                    out["codes"][code] = {"error": "bars_daily 无该标的数据"}
+                    continue
+                n = repo.insert_adj_factors(conn, code, chain, source=args.source,
+                                            now=now)
+            except adjust.EtfChainUnsupported as exc:
+                out["codes"][code] = {"skipped": str(exc)}
+                repo.log_event(conn, "adj", "warn",
+                               f"{code} 标的口径不可复权，跳过（ADR-008）",
+                               context={"code": code, "job": "adj_rebuild"}, now=now)
                 continue
-            n = repo.insert_adj_factors(conn, code, chain, source=args.source, now=now)
+            except Exception as exc:                   # noqa: BLE001 — 必须留痕
+                msg = f"{type(exc).__name__}: {exc}"
+                out["codes"][code] = {"error": msg}
+                repo.log_event(conn, "adj", "error",
+                               f"{code} 复权链重算失败: {msg}",
+                               context={"code": code, "job": "adj_rebuild"}, now=now)
+                failed.append(code)
+                continue
             out["codes"][code] = {"factor_rows": n,
                                   **adjust.chain_summary(chain)}
     finally:
         conn.close()
     print(json.dumps(out, ensure_ascii=False))
-    return 0
+    return 1 if failed else 0
 
 
 # ---------- backtest run（离线；复权价 + 成本 + 基准对照） ----------
@@ -1582,8 +1612,15 @@ def cmd_features_build(date: str, codes: list[str] | None) -> int:
             code = row["code"]
             if codes and code not in codes:
                 continue
-            raw_bars, chain = adjust.load_chain(conn, code)
+            # 每轮先清空：`except` 里的 context 要回答「这一轮到底有没有链」，
+            # 留上一轮的值会让它说谎（未绑定变量反而只是 NameError，脏值是隐形的）。
+            raw_bars: list = []
+            chain = None
             try:
+                # `load_chain` 与 `adjust_bars` **同一个保护边界**（ERROR_DIARY #81/#82）：
+                # 前者在真库上对 4 只 ETF 必抛 `EtfChainUnsupported`（ADR-008，设计如此），
+                # 留在 try 外 = 每次跑到第 8 只就整轮 abort。
+                raw_bars, chain = adjust.load_chain(conn, code)
                 # 窗口从 usable_from 起：早于它的一段跨越了无法定价的除权事件，
                 # 那几天的假跌幅无法还原 → 宁可少几天历史，也不交出失真的序列。
                 bars = adjust.adjust_bars(raw_bars, chain, date, code=code,
@@ -1594,8 +1631,8 @@ def cmd_features_build(date: str, codes: list[str] | None) -> int:
                 repo.log_event(conn, "features", "warn",
                                f"{code} {date} 复权链不可用，已跳过（不写不复权失真快照）",
                                context={"date": date, "reason": str(exc),
-                                        "usable_from": chain.usable_from,
-                                        "n_unusable": len(chain.unusable)},
+                                        "usable_from": chain.usable_from if chain else None,
+                                        "n_unusable": len(chain.unusable) if chain else None},
                                now=now)
                 continue
             snap = snapshot.build_snapshot(
