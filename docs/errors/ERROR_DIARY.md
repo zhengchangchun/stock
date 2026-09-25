@@ -4042,3 +4042,76 @@ HTTP 200   24675 B，与 proxy.finance.qq.com/ifzqgtimg/… 的 body **逐字节
 指数与除权事件两个调用点同样覆盖。
 `tests/test_config_universe.py::test_whitelist_is_exact` 更新为精确集合（+2），
 另加一条「镜像 host 过闸 ∧ 数字子域/后缀伪装仍拒」。
+
+
+---
+
+## #81 2026-09-25：兜底只 catch 子类 ⇒ 一条源站脏条款让 800 只的批次整体 abort（P75）
+
+**现象**：真库 800 只采集的 `ingest actions --universe csi300-500` **整批 exit=1**，
+`corp_actions` 写到 417 → **8,439** 行（131.1 min）后中断，自动重试**同因失败**。
+逐只复现（只读）后 468 个有事件的 code 里**只有 600602 一条链算不出来**：
+
+```sql
+SELECT * FROM corp_actions WHERE code='600602' AND cqr='1992-03-09';
+-- code=600602 cqr=1992-03-09 djr='0000-00-00' fh_sh=NULL content='10派100元' source=tencent
+```
+
+同期不复权 K 线（`bars_daily`）：`1992-03-02…03-06` 收盘 **9.35**、`1992-03-09` 起 **9.25**
+⇒ 真实跌幅只有 **0.10 元/股**，条款数理上应是「10派1元」，**源站把数量级写错**。
+按原文算 `k = (9.35 − 10.0) / 9.35 = **−0.0695 ≤ 0**`。
+
+**根本原因**：
+
+> **保护边界画错了两次，两次都画在了「子类」上而不是「这一类失败」上。**
+
+① `event_factor`（`adjust.py:159`）对 `k ≤ 0` 抛的是**裸 `AdjustError`**，
+   而 `build_chain`（`:241`）只 `except UnpriceableTerms` —— 两个类**同族但不同支**，
+   于是「条款荒谬」这条**新出现的**失败方式从兜底旁边穿了過去。
+   `UnpriceableTerms` 已有的三类（无原文 / 无识别条款 / 含配股）语义是「条款不可信 ⇒ 不可定价」，
+   `k ≤ 0` 是**同一件事的第四种来源**，本该走同一条路（记 `chain.unusable`、
+   推后 `usable_from`、由 `adjust_bars` 拒绝跨窗口），却因为异常类型选错而绕开了全部处理。
+
+② `cmd_ingest_actions`（`main.py:302–322`）的 `try` **只包 `fetch_corp_actions`**，
+   `adjust.load_chain` 与 `repo.insert_adj_factors` 在保护**之外** ⇒ 上面的异常
+   一路穿出采集循环，**一只坏码判死整批 800 只**。而同一次运行开头那个
+   「采集失败就记名 + continue」的 `try` 就在十行之外 —— 保护边界的**画法**不一致，
+   是这一族 bug 的共同签名。
+
+**教训**：
+
+- **兜底要 catch 的是「这一类失败」，不是「当前已有的那几个子类」。** 判据是问
+  「**还有哪些异常能从这条路径穿出去**」，而不是「我 catch 了所有已知的」。
+  `except UnpriceableTerms` 在读代码时看着像「条款问题的兜底」，实际只是
+  「条款问题的**已枚举**子集」。#77（修一处 ≠ 修一类）的同族。
+- **容错 ≠ 吞错。** 逐 code 容错是为了让 2 h 的联网作业不被第 600 只判死，
+  **不是**为了让它 exit 0：#54（预算用尽的链报绿码）与 #66（`is_error` 才是主判据）
+  都指向同一件事 —— **把红报成绿比直接炸更贵**。所以本站的容错必须同时做到四件事：
+  ① `out["codes"][code]["error"]` 带**前缀**（`复权链构建失败: …`，与采集失败可区分）
+  ② `system_events` 落 error 并通过 `code` 点名
+  ③ 计入 `failed` ④ 收尾 `status="failed"` ＋ **`return 1`**。
+- **「数据脏」与「代码坏」要分档，不能一起容错。** 只有「每股现金 ≥ 除权前收盘」是
+  **源站条款荒谬**（可判不可定价、走容错档）；`k > 1`（负现金＝解析 bug）与
+  `pre_close ≤ 0` 是**我们这边**的缺陷，必须炸 —— 容错档一旦把它们也吃掉，
+  真正的解析 bug 就会伪装成「一条脏数据」被越过。
+- **反向自检要有：子类化不能破坏既有捕获点。** `UnpriceableTerms` 改成继承
+  `AdjustError` 早已存在，故既有 `pytest.raises(AdjustError, match="复权系数越界")`
+  天然保持绿；异常消息**保留「复权系数越界」子串**是有意为之（子类 + 子串双保险）。
+- **真样本回归要钉在「链的完整性」上，不只是「抛不抛」。** 改后 600602 的链
+  `events=24 / unusable=['1992-03-09','1999-12-02'] / usable_from='1999-12-02'`，
+  且 8,373 个 K 线日**逐日因子齐全（无洞）** —— 这才证明是「归类为不可定价」，
+  而不是「静默丢了一段」。
+
+**已加判据**：`tests/test_adjust.py::test_p75_600602_absurd_terms_are_unpriceable_not_fatal`
+（真样本：`event_factor(9.35, "10派100元")` 抛 `UnpriceableTerms` 且 `isinstance(…, AdjustError)`；
+`build_chain` 的 `unusable == ['1992-03-09','1999-12-02']`、`usable_from == '1999-12-02'`、
+因子逐日齐全、`adjust_bars` 拒绝跨越该事件的窗口）与
+`test_p75_k_above_one_and_non_positive_pre_close_stay_bare_adjust_error`
+（H1b 反向自检：`pre_close ≤ 0` 仍是**裸** `AdjustError`，没被并进容错档）；
+`tests/test_cli_ingest_universe.py::test_p75_one_bad_chain_does_not_abort_the_batch`
+（monkeypatch 一只 `load_chain` 抛 `AdjustError` ⇒ 另一只照跑、`error` 点名前缀、
+`system_events` 有记录、`job_runs(status='failed', detail='1/2 ok')`、**返回 1**）与
+`test_p75_all_chains_ok_returns_zero_without_error_keys`（全绿 ⇒ 返回 0、无 `error` 键、`2/2 ok`）。
+真样本改前/改后（真库 `mode=ro` 复核，见任务书 §7.4）：
+改前 `RAISED AdjustError: 复权系数越界：pre_close=9.35 cash=10.0 share_ratio=0.0 → k=-0.0695…`，
+改后 `OK events=24 unusable=['1992-03-09','1999-12-02'] usable_from=1999-12-02 holes=False`。
