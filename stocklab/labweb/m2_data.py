@@ -40,6 +40,7 @@ from stocklab.backtest import metrics as bt
 from stocklab.config import m2_signals
 from stocklab.labweb import m2_charts
 from stocklab.labweb import paper_data
+from stocklab.paper import arm_names
 from stocklab.m2 import attribution as m2_attr
 from stocklab.m2 import bypass as m2_bypass
 from stocklab.m2 import cases as m2_cases
@@ -62,9 +63,12 @@ SIDE_AI = "ai"
 SIDE_MIRROR = "mirror"
 SIDE_BENCHMARK = "benchmark"
 
+#: 三方对标的两个标签（P84 / K7：名字走 `paper/arm_names.py` 的**唯一真源**）。
+#: `arm-agent-<策略版本>` 走家族前缀兜底 ⇒「AI操盘手·<策略版本>」；一旦某个具体
+#: 版本账户有映射行（如 `arm-agent-ds-v3`），`three_way` 会改用它的显示名。
 SIDE_LABELS: dict[str, str] = {
-    SIDE_AI: "AI 模拟（arm-agent-<策略版本>）",
-    SIDE_MIRROR: "人工镜像（arm-now）",
+    SIDE_AI: f"AI 模拟（{arm_names.display_name(m2_config.ACCOUNT_PREFIX + '<策略版本>')}）",
+    SIDE_MIRROR: f"人工镜像（{arm_names.display_name(m2_config.MIRROR_ACCOUNT)}）",
 }
 
 #: 基准行的标签：**每个指数各一个**，名字取自 `m2_config.BENCHMARK_NAMES`（口径一处定义）。
@@ -178,7 +182,9 @@ def three_way(conn: sqlite3.Connection, asof: str) -> dict:
                 sides.append(_absent_row(
                     SIDE_AI, aid, f"`{aid}` 在绩效读数里没有行 —— 账户在、读数不在"))
                 continue
-            sides.append(_side_row(SIDE_AI, base, excess=excess.get(aid)))
+            sides.append(_side_row(
+                SIDE_AI, base, excess=excess.get(aid),
+                label=f"AI 模拟（{arm_names.display_name(aid)}）"))
     else:
         sides.append(_absent_row(
             SIDE_AI, f"{m2_config.ACCOUNT_PREFIX}<策略版本>",

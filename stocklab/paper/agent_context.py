@@ -28,7 +28,10 @@ import json
 import sqlite3
 from typing import Mapping
 
-from stocklab.paper import agent_decide, agent_spec
+from stocklab.paper import agent_decide, agent_spec, market_view
+#: 模块名与 `build_decision_context` 的注入参数同名（`own_history`），
+#: 故这里带别名 import —— 参数遮蔽模块名会让现算那条分支静默变成 `None`。
+from stocklab.paper import own_history as own_history_view
 from stocklab.paper.config import (
     ARM_AGENT_RANDOM,
     DISCLOSURE_ITEMS,
@@ -41,9 +44,17 @@ from stocklab.paper.engine import (INDEX_300_SYMBOL, max_lots_affordable,
 from stocklab.paper.rules import check_no_lookahead, one_lot_cost
 
 #: 上下文里**刻意不带**的东西（写下来，免得以后有人往里加）。
+#:
+#: ⚠️ 第 1 条是 P84 / K5 的**口径变更**（ADR-035 点名）：D-34 之后 AI 臂的决策空间
+#: 是「方向 ＋ 仓位」，与纪律臂「禁方向择时」不是同一套规则 —— 后者由
+#: `tests/test_paper_discipline_guard.py` 按臂分作用域约束，**本块不放松它**。
+#: 文案逐字照任务书 §0.5 K5（`tests/test_paper_agent_context_p84.py` 钉住）。
 NON_GOALS: tuple[str, ...] = (
-    "不做方向择时：上下文里没有、也不许加任何「涨跌预测」类字段"
-    "（模型概率、资金流、均线方向、情绪分）",
+    "不做涨跌预测：上下文里不许出现任何**前向**字段（模型概率、预测价/目标价、"
+    "信号分、评级、买卖建议）；行情统计（指数已实现收益、当日涨跌家数、估值中位数、"
+    "当日资金净流入）只作**状态描述**，不得当作方向信号 —— D-34 之后 AI 臂的决策空间"
+    "是「方向＋仓位」，与纪律臂「禁方向择时」不是同一套规则，后者由 "
+    "tests/test_paper_discipline_guard.py 按臂分作用域约束",
     "不动成本口径 / PIT 判据 / 整手口径 / 白名单 / append-only 纪律",
     "不扩大变更空间本身（`SPEC_SCHEMA` 的区间不是可以改的字段）",
 )
@@ -147,6 +158,10 @@ def context_sha256(context: Mapping[str, object]) -> str:
 DECISION_HASHED_KEYS: tuple[str, ...] = (
     "arm", "asof", "account", "marks", "index_300", "pool", "guardrails",
     "tradability", "objective", "disclosure", "non_goals", "counter_arm",
+    # P84 / K1：**末尾追加**两块（前 12 键的名字、顺序、语义一字不动）。
+    # 它们是 AI 看得见的输入 ⇒ 必须进指纹：不进的话「同一输入同指纹」这条判据
+    # 会在「市场变了」时依然显示为真 —— 那正是本模块最危险的失效。
+    "market", "own_history",
 )
 
 #: **考核目标**（P80 / D7，用户 2026-09-26 第三条原话「预测准确性高的目的是盈利」）。
@@ -298,7 +313,9 @@ def build_decision_context(conn: sqlite3.Connection, *, arm: str, asof: str,
                            marks: Mapping[str, object],
                            total_assets: float,
                            net_deposits: float | None = None,
-                           sellable_qty: Mapping[str, int] | None = None) -> dict:
+                           sellable_qty: Mapping[str, int] | None = None,
+                           market: dict | None = None,
+                           own_history: dict | None = None) -> dict:
     """喂给 AI 操盘手的 **PIT 上下文**（与 `build_context` 并列，键集不同）。
 
     只含 `<= asof` 的行（净值 / 持仓 / 收盘价 / 候选池快照）；候选池快照本身也按
@@ -309,6 +326,11 @@ def build_decision_context(conn: sqlite3.Connection, *, arm: str, asof: str,
     实盘路径一律由 `engine.decision_context_for` 显式传入（含资本事件的真实净入金）；
     只有测试直接拼上下文时才会是 `None`。`sellable_qty` 不给 ⇒ 逐只报 0
     （T+1 可卖数量未知时报「一股都卖不了」比报「随便卖」安全）。
+
+    `market` / `own_history`（P84 / K1）是**可选注入点**（与 `prices` 同款）：
+    不给 ⇒ 本函数内部按 `asof` 现算（`market_view.market_block` /
+    `own_history.own_history_block`，都是只读、都自带 `<= asof` 过滤）。
+    注入什么就进什么 —— 「上下文里的市场/历史是哪个时刻的」只有参数化才钉得住。
     """
     check_no_lookahead(asof, marks)
     idx = marks.get(INDEX_300_SYMBOL) or pit_close(conn, INDEX_300_SYMBOL, asof)
@@ -353,6 +375,13 @@ def build_decision_context(conn: sqlite3.Connection, *, arm: str, asof: str,
         "disclosure": list(DISCLOSURE_ITEMS),
         "non_goals": list(NON_GOALS),
         "counter_arm": ARM_AGENT_RANDOM,
+        # P84 / K1：末尾两键（**只增键**，既有键的名字/顺序/语义一字不动）。
+        # 注入点与 `prices` 同款：不给就现算。两块都只描述、不预测（K5），
+        # 都不做新采集（K4），尺寸有界（K6）。
+        "market": (market_view.market_block(conn, asof=asof)
+                   if market is None else market),
+        "own_history": (own_history_view.own_history_block(conn, arm=arm, asof=asof)
+                        if own_history is None else own_history),
     }
 
 

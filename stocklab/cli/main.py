@@ -37,6 +37,7 @@ from stocklab.store.db import connect
 from stocklab.store.migrate import ensure_schema, init_db
 # `paper/config.py` 是纯常量叶子模块（无 import），在模块级引用它不会成环 ——
 # 这样 `SPEC_ARMS` 不需要在自己内部再抄一遍臂名字面量。
+from stocklab.paper import arm_names
 from stocklab.paper.config import (ARM_AGENT, ARM_AGENT_RANDOM,
                                   EXECUTOR_AGENT_DECISION, EXECUTOR_KEY,
                                   HALTED_LABEL, LIVE_KEY, RANDOM_MODEL_ID)
@@ -2449,12 +2450,16 @@ def cmd_paper_show(args: argparse.Namespace) -> int:
         return _paper_fail(exc)
     conn.close()
     print(json.dumps(payload, ensure_ascii=False, sort_keys=True, indent=2))
+    # 人类摘要（stderr）：**stdout 的 JSON 键集一个不动**（K7），只在这里补一个
+    # 给人看的 `display` —— 终端里 `arm-agent-ds-v3` 认不出是哪个。
     print(json.dumps({"asof": payload["asof"],
                       "asof_source": payload["asof_source"],
                       "latest_nav_date": payload["latest_nav_date"],
                       "agent_n_reviews": payload["agent"]["n_reviews"],
                       "agent_n_trials_total": payload["agent"]["n_trials_total"],
-                      "accounts": [{"account_id": a["account_id"], "nav": a["nav"],
+                      "accounts": [{"account_id": a["account_id"],
+                                    "display": arm_names.display_name(a["account_id"]),
+                                    "nav": a["nav"],
                                     "cum_return": a["cum_return"],
                                     "max_or_last_drawdown": a["drawdown"]}
                                    for a in payload["accounts"]]},
@@ -4436,7 +4441,9 @@ def build_parser() -> argparse.ArgumentParser:
         "account", help="实时账户与购买力（P80/D5）：现金/净值/净收益 + 每只买得起几手"
                         "（只读，不等收盘链）")
     pp_account.add_argument("--arm", required=True,
-                            help="账户 id：arm-agent / arm-agent-ds-v1 / arm-now …")
+                            help="账户 id：arm-agent / arm-agent-ds-v1 / arm-now …"
+                                 "（显示名见 stocklab/paper/arm_names.py，"
+                                 "如 arm-agent-ds-v3 = AI操盘手·三版）")
     pp_account.add_argument("--asof", help="asof 日期 YYYY-MM-DD"
                                           "（默认：库里有 PIT 收盘价的最近交易日）")
     pp_account.add_argument("--json", action="store_true",

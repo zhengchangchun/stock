@@ -64,21 +64,23 @@ from stocklab.labweb.paper_data import INDEX_LABEL, METRIC_KEYS, METRIC_LABELS
 from stocklab.labweb.render import (cell, esc, glance, glance_html, layout, money,
                                     more, num, ratio_pct, rich, section,
                                     sign_cls, signed_money)
+from stocklab.paper import arm_names
 from stocklab.paper.config import (AGENT_ARM_PREFIX, ARM_AGENT, ARM_AGENT_RANDOM,
                                    ARM_KIND_AGENT, ARM_KIND_AGENT_RANDOM,
                                    EXECUTOR_AGENT_DECISION, EXECUTOR_CHANNEL_A,
                                    HALTED_LABEL, NOT_COMPARABLE,
                                    RULE_CITATIONS_AGENT)
 
-#: 账户 → 人话。**只换标签**，不改任何数字。
+#: 账户 → 人话。**只换标签**，不改任何数字。真源是 `paper/arm_names.py`（P84 / K7）：
+#: 名字只在那里定义一次，本模块只查表 —— 两处各写一份迟早让同一个账户在两个页面上
+#: 有两个名字（本仓已经在「同一页两个数」上吃过这个亏）。
 #: ⚠️ 只钉**没有执行者声明**的两条静态线（`arm-now` / `arm-hold`）—— AI 家族一律走
 #: `_agent_label`（按 `params.executor` 分档）。把 `arm-agent*` 钉在这里就是 P56 §8.4
 #: 那个错标签的成因：`arm-agent-ds-v1/-v2` 的 `arm` 也是 `agent`，按 `arm` 一刀切
 #: 会把**决策台账臂**叫成「智能体 spec 编排」。
-_LABELS: dict[str, str] = {
-    "arm-now": "我 · 实盘账本镜像",
-    "arm-hold": "什么都不做 · 起跑日冻结快照",
-}
+_STATIC_LABEL_IDS = ("arm-now", "arm-hold")
+_LABELS: dict[str, str] = {aid: arm_names.display_name(aid)
+                           for aid in _STATIC_LABEL_IDS}
 
 #: AI 家族的**唯一颜色**（紫）。家族内的线型区分见 `arm_style`。
 _AGENT_COLOR = "#6a3d9a"
@@ -113,8 +115,8 @@ _UNKNOWN_STYLE: tuple[str, str, float] = ("#5a6672", "4 3", 1.6)
 #: 展示顺序：**我 → 什么都不做 → AI 三档**。这是给读者的阅读顺序（先看自己的线），
 #: 不是排名。AI 家族（`arm-agent*`）紧随其后，按「在飞 → 停飞、再按 id」排 ——
 #: 家族成员**不许在这里列举**（P69 §T3）：新开一条版本账户不该要改渲染代码。
-_DISPLAY_ORDER = ("arm-now", "arm-hold", "arm-discipline-05",
-                  "arm-discipline-10", "arm-discipline-15")
+#: 顺序与名字同源（`arm_names.DISPLAY_ORDER`）：两份列表迟早对不上。
+_DISPLAY_ORDER = arm_names.DISPLAY_ORDER
 
 #: AI 家族的两条内置成员（`arm-agent` 自己**不带**前缀那个连字符，要单列）。
 _AGENT_BUILTINS = (ARM_AGENT, ARM_AGENT_RANDOM)
@@ -166,10 +168,13 @@ def _family_style(arm: Mapping) -> tuple[str, str, float]:
 
 
 def _family_label(arm: Mapping) -> str:
-    """AI 家族 → 人话（P69 §T3 的三档）。
+    """AI 家族 → 人话（P69 §T3 的三档；P84 / K7 起名字走 `arm_names`）。
 
     - `executor=m2_channel_a` ⇒ 「通路A · 插桩脚本（`m2_a1`…）· v<策略版本>」；
-    - `executor=agent_decision` ＋ 有预注册 ⇒ 「LLM 操盘臂 · `<model_id>` · <臂名后缀>」；
+    - `executor=agent_decision` ＋ 有预注册 ⇒ 「<显示名> · `<model_id>`」；
+      **映射表里没有的家族成员**保留 P69 的版本后缀写法
+      （「LLM 操盘臂 · `<model_id>` · <臂名后缀>」）—— 新版本账户不会因为没有映射行
+      就掉进「口径未知」；
     - `arm=agent_random` ⇒ 「随机对照（同护栏同成本）」；
     - 执行者字段缺失（手工拼的 dict / 老库）⇒ 退回按 `arm` 给一句人话，**不写「口径未知」**。
     """
@@ -186,13 +191,16 @@ def _family_label(arm: Mapping) -> str:
             return "随机对照（同护栏同成本）"
         model = arm.get("model_id")
         if model:
-            # 臂名后缀 = 账户名去掉家族前缀（`arm-agent-ds-v2` → `ds-v2`）。
+            if aid in arm_names.ARM_NAMES:
+                # **显示名优先**（K7）：`arm-agent-ds-v2` → 「AI操盘手·二版 · <模型>」。
+                return f"{arm_names.display_name(aid)} · {model}"
+            # 没有映射行 ⇒ 保留「版本后缀」那套写法（P69 §T3 的原文案）。
             suffix = aid[len(AGENT_ARM_PREFIX):] if aid.startswith(AGENT_ARM_PREFIX) \
                 else aid
             return f"LLM 操盘臂 · {model} · {suffix}"
-        return f"{aid} · 无预注册（内置占位臂）"
+        return f"{arm_names.display_name(aid)} · 无预注册（内置占位臂）"
     if kind == ARM_KIND_AGENT:
-        return f"{aid} · AI 操盘手（`executor` 未声明）"
+        return f"{arm_names.display_name(aid)}（`executor` 未声明）"
     if kind == ARM_KIND_AGENT_RANDOM:
         return "随机对照（同护栏同成本）"
     return f"{aid}（口径未知）"
@@ -204,6 +212,9 @@ def arm_label(arm: Mapping) -> str:
     修的是 P56 §8.4 点名的错标签：`arm-agent-ds-v1/-v2` 的 `arm` 字段也是 `agent`，
     按 `arm` 一刀切会把**决策台账臂**叫成「智能体 spec 编排」（P37 的旧文案）——
     读表的人会误判口径。停飞臂一律加 `HALTED_LABEL`，与 `paper agent show` 同源。
+
+    P84 / K7：**人名一律查 `paper/arm_names.py`**（唯一真源）。认不出的账户仍按原规矩
+    「原样显示 id + 口径未知」，不猜成最像的那条臂 —— 新开的版本账户不会让页面 500。
     """
     aid = str(arm.get("account_id"))
     if aid in _LABELS:
@@ -212,7 +223,13 @@ def arm_label(arm: Mapping) -> str:
         return _family_label(arm) + _halted_suffix(arm)
     kind = str(arm.get("arm") or "")
     if kind == "discipline" and arm.get("etf_target_pct") is not None:
+        # 映射表里有的纪律档位走显示名；没登记的档位（`arm-discipline-20`）仍按
+        # `etf_target_pct` 拼出人话 —— 不因为「没登记」就降级成「口径未知」。
+        if aid in arm_names.ARM_NAMES:
+            return arm_names.display_name(aid)
         return f"AI 纪律臂 · ETF 目标 {float(arm['etf_target_pct']):.0f}%"
+    if aid in arm_names.ARM_NAMES:
+        return arm_names.display_name(aid)
     return f"{aid}（口径未知）"
 
 
