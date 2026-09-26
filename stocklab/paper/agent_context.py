@@ -57,6 +57,12 @@ NON_GOALS: tuple[str, ...] = (
     "tests/test_paper_discipline_guard.py 按臂分作用域约束",
     "不动成本口径 / PIT 判据 / 整手口径 / 白名单 / append-only 纪律",
     "不扩大变更空间本身（`SPEC_SCHEMA` 的区间不是可以改的字段）",
+    # P85 / K6：复盘的**边界声明**（逐字照任务书 §0.5 K6）。
+    # 复盘台账（`paper_agent_reviews`）是文字与读数，不是参数通路 ——
+    # 载荷 schema 的 `additionalProperties: false` 从结构上堵死了「改参数」字段，
+    # 这里再从输入侧写明一次：`facts` 只以**文本**进入上下文。
+    "复盘只写文字与读数：教训（facts）是**经验陈述**，不许当成参数改动的载体 ——"
+    "五字段白名单、成本口径、整手口径、熔断阈值都不在复盘的触达范围内",
 )
 
 

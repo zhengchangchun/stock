@@ -33,6 +33,20 @@
 净值的全量行数可能上千，上下文里只放最近 ≤20 行；累计数
 （`n_nav_days` / `n_trades` / `n_decisions`）另报**全量计数**——
 「最近 20 行」与「一共跑了多少天」是两件事，混在一起会让模型把切片长度当历史长度。
+
+## P85 / K5：末尾再加两个子键（`recent_reviews` / `facts`）
+
+- `recent_reviews` —— 本臂最近 ≤3 条**复盘**（`paper_agent_reviews`，升序），
+  原样搬运 `items` / `lessons`。这是「我上次复盘说了什么」。
+- `facts` —— K4 的**已确认教训**：同一 `key` 在 **≥2 条不同 asof** 的复盘里出现过
+  才进来（≤10 条）。这是「我反复看到的那件事」。
+
+两块都**只增子键**（既有子键的名字/顺序/语义一字不动，K8），都受 PIT 约束
+（`asof <= 决策日`）、都不含时间戳/自增 id ⇒ 在 `asof` 之后插一条复盘，
+决策日的 `own_history` 与 `decision_context_sha256` **逐字节不变**。
+
+判别 `recent_reviews`（原话）与 `facts`（归纳）是刻意的：原话可被引用、归纳可被检验，
+把两者合成一块，「我说过什么」与「我得出的结论是什么」就再也分不开了。
 """
 
 from __future__ import annotations
@@ -40,12 +54,15 @@ from __future__ import annotations
 import json
 import sqlite3
 
-from stocklab.paper import store
+from stocklab.paper import review, store
 
 #: 切片上限（K6，写进用例）。
 NAV_LIMIT = 20
 TRADE_LIMIT = 10
 DECISION_LIMIT = 5
+#: P85 / K5：复盘与已确认教训的条数上限（真源在 `paper/review.py`）。
+REVIEW_LIMIT = review.REVIEW_LIMIT
+FACT_LIMIT = review.FACT_LIMIT
 
 _TABLE_DECISIONS = "paper_agent_decisions"
 
@@ -145,6 +162,9 @@ def own_history_block(conn: sqlite3.Connection, *, arm: str, asof: str) -> dict:
     `load_nav` / `load_trades` 自带 `date <= asof`（PIT 的唯一实现），
     决策台账自带 `asof < 决策日`（P84 §0.7 修订，见模块 docstring）；
     本函数只做切片、取名、计数。缺表 / 空库 ⇒ 各列表为空、各计数为 0，**不抛**。
+
+    P85 起末尾多两个子键 `recent_reviews` / `facts`（K5，见模块 docstring）——
+    **只增键**，既有子键逐位不变（K8）。两者自带同一层 PIT 过滤。
     """
     nav_rows = ([dict(r) for r in store.load_nav(conn, arm, asof=asof)]
                 if _has_table(conn, "paper_nav_daily") else [])
@@ -198,8 +218,19 @@ def own_history_block(conn: sqlite3.Connection, *, arm: str, asof: str) -> dict:
             "realized_fees_total": realized,
             "decisions": decisions,
             "n_decisions": n_decisions,
-            "notes": notes[:4]}
+            "notes": notes[:4],
+            # P85 / K5：**末尾**追加两个子键（既有子键逐位不变，K8）。
+            # 都自带 PIT（`review.load_reviews` / `derive_facts` 的 `asof <=` 过滤），
+            # 都尺寸有界，都不含时间戳 / 自增 id。
+            "recent_reviews": [
+                {"asof": str(r["asof"]), "kind": str(r["kind"]),
+                 "context_sha256": str(r["context_sha256"] or ""),
+                 "n_items": int(r["n_items"]), "n_lessons": int(r["n_lessons"]),
+                 "items": r["items"], "lessons": r["lessons"]}
+                for r in review.load_reviews(conn, arm=arm, asof=asof,
+                                             limit=REVIEW_LIMIT)],
+            "facts": review.derive_facts(conn, arm=arm, asof=asof)["facts"]}
 
 
 __all__: list[str] = ["own_history_block", "NAV_LIMIT", "TRADE_LIMIT",
-                      "DECISION_LIMIT"]
+                      "DECISION_LIMIT", "REVIEW_LIMIT", "FACT_LIMIT"]

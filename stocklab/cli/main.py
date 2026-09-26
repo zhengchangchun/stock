@@ -3257,6 +3257,152 @@ def _render_agent_evals(payload: dict) -> str:
     return "\n".join(lines)
 
 
+# ---------- AI 操盘手的复盘（P85 / K1–K4） ----------
+
+def _review_context_sha256(conn, *, arm: str, asof: str) -> tuple[str, int]:
+    """复盘要的两样：当日上下文的指纹，与页面/加载器用的 `decision_context_for` 同源。
+
+    ⚠️ **在写之前算**（K7 的「现算」= 由 `decision_context_for` 算出来，不是从载荷里
+    取调用方给的值）。写下去之后这条复盘自己会出现在 `own_history.recent_reviews` 里，
+    于是**事后**现算得到的是「一个含它自己的输入」—— 那不是「写它时所依据的上下文」，
+    而且会变成 `sha = f(sha)` 的不动点。台账那一列记的是**前者**。
+    """
+    from stocklab.paper import agent_context, engine
+
+    ctx = engine.decision_context_for(conn, arm=arm, asof=asof)
+    return agent_context.decision_context_sha256(ctx), len(ctx["pool"]["codes"])
+
+
+def cmd_paper_agent_review(args: argparse.Namespace) -> int:
+    """写一条**复盘**（P85 / K1）：结构+证据校验 → 算上下文指纹 → 落 append-only 台账。
+
+    退出码（与 §0.2 的约定一致）：
+    **2** = 载荷不合法 **或证据指针在库里核不到**（K2/K3：缺 `evidence`、坏
+      `decision_id`/`trade_id`、`asof` 越界、`metric` 名不在白名单、`metric.value`
+      对不上库里的读数、`market.field` 不存在、多一个未知键）—— **一行都不写**；
+    **1** = `(arm, asof, kind)` 已经有一条（append-only，本命令不改写历史）；
+    **0** = 写成功。
+
+    `--model-id` / `--prompt-sha256` 不给 ⇒ 记 `manual` 那对固定值（与
+    `paper spec set` 同一口径：它如实说明这条复盘不是任何模型产出的）。
+    """
+    from stocklab.paper import agent_decide, agent_spec, engine, review
+
+    conn, code = _paper_conn(args)
+    if conn is None:
+        return code
+    try:
+        _agent_arms_check(conn, args.arm)
+        try:
+            payload = json.loads(Path(args.file).read_text(encoding="utf-8"))
+        except OSError as exc:
+            raise review.ReviewValidationError(
+                "--file", args.file, f"读不到复盘文件（{exc.strerror}）") from None
+        except json.JSONDecodeError as exc:
+            raise review.ReviewValidationError(
+                "--file", args.file, f"不是合法 JSON（{exc.msg}）") from None
+        context_sha256, n_pool = _review_context_sha256(
+            conn, arm=args.arm, asof=args.asof)
+        receipt = review.record_review(
+            conn, arm=args.arm, asof=args.asof, payload=payload,
+            model_id=args.model_id or agent_spec.MANUAL_MODEL_ID,
+            prompt_sha256=args.prompt_sha256 or agent_spec.MANUAL_PROMPT_SHA256,
+            context_sha256=context_sha256,
+            now=args.now or datetime.now(TZ).isoformat(timespec="seconds"))
+    except review.ReviewConflict as exc:
+        return _paper_fail(exc, EXIT_CONFLICT)
+    except review.ReviewValidationError as exc:
+        return _paper_fail(exc)
+    except agent_decide.DecisionPayloadError as exc:
+        return _paper_fail(exc)
+    except engine.PaperError as exc:
+        return _paper_fail(exc)
+    finally:
+        conn.close()
+    # stdout 的键集**逐字照 K7**（一行 JSON）；多出来的读数走 stderr。
+    print(json.dumps(
+        {"written": receipt["written"], "review_id": receipt["review_id"],
+         "arm": receipt["arm"], "asof": receipt["asof"],
+         "n_items": receipt["n_items"], "n_lessons": receipt["n_lessons"],
+         "facts": receipt["facts"], "context_sha256": receipt["context_sha256"]},
+        ensure_ascii=False, sort_keys=True))
+    print(json.dumps({
+        "kind": receipt["kind"], "n_facts_truncated": receipt["n_facts_truncated"],
+        "pool_codes": n_pool,
+        "note": ("复盘是**文字与读数**，不是参数：载荷里没有也不许有改参数/改公式的"
+                 "字段（K6）。`context_sha256` 是**写之前**算的 —— 落地之后这条复盘"
+                 "自己会进 `own_history.recent_reviews`，事后现算必然不同"),
+    }, ensure_ascii=False, sort_keys=True), file=sys.stderr)
+    return 0
+
+
+def cmd_paper_agent_reviews(args: argparse.Namespace) -> int:
+    """复盘台账的读出口（P85 / K7）**只读**：含 `payload` 全文，不重算任何东西。"""
+    from stocklab.paper import engine, review, store
+
+    conn, code = _paper_conn(args)
+    if conn is None:
+        return code
+    try:
+        if not store.account_exists(conn, args.arm):
+            raise engine.missing_account_error(args.arm)
+        total = len(review.load_reviews(conn, arm=args.arm))
+        rows = review.load_reviews(conn, arm=args.arm, limit=args.limit)
+        payload = {"arm": args.arm, "n_reviews": total, "n_shown": len(rows),
+                   "limit": args.limit, "reviews": rows,
+                   "note": ("只读投影：`payload` 是落库那一份的解析结果，"
+                            "本命令不重算、不翻译。`limit` 给了就取**最近** N 条"
+                            "（仍以 `asof` 升序返回）")}
+    except engine.PaperError as exc:
+        conn.close()
+        return _paper_fail(exc)
+    conn.close()
+    print(json.dumps(payload, ensure_ascii=False, sort_keys=True, indent=2))
+    return 0
+
+
+def cmd_paper_agent_facts(args: argparse.Namespace) -> int:
+    """打印 K4 的**已确认教训**（P85 / K7）**只读**、**确定性**。
+
+    「已确认」= 同一个 `key` 在 **≥2 条不同 `asof`** 的复盘里出现过。单次陈述是
+    **观察**，反复出现才是**模式** —— 这条规则就是「确认」二字的可执行定义。
+
+    `--asof` 不给 ⇒ 用该臂台账里**最后一条复盘的 `asof`**（`latest_review`）：
+    台账一行都没有 ⇒ 空 `facts` ＋ `note`、**exit 0**（「还没有」是合法读数）。
+    """
+    from stocklab.paper import engine, review, store
+
+    conn, code = _paper_conn(args)
+    if conn is None:
+        return code
+    try:
+        if not store.account_exists(conn, args.arm):
+            raise engine.missing_account_error(args.arm)
+        rows = review.load_reviews(conn, arm=args.arm)
+        asof = args.asof
+        source = "explicit"
+        if asof is None:
+            asof = rows[-1]["asof"] if rows else None
+            source = "latest_review" if rows else None
+        derived = ({"facts": [], "n_facts_truncated": 0, "n_reviews": 0}
+                   if asof is None
+                   else review.derive_facts(conn, arm=args.arm, asof=asof))
+        payload = {"arm": args.arm, "asof": asof, "asof_source": source,
+                   "n_reviews": derived["n_reviews"],
+                   "n_facts": len(derived["facts"]),
+                   "n_facts_truncated": derived["n_facts_truncated"],
+                   "facts": derived["facts"],
+                   "note": ("纯函数：同库同 arm 两次调用逐字节相同（不含时间戳、"
+                            "不含自增 id）。出现在 1 条复盘里的 key **不进** facts"
+                            "—— 单次陈述是观察，≥2 条不同 asof 才是模式")}
+    except engine.PaperError as exc:
+        conn.close()
+        return _paper_fail(exc)
+    conn.close()
+    print(json.dumps(payload, ensure_ascii=False, sort_keys=True, indent=2))
+    return 0
+
+
 # ---------- 基金净值（P52 / D-36 第三条对照臂） ----------
 def cmd_fund_ingest(args: argparse.Namespace) -> int:
     """把 `pingzhongdata/<code>.js` 落进 `fund_nav_daily`（**只增**）。
@@ -4609,6 +4755,40 @@ def build_parser() -> argparse.ArgumentParser:
     ppa_evals.add_argument("--json", action="store_true", help="打完整 JSON（默认人读摘要）")
     ppa_evals.add_argument("--db")
     ppa_evals.set_defaults(func=cmd_paper_agent_evals)
+
+    ppa_review = pp_agent_sub.add_parser(
+        "review", help="写一条复盘（P85）：证据指针必须在库里核到，读数不许编")
+    ppa_review.add_argument("--asof", required=True, help="复盘日 YYYY-MM-DD（PIT）")
+    ppa_review.add_argument("--arm", default=ARM_AGENT, help=f"目标臂（默认 {ARM_AGENT}）")
+    ppa_review.add_argument("--file", required=True, help="复盘载荷 JSON 路径")
+    ppa_review.add_argument(
+        "--model-id", dest="model_id", default=None,
+        help="产出这条复盘的模型标识（不给 ⇒ manual，"
+             "如实说明它不是模型产出的）")
+    ppa_review.add_argument(
+        "--prompt-sha256", dest="prompt_sha256", default=None,
+        help="提示词（含温度）指纹（不给 ⇒ 与 paper spec set 同一对固定值）")
+    ppa_review.add_argument("--db")
+    ppa_review.add_argument("--now", help="覆盖当前时刻（测试/补录用）")
+    ppa_review.set_defaults(func=cmd_paper_agent_review)
+
+    ppa_reviews = pp_agent_sub.add_parser(
+        "reviews", help="复盘台账（P85/K7）：只读列出，含 payload 全文")
+    ppa_reviews.add_argument("--arm", required=True,
+                             help="账户 id：arm-agent-ds-v2 …")
+    ppa_reviews.add_argument("--limit", type=int, default=None,
+                             help="只取**最近** N 条（仍以 asof 升序返回）")
+    ppa_reviews.add_argument("--db")
+    ppa_reviews.set_defaults(func=cmd_paper_agent_reviews)
+
+    ppa_facts = pp_agent_sub.add_parser(
+        "facts", help="已确认教训（P85/K4）：同一 key 在 ≥2 条不同 asof 复盘里出现过")
+    ppa_facts.add_argument("--arm", required=True,
+                           help="账户 id：arm-agent-ds-v2 …")
+    ppa_facts.add_argument("--asof", help="只统计 asof <= 这一天的复盘"
+                                          "（缺省 = 该臂最后一条复盘的 asof）")
+    ppa_facts.add_argument("--db")
+    ppa_facts.set_defaults(func=cmd_paper_agent_facts)
 
     fund = sub.add_parser(
         "fund", help="基金日净值（P52/D-36）：非官方源，等权平均臂只比净值曲线")

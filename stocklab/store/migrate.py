@@ -1163,6 +1163,107 @@ def migrate_p71_universe_memberships(conn) -> list[str]:
     return [f"{_P71_TABLE}.index"]
 
 
+# ---------------------------------------------------------------------------
+# P85：AI 操盘手**复盘台账** `paper_agent_reviews`（**新表**，K1）。
+#
+# ## 与 P58/P79/P80 的范式**有一处刻意的不同**：DDL 在本文件里，不在 schema.sql
+#
+# 那几站把新表写进 `schema.sql` 的 `CREATE TABLE IF NOT EXISTS`，于是老库与新库
+# 走同一条路径（表不存在 ⇒ executescript 直接建出）。本站的改动面白名单**不含**
+# `store/schema.sql`，所以表由本函数自己建 —— 「谁来建这张表」只有一个答案：
+# 就是这里。代价是 `executescript` 不再顺手建它，收益是**不存在第二种 shape**。
+#
+# ## 幂等
+#
+# 建表 / 建触发器 / 建索引各自判「在不在」，第二次调用返回 `[]`。
+# 本函数**只加表与触发器**，不改任何既有表 —— 真库前滚由 nanobot 做。
+#
+# ## 触发器文本与 P48/P58 同款
+#
+# `BEFORE UPDATE/DELETE` 双触发器拒绝改写历史行。⚠️ 用 `INSERT OR REPLACE`
+# 绕过需要 `db.connect()` 打开 `PRAGMA recursive_triggers=ON`（P6 实测）——
+# 这**不是**本表的缺陷，是全项目 append-only 的已知边界，用例按 P48 反向自检它。
+# ---------------------------------------------------------------------------
+
+_P85_TABLE = "paper_agent_reviews"
+
+#: 列逐字照任务书 §0.5 K1（**改列必须同时改任务书**）。
+_P85_DDL = """
+CREATE TABLE IF NOT EXISTS paper_agent_reviews (
+    review_id      INTEGER PRIMARY KEY AUTOINCREMENT,
+    arm            TEXT NOT NULL,
+    asof           TEXT NOT NULL,
+    kind           TEXT NOT NULL,
+    model_id       TEXT NOT NULL,
+    prompt_sha256  TEXT NOT NULL,
+    context_sha256 TEXT NOT NULL,
+    n_items        INTEGER NOT NULL,
+    n_lessons      INTEGER NOT NULL,
+    payload_json   TEXT NOT NULL,
+    created_at     TEXT NOT NULL,
+    UNIQUE (arm, asof, kind)
+)"""
+
+_P85_TRIGGERS = (
+    "CREATE TRIGGER IF NOT EXISTS trg_paper_agent_reviews_no_update"
+    " BEFORE UPDATE ON paper_agent_reviews"
+    " BEGIN SELECT RAISE(ABORT, 'paper_agent_reviews is append-only"
+    " (改错请再审一版)'); END;\n"
+    "CREATE TRIGGER IF NOT EXISTS trg_paper_agent_reviews_no_delete"
+    " BEFORE DELETE ON paper_agent_reviews"
+    " BEGIN SELECT RAISE(ABORT, 'paper_agent_reviews is append-only'); END;"
+)
+
+_P85_TRIGGER_NAMES = ("trg_paper_agent_reviews_no_update",
+                      "trg_paper_agent_reviews_no_delete")
+
+#: K1：`(arm, asof)` 是读侧的两个过滤列（`load_reviews` / `derive_facts` 都按它们扫）。
+_P85_INDEX = ("CREATE INDEX IF NOT EXISTS idx_paper_agent_reviews_arm_asof"
+              " ON paper_agent_reviews (arm, asof)")
+
+_P85_INDEX_NAME = "idx_paper_agent_reviews_arm_asof"
+
+
+def _index_exists(conn, name: str) -> bool:
+    return conn.execute(
+        "SELECT COUNT(*) FROM sqlite_master WHERE type='index' AND name=?",
+        (name,)).fetchone()[0] > 0
+
+
+def agent_reviews_need_p85(conn) -> bool:
+    """复盘台账**建全了没有**（表 + 两触发器 + 索引）？（只读探测，供 doctor 用）
+
+    与 P58/P79 的判据刻意不同：那几站**不含「表不存在」**（表由 schema.sql 的
+    executescript 建出，不存在 ⇒ 不 pending）。本站的 DDL 在本文件里 ⇒
+    「表不存在」**就是**待前滚，故判据含它。
+    """
+    if not _table_exists(conn, _P85_TABLE):
+        return True
+    if any(not _trigger_exists(conn, name) for name in _P85_TRIGGER_NAMES):
+        return True
+    return not _index_exists(conn, _P85_INDEX_NAME)
+
+
+def migrate_p85_agent_reviews(conn) -> list[str]:
+    """建/补齐复盘台账 `paper_agent_reviews`（表 + 两触发器 + 索引）。**可重入**。
+
+    只加表与触发器，**不改任何既有表**（真库前滚由 nanobot 做，见任务书 §5）。
+    第二次调用返回 `[]`（三样都在位即跳过）。
+    """
+    changes: list[str] = []
+    if not _table_exists(conn, _P85_TABLE):
+        conn.execute(_P85_DDL)
+        changes.append(f"{_P85_TABLE}.table")
+    missing = [n for n in _P85_TRIGGER_NAMES if not _trigger_exists(conn, n)]
+    if missing:
+        conn.executescript(_P85_TRIGGERS)
+        changes.append(f"{_P85_TABLE}.triggers")
+    if not _index_exists(conn, _P85_INDEX_NAME):
+        conn.execute(_P85_INDEX)
+        changes.append(f"{_P85_TABLE}.index")
+    return changes
+
+
 #: 已知迁移 marker 清单：doctor 逐个报告在位与否（只读，不迁移）。#: (name, table, 判据)。判据是列名（str）或一个只读探测函数。
 #: 新增迁移时必须在这里登记，否则 doctor 看不出来。
 _KNOWN_MARKERS: list[tuple[str, str, object]] = [
@@ -1213,6 +1314,11 @@ _KNOWN_MARKERS: list[tuple[str, str, object]] = [
     # 真库落位由 nanobot 显式调 `seed_agent_capital_topup`（D9 的备份 → 副本 → 核对）。
     ("p80_agent_capital_topup", "paper_capital_events",
      lambda conn: not agent_capital_topup_missing(conn)),
+    # P85：复盘台账是**新表**，与 P58/P79 同档 —— 不挂 `_pending_column_migrations`
+    # （表不存在 ⇒ 无需备份），结构前滚走 `_apply_schema`。这里让 doctor 只读报告
+    # 「复盘台账、两触发器与索引还在不在」。
+    ("p85_agent_reviews", "paper_agent_reviews",
+     lambda conn: not agent_reviews_need_p85(conn)),
 ]
 
 
@@ -1282,6 +1388,7 @@ def _apply_schema(conn, sql: str) -> list[str]:
     changes += migrate_p56_agent_arms_executor(conn)
     changes += migrate_p58_plugin_reviews(conn)
     changes += migrate_p80_capital_events(conn)
+    changes += migrate_p85_agent_reviews(conn)
     return changes
 
 
