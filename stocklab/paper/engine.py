@@ -45,6 +45,7 @@ import json
 import re
 import sqlite3
 from dataclasses import replace
+from statistics import median
 from typing import Mapping, Sequence
 
 from stocklab.calendar.trading_calendar import Calendar
@@ -274,6 +275,117 @@ def max_lots_affordable(cash: float, one_lot_cost_value: float) -> int:
 
 
 # ---------- 臂的分派 ----------
+
+def missing_account_error(arm: str) -> PaperError:
+    """「账户不存在」的**唯一**措辞（P81 / D2：新读出口沿用 `paper account` 的口径）。
+
+    账户名拼错与「还没建」都点到这里，**不静默返回空** —— 空列表与不存在的账户
+    在 JSON 上长得一样，而它们不是一回事。
+    """
+    return PaperError(
+        f"账户 {arm} 不存在；先 `paper init`（或 `paper agent enroll`）—— "
+        f"账户名拼错与「还没建」都点到这里，不静默返回空")
+
+
+def min_weight_pct(one_lot_cost_value: float, total_assets: float) -> float | None:
+    """`一手含费成本 / 总资产 × 100`（4 位小数）—— 这条占比公式的**唯一**实现。
+
+    AI 输入侧的 `tradability.min_weight_pct`（P79/P80）与可下手域读数
+    （`trading_domain.min_tradable_weight_pct`，P81/D4）都是它。
+    `total_assets ≤ 0` ⇒ `None`：算不出占比时**不猜一个数**。
+    """
+    total = float(total_assets)
+    if total <= 0:
+        return None
+    return round(float(one_lot_cost_value) / total * 100.0, 4)
+
+
+def tradable_verdict(*, affordable_lots: int, one_lot_cost_value: float,
+                     total_assets: float, cash: float) -> tuple[bool, str | None]:
+    """「这只标的**今天**下不下得了手」—— 判据的**唯一**实现（P81 / D1 ＋ D4）。
+
+    ## 为什么必须只有一处
+
+    同一个结论要在两个面上出现：AI 的输入侧（`agent_context._tradability_block`
+    的 `tradable`）与账户读数的购买力（`account_view.buying_power.by_code`）。
+    两处各写一遍「买不买得起」，迟早会有一处口径漂移 —— 那就是 D-37 那类
+    「同一页两个数」的事故形状（ERROR_DIARY #70）。
+
+    ## 判据只有一条
+
+    `tradable = (affordable_lots >= 1)`，而 `affordable_lots` 由
+    `max_lots_affordable`（唯一的整手数公式）算出。**不另写**「买不买得起」的算法。
+
+    ## 这是「现金口径的今天」，不是「这标的不许交易」
+
+    `tradable=False` 只说明**现在**下不了手，不预测「卖掉别的标的是否能凑够」，
+    也**不许**被任何写入口当成硬拒绝（P79 / D2 的条款：写入口不因可成交性拒载荷）。
+    理由文本把两个数都点名，正是为了让读者能自己判断该不该先卖出别的标的。
+
+    成因分两种（两种**分开**说，因为处置不同：一种是无解，一种是先卖再买）：
+    - 一手成本 > 总资产 ⇒ 「已超过总资产」（这个账户再怎么样也买不起）；
+    - 否则（总资产够、现金不够）⇒ 「现金不足…（先卖出其他标的可释放现金）」。
+    """
+    if int(affordable_lots) >= 1:
+        return True, None
+    cost = float(one_lot_cost_value)
+    total = float(total_assets)
+    if cost > total:
+        return False, f"一手 ¥{cost:.2f} 已超过总资产 ¥{total:.2f}"
+    return False, (f"现金 ¥{float(cash):.2f} 不足一手 ¥{cost:.2f}"
+                   f"（先卖出其他标的可释放现金）")
+
+
+def trading_domain(*, by_code: Mapping[str, Mapping[str, object]],
+                   n_pool_codes: int, total_assets: float) -> dict:
+    """**可下手域**的读数面（P81 / D4）：池内一手成本分布 ＋ 可下手只数。
+
+    ## 为什么它是一块独立的读数
+
+    「小面额也能下手」这件事此前没有任何可核对的数：池内一手成本分布、可下手
+    只数、最小可成交权重全要手工算。`min_tradable_weight_pct` 是「用最少的钱
+    铺开最多只」的那把尺子 —— 低于它的目标权重买不到任何东西。
+
+    ## 口径（**不重算**任何判据）
+
+    数据源是 `account_view.buying_power.by_code` 的成品行：
+    `tradable` / `one_lot_cost` 都是那边已经算好的，本函数只做汇总
+    （计数、最小值、中位数），不重新判一次「买不买得起」。
+
+    - `one_lot_cost_p50` / `one_lot_cost_min`：**池内可定价**（`by_code` 全部行）
+      的一手成本中位数与最小值 —— 「池内成本分布」描述的是这一池，不是可下手子集；
+    - `cheapest_code`：**可下手子集**里一手最便宜的那只（与 D1 的
+      `tradability.cheapest` 同一个含义：真能下手的里面最便宜的）；
+    - `untradable`：每只买不起的 code ＋ 一手成本 ＋ 理由原文（页面/报告据此
+      **点名**，而不是只报一个数）；
+    - 两边都为空 ⇒ 相关键一律 `None`（**不猜数**）。
+    """
+    rows = {str(c): r for c, r in by_code.items()}
+    costs = sorted(float(r["one_lot_cost"]) for r in rows.values())
+    tradable = sorted(c for c, r in rows.items() if r.get("tradable"))
+    untradable = [{"code": c, "one_lot_cost": float(rows[c]["one_lot_cost"]),
+                   "reason": rows[c].get("untradable_reason")}
+                  for c in sorted(c for c, r in rows.items() if not r.get("tradable"))]
+    cheapest = None
+    if tradable:
+        code = min(tradable, key=lambda c: (float(rows[c]["one_lot_cost"]), c))
+        cheapest = {"code": code, "one_lot_cost": float(rows[code]["one_lot_cost"])}
+    mins = [p for c in tradable
+            if (p := min_weight_pct(float(rows[c]["one_lot_cost"]), total_assets))
+            is not None]
+    return {
+        "n_pool_codes": int(n_pool_codes),
+        "n_priced": len(rows),
+        "n_tradable": len(tradable),
+        "n_untradable": len(rows) - len(tradable),
+        "min_tradable_weight_pct": (min(mins) if mins else None),
+        "one_lot_cost_p50": (median(costs) if costs else None),
+        "one_lot_cost_min": (costs[0] if costs else None),
+        "cheapest_code": (None if cheapest is None else cheapest["code"]),
+        "cheapest": cheapest,
+        "untradable": untradable,
+    }
+
 
 def has_rules(account: dict) -> bool:
     """这条臂跑不跑**写死的纪律条文**（`_plan_steps` 那条路径）。
@@ -1435,9 +1547,7 @@ def account_view(conn: sqlite3.Connection, arm: str, asof: str | None = None) ->
     account = next((a for a in store.load_accounts(conn)
                     if a["account_id"] == arm), None)
     if account is None:
-        raise PaperError(
-            f"账户 {arm} 不存在；先 `paper init`（或 `paper agent enroll`）—— "
-            f"账户名拼错与「还没建」都点到这里，不静默返回空")
+        raise missing_account_error(arm)
     executor_kind(account)      # 认领关系 fail-closed（与 `_account_entry` 同一道闸）
 
     resolved = asof if asof is not None else latest_pit_close_date(conn)
@@ -1496,11 +1606,22 @@ def account_view(conn: sqlite3.Connection, arm: str, asof: str | None = None) ->
                            "error": str(exc), "type": type(exc).__name__})
             continue
         cost = one_lot_cost(price=float(p.price), asset_class=asset_class)
+        lots = max_lots_affordable(cash, cost)
+        # P81 / D4：「今天下不下得了手」的结论。判据是 `tradable_verdict` 一处实现
+        # —— AI 输入侧的 `tradability.by_code[c].tradable` 调的是**同一个函数**，
+        # 两处各写一份就会造出同一页两个数（ERROR_DIARY #70）。
+        tradable, reason = tradable_verdict(affordable_lots=lots,
+                                            one_lot_cost_value=cost,
+                                            total_assets=total, cash=cash)
         by_code[code] = {
             "one_lot_cost": cost, "asset_class": asset_class,
             "price": float(p.price), "price_asof": str(p.price_asof),
-            "max_lots_affordable": max_lots_affordable(cash, cost),
+            "max_lots_affordable": lots,
+            "tradable": tradable, "untradable_reason": reason,
         }
+
+    domain = trading_domain(by_code=by_code, n_pool_codes=len(pool_codes),
+                            total_assets=total)
 
     fills = store.trades_on(conn, arm, resolved)
     return {
@@ -1533,6 +1654,10 @@ def account_view(conn: sqlite3.Connection, arm: str, asof: str | None = None) ->
             "by_code": by_code,
             "n_pool_codes": len(pool_codes),
             "n_priced": len(by_code),
+            # P81 / D4：可下手域的读数面（计数 / 中位数 / 最小可成交权重）。
+            # 它就是本函数算出来的那一份 —— `build_report` 与页面直接取它，
+            # **不另算**（另算就是第二个真相）。
+            "tradable_domain": domain,
             "fills_on_asof": {
                 "n": len(fills),
                 "amount": round(sum(float(t["fill_price"]) * int(t["qty"])
@@ -1618,6 +1743,79 @@ def arm_target_label(arm_kind: str, etf_target_pct: float | None) -> str:
     return f"{arm_kind}（口径未登记）"
 
 
+#: 未成交腿理由在**对账表**里截断到多少字符（原文仍是 `paper agent evals` 的出口）。
+RECON_REASON_MAX = 120
+
+#: 台账里一条有决策的 AI 臂都没有时的**唯一**措辞 —— 空列表不是「全都落地了」。
+NO_RECON_FMT = ("`paper_agent_decisions` 里没有任何一条 AI 臂的决策 ⇒ 没有「意图」"
+                "可比，本块**不是**「全都落地了」")
+
+
+def _truncate_reason(text: str, limit: int = RECON_REASON_MAX) -> str:
+    return text if len(text) <= limit else text[:limit] + "…"
+
+
+def reconciliation_block(conn: sqlite3.Connection, asof: str) -> dict:
+    """「AI 意图」vs「账户落地」的逐臂对账（P81 / D3）。
+
+    ## 为什么必须有它
+
+    P79 把「为什么没动」落进了 `paper_agent_evals`（`plan_orders` 早就算得出的
+    理由），但**一个消费者都没有**：`paper show` / `/lab/paper` / 日报全都不读它。
+    于是「AI 意图 67% 仓位、账户 0% 现金」这类事故（P79 §0.1 的真实故障）
+    在页面上依然看不见。可观测性是本站的全部目的。
+
+    ## 覆盖面：**有决策的臂**，不写死 `arm-agent`
+
+    `agent_block` 的其余字段讲的是 `arm-agent`；而真库在跑的其实是
+    `arm-agent-ds-v1` / `-v2`（`arm-agent` 一条决策都没有，见 P81 §0.2）。
+    写死一条臂 ⇒ 页面长期展示一条空臂。故本块是**列表**：覆盖 `paper_accounts`
+    里 `arm` 以 `agent` 开头、且在 `paper_agent_decisions` 里有行的每一条臂，
+    各取自己最新的决策日（且 `asof <=` 本块的 asof —— 历史视图不显示未来）。
+
+    ## 三个数各自如实，**不用 `min()` 抹平**
+
+    - `n_legs_planned`：最新一条 `portfolio` 决策的载荷条数；
+    - `n_legs_filled`：该臂**那个决策日**的 `paper_trades` 行数；
+    - `n_legs_unfilled` 与 `n_evals`：同一日的 `paper_agent_evals` 行数。
+      后两个**故意重复**（一个是「腿数」、一个是「台账行数」）：两者不等的差额
+      本身就是信号，抹平它等于把信号藏起来。
+
+    该臂只有 spec 复审行、没有操盘决策 ⇒ `n_legs_planned` 是 `None`（**不猜 0**：
+    「没有载荷可比」与「载荷是空的」不是一回事）。
+    """
+    arms: list[dict] = []
+    for account in store.load_accounts(conn):
+        if not str(account["arm"]).startswith("agent"):
+            continue
+        arm = str(account["account_id"])
+        rows = [d for d in agent_decide.load_decisions(conn, arm)
+                if str(d["asof"]) <= asof]
+        if not rows:
+            continue
+        portfolio = agent_decide.portfolio_decisions_only(rows)
+        decision = portfolio[-1] if portfolio else None
+        d_asof = str(decision["asof"] if decision is not None else rows[-1]["asof"])
+        planned = (None if decision is None else
+                   len((decision.get("payload") or {}).get("decisions") or []))
+        trades = store.trades_on(conn, arm, d_asof)
+        evals = store.load_agent_evals(conn, arm=arm, asof=d_asof)
+        arms.append({
+            "arm": arm,
+            "asof": d_asof,
+            "n_legs_planned": planned,
+            "n_legs_filled": len(trades),
+            "n_legs_unfilled": len(evals),
+            # 与 `n_legs_unfilled` 同值（故意重复，见 docstring）：一个是台账行数、
+            # 一个是腿数；不等时**如实报**两个数。
+            "n_evals": len(evals),
+            "unfilled": [{"code": str(e["code"]), "action": str(e["action"]),
+                          "reason": _truncate_reason(str(e["reason"]))}
+                         for e in evals],
+        })
+    return {"arms": arms, "note": (None if arms else NO_RECON_FMT)}
+
+
 def _cum_return_at(conn: sqlite3.Connection, account_id: str,
                    asof: str) -> float | None:
     row = conn.execute(
@@ -1639,6 +1837,8 @@ def agent_block(conn: sqlite3.Connection, asof: str) -> dict:
     spec = agent_spec.current_spec(conn, ARM_AGENT, asof)
     ledger = agent_spec.ledger_summary(conn, ARM_AGENT, asof)
     random_ledger = agent_spec.ledger_summary(conn, ARM_AGENT_RANDOM, asof)
+    # P81 / D3：逐臂对账（覆盖**有决策的**臂，不写死 `arm-agent`）。
+    recon = reconciliation_block(conn, asof)
     rows = agent_decide.load_decisions(conn, ARM_AGENT)
     portfolio = agent_decide.portfolio_decisions_only(rows)
     history = []
@@ -1705,6 +1905,10 @@ def agent_block(conn: sqlite3.Connection, asof: str) -> dict:
         "counter_arm": {"arm": ARM_AGENT_RANDOM,
                         "n_reviews": random_ledger["n_reviews"],
                         "wired": available},
+        # P81 / D3：「AI 说的」vs「账户做的」逐臂对账。**只增键** —— 既有读者
+        # （`paper show` / 页面 / `--json` 的下游）拿到的是多出来的两个键，不是变了形的键。
+        "reconciliation": recon["arms"],
+        "reconciliation_note": recon["note"],
         "evidence_note": ("n_trials_total 与 n_rejected 必须与净值同时读："
                           "试了很多版选最好那版，读数是**上界**不是期望"),
     }
@@ -1759,6 +1963,40 @@ def show_payload(conn: sqlite3.Connection, today: str, *,
     return payload
 
 
+def tradable_domain_block(conn: sqlite3.Connection, arm: str, asof: str) -> dict:
+    """一条 AI 臂在 `asof` 的可下手域读数（P81 / D4）。
+
+    数据源是 `account_view`（账户 ＋ 购买力的**唯一**投影）—— 这里只把
+    `buying_power.tradable_domain` 原样取出来，**不另算**一遍：「同一个数只许有一个
+    来源」是这一页的既有纪律（ADR-023 / D-37）。
+
+    取不到（缺价 / 无池 / 账户口径坏掉）⇒ `available: False` ＋ 点名原因，**不编数**
+    （与页面既有降级分支同形：取不到就写取不到，不填 0）。「无池」与「池内一只都取不到
+    价」都要走这条路：那时 `n_tradable=0` 是**不可判定**，不是「一只都买不起」。
+
+    ⚠️ 降级分支**必须真的降级**：这一段挂在 `build_report` / 页面上，一个账户的口径
+    读不出来（例如老账户的 `params_json` 里没有 `initial_capital`）**不许把整份报告
+    打崩** —— 报告里少一行是真的，500 是坏的。故这里连 `KeyError` / `ValueError`
+    一起接住并**点名类型**（`type`），而不是让它冒到渲染层。
+    """
+    try:
+        view = account_view(conn, arm, asof)
+    except (PaperError, agent_decide.DecisionPayloadError, KeyError,
+            ValueError) as exc:
+        return {"available": False, "arm": arm, "asof": asof,
+                "reason": str(exc), "type": type(exc).__name__}
+    domain = dict(view["buying_power"]["tradable_domain"])
+    if domain["n_pool_codes"] == 0:
+        return {"available": False, "arm": arm, "asof": view["asof"],
+                "reason": f"{view['asof']} 没有候选池（可投集合为空）—— "
+                          f"可下手域不可判定，不填 0"}
+    if domain["n_priced"] == 0:
+        return {"available": False, "arm": arm, "asof": view["asof"],
+                "reason": f"池内 {domain['n_pool_codes']} 只标的都取不到 "
+                          f"≤ {view['asof']} 的收盘价 —— 不可判定，不填 0"}
+    return {"available": True, "arm": arm, "asof": view["asof"], **domain}
+
+
 def build_report(conn: sqlite3.Connection, asof: str) -> dict:
     """报告数据（纯函数式：同一库 + 同一 asof → 同一结果，不含生成时刻）。"""
     accounts = store.load_accounts(conn)
@@ -1779,7 +2017,7 @@ def build_report(conn: sqlite3.Connection, asof: str) -> dict:
             peak = max(peak, v)
             if peak > 0:
                 mdd = max(mdd, (peak - v) / peak)
-        per_account.append({
+        entry = {
             **{k: e[k] for k in ("account_id", "arm", "etf_target_pct", "date",
                                  "live",
                                  "cash", "positions", "market_value", "nav",
@@ -1793,7 +2031,13 @@ def build_report(conn: sqlite3.Connection, asof: str) -> dict:
                 sum(e["positions"].get(c, 0) * e["marks"][c]["price"]
                     for c in ETF_WHITELIST if c in e["marks"]) / e["nav"] * 100.0, 4)
             if e["nav"] else None,
-        })
+        }
+        if e["arm"] in (ARM_KIND_AGENT, ARM_KIND_AGENT_RANDOM):
+            # P81 / D4：**每条 AI 臂**补一个可下手域块（非 AI 臂不加键：它们的
+            # 「一手买不买得起」不是这套口径要回答的问题）。
+            entry["tradable_domain"] = tradable_domain_block(conn, e["account_id"],
+                                                             asof)
+        per_account.append(entry)
     return {
         "asof": asof, "start_date": start,
         "index_300": ({"level": idx.price, "price_asof": idx.price_asof,
@@ -1808,6 +2052,27 @@ def build_report(conn: sqlite3.Connection, asof: str) -> dict:
                         f"{len(store.load_nav(conn, accounts[0]['account_id'], asof=asof)) if accounts else 0}"
                         f" 个交易日，**<120 交易日 → 样本不足，仅供观察**"),
     }
+
+
+def render_tradable_domain(domain: Mapping | None) -> list[str]:
+    """可下手域那一行的 Markdown（P81 / D4；报告与页面用**同一批措辞**）。
+
+    数字全部来自 `tradable_domain`（`account_view.buying_power` 的成品），
+    本函数不重算；形状不全就写「取不到」——**不填 0**。
+    买不起的标的**点名**（code ＋ 理由原文），因为「买不起」有两种成因、
+    处置不同（一种是这个账户无解，另一种是先卖出别的标的）。
+    """
+    if not domain:
+        return ["- 可下手域：**取不到**（这条臂当日没有账户投影）—— 不填 0"]
+    if not domain.get("available"):
+        return [f"- 可下手域：**取不到**（{domain.get('reason')}）—— 不编数"]
+    pct, p50 = domain["min_tradable_weight_pct"], domain["one_lot_cost_p50"]
+    lines = [f"- 池内可下手 {domain['n_tradable']}/{domain['n_pool_codes']} 只；"
+             f"最小可成交权重 {'—' if pct is None else f'{pct:.2f}%'}；"
+             f"一手成本中位数 {'—' if p50 is None else f'¥{p50:,.2f}'}"]
+    for row in domain.get("untradable") or []:
+        lines.append(f"  - 买不起：{row['code']} —— {row['reason']}")
+    return lines
 
 
 def render_report(rep: dict) -> str:
@@ -1896,6 +2161,9 @@ def render_report(rep: dict) -> str:
                      f"{a['etf_actual_pct']:.2f}%（差 "
                      f"{a['etf_target_pct'] - a['etf_actual_pct']:.2f} 个百分点；"
                      f"差额若来自现金下限 45%，见下节口径说明）")
+        if "tradable_domain" in a:
+            # P81 / D4：AI 臂才有的「可下手域」读数（小面额能不能下手，得有个数）。
+            L.extend(render_tradable_domain(a["tradable_domain"]))
         L.append("")
     L.append("## 五、起跑日至今的调仓流水（append-only）")
     L.append("")

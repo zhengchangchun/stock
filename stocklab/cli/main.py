@@ -3181,8 +3181,77 @@ def cmd_paper_agent_show(args: argparse.Namespace) -> int:
     return 0
 
 
-# ---------- 基金净值（P52 / D-36 第三条对照臂） ----------
+#: `paper agent evals` 读到空台账时的**唯一**措辞 —— 空列表本身就是「这台账里
+#: 一条未成交腿都没有」，不拿它冒充「AI 什么都没想做」。
+NO_AGENT_EVALS_FMT = ("这台账里还没有任何未成交腿（P79 之后执行的 run 才会有）"
+                      "—— 空列表不是「AI 没动过」，是这张表还没有行")
 
+
+def cmd_paper_agent_evals(args: argparse.Namespace) -> int:
+    """未成交腿台账的读出口（P81 / D2）：**只读**，不重算任何理由。
+
+    数据源只有 `store.load_agent_evals` —— 理由的原文就是落库时那一份，
+    这里既不重新解释也不翻译（重算等于伪造「当时为什么没动」）。
+
+    - `--asof` 缺省 = 该臂台账里最后一个有 evals 的日子（`MAX(asof)`）；
+    - 该臂一行都没有 ⇒ 空列表 ＋ `note`，**exit 0**（「还没有」是合法读数）；
+    - 账户不存在 ⇒ 沿用 `paper account` 的口径 **exit 2**（点名，不静默返回空）；
+    - `--json` 不加 ⇒ 人读摘要（逐行 code/action/reason），加了 ⇒ 完整 JSON。
+    """
+    from stocklab.paper import engine, store
+
+    conn, code = _paper_conn(args)
+    if conn is None:
+        return code
+    try:
+        if not store.account_exists(conn, args.arm):
+            raise engine.missing_account_error(args.arm)
+        latest = store.latest_agent_eval_asof(conn, args.arm)
+        asof = args.asof or latest
+        rows = ([] if asof is None
+                else store.load_agent_evals(conn, arm=args.arm, asof=asof))
+        if latest is None:
+            note = NO_AGENT_EVALS_FMT
+        elif args.asof and not rows:
+            # 显式问了没有腿的那一天：**点名**最新的一天在哪，别让人以为这台账是空的。
+            note = (f"该臂在 {asof} 没有未成交腿；台账里最后一个有腿的日子是 "
+                    f"{latest}（用 --asof {latest} 看）")
+        else:
+            note = None
+        payload = {
+            "arm": args.arm,
+            "asof": asof,
+            "asof_source": ("explicit" if args.asof else
+                            ("latest_eval" if latest is not None else None)),
+            "latest_eval_asof": latest,
+            "n_evals": len(rows),
+            "evals": rows,
+            "note": note,
+        }
+    except engine.PaperError as exc:
+        conn.close()
+        return _paper_fail(exc)
+    conn.close()
+    if args.json:
+        print(json.dumps(payload, ensure_ascii=False, sort_keys=True, indent=2))
+    else:
+        print(_render_agent_evals(payload))
+    return 0
+
+
+def _render_agent_evals(payload: dict) -> str:
+    """`paper agent evals` 的人读摘要（数字全部来自 `payload`，不重算）。"""
+    lines = [f"臂 {payload['arm']}　asof {payload['asof']}　"
+             f"未成交腿 {payload['n_evals']} 条"]
+    if payload["note"] is not None:
+        lines.append(f"（{payload['note']}）")
+    for row in payload["evals"]:
+        code = row["code"] or "（全现金载荷）"
+        lines.append(f"  {code}　{row['action']}　{row['reason']}")
+    return "\n".join(lines)
+
+
+# ---------- 基金净值（P52 / D-36 第三条对照臂） ----------
 def cmd_fund_ingest(args: argparse.Namespace) -> int:
     """把 `pingzhongdata/<code>.js` 落进 `fund_nav_daily`（**只增**）。
 
@@ -4523,6 +4592,15 @@ def build_parser() -> argparse.ArgumentParser:
     ppa_show.add_argument("--db")
     ppa_show.add_argument("--now", help="覆盖当前时刻（测试用）")
     ppa_show.set_defaults(func=cmd_paper_agent_show)
+
+    ppa_evals = pp_agent_sub.add_parser(
+        "evals", help="未成交腿台账（P81/D2）：AI 想动而没动成的理由，只读")
+    ppa_evals.add_argument("--arm", required=True,
+                           help="账户 id：arm-agent / arm-agent-ds-v1 …")
+    ppa_evals.add_argument("--asof", help="决策日 YYYY-MM-DD（缺省 = 该臂最后一个有腿的日子）")
+    ppa_evals.add_argument("--json", action="store_true", help="打完整 JSON（默认人读摘要）")
+    ppa_evals.add_argument("--db")
+    ppa_evals.set_defaults(func=cmd_paper_agent_evals)
 
     fund = sub.add_parser(
         "fund", help="基金日净值（P52/D-36）：非官方源，等权平均臂只比净值曲线")

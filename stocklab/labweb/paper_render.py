@@ -701,6 +701,73 @@ def comparison_block(data: Mapping) -> str:
             + f'<div class="scroll-x"><table class="tbl">{head}{"".join(rows)}</table></div>')
 
 
+def _tradable_domain_lines(rows: Sequence[Mapping], data: Mapping) -> str:
+    """逐臂的「可下手域」一行（P81 / D4）：池内可下手几只、最小可成交权重。
+
+    数据来自 `build_report` 给 AI 臂加的 `tradable_domain` 块（经 `track` 透传），
+    本函数**不重算**；某条臂取不到就写「取不到」，**不编数**（页面既有纪律）。
+    """
+    by_id = {str(a.get("account_id")): a for a in (data.get("arms") or [])}
+    out: list[str] = []
+    for r in rows:
+        arm = str(r["arm"])
+        domain = (by_id.get(arm) or {}).get("tradable_domain")
+        if not domain:
+            out.append(f'<div class="note"><code>{esc(arm)}</code> 的可下手域：'
+                       f'<b>取不到</b>（该臂当日没有账户投影）—— 不填 0</div>')
+            continue
+        if not domain.get("available"):
+            out.append(f'<div class="note"><code>{esc(arm)}</code> 的可下手域：'
+                       f'<b>取不到</b>（{rich(domain.get("reason"))}）—— 不编数</div>')
+            continue
+        line = (f'<code>{esc(arm)}</code>：池内可下手 '
+                f'{esc(domain["n_tradable"])}/{esc(domain["n_pool_codes"])} 只；'
+                f'最小可成交权重 {num(domain.get("min_tradable_weight_pct"), 2)}%；'
+                f'一手成本中位数 ¥{money(domain.get("one_lot_cost_p50"))}')
+        for u in domain.get("untradable") or []:
+            line += (f'　<span class="s-warn">买不起：{esc(u["code"])} —— '
+                     f'{rich(u["reason"])}</span>')
+        out.append(f'<div class="note">{line}</div>')
+    return "".join(out)
+
+
+def _reconciliation_block(ev: Mapping, data: Mapping) -> str:
+    """P81 / D3：**意图 vs 落地**逐臂对账表（＋ P81 / D4 的可下手域行）。
+
+    数字全部来自 `paper.engine.agent_block`（`paper show` 与 `/lab/paper` 同源）。
+    意图腿数取自决策载荷、成交笔数取自 `paper_trades`、未成交腿取自
+    `paper_agent_evals` —— 三个数各查各的行，**不互相顶替、不用 `min()` 抹平**
+    （两者不等的差额本身就是信号）。
+    """
+    rows = ev.get("reconciliation") or []
+    if not rows:
+        return ('<p class="note">意图 vs 落地：<b>取不到</b> —— '
+                + rich(ev.get("reconciliation_note") or "台账里没有任何一条有决策的臂")
+                + '（空表**不是**「全都落地了」）。</p>')
+    head = ("<tr><th>臂</th><th>决策日</th><th>意图腿数</th><th>成交笔数</th>"
+            "<th>未成交腿</th><th>evals 行数</th></tr>")
+    body: list[str] = []
+    for r in rows:
+        planned = ("<span class=\"s-unknown\">取不到</span>"
+                   if r["n_legs_planned"] is None else esc(r["n_legs_planned"]))
+        body.append(
+            f'<tr><td><code>{esc(r["arm"])}</code></td><td>{esc(r["asof"])}</td>'
+            f'<td class="num">{planned}</td>'
+            f'<td class="num">{esc(r["n_legs_filled"])}</td>'
+            f'<td class="num">{esc(r["n_legs_unfilled"])}</td>'
+            f'<td class="num">{esc(r["n_evals"])}</td></tr>')
+        subs = "".join(
+            f'<div>{esc(u["code"] or "（全现金载荷）")}　{esc(u["action"])}　'
+            f'{rich(u["reason"])}</div>' for u in r["unfilled"])
+        if subs:
+            body.append(f'<tr><td colspan="6" class="l">{subs}</td></tr>')
+    return ('<p class="note">意图 vs 落地（P81）：意图腿数取自决策载荷、成交笔数取自 '
+            '<code>paper_trades</code>、未成交腿取自 <code>paper_agent_evals</code>'
+            ' —— 三个数各查各的行，不等就如实报。</p>'
+            + f'<div class="scroll-x"><table class="tbl">{head}{"".join(body)}</table></div>'
+            + _tradable_domain_lines(rows, data))
+
+
 def agent_arm_block(data: Mapping) -> str:
     """智能体臂一段：当前 spec / 台账 / 与随机臂的差分 / 复现性。
 
@@ -743,11 +810,16 @@ def agent_arm_block(data: Mapping) -> str:
         '经 <code>paper agent decide</code> 校验后落 <code>paper_agent_decisions</code>；'
         '<code>arm-agent-random</code> 是它的随机对照 —— <b>同护栏、同成本、同候选池</b>。'
         '本页只报「按台账执行了几笔」，不替它解释理由。')
+    lines.append(
+        '下面这张对账表覆盖<b>台账里有决策的每一条臂</b>（真库在跑的是 '
+        '<code>arm-agent-ds-v1/-v2</code>，而 <code>arm-agent</code> 本身很久没有决策了）'
+        '—— 不把某一条臂写死成「就是它」。')
 
     detail = (_agent_history_table(ev) + _agent_change_space(ev)
               + '<p class="note">复现性判据（同 context + 同 model + 同 prompt + 同 seed '
                 '→ 同 spec）：</p>' + _agent_reproducibility(ev))
-    return glance_html(lines) + more(detail, label="查看详细：spec 台账、变更空间与复现性")
+    return (glance_html(lines) + _reconciliation_block(ev, data)
+            + more(detail, label="查看详细：spec 台账、变更空间与复现性"))
 
 
 # ---------- 「AI 自己编排的东西，用上了没有」 ----------

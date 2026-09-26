@@ -37,7 +37,7 @@ from stocklab.paper.config import (
     RULE_CITATIONS,
 )
 from stocklab.paper.engine import (INDEX_300_SYMBOL, max_lots_affordable,
-                                   pit_close)
+                                   min_weight_pct, pit_close, tradable_verdict)
 from stocklab.paper.rules import check_no_lookahead, one_lot_cost
 
 #: 上下文里**刻意不带**的东西（写下来，免得以后有人往里加）。
@@ -223,6 +223,19 @@ def _tradability_block(*, prices: Mapping[str, object], total_assets: float,
 
     `asset_classes` 必须由调用方按 `agent_decide.asset_class_for`（`instruments.type`
     是唯一真相）解析好；缺键 ⇒ `KeyError`，不静默退化成股票费率。
+
+    ## P81 补的是「**结论**」：`tradable` / `untradable_reason`
+
+    P79 给了一手多少钱、P80 给了买得起几手 —— 但「**所以今天这只下不下得了手**」
+    仍然要模型自己去和 0 比。`affordable_lots` 是个数，结论是个判断：把判断也交出去，
+    「买不起」这件事在输入侧就不再需要推理。
+
+    判据**不在本模块**：`engine.tradable_verdict` 是唯一实现，账户读数
+    （`account_view.buying_power.by_code`）与这里调的是同一个函数 —— 两处各写一份
+    就会重演 ERROR_DIARY #70（同一页两个数）。`untradable_reason` 里点名两个数
+    （一手成本与总资产 / 现金），是因为「买不起」有两种成因、处置不同。
+    顶层 `n_tradable` / `n_untradable` / `min_tradable_weight_pct` / `cheapest`
+    是可下手子集的读数面：子集为空时后两个一律 `None`（**不猜数**）。
     """
     total = float(total_assets)
     money = float(cash)
@@ -231,17 +244,37 @@ def _tradability_block(*, prices: Mapping[str, object], total_assets: float,
     for code in sorted(prices):
         cost = one_lot_cost(price=float(prices[code].price),
                             asset_class=asset_classes[str(code)], lot=lot)
+        lots = max_lots_affordable(money, cost)
+        tradable, reason = tradable_verdict(affordable_lots=lots,
+                                           one_lot_cost_value=cost,
+                                           total_assets=total, cash=money)
         by_code[str(code)] = {
             "one_lot_cost": cost,
-            "min_weight_pct": (round(cost / total * 100.0, 4) if total > 0 else None),
+            # 占比公式的唯一实现在 `engine.min_weight_pct`（P81 / D4 的可下手域
+            # 读数也是它）—— 两处各写一份，迟早读出两个「最小可成交权重」。
+            "min_weight_pct": min_weight_pct(cost, total),
             # 现金口径的整手数：`floor(现金 / 一手含费成本)`。0 是个**有意义的读数**
             # （「这只以我现在的钱一手都买不起」），不是缺数据。
-            "affordable_lots": max_lots_affordable(money, cost),
+            "affordable_lots": lots,
             # T+1：当日买入的不可卖。这只标的我**现在**能卖几股。
             "sellable_qty": int(pos_qty.get(str(code), 0)),
+            # 「今天下不下得了手」的结论（判据在 `engine.tradable_verdict`，
+            # 与账户读数同源）。`tradable == True` 时理由必须是 `None`
+            # —— 不是空串、不是省略键（省略键与「没有理由」长得一样）。
+            "tradable": tradable,
+            "untradable_reason": reason,
         }
     mins = [v["min_weight_pct"] for v in by_code.values()
             if v["min_weight_pct"] is not None]
+    tradable_codes = sorted(c for c, v in by_code.items() if v["tradable"])
+    tradable_mins = [by_code[c]["min_weight_pct"] for c in tradable_codes
+                     if by_code[c]["min_weight_pct"] is not None]
+    # 可下手子集里一手最便宜的那只（并列时按代码字典序定一个，不靠 dict 顺序）。
+    cheapest = None
+    if tradable_codes:
+        code = min(tradable_codes,
+                   key=lambda c: (by_code[c]["one_lot_cost"], c))
+        cheapest = {"code": code, "one_lot_cost": by_code[code]["one_lot_cost"]}
     return {"lot": int(lot),
             # 顶层 `cash` / `net_deposits`（P80 / D6）：`by_code` 里那个
             # `affordable_lots` 的分母与「净收益」那条口径的分母。不写它们，
@@ -250,6 +283,12 @@ def _tradability_block(*, prices: Mapping[str, object], total_assets: float,
             "net_deposits": (None if net_deposits is None
                              else round(float(net_deposits), 4)),
             "min_weight_pct": (min(mins) if mins else None),
+            # P81：可下手子集的读数面（只增键）。
+            "n_tradable": len(tradable_codes),
+            "n_untradable": len(by_code) - len(tradable_codes),
+            "min_tradable_weight_pct": (min(tradable_mins) if tradable_mins
+                                        else None),
+            "cheapest": cheapest,
             "by_code": by_code}
 
 

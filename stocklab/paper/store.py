@@ -151,6 +151,17 @@ def load_agent_evals(conn: sqlite3.Connection, *, arm: str | None = None,
     return [dict(r) for r in conn.execute(sql, args)]
 
 
+def latest_agent_eval_asof(conn: sqlite3.Connection, arm: str) -> str | None:
+    """该臂台账里**最后一个有未成交腿的日子**；一行都没有 → `None`。
+
+    `paper agent evals` 不给 `--asof` 时用它当缺省（P81 / D2）。
+    这里只回答「哪一天」，不解释理由 —— 理由的原文只有 `load_agent_evals` 那个出口。
+    """
+    row = conn.execute(f"SELECT MAX(asof) AS a FROM {TABLE_EVALS}"
+                       " WHERE arm = ?", (arm,)).fetchone()
+    return None if row is None or row["a"] is None else str(row["a"])
+
+
 # ---------- 资本事件（P80：入金 / 出金，append-only） ----------
 
 def insert_capital_event(conn: sqlite3.Connection, *, account_id: str, date: str,

@@ -903,6 +903,9 @@ def track(conn: sqlite3.Connection, asof: str) -> dict:
                             if "positions" in s else None),
             "n_trades": (len(s.get("trades") or []) if "trades" in s else None),
             "discipline": list(s.get("discipline") or []),
+            # P81 / D4：AI 臂才有这个键（`build_report` 只给 AI 臂加）。透传，
+            # **不重算** —— 页面上「池内可下手 X/Y 只」与报告里那一行必须是同一个数。
+            "tradable_domain": s.get("tradable_domain"),
         })
 
     now = next((a for a in arms if a["arm"] == _ARM_NOW), None)
