@@ -324,3 +324,7 @@ disclosure, non_goals, counter_arm` ＋ **P84 末尾追加** `market, own_histor
 
 - 2026-09-27: 补 P84 —— `market` / `own_history` 两块进 PIT 上下文与指纹（只增键）；
   `NON_GOALS` 第 1 条按 K5 改写（口径变更，ADR-035）；显示名真源 `paper/arm_names.py`。
+- 2026-09-27（修订）: `own_history.decisions` / `n_decisions` 的窗口改为
+  **`asof` 严格早于决策日**（`asof < 决策日`）；净值 / 成交仍 `date <= asof`
+  （唯一实现在 `store.load_nav` / `load_trades`，未改）。理由：窗口含当天会与 D-49 的
+  「重放同一条决策 ⇒ 未写入」互斥（详见 ADR-035 修订段）。
