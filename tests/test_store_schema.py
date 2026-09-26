@@ -39,6 +39,7 @@ EXPECTED_TABLES = {
     "plugin_reviews",                  # P58：插桩5 复盘台账（append-only，UNIQUE(asof,script_id)）
     "universe_memberships",            # P71：宇宙成员投影（真源是 config/universes/*.csv；
                                        #      刻意**不**挂 append-only —— sync 按 universe_id 整体重写）
+    "paper_agent_evals",               # P79：AI 臂的**未成交腿**留痕（D3；append-only 触发器）
 }
 
 

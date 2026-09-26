@@ -913,7 +913,7 @@ def test_p68_seed_97_counterexample_is_pinned_in_both_versions(db):
     市值 ¥2,074.10 与现市值 ¥8,247.00 差 ¥6,172.90 **不足一手 ¥8,242.88**
     ⇒ 执行层「不动」⇒ 那 42.15% **一分钱都不会变成现金**。
 
-    ## v3（P68）—— 同一天的只读探针原文
+    ## v3（P68）—— 同一天的只读探针原文（**本站之后不再是现役口径**）
 
     ```
     seed=97  reserved=42.1475  cap=47.85  exposure=44.55  verdict=ok
@@ -921,6 +921,21 @@ def test_p68_seed_97_counterexample_is_pinned_in_both_versions(db):
     ```
 
     `picks` 与 v2 **逐位相同**（只有敞口那一档数变了）—— 判据 4 的黄金表。
+    ⚠️ 但这一版**一笔都没成交**：四只的目标市值 ¥1,103 / ¥2,467 / ¥1,287 / ¥3,858
+    只有 `601398`（一手 ¥818）够一手 ⇒ 其余三只 `hold`。这正是 P79 要修的
+    「随机臂退化成 `arm-hold` 的副本」。
+
+    ## v4（P79，现役）—— 同一个 seed、同一份池
+
+    ```
+    seed=97  抽出 4 只 / 取整后 1 只 / 重抽 0 次  exposure=44.55
+    decisions: [('601398', 44.55)]  cash_pct=55.45
+    cash_after=3220.92  positions: 000333×100 + 601398×1000（**真的成交了 10 手**）
+    ```
+
+    v4 只**剔除**不到一手的腿（`S = picks 的子集`）、按整手数归一，敞口那个数
+    恰好没变（唯一保留的 `601398` 独占了整份敞口）。闸门照样活着 —— v2 那份
+    载荷仍被拒（下面那一段）。
     """
     c = connect(db)
     try:
@@ -934,21 +949,25 @@ def test_p68_seed_97_counterexample_is_pinned_in_both_versions(db):
         c.commit()
         marks = _p68_marks()
         pool_codes = set(P68_POOL_CLOSES)
+        classes = {code: ASSET_STOCK for code in pool_codes}
 
-        # ---------- v3（现役实现） ----------
-        v3 = agent_decide.random_payload(
+        # ---------- v4（现役实现） ----------
+        v4 = agent_decide.random_payload(
             arm=ARM_AGENT_RANDOM, asof=P66_ASOF, pool_codes=pool_codes,
-            held_qty=P68_HELD, marks=marks, total_assets=P68_TOTAL, seed=97)
-        assert [d["code"] for d in v3["decisions"]] == \
-            ["000333", "000651", "002508", "601398"], "picks 必须与 v2 逐位相同"
-        assert [d["target_weight_pct"] for d in v3["decisions"]] == \
-            [5.64, 12.61, 6.58, 19.72]
-        assert abs(_p66_number(v3, "reserved") - 42.15) <= 0.01
-        assert abs(_p66_number(v3, "cap") - 47.85) <= 0.01
-        assert round(100.0 - float(v3["cash_pct"]), 2) == 44.55
-        cash_after = _exec_random_payload(c, v3, marks=marks)
+            held_qty=P68_HELD, marks=marks, total_assets=P68_TOTAL, seed=97,
+            asset_classes=classes, cash=P68_CASH)
+        assert [d["code"] for d in v4["decisions"]] == ["601398"], \
+            "v4 只保留得起的腿（v3 的 picks 是它剔除前的抽取结果）"
+        assert set(d["code"] for d in v4["decisions"]) <= \
+            {"000333", "000651", "002508", "601398"}, "v4 不许凭空多出标的"
+        assert [d["target_weight_pct"] for d in v4["decisions"]] == [44.55]
+        assert "抽出 4 只 / 取整后 1 只 / 重抽 0 次" in v4["rationale"]
+        assert abs(_p66_number(v4, "reserved") - 42.15) <= 0.01
+        assert abs(_p66_number(v4, "cap") - 47.85) <= 0.01
+        assert round(100.0 - float(v4["cash_pct"]), 2) == 44.55
+        cash_after = _exec_random_payload(c, v4, marks=marks)
         assert cash_after >= 0.0, cash_after
-        assert cash_after == pytest.approx(8077.37, abs=0.01)
+        assert cash_after == pytest.approx(3220.92, abs=0.01)
 
         # ---------- v2（冻结副本）—— 同一个 seed、同一份池 ----------
         v2 = _p68_v2_payload(
@@ -969,12 +988,22 @@ def test_p68_seed_97_counterexample_is_pinned_in_both_versions(db):
 
 
 def test_p66_the_draw_sequence_is_unchanged_from_the_old_cadence():
-    """只有**抽取区间**变了：`k` 只数、`picks` 名单与旧口径逐位相同。
+    """**抽取序列**没动：`k` 只数与 `picks` 名单仍与旧口径逐位相同。
 
     黄金表取自改动前的实现（`git show HEAD:stocklab/paper/agent_decide.py`
-    在同一个 ctx 上跑出来的 `k` / `codes`）。「其余一个字不改」这句话只能靠
-    这张表兑现 —— 它一红就说明 `rng` 的**调用顺序**被动过（那会让台账里
-    同一个种子对不上净值）。
+    在同一个 ctx 上跑出来的 `k` / `codes`）。这张表一红就说明 `rng` 的**调用顺序**
+    被动过（那会让台账里同一个种子对不上净值）。
+
+    ⚠️ P79 起**载荷本身**不再与这张表逐位相同：口径 v4 会把「抽到了但买不起一手」
+    的腿剔除（P79 §0.1 的第二个故障）。所以判据分三半：
+
+    ① `rationale` 里的**抽出只数**仍等于黄金表的 `k` ⇒ `rng.randint` / `rng.sample`
+       的调用位置没动（前五步逐字节不变）；
+    ② **最终**标的必是黄金表 `picks` 的**子集** ⇒ v4 只做剔除，不另抽标的；
+    ③ 没触发重抽的种子（`重抽 0 次`）**敞口逐位等于** v3 抽出来的那个数
+       ⇒ `rng.uniform` 的调用位置也没动。触发重抽的种子（下表 seed 6 / 7：
+       v3 抽到的敞口 1.0% / 8.22% 连最便宜的一只都买不起）敞口必然不同 ——
+       那正是 v4 要的，单独钉住名单。
     """
     golden = {0: (4, ["000333", "510880", "600900", "601398"]),
               1: (1, ["510880"]),
@@ -987,7 +1016,7 @@ def test_p66_the_draw_sequence_is_unchanged_from_the_old_cadence():
               8: (4, ["510300", "510880", "600900", "601398"]),
               9: (2, ["510880", "600900"])}
     #: 旧口径（`uniform(0, 100)`）在**无持仓**（reserved=0 ⇒ cap=90）时的敞口，
-    #: 与**本站**在同一个 ctx 上的敞口。新值 ≈ 旧值的 0.9 倍（区间只缩了 10 个点），
+    #: 与口径 v3（P68）在同一个 ctx 上的敞口。新值 ≈ 旧值的 0.9 倍（区间只缩了 10 个点），
     #: 但**不是**逐位相等：`round(0.9 × round(100u, 2), 2)` 与 `round(90u, 2)`
     #: 会差一分（seed 7 就是 8.23 vs 8.22）—— 两次取整的地方不同，别把
     #: 「≈0.9 倍」当成可以逐位对上的恒等式。
@@ -995,13 +1024,27 @@ def test_p66_the_draw_sequence_is_unchanged_from_the_old_cadence():
                     5: 97.0, 6: 1.11, 7: 9.14, 8: 90.23, 9: 62.87}
     new_exposure = {0: 59.56, 1: 74.87, 2: 71.09, 3: 46.57, 4: 23.2,
                     5: 87.3, 6: 1.0, 7: 8.22, 8: 81.21, 9: 56.58}
+    #: v4 在夹具池上**真的触发重抽**的种子（v3 的敞口买不起任何一手）——
+    #: 名单本身是读数：多一个说明重抽路径被改宽了，少一个说明重抽失效了。
+    retried_seeds: list[int] = []
     for seed, (k, codes) in golden.items():
         payload = _p66_payload(seed, held_qty={})
-        assert len(payload["decisions"]) == k, seed
-        assert [d["code"] for d in payload["decisions"]] == codes, seed
+        m = re.search(r"抽出 (\d+) 只 / 取整后 (\d+) 只 / 重抽 (\d+) 次",
+                      str(payload["rationale"]))
+        assert m, payload["rationale"]
+        assert int(m.group(1)) == k, (seed, "抽出的只数与黄金表不符 ⇒ 抽取序列被动过")
+        retries = int(m.group(3))
+        got = [d["code"] for d in payload["decisions"]]
+        assert set(got) <= set(codes), (seed, got, codes)
+        assert 0 < len(got) <= k, (seed, got)
+        assert "口径 v4（P79）" in payload["rationale"], "口径标识必须写在台账上"
         exposure = round(100.0 - float(payload["cash_pct"]), 2)
-        assert exposure == new_exposure[seed], seed
+        if retries:
+            retried_seeds.append(seed)
+            continue
+        assert exposure == new_exposure[seed], (seed, exposure)
         assert abs(exposure - 0.9 * old_exposure[seed]) <= 0.01, seed
+    assert retried_seeds == [6, 7], retried_seeds
 
 
 def test_p66_same_seed_twice_is_byte_identical():
@@ -1102,10 +1145,10 @@ def test_p68_the_residual_overdraw_is_gone_and_only_that_changed(db):
             old = _p68_v2_payload(
                 arm=ARM_AGENT_RANDOM, asof=START, pool_codes=set(pool["codes"]),
                 held_qty=pos0, marks=marks, total_assets=total0, seed=seed)
-            # 判据 4 的黄金表：`k` 与 `picks` 逐位不变（**只有敞口那一档数变**，
-            # 所以权重**不**逐位相同 —— 权重 = 敞口 × rand/Σrand）。
-            assert [d["code"] for d in new["decisions"]] \
-                == [d["code"] for d in old["decisions"]], seed
+            # 判据 4 的黄金表：v4 的标的必是 v3 抽出来的那批的**子集**
+            # （v4 只剔除「抽到了但买不起一手」的腿，不另抽标的）。
+            assert set(d["code"] for d in new["decisions"]) \
+                <= set(d["code"] for d in old["decisions"]), seed
             same_draw += 1
             if run(new):
                 rejected.append(seed)
