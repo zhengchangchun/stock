@@ -949,6 +949,7 @@ def _step_all(conn: sqlite3.Connection, asof: str, *, accounts: list[dict],
         mv, _ = mark_to_market(positions, marks)
         total = round(cash + mv, 4)
         orders: list[Decision] = []
+        evals: list[Decision] = []
         if decision is not None and decision_codes:
             # 目标市值按**执行时**的总资产重算：写载荷时与执行时看的是同一批
             # `<= asof` 的行，所以两者同口径；重算是为了不把「报告里的权重」
@@ -956,7 +957,7 @@ def _step_all(conn: sqlite3.Connection, asof: str, *, accounts: list[dict],
             payload = agent_decide.rebase_payload(payload, total_assets=total,
                                                   marks=marks, positions=positions)
             try:
-                cash, positions, orders, _evals = agent_decide.execute_decision(
+                cash, positions, orders, evals = agent_decide.execute_decision(
                     conn, arm=account["account_id"], asof=asof, decision=payload,
                     cash=cash, positions=positions, marks=marks,
                     total_assets=total)
@@ -976,6 +977,12 @@ def _step_all(conn: sqlite3.Connection, asof: str, *, accounts: list[dict],
         for d in orders:
             store.insert_trade(conn, account_id=account["account_id"], date=asof,
                                decision=d, now=now, commit=False)
+        # P79 / D3：AI 臂的**未成交腿**落库（这里此前是 `_evals`，一个下划线丢掉）。
+        # 只有**决策驱动**的那条路落 —— 静态臂 / `arm-agent-v1`（m2 通路）的
+        # `_evals` 仍不落库：它们不是「AI 说了没做到」，落进来会把两种读数混成一种。
+        for e in evals:
+            store.insert_agent_eval(conn, arm=account["account_id"], asof=asof,
+                                    decision=e, now=now, commit=False)
         mv, _marks = mark_to_market(positions, marks)
         nav = round(cash + mv, 4)
         history = [r["nav"] for r in store.load_nav(conn, account["account_id"],

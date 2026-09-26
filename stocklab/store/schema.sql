@@ -772,6 +772,40 @@ CREATE TRIGGER IF NOT EXISTS trg_paper_agent_decisions_no_delete
 BEFORE DELETE ON paper_agent_decisions
 BEGIN SELECT RAISE(ABORT, 'paper_agent_decisions is append-only'); END;
 
+-- ---------- AI 臂的**未成交腿**留痕（P79 / D3） ----------
+-- 与 `paper_agent_decisions` 是**账的两半**：那条表记「AI 想做什么」，这张表记
+-- 「执行层为什么没做到」。在此之前，`execute_decision` 把 `evaluations`（「差额 < 1 手
+-- ⇒ 不动」这类理由）交出来、调用方用下划线丢掉（`engine._step_all` 的 `_evals`）
+-- ⇒ 页面上只看到「这条臂没动」，看不到「为什么没动」。
+--
+-- 为什么必须是**独立的表**而不是往决策行上加一列：一条决策可以有 0~N 条未成交腿，
+-- 加列就得存 JSON 数组（不可按 `(arm, asof, code)` 查、也没法用唯一键防重放）。
+--
+-- `code` 写空串（不是 NULL）表示「载荷为空（全现金）」那条留痕 —— SQLite 的
+-- `UNIQUE` 里 NULL 互不相等，用 NULL 会让同一天重复落库而不报错。
+--
+-- append-only：未成交的理由**是结论**，改它等于伪造「当时为什么没动」。
+CREATE TABLE IF NOT EXISTS paper_agent_evals (
+    eval_id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    arm              TEXT NOT NULL,        -- 账户 id：'arm-agent' | 'arm-agent-random'
+    asof             TEXT NOT NULL,        -- 决策日（PIT）
+    code             TEXT NOT NULL,        -- '' = 全现金载荷的那条留痕（见上）
+    action           TEXT NOT NULL,        -- 今天恒为 'hold'（未成交腿）
+    reason           TEXT NOT NULL,        -- 「为什么没动」的原文（人读）
+    constraints_json TEXT NOT NULL DEFAULT '[]',  -- 生效的约束代号（机器可读）
+    raw              TEXT NOT NULL,        -- 整条 `Decision` 的 canonical JSON
+    created_at       TEXT NOT NULL,
+    UNIQUE (arm, asof, code)
+);
+
+CREATE TRIGGER IF NOT EXISTS trg_paper_agent_evals_no_update
+BEFORE UPDATE ON paper_agent_evals
+BEGIN SELECT RAISE(ABORT, 'paper_agent_evals is append-only (改错请重跑那一天的 agent run)'); END;
+
+CREATE TRIGGER IF NOT EXISTS trg_paper_agent_evals_no_delete
+BEFORE DELETE ON paper_agent_evals
+BEGIN SELECT RAISE(ABORT, 'paper_agent_evals is append-only'); END;
+
 -- ---------- 基金日净值（P52：D-36 的第三条对照臂） ----------
 -- 净值源＝天天基金 `https://fund.eastmoney.com/pingzhongdata/<code>.js` 的
 -- `Data_netWorthTrend`（**非官方接口**，页面与报告必须标注「近似 / 非官方」）。

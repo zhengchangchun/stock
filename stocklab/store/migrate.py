@@ -698,6 +698,55 @@ def migrate_p58_plugin_reviews(conn) -> list[str]:
 
 
 # ---------------------------------------------------------------------------
+# P79：AI 臂**未成交腿**留痕表 `paper_agent_evals`（**新表**，D3）。
+#
+# 与 P58 同款：新表**不需要数据迁移** —— `schema.sql` 的
+# `CREATE TABLE IF NOT EXISTS` 会在下一次 `init_db` / `ensure_schema` 时把它建出来，
+# 老库与新库走同一条路径（表不存在 ⇒ 不 pending ⇒ 不备份 ⇒ executescript 直接建）。
+#
+# 本函数只在**结构漂移**时动手：表在、但 append-only 触发器不见了（被 DROP 过 /
+# 有人手工建过同名表）。那种库看着「有这张表」，实际可以改历史行的理由 —— 必须前滚。
+#
+# 判据刻意**不含「表不存在」**（同 P58 / P71 的约定）。
+#
+# 触发器文本与 `schema.sql` **同文**（改一处须同步两处）。
+# ---------------------------------------------------------------------------
+
+_P79_TABLE = "paper_agent_evals"
+
+_P79_TRIGGERS = (
+    "CREATE TRIGGER IF NOT EXISTS trg_paper_agent_evals_no_update"
+    " BEFORE UPDATE ON paper_agent_evals"
+    " BEGIN SELECT RAISE(ABORT, 'paper_agent_evals is append-only"
+    " (改错请重跑那一天的 agent run)'); END;\n"
+    "CREATE TRIGGER IF NOT EXISTS trg_paper_agent_evals_no_delete"
+    " BEFORE DELETE ON paper_agent_evals"
+    " BEGIN SELECT RAISE(ABORT, 'paper_agent_evals is append-only'); END;"
+)
+
+_P79_TRIGGER_NAMES = ("trg_paper_agent_evals_no_update",
+                      "trg_paper_agent_evals_no_delete")
+
+
+def agent_evals_needs_p79(conn) -> bool:
+    """未成交腿台账在、但 append-only 触发器缺席吗？（只读探测，供 doctor 用）
+
+    表**不存在**时返回 False —— 那不是「待迁移」，是「等着被建出来」。
+    """
+    if not _table_exists(conn, _P79_TABLE):
+        return False
+    return any(not _trigger_exists(conn, name) for name in _P79_TRIGGER_NAMES)
+
+
+def migrate_p79_agent_evals(conn) -> list[str]:
+    """补回未成交腿台账的 append-only 触发器（P79）。**可重入**、老库上零动作。"""
+    if not agent_evals_needs_p79(conn):
+        return []
+    conn.executescript(_P79_TRIGGERS)
+    return ["paper_agent_evals.triggers"]
+
+
+# ---------------------------------------------------------------------------
 # P62：AI 臂**未结算**的净值行 —— 数据修复（不是结构迁移）。
 #
 # 缺陷是怎么产生的：`paper/agent_decide.py::execute_decision` 只生成订单、原样
@@ -1024,6 +1073,10 @@ _KNOWN_MARKERS: list[tuple[str, str, object]] = [
     # 这里只让 doctor 只读报告「投影表与它的索引还在不在」。
     ("p71_universe_memberships", "universe_memberships",
      lambda conn: not universe_memberships_needs_p71(conn)),
+    # P79 同上：`paper_agent_evals` 是**新表**，不挂 `_pending_column_migrations`
+    # / `_apply_schema`。这里只让 doctor 只读报告「未成交腿台账与它的触发器还在不在」。
+    ("p79_agent_evals", "paper_agent_evals",
+     lambda conn: not agent_evals_needs_p79(conn)),
 ]
 
 

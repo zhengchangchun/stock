@@ -47,6 +47,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import random
 import re
 import sqlite3
@@ -61,14 +62,17 @@ from stocklab.paper.config import (
     DECISION_ITEM_KEYS,
     DECISION_KIND_PORTFOLIO,
     DECISION_PAYLOAD_KEYS,
+    LOT,
     NO_SHORT_SIDE_MSG,
     RANDOM_CASH_FLOOR,
     RANDOM_MODEL_ID,
     RANDOM_N_CODES,
+    RANDOM_RETRY_MAX,
     RULE_CITATIONS_AGENT_DECISION,
     WEIGHT_SUM_TOLERANCE,
 )
-from stocklab.paper.rules import C_TARGET, Decision, RuleParams, plan_target_weight
+from stocklab.paper.rules import (C_TARGET, Decision, RuleParams, one_lot_cost,
+                                  plan_target_weight)
 from stocklab.portfolio.prices import Price
 
 TABLE_DECISIONS = agent_spec.TABLE_DECISIONS
@@ -366,9 +370,125 @@ def _reserved_pct(*, held_qty: Mapping[str, int],
     return total
 
 
+def asset_classes_for(conn: sqlite3.Connection,
+                      codes: Iterable[str]) -> dict[str, str]:
+    """一次把一批标的的口径解析好（口径的**唯一真相**仍是 `instruments.type`）。
+
+    `asset_class_for` 是逐标的的那条路（未登记即报错）；本函数只是把它跑一遍，
+    好让 `paper agent random` 这类调用方**不必自己拼一个默认值** ——
+    「没有口径就退回股票费率」是静默错误，代价是成本算错（ADR-008）。
+    """
+    return {str(c): asset_class_for(conn, str(c)) for c in sorted(set(codes))}
+
+
+def _lot_counts(*, picks: Sequence[str], weights: Sequence[float],
+                total_assets: float, marks: Mapping[str, Price],
+                asset_classes: Mapping[str, str], lot: int) -> dict[str, int]:
+    """D4 步骤 2：每只按其目标市值折算**整手数** `q_c = floor(target / one_lot_cost_c)`。
+
+    一手成本走 `rules.one_lot_cost`（含滑点成交额 ＋ 费用），与 T1 的
+    `tradability.by_code[c].one_lot_cost` 是**同一个数** —— 上下文里告诉 AI 的门槛
+    与随机臂自己用的门槛不会漂成两个。
+    """
+    out: dict[str, int] = {}
+    for code, w in zip(picks, weights):
+        cost = one_lot_cost(price=float(marks[code].price),
+                            asset_class=asset_classes[code], lot=lot)
+        target = float(total_assets) * float(w) / 100.0
+        out[code] = int(target // cost) if cost > 0 else 0
+    return out
+
+
+def _tradeable(*, picks: Sequence[str], weights: Sequence[float], exposure: float,
+               total_assets: float, marks: Mapping[str, Price],
+               asset_classes: Mapping[str, str],
+               lot: int) -> tuple[dict[str, int], list[str], dict[str, float]]:
+    """口径 v4 的「可成交化」（P79 / D4 步骤 2–3）：抽出来的敞口 → **整手**。
+
+    返回 `(整手数 q, 保留的标的 S, 归一后的权重 w')`；`S = ∅` ⇒ `({}, [], {})`。
+
+    ## 为什么必须做这一步（P79 §0.1 的第二个故障）
+
+    v3 的抽样完全不管整手：`exposure × rand/Σrand` 抽到低敞口 ⇒ 每只目标市值都 < 一手
+    ⇒ `plan_target_weight` 全判 `hold` ⇒ **随机臂退化成 `arm-hold` 的第二份拷贝**。
+    真库实测 2026-09-23 / 09-24 **两天零成交**（敞口 16.43% / 0.17%），而
+    `delta_vs_random` 就是拿它当分母的 ⇒ 「AI 跑赢随机」这句话当时没有对手。
+
+    不到一手的票**剔除**，不是夹到一手 —— 夹上去会把敞口放大到超过抽出来的那个数。
+
+    ## 为什么「S 里每只至少 1 手」要跑到**不定点**
+
+    D4 给的归一式 `w'_c = q_c/Σq × exposure` 单遍跑完**不保证**它自己声明的这条：
+    一只很贵、`rand` 又抽得大的票（`q_c = 1` 而 `rand_c/Σrand` 很大）按整手数重分
+    之后会被挤到一手以下。所以这里收敛到不动点：每轮重算权重、剔除又掉到一手以下的，
+    直到 `S` 不再缩小。`S` 一轮就没变时，权重与 D4 的公式**逐位相同**。
+    """
+    qty = _lot_counts(picks=picks, weights=weights, total_assets=total_assets,
+                      marks=marks, asset_classes=asset_classes, lot=lot)
+    kept = [c for c in picks if qty[c] >= 1]
+    while kept:
+        share = sum(qty[c] for c in kept)
+        if share <= 0:
+            return {}, [], {}
+        wprime = {c: exposure * qty[c] / share for c in kept}
+        nxt = [c for c in kept
+               if float(total_assets) * wprime[c] / 100.0
+               >= one_lot_cost(price=float(marks[c].price),
+                               asset_class=asset_classes[c], lot=lot)]
+        if len(nxt) == len(kept):
+            return {c: qty[c] for c in kept}, kept, wprime
+        kept = nxt
+    return {}, [], {}
+
+
+def _cheapest_lot_fallback(*, usable: Sequence[str], held_qty: Mapping[str, int],
+                           marks: Mapping[str, Price],
+                           asset_classes: Mapping[str, str], lot: int,
+                           total_assets: float,
+                           cash: float | None) -> tuple[str | None, float | None, str]:
+    """D4 步骤 4 的**退路**：重抽到头还是 `S = ∅` ⇒ 给一手最便宜的票 1 手。
+
+    返回 `(code, target_weight_pct, note)`；给不出 ⇒ `(None, None, note)`（全现金）。
+
+    ## 为什么候选**优先取未持有的**
+
+    D4 的原话是「一手最便宜的池内标的」。但在**已持有该票一手**时，目标市值
+    （1 手）与现市值（也是 1 手）之差 ≈ 滑点 ＋ 费（几元钱），`plan_target_weight`
+    会判「差 < 1 手 → 不动」—— 退路就**完全落空**，而「退路落空」正是本站要修的
+    那种失效（P79 §0.1）。所以下标集优先取 `held_qty == 0` 的票（买它 ⇒ 必定
+    成交至少 1 手）；池内全都持有才退回「最便宜的」（此时如实说明可能不动）。
+
+    `weight` 用 `ceil` 到两位小数：向下取整会让目标市值掉到一手成本以下 ⇒
+    折算回 0 手 ⇒ 退路又落空（与本函数要防的是同一件事）。
+    """
+    costs = {c: one_lot_cost(price=float(marks[c].price),
+                             asset_class=asset_classes[c], lot=lot) for c in usable}
+    unheld = [c for c in usable if int(held_qty.get(c, 0) or 0) == 0]
+    candidates = unheld or list(usable)
+    code = min(sorted(candidates), key=lambda c: costs[c])
+    cost = costs[code]
+    if cash is None:
+        return None, None, (f"退路：现金未知 ⇒ 不给这一手（全现金），点名 {code}"
+                            f"（一手 ¥{cost:,.2f}）")
+    if float(cash) < cost:
+        return None, None, (f"退路：一手最便宜的 {code} 需 ¥{cost:,.2f} > 现金 "
+                            f"¥{float(cash):,.2f} ⇒ 全现金")
+    weight = math.ceil(cost / float(total_assets) * 100.0 * 100.0) / 100.0
+    if weight > 100.0:
+        return None, None, (f"退路：一手最便宜的 {code} 需 ¥{cost:,.2f} > 总资产 "
+                            f"¥{float(total_assets):,.2f} ⇒ 全现金")
+    want = "未持有" if code in unheld else "已持有（可能不动）"
+    return code, weight, (f"退路：重抽 {RANDOM_RETRY_MAX} 次仍不足一手 ⇒ 取一手最"
+                          f"便宜的池内标的 {code}（{want}，一手 ¥{cost:,.2f}）给 "
+                          f"{weight:g}%")
+
+
 def random_payload(*, arm: str, asof: str, pool_codes: set[str],
                    held_qty: Mapping[str, int], marks: Mapping[str, Price],
-                   total_assets: float, seed: int) -> dict:
+                   total_assets: float, seed: int,
+                   asset_classes: Mapping[str, str] | None = None,
+                   cash: float | None = None,
+                   lot: int = LOT) -> dict:
     """随机对照臂的载荷：**同护栏、同成本**，只是标的与权重随机抽。
 
     随机性是**种子驱动的**（`(arm, asof, seed)` 的 sha256），因此：
@@ -411,19 +531,34 @@ def random_payload(*, arm: str, asof: str, pool_codes: set[str],
     「只修了一半」指的是：P66 扣掉了「不在 picks 里的」，漏掉了「在 picks 里
     但**减不动**的」—— 同一条错假设换了个分支继续存在（ERROR_DIARY #77）。
 
+    ## 口径 v4（P79）：抽出来的敞口必须**能成交**
+
+    v3 只保证「不会透支」，不保证「成交得了」：低敞口 ＋ 分散 ⇒ 每只目标市值都 < 一手
+    ⇒ `plan_target_weight` 全判 `hold` ⇒ 随机臂**退化成 `arm-hold` 的第二份拷贝**。
+    真库实测 2026-09-23（16.43% 敞口分 4 只、每只 ¥317–1,323）与 09-24（0.17% 敞口
+    2 只、¥19.59/¥13.71）**两天零成交**，而 `delta_vs_random` 就是拿它当分母的
+    ⇒ 「AI 跑赢随机」这句话当时**没有对手**。修法就是 `_tradeable` ＋
+    `_cheapest_lot_fallback`（详见各自的 docstring），**上界与种子材料一字不改**。
+
     ## 口径的生效时点
 
-    口径 v1 的最后一天是 **2026-09-23**（那天台账里 `decision_id=1` 是 v1 的产物），
-    口径 v2 的最后一天是 **v2 合入日**；两者都**原样留着、一个字不改**
-    （append-only）。`rationale` 里的 `口径 v3（P68）` 就是为这件事 ——
-    读台账的人不必靠日期去猜某一行是哪条口径。
+    口径 v1 的最后一天是 **2026-09-23**（那天台账里 `decision_id=1` 是 v1 的产物）；
+    口径 v2 的最后一天是 **v2 合入日**；v3 的最后一天是 **P79 合入日**；三者都
+    **原样留着、一个字不改**（append-only）。`rationale` 里的 `口径 v3（P68）` /
+    `口径 v4（P79）` 就是为这件事 —— 读台账的人不必靠日期去猜某一行是哪条口径。
 
-    **改动的边界**：只有**抽取区间**从 `uniform(0, cap_v2)` 变成
-    `uniform(0, cap_v3)`。其余一个字不改 —— `k` 只数仍取
-    `rng.randint(*RANDOM_N_CODES)`、`picks` 仍是 `sorted(rng.sample(usable, k))`、
-    权重仍 `round(exposure × rand/Σrand, 2)`、余项仍进 `cash_pct`、
-    种子材料仍是 `sha256(f"{arm}|{asof}|{seed}")` ⇒ 抽取序列与旧口径**逐位相同**，
-    逐字节可复现仍然成立（只有敞口那一档数变了）。
+    ## 改动的边界（v4 这一站）
+
+    **v3 的抽取序列一字不改**：`k` 仍取 `rng.randint(*RANDOM_N_CODES)`、
+    `picks` 仍 `sorted(rng.sample(usable, k))`、`reserved` / `cap` 仍是 P68 那条
+    `(100 − 现金下限) − 全部存量`、`exposure` 仍 `round(rng.uniform(0, cap), 2)`、
+    权重仍 `round(exposure × rand/Σrand, 2)`、余项仍进 `cash_pct`、种子材料仍是
+    `sha256(f"{arm}|{asof}|{seed}")`。v4 只在**这之后**追加一步「可成交化」
+    （`_tradeable`：折算整手 → 剔除不足一手的 → 按整手数归一；`S = ∅` 时
+    `_cheapest_lot_fallback`）。所以「同一个种子跑两遍逐字节一致」仍然成立
+    （`test_p66_same_seed_twice_is_byte_identical`），而**载荷本身**与 v3
+    不再逐位相同 —— 那正是本站要的：v3 抽出来的东西在 2 万本金的账户上
+    **两天一笔都成交不了**。
     """
     rng = random.Random(_seed_material(arm, asof, seed))
     usable = sorted(c for c in pool_codes if c in marks)
@@ -439,36 +574,85 @@ def random_payload(*, arm: str, asof: str, pool_codes: set[str],
     exposure = round(rng.uniform(0.0, max(0.0, cap)), 2)
     raw = [rng.random() for _ in picks]
     total = sum(raw)
-    weights = [round(exposure * w / total, 2) for w in raw] if total else \
+    draw = [round(exposure * w / total, 2) for w in raw] if total else \
         [0.0 for _ in picks]
-    drift = round(exposure - sum(weights), 2)
-    weights[-1] = round(weights[-1] + drift, 2)
+    drift = round(exposure - sum(draw), 2)
+    draw[-1] = round(draw[-1] + drift, 2)
+
+    # ---- 口径 v4（P79 / D4）：在 v3 的抽取序列**之后**追加「可成交化」 ----
+    # 上面那五步（k / picks / reserved / cap / exposure / raw / draw）**逐字节不变**，
+    # 它们抽出来的数只用于**筛选**（不进载荷）；下面把它们映射到可成交的整手。
+    # 口径缺省（调用方没给 asset_class）按**股票费率**：买入口径下股票费率 ≥ ETF
+    # （股票有过户费、ETF 没有）⇒ 一手成本只会被算**高** ⇒ 门槛只会更严（少投方向）。
+    classes = {c: (asset_classes or {}).get(c, ASSET_STOCK) for c in usable}
+    retries = 0
+    qty, kept, wprime = _tradeable(picks=picks, weights=draw, exposure=exposure,
+                                   total_assets=total_assets, marks=marks,
+                                   asset_classes=classes, lot=lot)
+    while not kept and retries < RANDOM_RETRY_MAX:
+        # 重抽**只动 exposure**（其余不变），用**同一个 rng 序列**继续 ⇒
+        # 逐字节可复现仍然成立（同一个种子跑出来永远是同一条）。
+        retries += 1
+        exposure = round(rng.uniform(0.0, max(0.0, cap)), 2)
+        draw = [round(exposure * w / total, 2) for w in raw] if total else \
+            [0.0 for _ in picks]
+        drift = round(exposure - sum(draw), 2)
+        draw[-1] = round(draw[-1] + drift, 2)
+        qty, kept, wprime = _tradeable(picks=picks, weights=draw,
+                                       exposure=exposure, total_assets=total_assets,
+                                       marks=marks, asset_classes=classes, lot=lot)
+    fallback: str | None = None
+    if not kept:
+        code, weight, fallback = _cheapest_lot_fallback(
+            usable=usable, held_qty=held_qty, marks=marks,
+            asset_classes=classes, lot=lot, total_assets=total_assets, cash=cash)
+        if code is not None:
+            kept, qty, wprime = [code], {code: 1}, {code: float(weight)}
+            exposure = round(float(weight), 2)
+        else:
+            exposure = 0.0
+    # 最终权重：按整手数归一（`w'_c ∝ q_c`）＋ 2 位小数 ＋ 余项进最后一只
+    # （与 v3 同一条收口方式 ⇒ `Σ w'` 严格等于敞口、`Σ w' + cash = 100`）。
+    weights = {c: round(wprime[c], 2) for c in kept}
+    if weights:
+        tail = kept[-1]
+        weights[tail] = round(weights[tail] + round(exposure - sum(weights.values()), 2), 2)
     items: list[dict] = []
-    for code, weight in zip(picks, weights):
+    for code in kept:
+        weight = weights[code]
         if weight <= 0:
-            continue                      # 抽到 0 权重 = 不投它，下落成空仓
-        qty = int(held_qty.get(code, 0) or 0)
+            continue                      # 归一后掉到 0 ⇒ 不投它，下落成空仓
+        held = int(held_qty.get(code, 0) or 0)
         price = float(marks[code].price)
         target_value = round(total_assets * weight / 100.0, 4)
         side = side_for(target_value=target_value,
-                        current_value=round(price * qty, 4)) or SIDE_BUY
+                        current_value=round(price * held, 4)) or SIDE_BUY
         items.append({
             "code": code, "side": side, "target_weight_pct": weight,
             "reason": (f"随机对照臂：种子 ({arm}, {asof}, {seed}) 抽中 {code}，"
-                       f"目标 {weight:g}%；**不构成任何判断**，"
+                       f"目标 {weight:g}%（口径 v4：按整手数 {qty.get(code, 1)} 手归一）；"
+                       f"**不构成任何判断**，"
                        f"取值仅为「同预算同护栏下的运气」提供落点"),
         })
-    cash = round(100.0 - sum(d["target_weight_pct"] for d in items), 2)
+    cash_pct = round(100.0 - sum(d["target_weight_pct"] for d in items), 2)
     return {
-        "asof": asof, "decisions": items, "cash_pct": cash,
+        "asof": asof, "decisions": items, "cash_pct": cash_pct,
         "rationale": (f"随机对照臂（model_id={RANDOM_MODEL_ID}）：从 {len(usable)} 只"
-                      f"可定价池内标的里随机抽 {len(items)} 只，总敞口 {exposure:g}%，"
-                      f"**口径 v3（P68）**：reserved={reserved:g}%（**全部**存量持仓"
-                      f"占比 —— 不因 picks 而减免；v2 只扣了「不在 picks 里的」那一半，"
-                      f"而「在 picks 里但减不动」的存量照样不释放现金）、cap={cap:g}%"
+                      f"可定价池内标的里随机抽 {len(picks)} 只（抽出 "
+                      f"{len(picks)} 只 / 取整后 {len(items)} 只 / 重抽 {retries} 次），"
+                      f"最终敞口 {round(100.0 - cash_pct, 2):g}%，"
+                      f"**口径 v4（P79）：可成交化** —— 先按 v3 抽 k/敞口/权重"
+                      f"（只用于筛选），每只折算整手数 `floor(目标市值 / 一手含费)`，"
+                      f"不到一手的剔除、其余按整手数归一；全不足一手则重抽敞口"
+                      f"（上限 {RANDOM_RETRY_MAX} 次），仍不足则取一手最便宜的池内"
+                      f"标的给 1 手（旧口径 v3 在 09-23/09-24 两日**零成交**，"
+                      f"随机臂退化成 arm-hold 的副本）。"
+                      f"**口径 v3（P68）的敞口上界一字未动**：reserved={reserved:g}%"
+                      f"（**全部**存量持仓占比 —— 不因 picks 而减免）、cap={cap:g}%"
                       f"（= 100 − {RANDOM_CASH_FLOOR:g} − reserved），敞口在 [0, cap] 上抽。"
-                      f"种子固定以便逐字节复现。它没有任何依据可自述 —— "
-                      f"正因如此，AI 臂跑赢它才算「选对了」而不是「多试了几次」"),
+                      + (f"{fallback}。" if fallback else "")
+                      + "种子固定以便逐字节复现。它没有任何依据可自述 —— "
+                        "正因如此，AI 臂跑赢它才算「选对了」而不是「多试了几次」"),
     }
 
 

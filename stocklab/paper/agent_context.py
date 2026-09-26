@@ -28,15 +28,16 @@ import json
 import sqlite3
 from typing import Mapping
 
-from stocklab.paper import agent_spec
+from stocklab.paper import agent_decide, agent_spec
 from stocklab.paper.config import (
     ARM_AGENT_RANDOM,
     DISCLOSURE_ITEMS,
     HOLD_CODE,
+    LOT,
     RULE_CITATIONS,
 )
 from stocklab.paper.engine import INDEX_300_SYMBOL, pit_close
-from stocklab.paper.rules import check_no_lookahead
+from stocklab.paper.rules import check_no_lookahead, one_lot_cost
 
 #: 上下文里**刻意不带**的东西（写下来，免得以后有人往里加）。
 NON_GOALS: tuple[str, ...] = (
@@ -144,7 +145,7 @@ def context_sha256(context: Mapping[str, object]) -> str:
 #: 白名单不再约束它（D-34 覆盖 D-18）。
 DECISION_HASHED_KEYS: tuple[str, ...] = (
     "arm", "asof", "account", "marks", "index_300", "pool", "guardrails",
-    "disclosure", "non_goals", "counter_arm",
+    "tradability", "disclosure", "non_goals", "counter_arm",
 )
 
 #: 不许做的（写进上下文，让「越权」在**输入侧**就不可表达）。
@@ -157,6 +158,56 @@ GUARDRAILS: tuple[str, ...] = (
     "不许参数搜索：这一条决策就是这一条，试错次数必须与读数同时报",
     "不许改主干常量：熔断阈值 / 自评估边界 / approve 闸门都不在决策空间里",
 )
+
+
+def _tradability_block(*, prices: Mapping[str, object], total_assets: float,
+                       asset_classes: Mapping[str, str],
+                       lot: int = LOT) -> dict:
+    """「一手（100 股）够不够」这条约束的**输入侧**表达（P79 / D2）。
+
+    ## 为什么它必须出现在上下文里
+
+    A 股一手成本跨标的差 10 倍以上（`601398` 一手约 ¥813 vs `600519` 一手 ¥14 万+），
+    两万本金的账户上「目标权重 < 1.6%」就等于「不许买」。这条约束**不能靠模型自己悟**
+    —— 09-23 的 `arm-agent-ds-v1` 四笔买入全部落在「目标市值 < 一手」上（P79 §0.1），
+    而它的上下文里**一个字都没提一手多少钱**。把眼睛给足，是本站的一半。
+
+    ## 数字一律从 `rules.one_lot_cost` 取（一行费用公式都不另写）
+
+    `one_lot_cost = fill_price("buy", price) * lot + _fee_parts(...)["total"]`
+    —— 与执行层**同一个** `CostModel.fill_price` 与同一个 `_fee_parts`（P79 / D2）。
+
+    ## 键集 = `marks ∩ pool`
+
+    「池内标的」＝ 决策**可能落在**的集合（`validate_payload` 同时要求
+    `code ∈ pool_codes` 且 `code ∈ marks`）。所以这里只报这个交集：账户里的**池外**
+    持仓不在 AI 的可投集合内（对它下单会被写入口拒），指数（`sh000300`）也不在。
+
+    ## `min_weight_pct`
+
+    单个标的的 `min_weight_pct = round(一手总成本 / 总资产 × 100, 4)` —— 「想买它，
+    目标权重至少要这么大」。顶层那个是 `by_code` 里的**最小值**，即「这个账户上
+    最小的一笔可成交建仓占总资产几个点」：任何低于它的目标权重都买不到任何东西。
+
+    `total_assets ≤ 0` 时逐个标的一律 `None`、顶层也是 `None` —— 算不出占比时
+    **不猜一个数**（与 `_reserved_pct` 的退化口径同款）。
+
+    `asset_classes` 必须由调用方按 `agent_decide.asset_class_for`（`instruments.type`
+    是唯一真相）解析好；缺键 ⇒ `KeyError`，不静默退化成股票费率。
+    """
+    total = float(total_assets)
+    by_code: dict[str, dict] = {}
+    for code in sorted(prices):
+        cost = one_lot_cost(price=float(prices[code].price),
+                            asset_class=asset_classes[str(code)], lot=lot)
+        by_code[str(code)] = {
+            "one_lot_cost": cost,
+            "min_weight_pct": (round(cost / total * 100.0, 4) if total > 0 else None),
+        }
+    mins = [v["min_weight_pct"] for v in by_code.values()
+            if v["min_weight_pct"] is not None]
+    return {"lot": int(lot), "min_weight_pct": (min(mins) if mins else None),
+            "by_code": by_code}
 
 
 def build_decision_context(conn: sqlite3.Connection, *, arm: str, asof: str,
@@ -173,6 +224,10 @@ def build_decision_context(conn: sqlite3.Connection, *, arm: str, asof: str,
     idx = marks.get(INDEX_300_SYMBOL) or pit_close(conn, INDEX_300_SYMBOL, asof)
     if idx is not None:
         check_no_lookahead(asof, {INDEX_300_SYMBOL: idx})
+    # 可成交性只报**池内有价**的那些（见 `_tradability_block`）：口径按
+    # `instruments.type` 解析（未登记即报错，不默认成股票）。
+    tradable = sorted(set(marks) & {str(c) for c in (pool.get("codes") or [])})
+    asset_classes = {c: agent_decide.asset_class_for(conn, c) for c in tradable}
     return {
         "arm": arm,
         "asof": asof,
@@ -190,6 +245,13 @@ def build_decision_context(conn: sqlite3.Connection, *, arm: str, asof: str,
                  "pools": pool.get("pools") or {},
                  "missing_pools": list(pool.get("missing_pools") or []),
                  "available": bool(pool.get("available"))},
+        # ⚠️ 加了这一块之后，**同一个输入**在 P79 前后的 `decision_context_sha256`
+        # 不再相同（它是 AI 看得见的输入，必须进指纹 —— 见 `DECISION_HASHED_KEYS`）。
+        # 台账里**已有的**决策行的 sha 一律不改写（append-only）：D-49 的复核只对
+        # 新写入的载荷生效，旧行读出来的是「它当时看到的那个输入」。
+        "tradability": _tradability_block(
+            prices={c: marks[c] for c in tradable}, total_assets=float(total_assets),
+            asset_classes=asset_classes, lot=LOT),
         "guardrails": list(GUARDRAILS),
         "disclosure": list(DISCLOSURE_ITEMS),
         "non_goals": list(NON_GOALS),

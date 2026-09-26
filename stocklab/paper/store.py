@@ -24,12 +24,14 @@ from __future__ import annotations
 
 import json
 import sqlite3
+from dataclasses import asdict
 
 from stocklab.paper.rules import Decision
 
 TABLE_ACCOUNTS = "paper_accounts"
 TABLE_TRADES = "paper_trades"
 TABLE_NAV = "paper_nav_daily"
+TABLE_EVALS = "paper_agent_evals"
 
 
 # ---------- 账户 ----------
@@ -101,6 +103,51 @@ def insert_trade(conn: sqlite3.Connection, *, account_id: str, date: str,
     if commit:
         conn.commit()
     return int(cur.lastrowid)
+
+
+def insert_agent_eval(conn: sqlite3.Connection, *, arm: str, asof: str,
+                      decision: Decision, now: str, commit: bool = True) -> int:
+    """写一条**未成交腿**留痕（P79 / D3）。只增不改不删（触发器兜底）。
+
+    「不动的理由」是结论，不是日志：`plan_orders` 早就把它算出来了
+    （`Decision(action="hold", reason=...)`），只是 agent 那条执行路径把它丢了
+    （`engine._step_all` 的 `_evals` 下划线）。这张表就是那条路的落点。
+
+    幂等：`INSERT OR IGNORE` 靠 `UNIQUE(arm, asof, code)` 兜底 —— **不覆盖**已有行，
+    也不报错（同一天的 `paper agent run` 重跑不该炸；`OR IGNORE` 不产生隐式
+    DELETE，所以不会撞上 append-only 触发器）。
+
+    `decision.code` 为 `None`（全现金载荷的留痕）时写**空串**：`UNIQUE` 里的 NULL
+    互不相等，用 NULL 会让同一天重复落库。
+    """
+    payload = asdict(decision)
+    cur = conn.execute(
+        f"INSERT OR IGNORE INTO {TABLE_EVALS} (arm, asof, code, action, reason,"
+        " constraints_json, raw, created_at) VALUES (?,?,?,?,?,?,?,?)",
+        (arm, asof, decision.code or "", decision.action, decision.reason,
+         json.dumps(list(decision.binding_constraints), ensure_ascii=False),
+         json.dumps(payload, ensure_ascii=False, sort_keys=True), now),
+    )
+    if commit:
+        conn.commit()
+    return int(cur.lastrowid or 0)
+
+
+def load_agent_evals(conn: sqlite3.Connection, *, arm: str | None = None,
+                     asof: str | None = None) -> list[dict]:
+    """读未成交腿台账（**只读**；`raw` 原样 JSON 字符串，由调用方决定要不要解析）。"""
+    sql = f"SELECT * FROM {TABLE_EVALS}"
+    where, args = [], []
+    if arm is not None:
+        where.append("arm = ?")
+        args.append(arm)
+    if asof is not None:
+        where.append("asof = ?")
+        args.append(asof)
+    if where:
+        sql += " WHERE " + " AND ".join(where)
+    sql += " ORDER BY asof, eval_id"
+    return [dict(r) for r in conn.execute(sql, args)]
 
 
 def load_trades(conn: sqlite3.Connection, *, account_id: str | None = None,

@@ -2867,7 +2867,11 @@ def cmd_paper_agent_random(args: argparse.Namespace) -> int:
         payload = agent_decide.random_payload(
             arm=args.arm, asof=args.asof, pool_codes=set(pool["codes"]),
             held_qty=state["positions"], marks=marks,
-            total_assets=state["total_assets"], seed=args.seed)
+            total_assets=state["total_assets"], seed=args.seed,
+            # P79 / D4：口径按 `instruments.type` 解析（`asset_class_for` 未登记即
+            # 报错）；`cash` 只给退路那一步判「现金 ≥ 一手含费」用。
+            asset_classes=agent_decide.asset_classes_for(conn, set(pool["codes"])),
+            cash=float(state["cash"]))
         # 项目内产出的载荷也照同一条口径回传上下文指纹：写入口只有一条路，
         # 「谁产出的」不影响要不要证明「它看的是这一天的输入」。
         payload = {**payload, "context_sha256": context_sha256}
@@ -2914,7 +2918,11 @@ def cmd_paper_agent_random(args: argparse.Namespace) -> int:
         "note": ("随机对照臂：同护栏、同成本，标的与权重由固定种子决定；"
                  "敞口上界 **口径 v3（P68）** = (100 − 现金下限 10) − **全部**"
                  "存量持仓占比（不因 picks 而减免 —— v2 只扣了「不在 picks 里的」"
-                 "那一半，而「在 picks 里但整手减不动」的存量不会释放现金）")},
+                 "那一半，而「在 picks 里但整手减不动」的存量不会释放现金）；"
+                 "**口径 v4（P79）** 在此之上把抽出来的敞口映射到**可成交的整手**"
+                 "（不足一手的剔除、按整手数归一；全不足一手则重抽敞口，上限 "
+                 "8 次，仍不足则取一手最便宜的池内标的给 1 手）—— 旧口径 v3 在 "
+                 "2026-09-23/09-24 两日零成交，随机臂当时只是 arm-hold 的副本")},
         ensure_ascii=False, sort_keys=True, indent=2))
     return 0
 

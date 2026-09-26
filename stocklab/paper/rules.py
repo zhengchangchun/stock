@@ -580,3 +580,25 @@ def _fee_parts(costs: CostModel, side: str, price: float, qty: int, *,
     return {"commission": round(commission, 2), "stamp_tax": round(stamp, 2),
             "transfer_fee": round(transfer, 2), "slippage_cost": round(slip, 2),
             "total": round(commission + transfer + stamp, 2)}
+
+
+def one_lot_cost(*, price: float, asset_class: str, lot: int = LOT) -> float:
+    """一手（`lot` 股/份）**买入**要花掉的全部钱：含滑点成交额 ＋ 费用（P79 / D2）。
+
+    `= costs.fill_price("buy", price) * lot + _fee_parts(...)["total"]` —— 与
+    `plan_target_weight` 用的是**同一个** `CostModel.fill_price` 与同一个
+    `_fee_parts`，一行费用公式都不另写。存在的理由是 D2：AI 的输入侧必须知道
+    「一手要多少钱」，否则「目标权重 < 一手」这件事只能靠猜（P79 §0.3）。
+
+    与执行层判据的关系（**刻意取更严的那一侧**）：`plan_target_weight` 判
+    「差额 < 1 手」时用的是 `fill * lot`（**不含**费）。这里把费算进去 ⇒
+    `one_lot_cost ≥ fill * lot` ⇒ 「目标市值 ≥ `one_lot_cost`」**推得出**
+    执行层定会成交至少 1 手（`floor((fill*lot+费)/fill) ≥ lot`）。
+    方向是「门槛只会更高」—— 与风险规则「错的方向必须是少投」同一条纪律。
+
+    `asset_class` 未知 ⇒ `CostModel` 自己抛 `ValueError`（不静默退化成股票费率）。
+    """
+    costs = CostModel(asset_class=asset_class)
+    fill = costs.fill_price("buy", float(price))
+    total = _fee_parts(costs, "buy", fill, lot, ref=float(price))["total"]
+    return round(fill * lot + total, 4)
