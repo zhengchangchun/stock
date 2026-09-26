@@ -290,3 +290,37 @@ v1/v2/v3 的历史行一个字不改、读数**不可混引**。
   与报告/页面的一行读数（取不到写取不到，不填 0）。
 - 2026-09-26: 补 P79 —— 输入侧上下文键集（含 `tradability`）与台账两张表；随机臂 v4（可成交化）。
 - 2026-09-25: 首版（回答「准确率 + 全流程」）。
+
+## 6. AI 操盘手的 PIT 上下文（P37 起；P84 增两块）
+
+调用链只有一条（「它当时看到了什么」只能有一个答案）：
+
+```
+engine.decision_context_for(conn, arm=, asof=)          # paper/engine.py
+  → agent_context.build_decision_context(...)           # 顶层键（末尾两键为 P84 新增）
+      → market_view.market_block(conn, asof=)           # P84：market
+      → own_history.own_history_block(conn, arm=, asof=) # P84：own_history
+  → 生成器 `paper agent context --asof --arm` 整段 dump 进 user 消息（项目外）
+  → `paper agent decide` 重算 `decision_context_sha256` 比对后才落 `paper_agent_decisions`
+```
+
+`DECISION_HASHED_KEYS`（指纹覆盖，**顺序即声明顺序**）：
+
+`arm, asof, account, marks, index_300, pool, guardrails, tradability, objective,
+disclosure, non_goals, counter_arm` ＋ **P84 末尾追加** `market, own_history`。
+
+两块**只描述已经发生的事、零新采集、零网络**，尺寸有界（净值 ≤20 / 成交 ≤10 /
+决策 ≤5 / 指数 ≤2），每类统计一条 SQL：
+
+| 块 | 字段 | 真源 |
+|---|---|---|
+| `market` | `asof`（决策日）；`index{symbol → level/price_asof/ret_5_pct/ret_20_pct/ret_60_pct}`；`breadth{asof,n_total,n_up,n_down,n_flat,up_ratio,median_change_pct}`；`valuation{asof,n_total,pe_ttm_median,pe_ttm_p25,pe_ttm_p75,pb_median,pe_ttm_median_250d_ago,pe_ttm_median_change_pct}`；`money_flow{asof,n_total,main_net_sum_yi,net_inflow_ratio}`；`notes` | `bars_daily`（`adj_mode='none'`）/ `valuation_daily` / `money_flow_daily` / `trading_calendar` |
+| `own_history` | `arm`；`nav_series[{date,nav,cum_return,cum_cost,net_deposits,drawdown,index_300_level}]`（≤20，升序）；`n_nav_days`；`trades[{trade_id,date,code,name,side,fill_price,qty,fee_total,slippage_cost,rule_citation,reason}]`（≤10）；`n_trades/n_buy/n_sell`；`realized_fees_total`；`decisions[{decision_id,asof,decision_kind,n_orders,context_sha256(全 64 位),n_trials,n_rejected}]`（≤5）；`n_decisions`；`notes` | `paper_nav_daily` / `paper_trades` / `paper_agent_decisions` / `instruments`（经 `paper/store.py` 的 `load_nav`/`load_trades`，PIT 过滤在那里定死） |
+
+口径要点：`breadth` 的家数**不含指数**（`sh000300`/`sh000905` 也在 `bars_daily` 里）；
+真库 `bars_daily.pre_close` 整列为 NULL ⇒ 涨跌幅基准按定义回落「前一交易日收盘」；
+取不到一律 `None`，不猜数。两处都不含任何**前向**字段（见 `agent_context.NON_GOALS`
+第 1 条，ADR-035）。
+
+- 2026-09-27: 补 P84 —— `market` / `own_history` 两块进 PIT 上下文与指纹（只增键）；
+  `NON_GOALS` 第 1 条按 K5 改写（口径变更，ADR-035）；显示名真源 `paper/arm_names.py`。
