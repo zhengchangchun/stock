@@ -139,6 +139,10 @@ def test_t1_min_weight_pct_is_the_same_number_as_one_lot_cost():
     block = agent_context._tradability_block(
         prices=_marks(**{"000333": 87.23, "510300": 4.523, "600519": 1251.24}),
         total_assets=20037.91,
+        # P80 / D6：`cash` 与 `net_deposits` 是新增的必填口径（购买力与净收益的
+        # 分母）。本用例只测 `min_weight_pct` 与 `one_lot_cost` 同源，
+        # 故给夹具的起跑口径（现金 11314.91 = 20000 − 8680 − 5.09）。
+        cash=11314.91, net_deposits=20000.0,
         asset_classes={"000333": ASSET_STOCK, "510300": ASSET_ETF,
                        "600519": ASSET_STOCK})
     assert block["lot"] == LOT
@@ -160,6 +164,7 @@ def test_t1_zero_total_assets_gives_none_not_a_guessed_number():
     """总资产算不出（≤0）⇒ 逐只与顶层都是 `None` —— 不猜一个数。"""
     block = agent_context._tradability_block(
         prices=_marks(**{"510300": 4.523}), total_assets=0.0,
+        cash=0.0, net_deposits=20000.0,
         asset_classes={"510300": ASSET_ETF})
     assert block["by_code"]["510300"]["one_lot_cost"] > 0
     assert block["by_code"]["510300"]["min_weight_pct"] is None
@@ -234,6 +239,7 @@ def test_t1_only_pool_codes_with_a_price_are_reported():
     c_marks = _marks(**{"510300": 4.523, "600519": 1251.24})
     block = agent_context._tradability_block(
         prices=c_marks, total_assets=20037.91,
+        cash=11314.91, net_deposits=20000.0,
         asset_classes={"510300": ASSET_ETF, "600519": ASSET_STOCK})
     assert set(block["by_code"]) == {"510300", "600519"}
 
