@@ -1,0 +1,90 @@
+{
+  "_comment": "模拟盘各臂的对外显示名（单一真源）。页面/图表只改显示名，账户 id 一律不动（台账 append-only）。wired_from 记录该臂的机制出处。",
+  "updated": "2026-09-26",
+  "arms": {
+    "arm-agent-ds-v3": {
+      "name": "AI操盘手·三版（现役）",
+      "short": "AI三版",
+      "who": "DeepSeek V4 Pro + 提示词 v3（读上下文里的 tradability / 购买力结论）",
+      "status": "现役 · 2026-09-28 起以 5 万本金跑",
+      "kind": "llm"
+    },
+    "arm-agent-ds-v2": {
+      "name": "AI操盘手·二版",
+      "short": "AI二版",
+      "who": "同一模型 + 提示词 v2（相对 v1 的唯一变化：必须按整手报权重）",
+      "status": "已退役留档（2 个决策日：09-23 / 09-24）",
+      "kind": "llm"
+    },
+    "arm-agent-ds-v1": {
+      "name": "AI操盘手·一版",
+      "short": "AI一版",
+      "who": "同一模型 + 提示词 v1（按权重报，未按整手 → 09-23 四笔买入全被整手口径判「不动」）",
+      "status": "已退役留档（1 个决策日：09-23）",
+      "kind": "llm"
+    },
+    "arm-agent-v1": {
+      "name": "规则臂·A1 选股",
+      "short": "A1规则",
+      "who": "插桩脚本 A1/A2/A3（没有 LLM，按候选池分数挑前 N + 止损 + 目标仓位）",
+      "status": "在跑（模块2 通路 A）",
+      "kind": "rule"
+    },
+    "arm-agent-random": {
+      "name": "随机臂·对照组",
+      "short": "随机对照",
+      "who": "同护栏同成本，标的与权重随机抽（种子固定可复现）。它没有依据可自述 —— AI 跑赢它才算「选对了」",
+      "status": "在跑",
+      "kind": "random"
+    },
+    "arm-agent": {
+      "name": "AI操盘手·基座账户",
+      "short": "基座",
+      "who": "决策臂的基座（0 条决策、0 笔成交，净值＝不动）",
+      "status": "留档（不参与对照）",
+      "kind": "llm"
+    },
+    "arm-hold": {
+      "name": "什么都不做",
+      "short": "不动",
+      "who": "起跑日冻结快照（100 股 000333 + 现金），从不交易",
+      "status": "在跑（基准）",
+      "kind": "baseline"
+    },
+    "arm-now": {
+      "name": "你的实盘镜像",
+      "short": "实盘镜像",
+      "who": "实盘账本镜像（与「什么都不做」目前逐位相同：实盘只有 2026-09-15 那笔种子）",
+      "status": "在跑（基准）",
+      "kind": "baseline"
+    },
+    "arm-discipline-05": {
+      "name": "纪律臂·ETF 目标 5%",
+      "short": "纪律5%",
+      "who": "写死条文：止损 + 单票 ≤40% + ETF 分散，只差「ETF 目标占比」这一个数",
+      "status": "在跑",
+      "kind": "rule"
+    },
+    "arm-discipline-10": {
+      "name": "纪律臂·ETF 目标 10%",
+      "short": "纪律10%",
+      "who": "同上，单变量对照",
+      "status": "在跑",
+      "kind": "rule"
+    },
+    "arm-discipline-15": {
+      "name": "纪律臂·ETF 目标 15%",
+      "short": "纪律15%",
+      "who": "同上，单变量对照",
+      "status": "在跑",
+      "kind": "rule"
+    },
+    "sh000300": {
+      "name": "沪深300（大盘）",
+      "short": "大盘",
+      "who": "指数，不可直接交易、不扣成本",
+      "status": "基准",
+      "kind": "index"
+    }
+  }
+}

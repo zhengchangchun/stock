@@ -300,7 +300,8 @@ engine.decision_context_for(conn, arm=, asof=)          # paper/engine.py
   → agent_context.build_decision_context(...)           # 顶层键（末尾两键为 P84 新增）
       → market_view.market_block(conn, asof=)           # P84：market
       → own_history.own_history_block(conn, arm=, asof=) # P84：own_history
-  → 生成器 `paper agent context --asof --arm` 整段 dump 进 user 消息（项目外）
+  → 生成器 `paper agent context --asof --arm` 整段 dump 进 user 消息
+    （`tools/stock/ai-trader.py`：**仓内**、运行期在项目进程之外）
   → `paper agent decide` 重算 `decision_context_sha256` 比对后才落 `paper_agent_decisions`
 ```
 

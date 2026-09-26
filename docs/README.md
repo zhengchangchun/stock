@@ -254,6 +254,10 @@ stocklab portfolio show --asof 2026-09-15 --json     # P13 消费的稳定接口
   「当日净值行存在」⇒ 收盘链先跑完会让后写的决策永不执行，所以顺序是「先 decide 后 run」）；
   缺决策在三处的形态（回执 / `show` 的三字段 / 页面的「今日无决策」，与「有决策但不动手」不同形）；
   失败处置表；**预注册纪律与换模型流程**（换模型/换提示词/换通路 = 开新版本账户，旧账户保留）
+- [`../tools/stock/README.md`](../tools/stock/README.md) — **AI 操盘手的仓内工具**
+  （提示词 `prompts/trader-v*.txt` ＋ 决策生成器 `ai-trader.py` ＋ 画图 `paper-chart.py`）：
+  2026-09-27 起与代码同仓纳管 —— 否则 `prompt_sha256` 无法按仓核对、AI 臂的决策无法被复现；
+  运行环境 `~/.nanobot/workspace/tools/stock` 是指向该目录的软链（cron 绝对路径不变）
 - [`tasks/2026-09-22-p41-验收记录.md`](tasks/2026-09-22-p41-验收记录.md) — **P41 验收**：
   改了哪些文件 · 实测命令与**真库原始读数**（5 个交易日，全部 `insufficient`）· 五组测试逐条 ·
   剩余不确定性与待拍板项。口径决策见
