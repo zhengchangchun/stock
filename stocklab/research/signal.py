@@ -400,8 +400,13 @@ def _fallback_reason(exc: adjust.AdjustError) -> str:
     return FALLBACK_STALE_BLACKOUT
 
 
-class _ForwardPrices:
+class ForwardPrices:
     """`code → {调仓日: 收盘价}`，**一次/只**（D3）惰性载入并缓存。
+
+    ⚠️ **本类由 P83 从 `_ForwardPrices` 改名为公开名**（P83 T2「若需抽公共 helper，
+    抽完必须保证 `rank-ic` 的输出**逐位不变**」）：`research/factor.py`（因子级 IC
+    分解）要用**同一套**前向收益口径，而不是复制一份 —— 复制会让两个实验的收益
+    口径有分叉的可能。**只改名、无一行逻辑改动**。
 
     走 `data/adjust.py::load_bars_adjusted(conn, code, as_of=FWD_ASOF)`
     （**不自己实现一份复权、也不改 `adjust.py`**），只保留落在 `marks` 里的日期。
@@ -469,7 +474,7 @@ class _ForwardPrices:
 # 判定（D7：门槛全部 import，不新定）
 # ---------------------------------------------------------------------------
 
-def _ic_stats(series: list[float]) -> dict:
+def ic_stats(series: list[float]) -> dict:
     """IC 序列的训练/验证切分与汇总读数（切分复用 `replay.split_train_validate`）。"""
     train, validate = replay.split_train_validate(list(series))
 
@@ -578,7 +583,7 @@ def run_rank_ic(conn: sqlite3.Connection, *, pool: str, start: str, end: str,
         scored_by_mark[day] = list(res.scored.get(pool, []))
 
     tf = time.time()
-    provider = _ForwardPrices(conn, as_of=fwd_asof, dates=set(marks))
+    provider = ForwardPrices(conn, as_of=fwd_asof, dates=set(marks))
     fwd_s = time.time() - tf
 
     ic_adj: list[float | None] = []
@@ -634,8 +639,8 @@ def run_rank_ic(conn: sqlite3.Connection, *, pool: str, start: str, end: str,
     def _series(xs: list[float | None]) -> list[float]:
         return [x for x in xs if x is not None]
 
-    adj_stats = _ic_stats(_series(ic_adj))
-    raw_stats = _ic_stats(_series(ic_raw))
+    adj_stats = ic_stats(_series(ic_adj))
+    raw_stats = ic_stats(_series(ic_raw))
 
     layer_mean = {k: (sum(v) / len(v)) if v else None
                   for k, v in sorted(per_day_layer_means.items())}
@@ -724,7 +729,7 @@ def run_rank_ic(conn: sqlite3.Connection, *, pool: str, start: str, end: str,
 
 
 def _pearson_series(scored_by_mark: Mapping[str, list[dict]],
-                    provider: _ForwardPrices, marks: Sequence[str],
+                    provider: ForwardPrices, marks: Sequence[str],
                     field: str) -> list[float | None]:
     """Pearson 次读数序列（与主读数**同一批**截面与门槛）。
 
@@ -813,8 +818,8 @@ def render_md(report: Mapping) -> str:
     lines += [
         "",
         f"- Pearson 次读数（并列报出、不作判据）：验证段均值 adj "
-        f"{_num(_tail_mean(report['pearson_ic']['adj_score']))}、raw "
-        f"{_num(_tail_mean(report['pearson_ic']['raw_score']))}",
+        f"{_num(tail_mean(report['pearson_ic']['adj_score']))}、raw "
+        f"{_num(tail_mean(report['pearson_ic']['raw_score']))}",
         f"- 训练/验证切分复用 `candidate/replay.py::split_train_validate`"
         f"（周期序号 70/30，`SPLIT_TRAIN_RATIO`）",
         "",
@@ -886,7 +891,7 @@ def render_md(report: Mapping) -> str:
     return "\n".join(lines)
 
 
-def _tail_mean(series: Sequence[float | None]) -> float | None:
+def tail_mean(series: Sequence[float | None]) -> float | None:
     """Pearson 序列的验证段均值（与主读数同一套 70/30 切分）。"""
     vals = [x for x in series if x is not None]
     _train, validate = replay.split_train_validate(vals)

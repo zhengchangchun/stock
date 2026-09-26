@@ -56,6 +56,36 @@ FALLBACK_STALE_BLACKOUT = "stale_blackout_table"
 _ADJ_UNAVAILABLE = (adjust.EtfChainUnsupported, adjust.MissingFactor,
                     adjust.StaleFactorTable)
 
+#: 因子级 IC 分解（P83 D3）需要的**输入因子**窗口长度：插桩1（`script_id=7`）的
+#: `mom20` 要 `C[-1]`/`C[-20]`、`vr15` 要 `V[-5:]`/`V[-20:-5]` ⇒ 各取最近 20 根。
+FACTOR_WINDOW = 20
+
+#: `factor_inputs[code]["feats"]` 的键：管线里**已有**的 5 个财务因子 ＋ `period`。
+#: 这 5 个现役短池插桩**一个都没用**（`candidate/indicators.py:90-91`），在 P83 里
+#: 只作次读数。**不是新因子** —— 名单与 `research/factor.py::SECONDARY_FACTORS` 同源
+#: （用例钉住两处相等），本站不扩充因子库。
+FACTOR_FEATURE_KEYS: tuple[str, ...] = (
+    "roe", "gross_margin", "gm_yoy_pp", "inv_days", "fcf_margin")
+
+
+def _factor_payload(ctx: dict) -> dict:
+    """把**打分用的那个 ctx** 里的输入因子原样抠出来（P83 D3，只读暴露）。
+
+    `ctx` 就是 `score.build_ctx` 喂给打分插桩的那个字典 —— 本函数**不另立价格
+    口径、不重算复权**（D2），只是把插桩看得到的那两段窗口换个形状搬出来：
+
+      - `closes` / `volumes`：`ctx["bars"]` 的**最后 ≤20 根**（`bars` 本身已按
+        `date <= asof` 升序排好 ⇒ `closes[-1]` 就是插桩的 `C[-1]`）；
+      - `feats`：`ctx["features"]` 里 5 个财务因子键 ＋ `period`。
+
+    **它不进任何打分公式** —— 打分仍由插桩自己完成，本函数只做只读搬运。
+    """
+    bars = ctx["bars"][-FACTOR_WINDOW:]
+    feats = ctx["features"]
+    return {"closes": [float(b["close"]) for b in bars],
+            "volumes": [float(b["volume"]) for b in bars],
+            "feats": {k: feats[k] for k in (*FACTOR_FEATURE_KEYS, "period")}}
+
 
 def _fallback_reason(exc: adjust.AdjustError) -> str:
     if isinstance(exc, adjust.EtfChainUnsupported):
@@ -92,6 +122,13 @@ class PipelineResult:
     需要「该池全部已打分标的」（不只是前 N 只）来算 IC，而那条信息此前拿不到。
     `score_pipeline` 的打分口径/顺序/公式一字未动。同样是**只增字段**：老构造点
     不传即为空 dict（`frozen` ⇒ 必须给默认值）。
+
+    `factor_inputs`（P83 D3）：`{code: {"closes": […], "volumes": […], "feats": {…}}}`，
+    即短池打分插桩**这一次真正看到的输入因子**（取自同一个 `pool_ctx`，见
+    `_factor_payload`）。只有 `score_pipeline(..., want_factors=True)` 才填；
+    默认 `False` ⇒ 空 dict ⇒ **既有调用点的产物逐位不变**（`factor_inputs` 的
+    键集合恒等于 `scored["short"]` 的 code 集合）。同样**不是新的打分口径**：
+    打分仍由插桩完成，这里只是把它的输入读出来给因子级 IC 分解用。
     """
 
     members: list
@@ -99,6 +136,7 @@ class PipelineResult:
     params: dict
     eligible: dict[str, list[str]] = field(default_factory=dict)
     scored: dict[str, list[dict]] = field(default_factory=dict)
+    factor_inputs: dict[str, dict] = field(default_factory=dict)
 
 
 def _hydrate(loaded: dict) -> tuple[list[snapshot.MemberRow], list[snapshot.RejectRow]]:
@@ -198,7 +236,8 @@ def recommend_optimization(result: RunResult) -> bool:
 def score_pipeline(conn: sqlite3.Connection, *, asof: str,
                    plugin_overrides: dict[str, int] | None = None,
                    universe=None, universe_id: str | None = None,
-                   members_sha256: str | None = None
+                   members_sha256: str | None = None,
+                   want_factors: bool = False
                    ) -> PipelineResult:
     """跑一遍候选池打分（步骤 3–8），**只返回、不写库**。
 
@@ -222,6 +261,10 @@ def score_pipeline(conn: sqlite3.Connection, *, asof: str,
     `PipelineResult.scored`（P78 D2）把内部已构造好的完整打分行原样传出 ——
     给 `research rank-ic` 度量用，**不是新的打分口径**：`select_top` 与
     `eligible` 的派生逻辑、本函数的打分顺序与公式一字未动。
+
+    `want_factors`（P83 D3）：`True` 时额外填 `PipelineResult.factor_inputs`
+    （短池打分插桩这一次看到的输入因子）。默认 `False` ⇒ 一行都不多算、
+    既有字段逐位不变；**打分口径与本函数的流转一字未动**。
     """
     if universe_id is None:
         from stocklab.config.universes import SEED21_UNIVERSE_ID
@@ -233,6 +276,8 @@ def score_pipeline(conn: sqlite3.Connection, *, asof: str,
     members: list[snapshot.MemberRow] = []
     rejects: list[snapshot.RejectRow] = []
     scored: dict[str, list[dict]] = {p: [] for p in pools.ALL_POOLS}
+    #: 短池打分插桩这一次看到的输入因子（P83 D3）。默认空 ⇒ 老调用点产物逐位不变。
+    factor_inputs: dict[str, dict] = {}
     #: 打分输入价回退到未复权价的标的数（D3：fail-open 但**可见**）。
     #: 只统计**真正进入打分**的标的 —— `screen` 淘汰的标的从不构造 `ctx`，
     #: 把它们算进来会让这个数随排雷结果漂移，不是「这一轮有多少只没吃到复权」。
@@ -280,6 +325,10 @@ def score_pipeline(conn: sqlite3.Connection, *, asof: str,
                 continue
             final, risks = risk_adjust.adjust(conn, outcome, pool_ctx,
                                               plugin_overrides=plugin_overrides)
+            if want_factors and pool == pools.POOL_SHORT:
+                # 取自**打分用的同一个 `pool_ctx`**（D2/D4）—— 与上面那次
+                # `score_pool` 吃的是同一个对象，不另建价格口径。
+                factor_inputs[inst.code] = _factor_payload(pool_ctx)
             # 插桩0 的行业注记**无论排雷是否通过**都要进报告（P53 T5）。
             # 原来只在 `pass_flag=False` 的拒绝分支里用 `risk_note`，导致通过排雷的
             # 银行/保险在报告里看不到「金融业（银行Ⅱ）：…毛利率与存货周转无意义」
@@ -299,6 +348,7 @@ def score_pipeline(conn: sqlite3.Connection, *, asof: str,
 
     return PipelineResult(members=members, rejects=rejects,
                           eligible=eligible, scored=scored,
+                          factor_inputs=factor_inputs,
                           params={"seed_count": len(scan),
                                   "universe_id": universe_id,
                                   "members_sha256": members_sha256,

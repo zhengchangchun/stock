@@ -44,7 +44,8 @@ from stocklab.cli.plugin import (cmd_plugin_approve, cmd_plugin_list,
                                  cmd_plugin_reject, cmd_plugin_sandbox,
                                  cmd_plugin_submit)
 from stocklab.cli.candidate import cmd_candidate_review, cmd_candidate_run
-from stocklab.cli.research import (cmd_research_rank_ic, cmd_research_xsec_topn)
+from stocklab.cli.research import (cmd_research_factor_ic, cmd_research_rank_ic,
+                                   cmd_research_xsec_topn)
 from stocklab.cli.universe import (cmd_universe_build, cmd_universe_doctor,
                                    cmd_universe_sync)
 
@@ -5069,6 +5070,26 @@ def build_parser() -> argparse.ArgumentParser:
                               "带 `universe` 字段的预注册必须与它逐字一致，否则 exit 2")
     rsrch_r.add_argument("--db")
     rsrch_r.set_defaults(func=cmd_research_rank_ic)
+
+    rsrch_f = rsrch_sub.add_parser(
+        "factor-ic",
+        help="因子级 IC 分解：把短池打分的**输入因子**逐个算 rank IC ＋ 裁剪诊断"
+             "（离线只读；需 --prereg 预注册，fail-closed；**不出任何信号**）")
+    rsrch_f.add_argument("--pool", default="short",
+                         help="候选池（本实验只支持 short；其余 exit 2）")
+    rsrch_f.add_argument("--start", required=True,
+                         help="窗口起点 YYYY-MM-DD（必填；< 2015-01-01 exit 2）")
+    rsrch_f.add_argument("--end", default=None,
+                         help="窗口终点 YYYY-MM-DD（默认：今天）")
+    rsrch_f.add_argument("--prereg", required=True,
+                         help="预注册 md 路径（必填；内含 ```json 块，逐字段比对）")
+    rsrch_f.add_argument("--out", default=None,
+                         help="产物目录（默认：reports/research/）")
+    rsrch_f.add_argument("--universe", default=None,
+                         help="宇宙 id（默认 None ⇒ seed21 主干常量）；"
+                              "本站预注册**必填** universe，不一致即 exit 2")
+    rsrch_f.add_argument("--db")
+    rsrch_f.set_defaults(func=cmd_research_factor_ic)
 
     uni = sub.add_parser(
         "universe", help="宇宙（ADR-026：repo 文件＝真源、universe_memberships 表＝投影）")
