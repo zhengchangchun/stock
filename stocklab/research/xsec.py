@@ -64,6 +64,28 @@ ARM_ALL = "all"
 ARM_BOTH = "both"
 ARM_CHOICES: tuple[str, ...] = (ARM_TOPN, ARM_ALL, ARM_BOTH)
 
+#: 价格口径（P82 · D1/D6）。`raw` = 现状（默认，逐位不变）；`adj` = 只在**收益侧**
+#: 换 PIT 复权价；`both` = 一次扫描下同时出两套读数（便于并排对照）。
+PRICE_MODE_RAW = replay.DEFAULT_PRICE_MODE
+PRICE_MODE_ADJ = "adj"
+PRICE_MODE_BOTH = "both"
+PRICE_MODE_CHOICES: tuple[str, ...] = (PRICE_MODE_RAW, PRICE_MODE_ADJ,
+                                       PRICE_MODE_BOTH)
+
+#: D5 的口径披露句。`n_adj_fallback` 与「成本侧仍用未复权价」必须并列写出。
+PRICE_MODE_NOTE = (
+    "价格口径（P82）：`raw`（默认）＝收益侧直读未复权 `bars_daily.close`，"
+    "与加开关之前**逐位一致**；`adj` ＝收益侧换 **PIT 复权收盘价**"
+    "（`data/adjust.py::load_bars_adjusted`，`as_of` 取该周期的 `d1` ⇒ 只累乘 "
+    "`cqr <= d1` 的事件，`start` 取该只链的 `usable_from` ⇒ 主动放弃跨越不可定价"
+    "事件的那段历史）。**只有收益侧变、成本侧一字不动**：成交价、`_qty_for` 整手、"
+    "涨跌停判定与 `guard_pit_prices` 守卫一律仍用未复权价（D2，与 P77/ADR-029 同构）。"
+    "`n_adj_fallback` ＝复权不可用而回退未复权的 `(code, 周期)` 数（ETF 链不可用 / "
+    "缺口表过期 / `d0` 落在不可用段 / 该日无 bar）。`excess_index300` **仍是 raw 口径**"
+    "（`benchmark_excess` 内部那次 `period_returns` 未传 `price_mode`，本站未改该函数）"
+    "⇒ adj 臂的该字段与 raw 臂相同，**不得**读成「adj 口径的超额」。"
+)
+
 #: 预注册里对两臂的命名（逐字，取自任务书 T1 的 json）。
 HOLD_ARM = "topn"
 HOLD_CONTROL = "all-eligible"
@@ -315,13 +337,51 @@ def _arm_stats(series: list[float], train: list[float],
     }
 
 
+def _delta_of(readings: dict[str, dict]) -> dict | None:
+    """现状臂 − 对照臂的 Δ 与判定（两臂都在 `readings` 里才算）。
+
+    抽出来是因为 P82 起同一个 Δ 要在**两套价格口径**上各算一遍（raw / adj）——
+    口径不同但**判据必须同源**，所以只能有一份组装逻辑（否则两套 Δ 就不是同一个
+    门槛下的读数了）。
+    """
+    if ARM_TOPN not in readings or ARM_ALL not in readings:
+        return None
+    diffs = [a - b for a, b in zip(readings[ARM_TOPN]["period_returns"],
+                                   readings[ARM_ALL]["period_returns"])]
+    train_d, validate_d = replay.split_train_validate(diffs)
+    return {
+        "definition": "Δ = 现状臂（topn）周期收益 − 对照臂（all-eligible）周期收益",
+        "period_deltas": diffs,
+        "n_periods": len(diffs),
+        "n_train": len(train_d),
+        "mean_all": (sum(diffs) / len(diffs)) if diffs else None,
+        "mean_train": (sum(train_d) / len(train_d)) if train_d else None,
+        "mean_validate": (sum(validate_d) / len(validate_d))
+                         if validate_d else None,
+        "overfit_flag": sandbox.overfit_flag(
+            (sum(train_d) / len(train_d)) if train_d else None,
+            (sum(validate_d) / len(validate_d)) if validate_d else None),
+        **_verdict(validate_d),
+    }
+
+
 def run_xsec_topn(conn: sqlite3.Connection, *, pool: str, start: str,
                   end: str, prereg_path: Path,
-                  arm: str = ARM_BOTH, universe: str | None = None) -> dict:
+                  arm: str = ARM_BOTH, universe: str | None = None,
+                  price_mode: str = PRICE_MODE_RAW) -> dict:
     """跑实验，返回报告 dict（**不写任何文件**，落盘交给调用方）。
 
     `universe`：宇宙 id（`None` ⇒ `seed21`，主干常量）。非 `seed21` 走
     `resolve_universe`（**fail-closed**：文件缺失即抛 `PreregError`，不回退）。
+
+    `price_mode`（P82 · D1/D6）：`raw`（默认）｜`adj`｜`both`。
+      - `raw`  ⇒ `arms` / `delta` 是未复权读数（与加开关之前逐字段一致）；
+      - `adj`  ⇒ `arms` / `delta` 是 PIT 复权读数（`arms` 仍是「两臂读数」这个
+        语义，具体口径由 `price_mode` 字段钉住）；
+      - `both` ⇒ `arms` / `delta` 保持 **raw**（这一档是**对照**，锚点不能动），
+        另出 `arms_adj` / `delta_adj` 两套并排读数。
+      **两套读数的判据同源**：`_verdict` / `MIN_VALID_PERIODS` / bootstrap 次数与
+      种子全部 import 自 `plugin/sandbox.py`，一个数字都没抄。
 
     失败一律 `PreregError`（调用方 exit 2、零输出）。
     """
@@ -334,6 +394,9 @@ def run_xsec_topn(conn: sqlite3.Connection, *, pool: str, start: str,
             f"窗口起点不得早于 {MIN_START}（收到 {start!r}）—— 窗口即结论")
     if arm not in ARM_CHOICES:
         raise PreregError(f"未知 --arm {arm!r}；已知 {list(ARM_CHOICES)}")
+    if price_mode not in PRICE_MODE_CHOICES:
+        raise PreregError(
+            f"未知 --price-mode {price_mode!r}；已知 {list(PRICE_MODE_CHOICES)}")
 
     try:
         universe_id, members, members_sha256 = resolve_universe(universe)
@@ -356,41 +419,43 @@ def run_xsec_topn(conn: sqlite3.Connection, *, pool: str, start: str,
                                              universe=members)
     scan_s = time.time() - t0
 
+    # 一次扫描（`_scan_holds` 只跑一次）下按需出几套读数（D6）。
+    # 档位 → 要算的 (口径, 落点) 列表；`both` 是唯一出两套的档。
     wanted = {ARM_TOPN: (ARM_TOPN, topn_holds),
               ARM_ALL: (ARM_ALL, eligible_holds)}
+    plan: list[tuple[str, str]] = [(PRICE_MODE_RAW, "arms")]
+    if price_mode == PRICE_MODE_ADJ:
+        plan = [(PRICE_MODE_ADJ, "arms")]
+    elif price_mode == PRICE_MODE_BOTH:
+        plan = [(PRICE_MODE_RAW, "arms"), (PRICE_MODE_ADJ, "arms_adj")]
+
     arms: dict[str, dict] = {}
+    arms_adj: dict[str, dict] = {}
+    sinks = {"arms": arms, "arms_adj": arms_adj}
+    n_adj_fallback = 0
     for key, (name, holds) in wanted.items():
         if arm not in (name, ARM_BOTH):
             continue
-        series = replay.period_returns(conn, asof_dates=marks, pool=pool,
-                                       hold_override=holds)
-        train, validate = replay.split_train_validate(series)
-        excess = replay.benchmark_excess(conn, asof_dates=marks, pool=pool,
-                                         hold_override=holds)
-        arms[name] = _arm_stats(series, train, validate, excess)
+        for mode, sink_name in plan:
+            stats: dict = {}
+            series = replay.period_returns(
+                conn, asof_dates=marks, pool=pool, hold_override=holds,
+                price_mode=mode, price_stats=stats)
+            train, validate = replay.split_train_validate(series)
+            # 基准超额的**口径未动**（`benchmark_excess` 内部那次 period_returns
+            # 没传 price_mode）—— 基准是指数，不可复权；披露见 PRICE_MODE_NOTE。
+            excess = replay.benchmark_excess(conn, asof_dates=marks, pool=pool,
+                                             hold_override=holds)
+            sinks[sink_name][name] = {
+                **_arm_stats(series, train, validate, excess),
+                "n_adj_fallback": stats["n_adj_fallback"],
+            }
+            n_adj_fallback += stats["n_adj_fallback"]
 
-    delta: dict | None = None
-    if ARM_TOPN in arms and ARM_ALL in arms:
-        diffs = [a - b for a, b in zip(arms[ARM_TOPN]["period_returns"],
-                                       arms[ARM_ALL]["period_returns"])]
-        train_d, validate_d = replay.split_train_validate(diffs)
-        delta = {
-            "definition": "Δ = 现状臂（topn）周期收益 − 对照臂（all-eligible）周期收益",
-            "period_deltas": diffs,
-            "n_periods": len(diffs),
-            "n_train": len(train_d),
-            "mean_all": (sum(diffs) / len(diffs)) if diffs else None,
-            "mean_train": (sum(train_d) / len(train_d)) if train_d else None,
-            "mean_validate": (sum(validate_d) / len(validate_d))
-                             if validate_d else None,
-            "overfit_flag": sandbox.overfit_flag(
-                (sum(train_d) / len(train_d)) if train_d else None,
-                (sum(validate_d) / len(validate_d)) if validate_d else None),
-            **_verdict(validate_d),
-        }
-
+    delta = _delta_of(arms)
+    delta_adj = _delta_of(arms_adj) if arms_adj else None
     elapsed = time.time() - t0
-    return {
+    report = {
         "experiment": EXPERIMENT,
         "pool": pool,
         "start": start,
@@ -418,6 +483,9 @@ def run_xsec_topn(conn: sqlite3.Connection, *, pool: str, start: str,
         "replay_s": elapsed - scan_s,
         "arms": arms,
         "delta": delta,
+        "price_mode": price_mode,
+        "n_adj_fallback": n_adj_fallback,
+        "price_mode_note": PRICE_MODE_NOTE,
         "non_pit_items": list(NON_PIT_ITEMS),
         "non_pit_universe_items": list(NON_PIT_UNIVERSE_ITEMS),
         "universe_note": (
@@ -430,6 +498,13 @@ def run_xsec_topn(conn: sqlite3.Connection, *, pool: str, start: str,
         "seed_scope_note": _seed_scope_note(universe_id, len(members)),
         "window_note": WINDOW_IS_CONCLUSION_NOTE,
     }
+    if arms_adj:
+        # D5：只**新增**键。raw 档不出现这两个键 ⇒ 与加开关之前的产物逐字段一致。
+        # 判定「有没有 adj 读数」看 `arms_adj`，**不是**看 `delta_adj` ——
+        # `--arm topn|all` 单臂跑时 adj 读数有、Δ 恒为 None，看 Δ 会把读数丢掉。
+        report["arms_adj"] = arms_adj
+        report["delta_adj"] = delta_adj
+    return report
 
 
 # ---------------------------------------------------------------------------
@@ -440,19 +515,26 @@ def _pct(x: float | None) -> str:
     return "—" if x is None else f"{x:+.4%}"
 
 
+def _mode_tag(report: Mapping) -> str:
+    """`summary:` 里的价格口径标记 —— **raw 档为空串**（既不改字面，也不改长度）。"""
+    mode = report.get("price_mode", PRICE_MODE_RAW)
+    return "" if mode == PRICE_MODE_RAW else f" price_mode={mode}"
+
+
 def summary_line(report: Mapping) -> str:
     """md 结尾那一行 `summary:`（nanobot 直接贴给用户）。"""
     d = report.get("delta")
+    tag = _mode_tag(report)
     if d is None:
         arms = "/".join(sorted(report["arms"]))
         return (f"summary: xsec-topn pool={report['pool']} "
-                f"{report['start']}~{report['end']} arm={arms} "
+                f"{report['start']}~{report['end']} arm={arms}{tag} "
                 f"n_periods={report['n_periods']} —— 单臂跑，无 Δ 与 verdict")
     return (f"summary: xsec-topn pool={report['pool']} "
             f"{report['start']}~{report['end']} n_periods={report['n_periods']} "
             f"验证段 n={d['n_validate']} "
             f"Δ={_pct(d['mean_validate'])} CI[{_pct(d['ci_low'])},"
-            f"{_pct(d['ci_high'])}] verdict={d['verdict']}"
+            f"{_pct(d['ci_high'])}] verdict={d['verdict']}{tag}"
             + ("" if d["verdict"] != "INCONCLUSIVE" else "（样本不足）"))
 
 
@@ -530,6 +612,48 @@ def render_md(report: Mapping) -> str:
               f"{report['topn']}，所以「选前 {report['topn']} vs 持全部」"
               "之间的区分度**结构性地小** —— 这是本实验的固有上限。", ""]
 
+    # §3c：价格口径对照（P82 · D6）。只在真的算了两套读数时出现 ——
+    # raw 档一个字节都不加，与加开关之前的 md 逐字一致。
+    if report.get("arms_adj"):
+        dj = report.get("delta_adj")
+        aj = report["arms_adj"]
+        lines += ["## 3c. 价格口径对照（raw vs adj · P82）", "",
+                  f"- {report['price_mode_note']}",
+                  f"- 本品 `price_mode` = `{report.get('price_mode')}`；"
+                  f"本次复权回退 `n_adj_fallback` = "
+                  f"**{report.get('n_adj_fallback')}** 个 `(code, 周期)`。",
+                  "",
+                  "| 臂 | 口径 | 全窗均值/期 | 训练段 | 验证段 | 复权回退数 |",
+                  "|---|---|---|---|---|---|"]
+        for name in (ARM_TOPN, ARM_ALL):
+            for label, src in (("raw", arms), ("adj", aj)):
+                a = src.get(name)
+                if a is None:
+                    continue
+                lines.append(
+                    f"| `{name}` | `{label}` | {_pct(a['mean_all'])} | "
+                    f"{_pct(a['mean_train'])} | {_pct(a['mean_validate'])} | "
+                    f"{a.get('n_adj_fallback', 0)} |")
+        lines.append("")
+        if dj is None:
+            lines += ["> 本次单臂跑（`--arm`），**没有 Δ**，也就没有 adj 的 verdict。",
+                      ""]
+        else:
+            lines += [
+                f"- Δ（raw）：验证段 n={d['n_validate'] if d else '—'}，"
+                f"均值 {_pct(d['mean_validate']) if d else '—'}；"
+                f"verdict = **{d['verdict'] if d else '—'}**",
+                f"- Δ（adj）：验证段 n={dj['n_validate']}，均值 "
+                f"{_pct(dj['mean_validate'])}，95% CI "
+                f"[{_pct(dj['ci_low'])}, {_pct(dj['ci_high'])}]；"
+                f"verdict = **{dj['verdict']}**",
+                "- 判词只许三选一：`SAME_VERDICT` / `VERDICT_FLIPPED` / "
+                "`INCONCLUSIVE` —— 本档**不做采纳**（D7）：把默认口径切到复权价是"
+                "**另一次**决定（另立任务书），报告里**不得**写「口径修好了所以"
+                "策略变好了」。",
+                "",
+            ]
+
     lines += ["## 3b. 宇宙（P71 的口径增量）", "",
               f"- {report['universe_note']}"]
     lines += [f"- {item}" for item in report.get("non_pit_universe_items", ())]
@@ -538,13 +662,18 @@ def render_md(report: Mapping) -> str:
                   "（缺席 ⇒ 语义为 `seed21`；命令行与它不一致则 exit 2，"
                   "**换宇宙必须新预注册**）。", ""]
 
+    # 复现命令：`--price-mode` 只在**非默认**档出现 —— raw 档的 md 必须与
+    # 加开关之前逐字一致（§2 判据）。
+    repro = [".venv/bin/python -m stocklab.cli.main research xsec-topn \\",
+             f"    --pool {report['pool']} --start {report['start']} \\"]
+    if report.get("price_mode", PRICE_MODE_RAW) != PRICE_MODE_RAW:
+        repro.append(f"    --price-mode {report['price_mode']} \\")
+    repro.append(f"    --prereg {report['prereg_path']} --out reports/research/")
     lines += [
         "## 4. 复现与耗时",
         "",
         "```bash",
-        ".venv/bin/python -m stocklab.cli.main research xsec-topn \\",
-        f"    --pool {report['pool']} --start {report['start']} \\",
-        f"    --prereg {report['prereg_path']} --out reports/research/",
+        *repro,
         "```",
         "",
         f"- 总耗时 {report['elapsed_s']:.1f} s"
@@ -561,15 +690,22 @@ def render_md(report: Mapping) -> str:
 
 
 def write_report(report: Mapping, out_dir: Path) -> tuple[Path, Path]:
-    """落 `<out>/<end>-xsec-topn-<universe_id>.{json,md}`，返回两个路径。
+    """落 `<out>/<end>-xsec-topn-<universe_id>[-adj].{json,md}`，返回两个路径。
 
     **文件名必须带宇宙 id**（P77 T7）：不带时「换宇宙重跑同一个 end」会**覆盖**
     上一份产物 —— 2026-09-25 的扩池重跑就是这样把 P60 的
     `reports/research/2026-09-24-xsec-topn.{md,json}` 覆盖掉的（已不可恢复）。
     `seed21` 也带上 id ⇒ 与旧名不同是**有意的**：旧名本身就是碰撞源。
+
+    **非 raw 档再加 `-adj` 后缀**（P82 · D6）：`--price-mode adj|both` 的产物
+    绝不能盖掉 `reports/research/` 里既有的 raw 产物。`both` 的内容是 raw + adj
+    **两套**，是 `adj` 档的超集（`adj` 档的 `arms` 换成 adj 读数），所以两档同名
+    时后跑的 `both` 不会丢掉 `adj` 档的数值。
     """
     out_dir.mkdir(parents=True, exist_ok=True)
     stem = f"{report['end']}-xsec-topn-{report['universe_id']}"
+    if report.get("price_mode", PRICE_MODE_RAW) != PRICE_MODE_RAW:
+        stem += "-adj"
     json_path = out_dir / f"{stem}.json"
     md_path = out_dir / f"{stem}.md"
     json_path.write_text(

@@ -54,6 +54,11 @@ def cmd_research_xsec_topn(args) -> int:
         print(f"--start 不得早于 {xsec.MIN_START}（收到 {args.start!r}）："
               "窗口即结论，短池在 3 年窗上会翻符号", file=sys.stderr)
         return 2
+    price_mode = getattr(args, "price_mode", xsec.PRICE_MODE_RAW)
+    if price_mode not in xsec.PRICE_MODE_CHOICES:
+        print(f"未知 --price-mode {price_mode!r}；已知 "
+              f"{list(xsec.PRICE_MODE_CHOICES)}", file=sys.stderr)
+        return 2
 
     # ── ② 预注册（纯文件 IO） ────────────────────────────────────────
     prereg_path = Path(args.prereg)
@@ -81,7 +86,8 @@ def cmd_research_xsec_topn(args) -> int:
             report = xsec.run_xsec_topn(
                 conn, pool=args.pool, start=args.start, end=end,
                 prereg_path=prereg_path, arm=args.arm,
-                universe=getattr(args, "universe", None))
+                universe=getattr(args, "universe", None),
+                price_mode=price_mode)
         except xsec.PreregError as exc:
             print(f"预注册校验失败：{exc}", file=sys.stderr)
             return 2
@@ -94,6 +100,9 @@ def cmd_research_xsec_topn(args) -> int:
           f"{report['start']}~{report['end']} "
           f"marks={report['n_marks']} periods={report['n_periods']} "
           f"elapsed={report['elapsed_s']:.1f}s")
+    if price_mode != xsec.PRICE_MODE_RAW:
+        print(f"price_mode={price_mode} "
+              f"n_adj_fallback={report['n_adj_fallback']}")
     if d is not None:
         print(f"verdict={d['verdict']} n_validate={d['n_validate']}")
         print(d["note"])

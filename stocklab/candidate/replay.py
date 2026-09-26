@@ -40,10 +40,29 @@ from typing import Mapping, Sequence
 from stocklab.backtest.portfolio import BoardUnknown, LIMIT_BY_BOARD, LIMIT_TOLERANCE
 from stocklab.config.costs import CostModel
 from stocklab.config.replay import POSITION_NOTIONAL, REBALANCE_DAYS
+from stocklab.data import adjust
+from stocklab.data.models import Bar
 
 #: 空池时的处置：持现金。**不是**「跳过该周期」—— 卖出上一期持仓是要付
 #: 成本的，跳过会把那笔成本抹掉。
 EMPTY_POOL_IS_CASH: bool = True
+
+#: 收益侧的价格口径（D1）。`raw` = 现状（直读 `bars_daily.close`，全表 `adj_mode='none'`
+#: ⇒ **未复权价**）；`adj` = **PIT 复权价**。只作用于周期毛收益的 `p0/p1`（D2）：
+#: 成本侧成交价、`_qty_for` 整手、涨跌停判定一律保持未复权（与 P77 / ADR-029 同构）。
+PRICE_MODES: tuple[str, ...] = ("raw", "adj")
+
+#: 默认口径 = **现状**。不传 `price_mode` 的调用点（含 `plugin/sandbox.py` 经注入
+#: 调用的 `benchmark_excess`）走 `raw`，逐位不变（D1 / T3 用例①）。
+DEFAULT_PRICE_MODE = "raw"
+
+#: 「**这个标的的复权价算不出来**」这一类失败（数据侧不可用 ⇒ 回退未复权 + 计数）。
+#: 与 `candidate/run.py` / `research/signal.py` 的 `_ADJ_UNAVAILABLE` **同一集合**（三类）。
+#: 刻意不是 `AdjustError` 全体：裸 `AdjustError`（`k > 1` = 负现金解析 bug、
+#: `pre_close <= 0` = 数据坏）是**我们这边**的缺陷，必须炸出来
+#: （ERROR_DIARY #81「数据脏与代码坏要分档」）。D3：不抛异常、也不静默。
+_ADJ_UNAVAILABLE = (adjust.EtfChainUnsupported, adjust.MissingFactor,
+                    adjust.StaleFactorTable)
 
 #: 涨跌停判定时的比较容差（同 `backtest.portfolio.LIMIT_TOLERANCE`）。
 #: `portfolio.py` 使用 1e-6 处理浮点表示误差（如 1.1*10 = 10.999…）。
@@ -174,11 +193,92 @@ def _qty_for(px: float) -> int:
     return max(1, int(POSITION_NOTIONAL / px))
 
 
+class _AdjCloses:
+    """`(code, d0, d1)` → 该期收益侧要用的 PIT 复权收盘价对，惰性载入并缓存。
+
+    ## 读法（D4，锁定）
+
+    `adjust.load_bars_adjusted(conn, code, as_of=d1, start=chain.usable_from)`：
+      - `as_of = d1` ⇒ 只累乘 `cqr <= d1` 的事件，**无未来函数**；
+      - `start = chain.usable_from` ⇒ 主动放弃「跨越不可定价事件」的那段历史。
+        缩窗口是**显式决定**（`adjust_bars` 的契约要求调用方显式传，不许本层
+        替调用方默默做掉）；落在这个段里的 `d0` 一律**回退未复权**并计数。
+
+    ## 为什么把 `load_bars_adjusted` 拆开
+
+    该函数里 `as_of` **无关**的部分（读该只全量 K 线 ＋ 建链 ＋ 核对缺口表）才是
+    大头 —— 真库单只 8500 根 K 线实测 **32 ms/次**，而它会被逐 `(code, 周期)`
+    重复几万次。所以这里把它的**全部三步**按 `code` 缓存前两步：
+
+        bars, chain = adjust.load_chain(conn, code)
+        adjust.assert_blackout_current(conn, code, chain)
+        adjust.adjust_bars(bars, chain, as_of=d1, code=code, start=chain.usable_from)
+
+    —— 没有第二套复权口径。唯一的差别是第三步只传**该周期要用的两根 bar**：
+    `adjust_bars` 只用到 `usable` 的 `max`（= `base_date`）与 `chain.at(bar.date)`，
+    传 `[bar(d0), bar(d1)]` 时 `base_date` 仍是 `d1`、`multiplier(d0) = F(d1)/F(d0)`
+    逐位相同。可定价性检查在 `d0 >= chain.usable_from` 时**必为空**（不可定价事件的
+    `cqr` 全 `<= usable_from`），所以 `_load` 先把这条前提显式守住。
+    等价性由 `tests/test_replay_price_mode.py::test_adj_pair_matches_load_bars_adjusted`
+    拿 `load_bars_adjusted` 的返回值直接钉住。
+
+    复权不可用（三类）／`d0` 落在不可用段／该日无 bar ⇒ `pair()` 返回 `None`，
+    调用方回退未复权价并按 `(code, 周期)` 计数 `n_fallback`（D3）。
+    """
+
+    def __init__(self, conn: sqlite3.Connection) -> None:
+        self._conn = conn
+        self._by_date: dict[str, dict[str, Bar]] = {}
+        self._chain: dict[str, adjust.Chain] = {}
+        self._cache: dict[tuple[str, str, str], tuple[float, float] | None] = {}
+        #: 回退计数：**每次 `pair()` 返回 `None` 计一次**，而调用方每 `(code, 周期)`
+        #: 只问一次 ⇒ 天然满足 D3 的「按 (code, 周期) 去重」。
+        self.n_fallback = 0
+
+    def _bars_and_chain(self, code: str) -> tuple[dict[str, Bar], adjust.Chain]:
+        if code not in self._chain:
+            bars, chain = adjust.load_chain(self._conn, code)
+            adjust.assert_blackout_current(self._conn, code, chain)
+            self._by_date[code] = {b.date: b for b in bars}
+            self._chain[code] = chain
+        return self._by_date[code], self._chain[code]
+
+    def _load(self, code: str, d0: str,
+              d1: str) -> tuple[float, float] | None:
+        try:
+            by_date, chain = self._bars_and_chain(code)
+            if chain.usable_from is not None and d0 < chain.usable_from:
+                return None          # D4 的缩窗口：d0 在不可用段内 ⇒ 该期回退
+            b0, b1 = by_date.get(d0), by_date.get(d1)
+            if b0 is None or b1 is None:
+                return None          # 该日无 bar（raw 侧同样取不到 ⇒ 本就不进 gross）
+            out = adjust.adjust_bars([b0, b1], chain, d1, code=code,
+                                     start=chain.usable_from)
+        except _ADJ_UNAVAILABLE:
+            return None
+        closes = {b.date: b.close for b in out}
+        p0, p1 = closes.get(d0), closes.get(d1)
+        if not p0 or not p1:
+            return None
+        return p0, p1
+
+    def pair(self, code: str, d0: str, d1: str) -> tuple[float, float] | None:
+        key = (code, d0, d1)
+        if key not in self._cache:
+            self._cache[key] = self._load(code, d0, d1)
+        got = self._cache[key]
+        if got is None:
+            self.n_fallback += 1
+        return got
+
+
 def period_returns(conn: sqlite3.Connection, *, asof_dates: list[str],
                    pool: str, plugin_overrides: dict[str, int] | None = None,
                    costs: CostModel | None = None,
                    hold_override: Mapping[str, Sequence[str]] | None = None,
-                   _pools_for_test: dict[str, list[str]] | None = None
+                   _pools_for_test: dict[str, list[str]] | None = None,
+                   price_mode: str = DEFAULT_PRICE_MODE,
+                   price_stats: dict | None = None
                    ) -> list[float]:
     """逐周期收益序列（每个调仓周期一个观测）。
 
@@ -223,7 +323,22 @@ def period_returns(conn: sqlite3.Connection, *, asof_dates: list[str],
 
     与 `_pools_for_test` **同时**传 → 抛 `ValueError`：两条路都声称自己决定池成员，
     静默取其一就会得到一个「说不清用哪套成员」的读数。生产路径两个都不传。
+
+    ## `price_mode`（P82 · D1/D2）
+
+    `"raw"`（默认 = **现状**）｜`"adj"`。**只换收益侧的 `p0 / p1`**：
+    `adj` 下换成 PIT 复权收盘价（`_AdjCloses`，as-of = `d1`）；成本侧成交价、
+    `_qty_for` 整手、涨跌停判定、`guard_pit_prices` 守卫**一律不动** ——
+    与 P77/ADR-029 同构（收益用复权、交易约束用真实价）。
+
+    `price_stats`：**旁路统计出口**（D5）。传了就在其中写入 `price_mode` 与
+    `n_adj_fallback`（复权不可用 ⇒ 回退未复权的 `(code, 周期)` 数）。默认 `None`
+    ⇒ 什么都不写，返回值**逐位不变**（T3 用例①钉住的就是这条）。
     """
+    if price_mode not in PRICE_MODES:
+        raise ValueError(
+            f"未知 price_mode {price_mode!r}；取值只许 {list(PRICE_MODES)}"
+            f"（`both` 是 CLI 层的一次扫描出两套读数，不是本函数的取值）")
     if hold_override is not None and _pools_for_test is not None:
         raise ValueError(
             "hold_override 与 _pools_for_test 不能同时传 —— 两者都决定持有集合，"
@@ -231,6 +346,9 @@ def period_returns(conn: sqlite3.Connection, *, asof_dates: list[str],
     effective_dates = list(asof_dates)
 
     if len(effective_dates) < 2:
+        if price_stats is not None:
+            price_stats["price_mode"] = price_mode
+            price_stats["n_adj_fallback"] = 0
         return []
 
     # ADR-008 记：ETF 与 stock 印花税/过户费口径不同，混用会算错成本方向。
@@ -258,6 +376,9 @@ def period_returns(conn: sqlite3.Connection, *, asof_dates: list[str],
         return sorted(m.code for m in res.members if m.pool == pool)
 
     out: list[float] = []
+    #: 复权读层：`price_mode == "raw"` 时**根本不构造** ⇒ 默认路径连一次
+    #: `load_chain` 都不会发生（不只数值不变，开销也不变）。
+    adj = _AdjCloses(conn) if price_mode == "adj" else None
     for i in range(len(effective_dates) - 1):
         d0, d1 = effective_dates[i], effective_dates[i + 1]
         hold = _members_on(d0)   # 本期实际持仓（d0 决定，[d0,d1] 持有）
@@ -290,8 +411,16 @@ def period_returns(conn: sqlite3.Connection, *, asof_dates: list[str],
 
         gains: list[float] = []
         for c in tradable_hold:
-            if p0.get(c) and p1.get(c):
-                gains.append(p1[c] / p0[c] - 1.0)
+            q0, q1 = p0.get(c), p1.get(c)
+            if not (q0 and q1):
+                continue
+            if adj is not None:
+                # D2：**只**换收益分子/分母。复权不可用 ⇒ 回退本期的未复权对
+                # （D3），同时由 `pair()` 计入 `n_fallback`（不抛、不静默）。
+                pair = adj.pair(c, d0, d1)
+                if pair is not None:
+                    q0, q1 = pair
+            gains.append(q1 / q0 - 1.0)
         # 等权：分母是 hold 的**目标持仓数**（含无法买入的部分——它们占权重但收益 0）。
         # 空 hold → 无持仓收益（持现金）；仅在下方产生清仓成本。
         n_hold = max(len(hold), 1)
@@ -344,6 +473,10 @@ def period_returns(conn: sqlite3.Connection, *, asof_dates: list[str],
         slippage_ratio = base_slippage_bps / 10_000.0 * n_filled / n_hold
 
         out.append(gross - fee_ratio - slippage_ratio)
+    if price_stats is not None:
+        # D5：只**新增**键，既有键的名字与语义一个都不动。
+        price_stats["price_mode"] = price_mode
+        price_stats["n_adj_fallback"] = adj.n_fallback if adj is not None else 0
     return out
 
 
