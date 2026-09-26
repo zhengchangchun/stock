@@ -78,7 +78,7 @@ from stocklab.paper.config import (ARM_AGENT, ARM_AGENT_RANDOM, ARM_KIND_AGENT,
                                    RULE_CITATIONS_AGENT,
                                    RULE_CITATIONS_AGENT_DECISION)
 from stocklab.paper.engine import (INDEX_300_SYMBOL, agent_block, build_report,
-                                   live_of)
+                                   live_of, net_deposits_at)
 from stocklab.plugin import lifecycle as plugin_lifecycle
 from stocklab.plugin import store as plugin_store
 from stocklab.session.review import rolling_accuracy
@@ -413,21 +413,29 @@ def sample_gate(n_sessions: int) -> dict:
     }
 
 
-def _row_metrics(account: dict, rows: list[dict]) -> dict:
+def _row_metrics(account: dict, rows: list[dict], *, conn: sqlite3.Connection,
+                 start: str) -> dict:
     """一个账户的五个指标：期初 = **净入金**（不是 0、不是现金、也不是 `initial_nav`）。
 
     与既有「累计收益」列（`paper_nav_daily.cum_return`）**同一个基**，所以新节的
     「总收益」与那一列逐位一致 —— 见 `performance` 的「期初口径」与 ADR-023 修正段
     （D-37）。取 `paper_accounts.initial_nav` 的话，起跑日那笔浮盈会被算进每一臂，
     同一个页面上就会有两个差一个常数（真实库 0.2155%）的「总收益」。
+
+    ## 窗口内一行净值都没有时：向**引擎**要净入金（P80 / D8）
+
+    改前这里是 `params_json.initial_capital` —— 那是**同一个数第二份实现**。
+    入金事件（`paper_capital_events`）落地后它会与引擎分叉：引擎的净入金是
+    「起跑本金 ＋ Σ(带符号事件 ≤ asof)」，而这里的字面量永远是 2 万。
+    同一个数两个实现，迟早分叉（本项目的既有教训），所以收口到
+    引擎的 `net_deposits_at`（**那一份**，含资本事件）。
+    期初锚点用窗口起点 `start`，与上面 `rows[0]["net_deposits"]` 同一天。
     """
     try:
         if rows:
             initial = float(rows[0]["net_deposits"])
         else:
-            # 窗口内一行净值都没有：五个指标全是「算不出」，但期初基还得有个来源 ——
-            # 净入金的定义就是账户参数里的 `initial_capital`（`engine` 同一次读取）。
-            initial = float(json.loads(account["params_json"])["initial_capital"])
+            initial = float(net_deposits_at(conn, account, start))
     except (KeyError, TypeError, ValueError):
         return _metrics([])
     return _metrics([initial, *[float(r["nav"]) for r in rows]])
@@ -484,7 +492,7 @@ def performance(conn: sqlite3.Connection, asof: str, *,
     for account in accounts:
         aid = str(account["account_id"])
         own = paper_store.load_nav(conn, aid, asof=asof)
-        m = _row_metrics(account, own)
+        m = _row_metrics(account, own, conn=conn, start=start)
         rows.append({
             "account_id": aid, "arm": str(account["arm"]),
             "kind": (_ARM_HOLD if str(account["arm"]) == _ARM_HOLD
@@ -697,6 +705,9 @@ def agent_ops(conn: sqlite3.Connection, asof: str, *, accounts: list[dict],
             "plugin_hooks": arm.get("plugin_hooks") or [],
             "strategy_version": arm.get("strategy_version"),
             "nav": arm.get("nav"), "cum_return": cum,
+            # P80 / D8：净收益(元) 从 `track` 已算好的那一条原样传下去
+            # （**不重算**：净值行两列相减只有一个地方做，就是 `_account_entry`）。
+            "profit_cny": arm.get("profit_cny"),
             "cum_cost": arm.get("cum_cost"), "max_drawdown": arm.get("max_drawdown"),
             "n_positions": arm.get("n_positions"),
             "latest_nav_date": arm.get("latest_nav_date"),
@@ -878,6 +889,11 @@ def track(conn: sqlite3.Connection, asof: str) -> dict:
             "nav": s.get("nav"), "cash": s.get("cash"),
             "market_value": s.get("market_value"),
             "net_deposits": s.get("net_deposits"),
+            # P80 / D8：**净收益(元)**（= 净值 − 累计净入金）。来源是 `build_report`
+            # 的账户条目（`engine._account_entry` 由净值行两列相减），本模块不重算 ——
+            # 入金会让「累计收益率」的分母变大，只有净收益(元) 与它并列才能看出
+            # 「是赚了还是只是加钱了」。
+            "profit_cny": s.get("profit_cny"),
             "cum_return": s.get("cum_return"),
             "max_drawdown": s.get("max_drawdown"),
             "cum_cost": s.get("cum_cost"),

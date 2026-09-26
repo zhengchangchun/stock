@@ -32,6 +32,7 @@ TABLE_ACCOUNTS = "paper_accounts"
 TABLE_TRADES = "paper_trades"
 TABLE_NAV = "paper_nav_daily"
 TABLE_EVALS = "paper_agent_evals"
+TABLE_CAPITAL_EVENTS = "paper_capital_events"
 
 
 # ---------- 账户 ----------
@@ -147,6 +148,49 @@ def load_agent_evals(conn: sqlite3.Connection, *, arm: str | None = None,
     if where:
         sql += " WHERE " + " AND ".join(where)
     sql += " ORDER BY asof, eval_id"
+    return [dict(r) for r in conn.execute(sql, args)]
+
+
+# ---------- 资本事件（P80：入金 / 出金，append-only） ----------
+
+def insert_capital_event(conn: sqlite3.Connection, *, account_id: str, date: str,
+                         kind: str, amount: float, note: str, idem: str,
+                         now: str, commit: bool = True) -> int:
+    """写一条资本事件（**只增不改不删**：本模块不提供 UPDATE / DELETE）。
+
+    幂等靠 `idem` 的 `UNIQUE` ＋ `INSERT OR IGNORE` —— 二次调用**不新增、不报错**
+    （重跑 `paper init` / `enroll` 不该炸，也不该给同一笔入金记两行）。
+    `OR IGNORE` 不产生隐式 DELETE，所以不会撞上 append-only 的 DELETE 触发器。
+
+    返回 1 = 真写了一行、0 = 幂等命中（**不是**「事件不存在」）。
+
+    `kind` 带符号的规则（`deposit` = +、`withdraw` = −）**不在这里再实现一遍**：
+    符号只在 `engine.capital_events_sum` 一处解释，两处各推一次迟早会有一处反了。
+    这里只做「kind 必须是我们认识的」这道 face-value 校验（错误得早、名字要准）。
+    """
+    if kind not in ("deposit", "withdraw"):
+        raise ValueError(f"kind={kind!r} 不是资本事件（只认 deposit / withdraw）")
+    if not (float(amount) > 0):
+        raise ValueError(f"amount={amount!r} 必须为正：方向由 kind 表达，"
+                         f"存有符号数会让两处符号推导迟早对不上")
+    cur = conn.execute(
+        f"INSERT OR IGNORE INTO {TABLE_CAPITAL_EVENTS} (account_id, date, kind,"
+        " amount, note, idem, created_at) VALUES (?,?,?,?,?,?,?)",
+        (account_id, date, kind, float(amount), note, idem, now))
+    if commit:
+        conn.commit()
+    return int(cur.rowcount or 0)
+
+
+def load_capital_events(conn: sqlite3.Connection, account_id: str, *,
+                        asof: str | None = None) -> list[dict]:
+    """读某账户的资本事件（**只读**）。`asof` 给了 ⇒ 只取 `date <= asof`（PIT）。"""
+    sql = f"SELECT * FROM {TABLE_CAPITAL_EVENTS} WHERE account_id = ?"
+    args: list = [account_id]
+    if asof is not None:
+        sql += " AND date <= ?"
+        args.append(asof)
+    sql += " ORDER BY date, event_id"
     return [dict(r) for r in conn.execute(sql, args)]
 
 

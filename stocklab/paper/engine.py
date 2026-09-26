@@ -52,6 +52,9 @@ from stocklab.config.costs import ASSET_ETF, ASSET_STOCK, CostModel
 from stocklab.paper import agent_decide, agent_spec, store
 from stocklab.paper.config import (
     AGENT_ARM_PREFIX,
+    AGENT_CAPITAL_TOPUP_AMOUNT,
+    AGENT_CAPITAL_TOPUP_DATE,
+    AGENT_CAPITAL_TOPUP_NOTE,
     ARM_AGENT,
     ARM_AGENT_RANDOM,
     ARM_HOLD,
@@ -82,6 +85,7 @@ from stocklab.paper.config import (
     PREREGISTERED_KEY,
     PREREGISTRATION_KEYS,
     RULE_CITATIONS,
+    agent_capital_topup_idem,
 )
 from stocklab.paper.rules import (
     C_LOT,
@@ -93,6 +97,7 @@ from stocklab.paper.rules import (
     check_no_lookahead,
     etf_leg_targets,
     floor_lot,
+    one_lot_cost,
     plan_etf_buy,
     plan_stop_loss,
     plan_trim,
@@ -191,6 +196,83 @@ def ledger_state(conn: sqlite3.Connection, asof: str) -> dict:
     }
 
 
+# ---------- 资本事件（P80 / D2–D4） ----------
+
+def capital_events_sum(conn: sqlite3.Connection, account_id: str,
+                       asof: str | None = None) -> float:
+    """该账户 `date <= asof` 的**带符号**资本事件合计（deposit 正 / withdraw 负）。
+
+    符号**只在这里解释一次**：`paper_capital_events.amount` 恒正、方向由 `kind` 表达，
+    于是「加还是减」这个问题在代码里只有一个答案（两处各推一次，迟早有一处反了，
+    而且反了的症状是净值少/多 3 万，看起来像「算错了」而不是「符号错了」）。
+    """
+    rows = store.load_capital_events(conn, account_id, asof=asof)
+    return round(sum(float(r["amount"]) if r["kind"] == "deposit"
+                     else -float(r["amount"]) for r in rows), 4)
+
+
+def net_deposits_at(conn: sqlite3.Connection, account: dict, asof: str) -> float:
+    """`net_deposits` 的**唯一**实现：起跑本金 ＋ Σ(带符号事件 ≤ asof)。
+
+    起跑本金取 `params_json.initial_capital`（不是 `INITIAL_CAPITAL` 常量）：
+    老账户的账户行里冻结着它当时的口径，常量只保证**新账户**从同一个数起跑。
+    `arm-now`（实盘镜像）不走这里 —— 它的净入金来自 `cash_flows`（`ledger_state`）。
+    """
+    base = float(json.loads(account["params_json"])["initial_capital"])
+    return round(base + capital_events_sum(conn, str(account["account_id"]), asof), 4)
+
+
+def agent_capital_events_for(account_id: str) -> list[tuple[str, str, float, str, str]]:
+    """AI 家族账户要自动挂上的资本事件：`[(date, kind, amount, note, idem)]`。
+
+    **一处定义**（P80 / D3）：三条建账路径（`init_accounts` 的 agent 分支 /
+    `enroll_agent_arm` / 通路 A 的 `m2.channel_a.create_account`）都调它，
+    不许各写一遍 —— 各写一遍的下场是某天只改了其中一处，于是同一天的
+    `paper init` 与 `enroll` 造出两个不同的本金口径。
+
+    非 AI 家族（账户 id 不以 `arm-agent` 开头）⇒ `[]`：静态臂 / `arm-now`
+    的本金口径**一字不动**（D1：它们永远是 20,000）。
+    """
+    aid = str(account_id)
+    if not aid.startswith(ARM_AGENT):
+        return []
+    return [(AGENT_CAPITAL_TOPUP_DATE, "deposit", float(AGENT_CAPITAL_TOPUP_AMOUNT),
+             AGENT_CAPITAL_TOPUP_NOTE, agent_capital_topup_idem(aid))]
+
+
+def attach_agent_capital_events(conn: sqlite3.Connection, account_id: str, *,
+                                now: str) -> list[str]:
+    """把 `agent_capital_events_for` 的事件**幂等**写进库；返回本次真写入的 `idem`。
+
+    三条建账路径调本函数（而不是各自展开那个循环）：事件的定义在
+    `agent_capital_events_for`，写入动作在这里，于是「有哪些事件」与「怎么写进去」
+    各只有一个地方。重跑（账户已存在 + 事件已挂）⇒ `[]`、库一行不动。
+    """
+    written = []
+    for date, kind, amount, note, idem in agent_capital_events_for(account_id):
+        if store.insert_capital_event(conn, account_id=account_id, date=date,
+                                      kind=kind, amount=amount, note=note,
+                                      idem=idem, now=now):
+            written.append(idem)
+    return written
+
+
+def max_lots_affordable(cash: float, one_lot_cost_value: float) -> int:
+    """`floor(现金 / 一手含费成本)` —— 「这笔钱最多能买几手」。
+
+    **唯一**实现：`paper account` 的 `buying_power` 与 AI 上下文里的
+    `tradability.affordable_lots` 都调它（T3 的判据就是这两处同源同值）。
+
+    `+1e-9` 是浮点写法容差，不是「允许差一点」的额度：`cash / cost` 恰好是整数时
+    （如现金 3,000 / 一手 1,000）二进制浮点可能给出 2.9999999996，
+    截断后会少一整手 —— 那是**量级错**，不是舍入误差。
+    """
+    cost = float(one_lot_cost_value)
+    if cost <= 0:
+        return 0
+    return int(float(cash) / cost + 1e-9)
+
+
 # ---------- 臂的分派 ----------
 
 def has_rules(account: dict) -> bool:
@@ -258,6 +340,19 @@ def _ledger_arm_state(conn: sqlite3.Connection, account: dict, asof: str) -> dic
 
     `replays_own_trades(account)` 决定要不要重放自己的成交 —— `arm-agent*` 与
     `arm-discipline-*` 共用同一条重放路径（都不读 `real_trades`）。
+
+    ## 资本事件（P80 / D4）
+
+    `date <= asof` 的 `deposit` 加现金、`withdraw` 减现金；`net_deposits` 同步
+    变成「起跑本金 ＋ Σ(带符号金额 ≤ asof)」。两条一起动是**必须**的：只有现金动
+    会让「净入金」少 3 万（于是 `cum_return` 凭空多出 150%），只有净入金动会让
+    账户多出 3 万却买不起东西 —— 两种都是假账。
+
+    **`cum_cost` 不因入金变化**：入金不是成本（与 P19 对入场费的处置同一条理由 ——
+    把钱转进账户不产生佣金）。这一条是刻意的，`test_p80_cum_cost_ignores_topup` 钉住。
+
+    `arm-now`（`ledger_state`，读实盘账本）与 `arm-hold`（冻结快照）**不受影响**：
+    前者根本不走这条路径，后者没有事件（`attach_agent_capital_events` 只挂 AI 家族）。
     """
     cash = float(account["initial_cash"])
     positions = _position_snapshot(account)
@@ -269,11 +364,13 @@ def _ledger_arm_state(conn: sqlite3.Connection, account: dict, asof: str) -> dic
             cash += -(gross + float(t["fee_total"])) if t["side"] == "buy" \
                 else gross - float(t["fee_total"])
             cum_cost += float(t["fee_total"])
-    # net_deposits 是**本金**（20,000）。入场费 5.09 是**成本**不是入金 ——
-    # 把它算进分母会让「累计收益」凭空好看一点点，而那正是最不该有的偏差。
+    # 入金/出金：只动现金与净入金，不动成本（理由见 docstring）。
+    cash += capital_events_sum(conn, str(account["account_id"]), asof)
+    # net_deposits 是**本金**（起跑 20,000 ＋ 入金/出金）。入场费 5.09 是**成本**
+    # 不是入金 —— 把它算进分母会让「累计收益」凭空好看一点点，而那正是最不该有的偏差。
     return {"cash": round(cash, 4), "positions": positions,
             "cum_cost": round(cum_cost, 4),
-            "net_deposits": float(json.loads(account["params_json"])["initial_capital"])}
+            "net_deposits": net_deposits_at(conn, account, asof)}
 
 
 def mark_to_market(positions: dict[str, int],
@@ -549,6 +646,11 @@ def init_accounts(conn: sqlite3.Connection, *, start_date: str = PAPER_START_DAT
                                for c, q in sorted(state["positions"].items())],
             initial_nav=state["initial_nav"], params=acct_params, now=now)
         created.append(account_id)
+    # P80 / D3 路径①：AI 家族账户自动挂标准入金事件（幂等）。
+    # **不在 `if not exists` 分支里**：老库重跑 `paper init` 也要能把缺的事件补上
+    # （三条路径共用同一个 helper，谁先跑到谁把它挂上）。
+    for account_id, *_ in specs:
+        attach_agent_capital_events(conn, account_id, now=now)
     return {"created": bool(created), "accounts": created, "start_date": start_date,
             "initial_nav": state["initial_nav"], "initial_cash": state["cash"],
             "initial_positions": state["positions"]}
@@ -623,6 +725,8 @@ def enroll_agent_arm(conn: sqlite3.Connection, *, arm_name: str, model_id: str,
                 PREREGISTERED_KEY, got["model_id"],
                 f"账户 {name} 已预注册 {got['model_id']!r}，本次是 "
                 f"{want['model_id']!r} —— 换模型 = 开新版本账户（旧账户保留）")
+        # P80 / D3 路径②：老版本账户也把入金事件补上（幂等；账户行仍一字未改）。
+        attach_agent_capital_events(conn, name, now=now)
         return {"created": False, "account_id": name, **got,
                 "start_date": str(existing["start_date"]), "initial_nav": None,
                 "note": "账户已存在且预注册一致：**一行都没改**（幂等）"}
@@ -641,6 +745,8 @@ def enroll_agent_arm(conn: sqlite3.Connection, *, arm_name: str, model_id: str,
         params={**_agent_params(params), PREREGISTERED_KEY: want,
                 "wired_from": "P56 / D-48：AI 操盘手版本账户（预注册模型与提示词指纹）"},
         now=now)
+    # P80 / D3 路径②：新版本账户同样自动挂标准入金事件（幂等）。
+    attach_agent_capital_events(conn, name, now=now)
     return {"created": True, "account_id": name, **want,
             "start_date": start_date, "initial_nav": state["initial_nav"],
             "note": ("新版本账户：模型/提示词指纹已预注册，decision 时逐字段比对；"
@@ -1038,6 +1144,10 @@ def _account_entry(conn: sqlite3.Connection, account: dict, asof: str,
         "market_value": nav_row["market_value"], "nav": nav_row["nav"],
         "drawdown": nav_row["drawdown"], "cum_cost": nav_row["cum_cost"],
         "cum_return": nav_row["cum_return"], "net_deposits": nav_row["net_deposits"],
+        # P80 / D8：考核目标是「扣完成本之后的净收益（元）」，而
+        # `cum_return` 的分母（净入金）会被入金改大 ⇒ 只看收益率会把「加钱了」
+        # 读成「赚少了」。两个数并列摆出来，**口径只有这一处**（净值行两列相减）。
+        "profit_cny": round(float(nav_row["nav"]) - float(nav_row["net_deposits"]), 4),
         "marks": {c: {"price": p.price, "source": p.source,
                       "price_asof": p.price_asof} for c, p in sorted(marks.items())
                   if c in positions},
@@ -1266,6 +1376,174 @@ def arm_state_for(conn: sqlite3.Connection, arm: str, asof: str) -> dict | None:
     }
 
 
+# ---------- P80：实时账户与购买力（D5 / D6 的**唯一**投影） ----------
+
+def latest_pit_close_date(conn: sqlite3.Connection) -> str | None:
+    """库里有 PIT 收盘价的**最近**日期。一条收盘价都没有 → `None`。
+
+    为什么不用 `paper_nav_daily` 的最新日期当默认 asof：那个要等收盘链跑完
+    （`paper step` / `paper agent run` 才写净值），而 D5 要的是「**随时可查**」
+    —— 盘中、收盘链之前也要能问「我现在有多少钱、每只最多能买几手」。
+    `bars_daily` 只收交易日行，所以「有收盘价的最近日期」就是最近交易日。
+    """
+    row = conn.execute("SELECT MAX(date) AS d FROM bars_daily"
+                       " WHERE adj_mode = 'none'").fetchone()
+    return None if row is None or row["d"] is None else str(row["d"])
+
+
+def sellable_positions(conn: sqlite3.Connection, account: dict, asof: str) -> dict:
+    """可卖数量（**T+1**）：当日买入的部分当日不可卖。
+
+    判据只有一条恒等式：`可卖 = 当前持仓 − 当日买入`（当日卖出已经反映在当前持仓里，
+    再减一次就少算了）。**不重放第二遍成交**：重放出来的持仓与 `_ledger_arm_state`
+    是同一份，`- 当日买入` 是同一个量上的一次减法，不会造出第二个真相。
+    """
+    current = _arm_state(conn, account, asof)["positions"]
+    out = {code: int(qty) for code, qty in current.items()}
+    for t in store.trades_on(conn, str(account["account_id"]), asof):
+        if t["side"] != "buy":
+            continue
+        code = str(t["code"])
+        if code in out:
+            out[code] = max(0, out[code] - int(t["qty"]))
+    return out
+
+
+def account_view(conn: sqlite3.Connection, arm: str, asof: str | None = None) -> dict:
+    """一条臂在 `asof` 的**实时账户 ＋ 购买力**（P80 / D5）。
+
+    ## 为什么它必须是「一处的投影」
+
+    CLI 的 `paper account` 与 AI 的输入侧（`tradability` / D6）回答的是**同一个问题**
+    （「我手上有多少现金、每只最多能买几手」）。两条路各拼一套的话，页面上会出现
+    两个「能买几手」—— 而这正是 D-37（同一页两个「总收益」差一个常数）那类事故。
+    所以购买力只有这一个函数：`max_lots_affordable(rules.one_lot_cost)`。
+
+    ## 不落净值行也能读
+
+    账户状态由 `_arm_state` **重放**算出（`<= asof` 的成交 ＋ `<= asof` 的资本事件），
+    不要求 `paper_nav_daily` 有这一天的行 —— 这正是「随时可查」与「等收盘链」的区别。
+    `account.date` 是**问的那一天**（`asof`），不是净值行的日期。
+
+    ## 缺什么就报什么，不猜数
+
+    - 账户不存在 / 库里没有任何收盘价 ⇒ `PaperError`（点名）；
+    - 持仓缺 `<= asof` 的收盘价 ⇒ `MissingPriceError`（不用成本价冒充现价）；
+    - 池内标的缺 `instruments.type` ⇒ 进 `errors`，**不进** `by_code`
+      （口径未知时不得退化成股票费率）。
+    """
+    account = next((a for a in store.load_accounts(conn)
+                    if a["account_id"] == arm), None)
+    if account is None:
+        raise PaperError(
+            f"账户 {arm} 不存在；先 `paper init`（或 `paper agent enroll`）—— "
+            f"账户名拼错与「还没建」都点到这里，不静默返回空")
+    executor_kind(account)      # 认领关系 fail-closed（与 `_account_entry` 同一道闸）
+
+    resolved = asof if asof is not None else latest_pit_close_date(conn)
+    if resolved is None:
+        raise PaperError("库里一条收盘价都没有（`bars_daily` 为空）—— "
+                         "「最多能买几手」无从算起；先 `ingest bars`")
+    state = _arm_state(conn, account, resolved)
+    positions = dict(state["positions"])
+    marks = resolve_marks(conn, set(positions), resolved)
+    missing = sorted(set(positions) - set(marks))
+    if missing:
+        raise MissingPriceError(
+            f"账户 {arm} 的持仓 {missing} 取不到 ≤ {resolved} 的收盘价 → "
+            f"账户状态不可判定。先跑 `ingest bars`；**不用成本价冒充现价**")
+    mv, marked = mark_to_market(positions, marks)
+    cash = round(float(state["cash"]), 4)
+    total = round(cash + mv, 4)
+    nav = round(cash + mv, 4)
+    net_deposits = round(float(state["net_deposits"]), 4)
+
+    errors: list[dict] = []
+    sellable = sellable_positions(conn, account, resolved)
+    detail = []
+    for row in marked:
+        code = str(row["code"])
+        try:
+            asset_class = agent_decide.asset_class_for(conn, code)
+        except agent_decide.DecisionPayloadError as exc:
+            asset_class, cost = None, None
+            errors.append({"code": code, "where": "positions_detail",
+                           "error": str(exc), "type": type(exc).__name__})
+        else:
+            cost = one_lot_cost(price=float(row["price"]), asset_class=asset_class)
+        detail.append({
+            "code": code, "qty": int(row["qty"]), "price": float(row["price"]),
+            "price_asof": str(row["price_asof"]), "source": str(row["source"]),
+            "market_value": round(float(row["price"]) * int(row["qty"]), 4),
+            "one_lot_cost": cost, "asset_class": asset_class,
+            "sellable_qty": int(sellable.get(code, 0)),
+        })
+
+    pool = agent_decide.pool_for(conn, resolved)
+    pool_codes = sorted({str(c) for c in (pool.get("codes") or [])})
+    pool_marks = resolve_marks(conn, set(pool_codes), resolved)
+    by_code: dict[str, dict] = {}
+    for code in pool_codes:
+        p = pool_marks.get(code)
+        if p is None:
+            # 池内无 PIT 收盘价 ⇒ 算不出一手成本。**不进 `by_code`**
+            # （与 `tradability` 的 `marks ∩ pool` 同一个集合），也不猜一个数。
+            continue
+        try:
+            asset_class = agent_decide.asset_class_for(conn, code)
+        except agent_decide.DecisionPayloadError as exc:
+            errors.append({"code": code, "where": "buying_power",
+                           "error": str(exc), "type": type(exc).__name__})
+            continue
+        cost = one_lot_cost(price=float(p.price), asset_class=asset_class)
+        by_code[code] = {
+            "one_lot_cost": cost, "asset_class": asset_class,
+            "price": float(p.price), "price_asof": str(p.price_asof),
+            "max_lots_affordable": max_lots_affordable(cash, cost),
+        }
+
+    fills = store.trades_on(conn, arm, resolved)
+    return {
+        "arm": arm,
+        "asof": resolved,
+        "asof_source": "explicit" if asof is not None else "latest_pit_close",
+        "account_exists": True,
+        "account": {
+            # 与 CLI 的降级分支同形（那里 `available=False` + 点名原因）：
+            # 「算得出」与「算不出」必须长得不一样。
+            "available": True,
+            "date": resolved, "cash": cash, "market_value": mv,
+            "total_assets": total, "net_deposits": net_deposits,
+            "cum_return": (round(nav / net_deposits - 1.0, 6)
+                           if net_deposits else 0.0),
+            "cum_cost": round(float(state["cum_cost"]), 4),
+            "drawdown": drawdown([float(r["nav"]) for r in
+                                  store.load_nav(conn, arm, asof=resolved)], nav),
+            "nav": nav,
+            # **考核目标就是这一个数**（净收益 = 净值 − 累计净入金）。入金会让
+            # 分子同步变大，所以它**不因入金跳变** —— 跳变的只是现金，
+            # 而现金不是收益。
+            "profit_cny": round(nav - net_deposits, 4),
+        },
+        "positions_detail": detail,
+        "buying_power": {
+            "cash": cash,
+            "lot": LOT,
+            "pool_asof": pool.get("asof"),
+            "by_code": by_code,
+            "n_pool_codes": len(pool_codes),
+            "n_priced": len(by_code),
+            "fills_on_asof": {
+                "n": len(fills),
+                "amount": round(sum(float(t["fill_price"]) * int(t["qty"])
+                                    for t in fills), 4),
+                "fee": round(sum(float(t["fee_total"]) for t in fills), 4),
+            },
+        },
+        "errors": errors,
+    }
+
+
 def decision_context_for(conn: sqlite3.Connection, *, arm: str,
                          asof: str) -> dict:
     """喂给 AI 操盘手的 **PIT 上下文**（`paper agent context` 与两个写入口共用）。
@@ -1284,10 +1562,17 @@ def decision_context_for(conn: sqlite3.Connection, *, arm: str,
     pool = agent_decide.pool_for(conn, asof)
     marks = {**resolve_marks(conn, set(state["positions"]) | set(pool["codes"]), asof),
              **state["marks"]}
+    # `net_deposits` 与 `sellable_qty`（P80 / D6）：前者是「净入金」这条口径的唯一
+    # 来源（`_ledger_arm_state`，含资本事件），后者是同一份持仓上的一次减法。
+    # 购买力（`affordable_lots`）**不在这里传**：它由 `agent_context` 用
+    # `engine.max_lots_affordable` ＋ `rules.one_lot_cost` 与 `account_view` 同源算出。
+    account = next(a for a in store.load_accounts(conn) if a["account_id"] == arm)
     return agent_context.build_decision_context(
         conn, arm=arm, asof=asof, pool=pool, cash=state["cash"],
         positions=state["positions"], marks=marks,
-        total_assets=state["total_assets"])
+        total_assets=state["total_assets"],
+        net_deposits=float(state["net_deposits"]),
+        sellable_qty=sellable_positions(conn, account, asof))
 
 
 def state_payload(conn: sqlite3.Connection, asof: str) -> dict:

@@ -63,7 +63,7 @@ from typing import Any, Mapping, Sequence
 from stocklab.labweb.paper_data import INDEX_LABEL, METRIC_KEYS, METRIC_LABELS
 from stocklab.labweb.render import (cell, esc, glance, glance_html, layout, money,
                                     more, num, ratio_pct, rich, section,
-                                    sign_cls)
+                                    sign_cls, signed_money)
 from stocklab.paper.config import (AGENT_ARM_PREFIX, ARM_AGENT, ARM_AGENT_RANDOM,
                                    ARM_KIND_AGENT, ARM_KIND_AGENT_RANDOM,
                                    EXECUTOR_AGENT_DECISION, EXECUTOR_CHANNEL_A,
@@ -985,7 +985,8 @@ def _ops_arms_table(ops: Mapping) -> str:
     rows = ops.get("arms") or []
     if not rows:
         return '<p class="note">没有 `params.executor` 非空的账户 —— 现在没有在跑的 AI 臂。</p>'
-    head = ("<tr><th>臂</th><th>净值</th><th>累计收益</th><th>相对大盘</th>"
+    head = ("<tr><th>臂</th><th>净值</th><th>净收益(元)</th><th>累计收益</th>"
+            "<th>相对大盘</th>"
             "<th>相对「不动」</th><th>最大回撤</th><th>持仓</th><th>累计成本</th>"
             "<th>Δ vs 随机</th></tr>")
     body = []
@@ -1009,6 +1010,8 @@ def _ops_arms_table(ops: Mapping) -> str:
             f'<tr><td class="l">{_swatch(color, dash)}'
             f'<b>{esc(arm_label(a))}</b>{note}</td>'
             f'<td class="num">{money(a.get("nav"))}</td>'
+            f'<td class="num {sign_cls(a.get("profit_cny"))}">'
+            f'{signed_money(a.get("profit_cny"))}</td>'
             f'<td class="num {sign_cls(a.get("cum_return"))}">'
             f'{ratio_pct(a.get("cum_return"))}</td>'
             f'<td class="num">{ratio_pct(a.get("excess_vs_index_300"))}</td>'
@@ -1020,7 +1023,11 @@ def _ops_arms_table(ops: Mapping) -> str:
     return (f'<div class="scroll-x"><table class="tbl">{head}{"".join(body)}</table></div>'
             + '<p class="note">数字**全部**来自 `paper.engine.build_report`（同一份实现），'
               '本页不重算；「相对大盘 / 相对不动 / Δ vs 随机」都是**一次减法**。'
-              '`Δ` 为 `未知` = 那条臂或随机对照还没有累计收益 ⇒ **差分不存在，不是 0**。</p>')
+              '`Δ` 为 `未知` = 那条臂或随机对照还没有累计收益 ⇒ **差分不存在，不是 0**。'
+              '「**净收益(元)**」= 净值 − 累计净入金（`net_deposits`）：入金会让'
+              '「累计收益」的分母变大，只有与它并列才能看出**是赚了还是只是加钱了**'
+              '（用户 2026-09-26 第三条：预测准确度是手段，考核目标是扣完成本后的净收益）。'
+              '</p>')
 
 
 def _decision_state_cell(row: Mapping) -> str:

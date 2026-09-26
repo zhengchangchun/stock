@@ -806,6 +806,43 @@ CREATE TRIGGER IF NOT EXISTS trg_paper_agent_evals_no_delete
 BEFORE DELETE ON paper_agent_evals
 BEGIN SELECT RAISE(ABORT, 'paper_agent_evals is append-only'); END;
 
+-- ---------- 资本事件（P80 / D2：入金 / 出金，append-only） ----------
+-- 「本金」是**口径**，口径只能靠**事件**改，不能靠改行。
+--
+-- 为什么不能就地 UPDATE `paper_accounts.initial_cash`：那张表与 `paper_nav_daily`
+-- 都有 `BEFORE UPDATE/DELETE` 触发器（append-only），而且 P62 的不变量
+-- `nav == initial_cash + 重放成交 + mark-to-market` 就写在净值行上 —— 把 5 条
+-- AI 账户的 `initial_cash` 改成 5 万，09-23/09-24 那 5×2 行净值**当场变成假账**。
+-- 真实账户遇到「加钱」也是记一笔入金流水，不是去改开户金额。
+--
+-- `amount` 恒**正**，方向由 `kind` 带符号（`deposit` = +amount、`withdraw` = −amount）：
+-- 存有符号数+kind 两个真相，迟早有一处把符号加错且看不出来（与 `cash_flows` 的
+-- 纪律相反是**刻意的** —— 那张表的 amount 本身就带符号，两者各自自洽即可）。
+--
+-- PIT：事件只计入 `date <= asof` 的读数。生效日 = 事件自己的 `date`，
+-- 于是「09-15→09-24 保持 2 万口径、5 万从 09-28 起生效」这条口径由数据表达，
+-- 不靠代码里的 if。
+CREATE TABLE IF NOT EXISTS paper_capital_events (
+    event_id    INTEGER PRIMARY KEY AUTOINCREMENT,
+    account_id  TEXT NOT NULL,           -- 账户 id：'arm-agent' | 'arm-agent-ds-v1' …
+    date        TEXT NOT NULL,           -- 生效日（PIT：只计入 date <= asof）
+    kind        TEXT NOT NULL CHECK (kind IN ('deposit','withdraw')),
+    amount      REAL NOT NULL CHECK (amount > 0),  -- 恒正；方向看 kind
+    note        TEXT NOT NULL,           -- 人读的理由（不许留空：钱从哪来要能回答）
+    idem        TEXT NOT NULL UNIQUE,    -- 幂等键（重跑不产生第二行）
+    created_at  TEXT NOT NULL
+);
+
+-- append-only：入金/出金一旦发生就是**事实**。记错了只能补一笔反向事件（冲正），
+-- 与 `real_trades` / `cash_flows` 同一条纪律。
+CREATE TRIGGER IF NOT EXISTS trg_paper_capital_events_no_update
+BEFORE UPDATE ON paper_capital_events
+BEGIN SELECT RAISE(ABORT, 'paper_capital_events is append-only (改错请冲正：补一笔反向事件)'); END;
+
+CREATE TRIGGER IF NOT EXISTS trg_paper_capital_events_no_delete
+BEFORE DELETE ON paper_capital_events
+BEGIN SELECT RAISE(ABORT, 'paper_capital_events is append-only'); END;
+
 -- ---------- 基金日净值（P52：D-36 的第三条对照臂） ----------
 -- 净值源＝天天基金 `https://fund.eastmoney.com/pingzhongdata/<code>.js` 的
 -- `Data_netWorthTrend`（**非官方接口**，页面与报告必须标注「近似 / 非官方」）。

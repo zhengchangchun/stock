@@ -119,6 +119,11 @@ def create_account(conn: sqlite3.Connection, *, strategy_version: str,
         start_date=base["start_date"], initial_cash=base["initial_cash"],
         initial_positions=json.loads(base["initial_positions_json"]),
         initial_nav=base["initial_nav"], params=params, now=now)
+    # P80 / D3 路径③：通路 A 建的 `arm-agent-<策略版本>` 也是 AI 家族 ⇒ 自动挂
+    # 标准入金事件（幂等）。函数级 import：方向是 m2 → paper，模块级反向 import
+    # 会成环（`paper.engine` 在模块级 import 本包的兄弟模块）。
+    from stocklab.paper import engine as paper_engine
+    paper_engine.attach_agent_capital_events(conn, account_id, now=now)
     return {"account_id": account_id, "strategy_version": strategy_version,
             "created": True, "start_date": base["start_date"],
             "initial_nav": base["initial_nav"], "initial_cash": base["initial_cash"],

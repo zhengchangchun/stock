@@ -31,6 +31,54 @@ HOLD_CODE: str = "000333"
 HOLD_QTY: int = 100
 HOLD_COST_PRICE: float = 86.80
 
+# ---------- P80：AI 家族本金 5 万（**入金事件**，不是改行） ----------
+
+#: AI 家族（账户 id 以 `arm-agent` 开头）的目标本金。它是
+#: `INITIAL_CAPITAL`（20,000，**所有臂的起跑口径，一字不改**）＋ 一笔入金。
+#:
+#: 为什么不改 `INITIAL_CAPITAL`：那会同时改掉静态臂 / `arm-now`（实盘镜像）的
+#: 起跑口径，也会让 09-23/09-24 那 5×2 行净值行**当场变成假账**
+#: （P62 的不变量 `nav == initial_cash + 重放成交 + mark-to-market` 立刻不成立）。
+AGENT_EFFECTIVE_CAPITAL: float = 50_000.0
+
+#: 标准入金的**生效日**（PIT）。09-15→09-24 保持 2 万口径的历史原样（既成事实），
+#: 5 万从下一个交易日 2026-09-28 起生效 —— 这条口径由**事件的 date** 表达，
+#: 不靠代码里的 if。
+AGENT_CAPITAL_TOPUP_DATE: str = "2026-09-28"
+
+#: 标准入金金额（元）。恒正；方向由事件的 `kind='deposit'` 表达。
+AGENT_CAPITAL_TOPUP_AMOUNT: float = 30_000.0
+
+#: 标准入金的**幂等键**：同一笔入金重跑不产生第二行（`paper init` / `enroll` /
+#: 通路 A 建账三条路径都自动挂它，任一条重跑都命中这一行）。
+AGENT_CAPITAL_TOPUP_IDEM: str = "p80-agent-capital-topup-30000-2026-09-28"
+
+#: 标准入金的理由原文。放进 `paper_capital_events.note`（那一列 NOT NULL，
+#: 且是「这笔钱从哪来」的唯一答案）—— 一处定义，数据库与报告读到的是同一句话。
+AGENT_CAPITAL_TOPUP_NOTE: str = (
+    "P80：AI 家族本金 2 万 → 5 万（用户 2026-09-26 原话「Ai 模拟金额改成 5w」）。"
+    "入金而非改行：paper_accounts / paper_nav_daily 的既有行一个字节都不改，"
+    "09-15→09-24 保持 2 万口径的历史原样，本笔从 2026-09-28（下一交易日）起生效"
+)
+
+#: 模块级断言（D3 要求）：两个数一旦不同步，这里就炸 —— 而不是等到某天净值行
+#: 的 `net_deposits` 与预期差 3 万才被发现。
+assert AGENT_EFFECTIVE_CAPITAL == INITIAL_CAPITAL + AGENT_CAPITAL_TOPUP_AMOUNT, (
+    f"AI 家族本金口径不自洽：{AGENT_EFFECTIVE_CAPITAL} ≠ "
+    f"{INITIAL_CAPITAL} + {AGENT_CAPITAL_TOPUP_AMOUNT}")
+
+
+def agent_capital_topup_idem(account_id: str) -> str:
+    """标准入金的**逐账户**幂等键（`AGENT_CAPITAL_TOPUP_IDEM` ＋ 账户 id）。
+
+    ⚠️ 为什么必须带账户后缀：`paper_capital_events.idem` 是**全表** UNIQUE，
+    而 5 条 AI 账户各要挂**自己**那条入金。用裸字面量会让第一条之后的所有账户
+    被 `INSERT OR IGNORE` 静默吃掉（症状是「4 条账户的净入金还是 2 万」，
+    看起来像迁移漏跑，不像键冲突）。带后缀则「同一个账户重跑」仍然幂等
+    （这正是不带账户序号、只带账户 id 的理由：重跑要命中同一行）。
+    """
+    return f"{AGENT_CAPITAL_TOPUP_IDEM}-{account_id}"
+
 # ---------- 三臂 ----------
 
 ARM_HOLD: str = "arm-hold"

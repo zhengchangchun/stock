@@ -747,6 +747,129 @@ def migrate_p79_agent_evals(conn) -> list[str]:
 
 
 # ---------------------------------------------------------------------------
+# P80 / D2：资本事件表 `paper_capital_events`（**新表**，append-only）。
+#
+# ## 两个函数，**不合成一个**（D9 / T1 的硬要求）
+#
+# ① `migrate_p80_capital_events` —— **结构前滚**（补 append-only 触发器）。
+#    与 P58/P79 同款：新表由 `schema.sql` 的 `CREATE TABLE IF NOT EXISTS` 在
+#    下一次 `init_db` / `ensure_schema` 时建出，本函数只处理**结构漂移**
+#    （表在、触发器被 DROP 过 / 有人手工建过同名表）。幂等可重入 ⇒ 可以挂
+#    `_apply_schema`（与 P58 同档：只动触发器，一行数据都不碰）。
+#
+# ② `seed_agent_capital_topup` —— **数据前滚**（给 AI 家族账户挂标准入金事件）。
+#    **合成一个**就等于让任一写库入口顺手改本金口径 —— 这正是 P62 那段注释
+#    说的：把「数据变更」挂到「每次写库都会跑」的位置，某次 `paper predict`
+#    就会静默把 5 条账户的本金改成 5 万。所以它**只登记 `_KNOWN_MARKERS`、
+#    只准显式调用**（真库落位由 nanobot 显式调，见任务书 D9）。
+# ---------------------------------------------------------------------------
+
+_P80_TABLE = "paper_capital_events"
+
+_P80_TRIGGERS = (
+    "CREATE TRIGGER IF NOT EXISTS trg_paper_capital_events_no_update"
+    " BEFORE UPDATE ON paper_capital_events"
+    " BEGIN SELECT RAISE(ABORT, 'paper_capital_events is append-only"
+    " (改错请冲正：补一笔反向事件)'); END;\n"
+    "CREATE TRIGGER IF NOT EXISTS trg_paper_capital_events_no_delete"
+    " BEFORE DELETE ON paper_capital_events"
+    " BEGIN SELECT RAISE(ABORT, 'paper_capital_events is append-only'); END;"
+)
+
+_P80_TRIGGER_NAMES = ("trg_paper_capital_events_no_update",
+                      "trg_paper_capital_events_no_delete")
+
+
+def capital_events_need_p80(conn) -> bool:
+    """资本事件表在、但 append-only 触发器缺席吗？（只读探测，供 doctor 用）
+
+    表**不存在**时返回 False —— 那不是「待迁移」，是「等着被建出来」（同 P58/P79）。
+    """
+    if not _table_exists(conn, _P80_TABLE):
+        return False
+    return any(not _trigger_exists(conn, name) for name in _P80_TRIGGER_NAMES)
+
+
+def migrate_p80_capital_events(conn) -> list[str]:
+    """补回资本事件表的 append-only 触发器（P80）。**可重入**、老库上零动作。"""
+    if not capital_events_need_p80(conn):
+        return []
+    conn.executescript(_P80_TRIGGERS)
+    return ["paper_capital_events.triggers"]
+
+
+def _p80_topup_event(account_id: str) -> tuple[str, str, float, str, str]:
+    """某账户的标准入金事件：`(date, kind, amount, note, idem)`。
+
+    常量、文案与**逐账户幂等键**都从 `paper.config` 取（**不许在迁移里另抄一份
+    数字**）—— 所以这里用**函数级** import：方向是 paper → store，模块级反向
+    import 会成环（`paper.engine` 在模块级 import 本模块）。
+
+    幂等键必须**带账户后缀**（`agent_capital_topup_idem`）：`idem` 是全表 UNIQUE，
+    用裸字面量会让第一条之后的账户被 `INSERT OR IGNORE` 静默吃掉。
+    """
+    from stocklab.paper.config import (AGENT_CAPITAL_TOPUP_AMOUNT,
+                                       AGENT_CAPITAL_TOPUP_DATE,
+                                       AGENT_CAPITAL_TOPUP_NOTE,
+                                       agent_capital_topup_idem)
+    return (AGENT_CAPITAL_TOPUP_DATE, "deposit", float(AGENT_CAPITAL_TOPUP_AMOUNT),
+            AGENT_CAPITAL_TOPUP_NOTE, agent_capital_topup_idem(str(account_id)))
+
+
+def _p80_agent_accounts(conn) -> list[str]:
+    """AI 家族（`arm-agent` 前缀）的账户 id，升序。表不存在 ⇒ `[]`。"""
+    if not _table_exists(conn, "paper_accounts"):
+        return []
+    return [str(r[0]) for r in conn.execute(
+        "SELECT account_id FROM paper_accounts WHERE account_id LIKE 'arm-agent%'"
+        " ORDER BY account_id")]
+
+
+def agent_capital_topup_missing(conn) -> list[str]:
+    """只读探测：哪几条 AI 家族账户**还没挂上**标准入金事件（供 doctor 报告）。
+
+    判据是**逐账户幂等键**（`agent_capital_topup_idem(账户)`）在不在，而不是
+    「有没有任意一条事件」—— 后者会把「手工记了一笔别的入金」当成已前滚。
+    表不存在 ⇒ 点名的清单仍按账户算（doctor 会同时报表缺席）。
+    """
+    accounts = _p80_agent_accounts(conn)
+    if not _table_exists(conn, _P80_TABLE):
+        return accounts
+    return [a for a in accounts if _p80_topup_event(a)[4] not in _p80_idems(conn, a)]
+
+
+def _p80_idems(conn, account_id: str) -> set[str]:
+    """该账户已有的 `idem` 集合（只读）。"""
+    return {str(r[0]) for r in conn.execute(
+        "SELECT idem FROM paper_capital_events WHERE account_id = ?",
+        (str(account_id),))}
+
+
+def seed_agent_capital_topup(conn, now: str) -> list[str]:
+    """**数据前滚**（P80 / D3）：给每条 AI 家族账户挂一条标准入金事件。
+
+    幂等：靠 `idem`（**逐账户**）的 `INSERT OR IGNORE` —— 重跑不产生第二行、不报错。
+    只写 `paper_capital_events` 一张表；`paper_accounts` / `paper_nav_daily`
+    的既有行**一个字节都不碰**（那两张表是 append-only，改一行就是伪造历史账）。
+
+    **只准显式调用**（理由见本节的段头注释）：不给 `_apply_schema`、
+    不给 `_pending_column_migrations`，只登记 `_KNOWN_MARKERS`。
+    返回本次实际新挂上的账户 id（老库上重跑 ⇒ `[]`）。
+    """
+    written: list[str] = []
+    for account_id in _p80_agent_accounts(conn):
+        date, kind, amount, note, idem = _p80_topup_event(account_id)
+        cur = conn.execute(
+            f"INSERT OR IGNORE INTO {_P80_TABLE} (account_id, date, kind, amount,"
+            " note, idem, created_at) VALUES (?,?,?,?,?,?,?)",
+            (account_id, date, kind, amount, note, idem, now))
+        if cur.rowcount:
+            written.append(account_id)
+    conn.commit()
+    return written
+
+
+# ---------------------------------------------------------------------------
 # P62：AI 臂**未结算**的净值行 —— 数据修复（不是结构迁移）。
 #
 # 缺陷是怎么产生的：`paper/agent_decide.py::execute_decision` 只生成订单、原样
@@ -1077,6 +1200,19 @@ _KNOWN_MARKERS: list[tuple[str, str, object]] = [
     # / `_apply_schema`。这里只让 doctor 只读报告「未成交腿台账与它的触发器还在不在」。
     ("p79_agent_evals", "paper_agent_evals",
      lambda conn: not agent_evals_needs_p79(conn)),
+    # P80 ①：`paper_capital_events` 是**新表**，与 P79 同档 —— 不挂
+    # `_pending_column_migrations`（表不存在 ⇒ executescript 直接建出，无需备份），
+    # 结构前滚（触发器漂移）走 `_apply_schema`。这里让 doctor 只读报告
+    # 「资本事件表与它的触发器还在不在」。
+    ("p80_capital_events", "paper_capital_events",
+     lambda conn: not capital_events_need_p80(conn)),
+    # P80 ②：**数据**前滚（给 5 条 AI 账户挂标准入金），与 P62 / P69 同款
+    # **不挂** `_apply_schema` / `_pending_column_migrations` —— 挂上去等于让
+    # 任一写库入口（`paper predict` / `db init`）顺手把本金口径改成 5 万。
+    # 这里只让 doctor 只读报告「哪几条 AI 账户还没挂上入金事件」。
+    # 真库落位由 nanobot 显式调 `seed_agent_capital_topup`（D9 的备份 → 副本 → 核对）。
+    ("p80_agent_capital_topup", "paper_capital_events",
+     lambda conn: not agent_capital_topup_missing(conn)),
 ]
 
 
@@ -1145,6 +1281,7 @@ def _apply_schema(conn, sql: str) -> list[str]:
     changes += migrate_p52_agent_decisions_portfolio(conn)
     changes += migrate_p56_agent_arms_executor(conn)
     changes += migrate_p58_plugin_reviews(conn)
+    changes += migrate_p80_capital_events(conn)
     return changes
 
 

@@ -2461,6 +2461,168 @@ def cmd_paper_show(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_paper_account(args: argparse.Namespace) -> int:
+    """实时账户与购买力（P80 / D5）：**只读**，不写库、不落报告。
+
+    与 `paper show` 的分工：那个是**全臂快照**、只给最新一行净值；这条回答的是
+    「**这一条臂此刻**有多少现金、每只池内标的买得起几手、今天花了多少」——
+    而且**不等收盘链**（账户状态由 `<= asof` 的成交与资本事件重放算出，
+    默认 asof = 库里有 PIT 收盘价的最近交易日）。
+
+    投影只有一份实现（`engine.account_view`）：AI 的输入侧（`tradability`）与这里
+    读的是同一个函数，否则页面上会出现两个「能买几手」。
+    """
+    from stocklab.paper import agent_decide, engine
+
+    conn, code = _paper_conn(args)
+    if conn is None:
+        return code
+    try:
+        view = engine.account_view(conn, args.arm, args.asof)
+    except (engine.PaperError, agent_decide.DecisionPayloadError) as exc:
+        conn.close()
+        return _paper_fail(exc)
+    conn.close()
+
+    if args.json:
+        print(json.dumps(view, ensure_ascii=False, sort_keys=True, indent=2))
+    else:
+        print(_render_account_view(view))
+    if view["errors"]:
+        # 不猜数的地方**点名报出来**（缺 `instruments.type` 的池内标的）：
+        # 静默少几行会让「21 只池内标的」看起来只有 18 只。
+        print(json.dumps({"errors": view["errors"]}, ensure_ascii=False,
+                         sort_keys=True), file=sys.stderr)
+    return 0
+
+
+def _render_account_view(view: dict) -> str:
+    """`paper account` 的**文本**读数（人读；数字全部来自 `view`，不重算）。
+
+    净收益(元) 与累计收益率**并列**打印 —— 用户 2026-09-26 第三条原话是
+    「预测准确性高的目的是盈利」，而累计收益率会被入金改变分母，
+    净收益(元) 不会：两个数并排，才能看出「是赚了还是只是加钱了」。
+    """
+    a = view["account"]
+    bp = view["buying_power"]
+    lines = [
+        f"臂 {view['arm']}　asof {view['asof']}（{view['asof_source']}）",
+        f"现金 {a['cash']:,.2f}　市值 {a['market_value']:,.2f}　"
+        f"总资产 {a['total_assets']:,.2f}　净值 {a['nav']:,.2f}",
+        f"净入金 {a['net_deposits']:,.2f}　**净收益(元)** {a['profit_cny']:,.2f}　"
+        f"累计收益率 {a['cum_return'] * 100:,.4f}%　回撤 {a['drawdown'] * 100:,.4f}%　"
+        f"累计成本 {a['cum_cost']:,.2f}",
+    ]
+    if not view["positions_detail"]:
+        lines.append("持仓：无")
+    else:
+        lines.append("持仓：")
+        for p in view["positions_detail"]:
+            lines.append(
+                f"  {p['code']} {p['qty']} 股 @{p['price']:.4f}"
+                f"（{p['price_asof']} / {p['source']}）市值 {p['market_value']:,.2f}"
+                f"　可卖 {p['sellable_qty']} 股　一手含费 "
+                + ("—" if p["one_lot_cost"] is None else f"{p['one_lot_cost']:,.2f}"))
+    f = bp["fills_on_asof"]
+    lines.append(f"当日成交（{view['asof']}）：{f['n']} 笔 / ¥{f['amount']:,.2f} / "
+                 f"费用 ¥{f['fee']:,.2f}")
+    lines.append(f"购买力（池内 {bp['n_pool_codes']} 只 / 有价 {bp['n_priced']} 只）：")
+    if not bp["by_code"]:
+        lines.append("  （池内没有一只有 PIT 收盘价的标的）")
+    for code, row in sorted(bp["by_code"].items()):
+        lines.append(f"  {code}　一手含费 {row['one_lot_cost']:,.2f}　"
+                     f"最多 {row['max_lots_affordable']} 手（{row['asset_class']}）")
+    return "\n".join(lines)
+
+
+#: `paper capital add` 的默认幂等键前缀。同一笔入金重跑命中同一个键 ⇒ 不写第二行；
+#: 真要记**两笔金额相同**的入金 ⇒ 显式给 `--idem`（两条不同的事件本来就有两个理由）。
+CAPITAL_IDEM_PREFIX = "p80-cli"
+
+
+def _capital_idem(*, arm: str, date: str, kind: str, amount: float) -> str:
+    return f"{CAPITAL_IDEM_PREFIX}-{arm}-{date}-{kind}-{amount:g}"
+
+
+def cmd_paper_capital_add(args: argparse.Namespace) -> int:
+    """记一笔入金 / 出金（P80 / D5）：**append-only 写入口**，幂等，支持 `--dry-run`。
+
+    为什么本金变更要走**事件**而不是改账户行：`paper_accounts` 与 `paper_nav_daily`
+    都是 append-only，且 P62 的不变量（`nav == initial_cash + 重放成交 + mtm`）就写在
+    净值行上 —— 就地改 `initial_cash` 会让历史净值行**当场变成假账**。
+    真实账户加钱也是记一笔流水，不改开户金额。
+
+    退出码：0 = 写出（或 `--dry-run` 打出载荷）、2 = 输入不合法（**零写入**）。
+    """
+    from stocklab.paper import engine, store
+
+    conn, code = _paper_conn(args)
+    if conn is None:
+        return code
+    try:
+        # fail-closed：账户不在 ⇒ 点名拒绝。给一个不存在的账户记入金 =
+        # 记进了一个永远没人读的角落（净值表上什么都不会发生）。
+        if not store.account_exists(conn, args.arm):
+            raise engine.PaperError(
+                f"账户 {args.arm} 不存在 —— 不为不存在的账户记资本事件"
+                f"（先 `paper init` 或 `paper agent enroll`）")
+        idem = args.idem or _capital_idem(arm=args.arm, date=args.date,
+                                          kind=args.kind, amount=args.amount)
+        payload = {"account_id": args.arm, "date": args.date, "kind": args.kind,
+                   "amount": float(args.amount), "note": args.note, "idem": idem,
+                   "dry_run": bool(args.dry_run),
+                   "signed_amount": (float(args.amount) if args.kind == "deposit"
+                                     else -float(args.amount))}
+        if not args.dry_run:
+            written = store.insert_capital_event(
+                conn, account_id=args.arm, date=args.date, kind=args.kind,
+                amount=float(args.amount), note=args.note, idem=idem,
+                now=args.now or datetime.now(TZ).isoformat(timespec="seconds"))
+            payload["written"] = int(written)
+        print(json.dumps(payload, ensure_ascii=False, sort_keys=True, indent=2))
+        if args.dry_run:
+            print(json.dumps({"dry_run": True, "written": 0,
+                              "note": "**零写入**：`paper_capital_events` 行数不变"},
+                             ensure_ascii=False, sort_keys=True), file=sys.stderr)
+        else:
+            print(json.dumps({"written": payload["written"], "idem": idem},
+                             ensure_ascii=False, sort_keys=True), file=sys.stderr)
+    except (ValueError, engine.PaperError) as exc:
+        conn.close()
+        return _paper_fail(exc)
+    conn.close()
+    return 0
+
+
+def cmd_paper_capital_list(args: argparse.Namespace) -> int:
+    """列资本事件（P80：**只读**）。`--asof` 给了 ⇒ 只列 `<= asof`（PIT）。"""
+    from stocklab.paper import engine, store
+
+    conn, code = _paper_conn(args)
+    if conn is None:
+        return code
+    events: list[dict] = []
+    arms = ([args.arm] if args.arm
+            else [str(a["account_id"]) for a in store.load_accounts(conn)])
+    for arm in arms:
+        for row in store.load_capital_events(conn, arm, asof=args.asof):
+            events.append(row)
+    payload = {
+        "asof": args.asof,
+        "arm": args.arm,
+        "n_events": len(events),
+        "events": sorted(events, key=lambda r: (r["date"], r["account_id"],
+                                                r["event_id"])),
+        # 带符号合计：与 `_ledger_arm_state` 同一个解释（deposit +、withdraw −）。
+        # 逐账户给，因为「净入金」是**账户**的属性，合计跨账户没有意义。
+        "signed_by_account": {
+            arm: engine.capital_events_sum(conn, arm, args.asof) for arm in arms},
+    }
+    conn.close()
+    print(json.dumps(payload, ensure_ascii=False, sort_keys=True, indent=2))
+    return 0
+
+
 def cmd_paper_metrics(args: argparse.Namespace) -> int:
     """绩效对比（模块2 §4）：五个指标 + 样本量门禁。**离线只读**。
 
@@ -2957,6 +3119,19 @@ def cmd_paper_agent_show(args: argparse.Namespace) -> int:
                                                       asof=asof)
         prereg = None if account is None else engine.preregistration(account)
         live = True if account is None else engine.is_live(account)
+        # P80 / D8：把「钱」摆出来（净值 / 净入金 / 净收益(元) / 累计收益率 / 回撤 /
+        # 累计成本）。与 `paper account`、AI 输入侧同源（`engine.account_view`）——
+        # 两处各拼一套的话，同一天会读出两个「净收益」。缺价时**点名**说不可判定，
+        # 不拿净值行顶（净值行可能是事件生效前的旧口径）。
+        account_block: dict = {"available": False, "asof": asof,
+                               "reason": None, "type": None}
+        if account is not None:
+            try:
+                account_block = engine.account_view(conn, args.arm, asof)["account"]
+            except engine.PaperError as exc:
+                account_block = {"available": False, "asof": asof,
+                                 "reason": str(exc), "type": type(exc).__name__,
+                                 "note": "这一格算不出就**说算不出**，不猜数"}
         payload = {
             "arm": args.arm,
             "asof": asof,
@@ -2966,6 +3141,8 @@ def cmd_paper_agent_show(args: argparse.Namespace) -> int:
             "live": live,
             "n_rows": len(rows),
             "n_decisions": len(portfolio),
+            # P80 / D8：账户与**净收益(元)**（考核目标，见 `objective`）。
+            "account": account_block,
             "decision_on_asof": decision_on_asof,
             "latest_decision": portfolio[-1] if portfolio else None,
             "pool_on_asof": agent_pool.pool_snapshot(conn, asof),
@@ -4184,6 +4361,51 @@ def build_parser() -> argparse.ArgumentParser:
     pp_show.add_argument("--db")
     pp_show.add_argument("--now", help="覆盖当前时刻（测试用）")
     pp_show.set_defaults(func=cmd_paper_show)
+
+    pp_account = paper_sub.add_parser(
+        "account", help="实时账户与购买力（P80/D5）：现金/净值/净收益 + 每只买得起几手"
+                        "（只读，不等收盘链）")
+    pp_account.add_argument("--arm", required=True,
+                            help="账户 id：arm-agent / arm-agent-ds-v1 / arm-now …")
+    pp_account.add_argument("--asof", help="asof 日期 YYYY-MM-DD"
+                                          "（默认：库里有 PIT 收盘价的最近交易日）")
+    pp_account.add_argument("--json", action="store_true",
+                            help="打整份载荷到 stdout（默认打文本读数）")
+    pp_account.add_argument("--db")
+    # 收下 `--now` 只为与其余 `paper` 子命令同形（测试/补录脚本统一拼这个参数）；
+    # 本命令**不用时钟**：默认 asof 是「库里有 PIT 收盘价的最近交易日」，
+    # 那是**数据**决定的，不是「今天」决定的（D5 的「随时可查」正是这个意思）。
+    pp_account.add_argument("--now", help="（本命令不用时钟，收下只为同形）")
+    pp_account.set_defaults(func=cmd_paper_account)
+
+    pp_capital = paper_sub.add_parser(
+        "capital", help="资本事件（P80/D2）：入金/出金只增不改，本金口径靠事件改")
+    pp_capital_sub = pp_capital.add_subparsers(dest="capital_action", required=True)
+
+    ppc_add = pp_capital_sub.add_parser(
+        "add", help="记一笔入金/出金（append-only + 幂等；--dry-run 可零写入预演）")
+    ppc_add.add_argument("--arm", required=True, help="账户 id（必须已存在）")
+    ppc_add.add_argument("--date", required=True,
+                         help="生效日 YYYY-MM-DD（PIT：只计入 date <= asof 的读数）")
+    ppc_add.add_argument("--kind", required=True, choices=["deposit", "withdraw"],
+                         help="deposit = 入金（+）、withdraw = 出金（−）")
+    ppc_add.add_argument("--amount", required=True, type=float,
+                         help="金额（元，**恒正**：方向由 --kind 表达）")
+    ppc_add.add_argument("--note", required=True, help="这笔钱从哪来（写进台账，非空）")
+    ppc_add.add_argument("--idem", help="幂等键（默认由 臂/日/方向/金额 推出；"
+                                        "要记两笔金额相同的入金请显式给不同的键）")
+    ppc_add.add_argument("--dry-run", dest="dry_run", action="store_true",
+                         help="只打载荷、**零写入**")
+    ppc_add.add_argument("--db")
+    ppc_add.add_argument("--now", help="覆盖当前时刻（测试/补录用）")
+    ppc_add.set_defaults(func=cmd_paper_capital_add)
+
+    ppc_list = pp_capital_sub.add_parser("list", help="列资本事件（只读）")
+    ppc_list.add_argument("--arm", help="只看这一条臂（不传 = 全部账户）")
+    ppc_list.add_argument("--asof", help="只看 date <= asof 的事件（PIT）")
+    ppc_list.add_argument("--db")
+    ppc_list.add_argument("--now", help="（本命令不用时钟，收下只为同形）")
+    ppc_list.set_defaults(func=cmd_paper_capital_list)
 
     pp_metrics = paper_sub.add_parser(
         "metrics", help="绩效对比（模块2 §4）：五指标 + 样本量门禁（离线只读）")

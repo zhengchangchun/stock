@@ -36,7 +36,8 @@ from stocklab.paper.config import (
     LOT,
     RULE_CITATIONS,
 )
-from stocklab.paper.engine import INDEX_300_SYMBOL, pit_close
+from stocklab.paper.engine import (INDEX_300_SYMBOL, max_lots_affordable,
+                                   pit_close)
 from stocklab.paper.rules import check_no_lookahead, one_lot_cost
 
 #: 上下文里**刻意不带**的东西（写下来，免得以后有人往里加）。
@@ -145,8 +146,24 @@ def context_sha256(context: Mapping[str, object]) -> str:
 #: 白名单不再约束它（D-34 覆盖 D-18）。
 DECISION_HASHED_KEYS: tuple[str, ...] = (
     "arm", "asof", "account", "marks", "index_300", "pool", "guardrails",
-    "tradability", "disclosure", "non_goals", "counter_arm",
+    "tradability", "objective", "disclosure", "non_goals", "counter_arm",
 )
+
+#: **考核目标**（P80 / D7，用户 2026-09-26 第三条原话「预测准确性高的目的是盈利」）。
+#:
+#: `non_goals` 说的是「不许做什么」，这块说的是「**为了什么**」。不写它，模型就会去
+#: 优化它**看得见**的那个数（准确度 / 胜率 / 命中率），而本项目拿准确度当**手段**：
+#: 起跑口径已明写「模型方向能力 ≈ 0」，模拟盘对照的是纪律与分散本身，读数以
+#: `paper_nav_daily` 的 `cum_return` 与**净收益(元)** 为准。
+#:
+#: ⚠️ 文案**逐字**照任务书 D7 抄（测试 `test_p80_objective_is_verbatim` 钉住）：
+#: 这块是输入侧的口径声明，改一个字就是改口径，必须与任务书/ADR 同时改。
+OBJECTIVE: dict[str, str] = {
+    "goal": "扣除全部成本（佣金/印花税/过户费/滑点）后的净收益最大化",
+    "note": "预测准确度只是手段，不是考核目标 —— 本期读数以 paper_nav_daily 的 "
+            "cum_return 与净收益(元) 为准",
+    "accounting": "net_deposits 含全部入金；cost 累计在 cum_cost",
+}
 
 #: 不许做的（写进上下文，让「越权」在**输入侧**就不可表达）。
 GUARDRAILS: tuple[str, ...] = (
@@ -161,9 +178,11 @@ GUARDRAILS: tuple[str, ...] = (
 
 
 def _tradability_block(*, prices: Mapping[str, object], total_assets: float,
+                       cash: float, net_deposits: float,
                        asset_classes: Mapping[str, str],
+                       sellable_qty: Mapping[str, int] | None = None,
                        lot: int = LOT) -> dict:
-    """「一手（100 股）够不够」这条约束的**输入侧**表达（P79 / D2）。
+    """「一手（100 股）够不够 / 买得起几手」这条约束的**输入侧**表达（P79 D2 + P80 D6）。
 
     ## 为什么它必须出现在上下文里
 
@@ -172,10 +191,20 @@ def _tradability_block(*, prices: Mapping[str, object], total_assets: float,
     —— 09-23 的 `arm-agent-ds-v1` 四笔买入全部落在「目标市值 < 一手」上（P79 §0.1），
     而它的上下文里**一个字都没提一手多少钱**。把眼睛给足，是本站的一半。
 
-    ## 数字一律从 `rules.one_lot_cost` 取（一行费用公式都不另写）
+    ## P80 补的是**另一半**：`affordable_lots` 与 `sellable_qty`
+
+    P79 给了「一手多少钱」，没给「我买得起几手」—— 半个眼睛：`one_lot_cost` 说
+    「这只贵」，`affordable_lots` 说「以我现在的现金，最多买 N 手（N 可能是 0）」。
+    只看前者，模型仍然要靠心算总资产；心算错一次的代价是一笔必然被资金闸门拒的订单
+    （或更糟：一笔买不起却写进载荷的单子）。`sellable_qty` 同理：**A 股 T+1 ，
+    今天买的不许今天卖** —— 「看空就清仓」这条表达在当日买入的腿上不成立。
+
+    ## 数字一律从 `rules.one_lot_cost` / `engine.max_lots_affordable` 取
 
     `one_lot_cost = fill_price("buy", price) * lot + _fee_parts(...)["total"]`
-    —— 与执行层**同一个** `CostModel.fill_price` 与同一个 `_fee_parts`（P79 / D2）。
+    —— 与执行层**同一个** `CostModel.fill_price` 与同一个 `_fee_parts`（P79 / D2）；
+    `affordable_lots = floor(cash / one_lot_cost)` —— 与 `paper account` 的
+    `buying_power` **同一个函数**（P80 / T3 的判据就是这两处同源同值）。
 
     ## 键集 = `marks ∩ pool`
 
@@ -196,6 +225,8 @@ def _tradability_block(*, prices: Mapping[str, object], total_assets: float,
     是唯一真相）解析好；缺键 ⇒ `KeyError`，不静默退化成股票费率。
     """
     total = float(total_assets)
+    money = float(cash)
+    pos_qty = sellable_qty or {}
     by_code: dict[str, dict] = {}
     for code in sorted(prices):
         cost = one_lot_cost(price=float(prices[code].price),
@@ -203,10 +234,22 @@ def _tradability_block(*, prices: Mapping[str, object], total_assets: float,
         by_code[str(code)] = {
             "one_lot_cost": cost,
             "min_weight_pct": (round(cost / total * 100.0, 4) if total > 0 else None),
+            # 现金口径的整手数：`floor(现金 / 一手含费成本)`。0 是个**有意义的读数**
+            # （「这只以我现在的钱一手都买不起」），不是缺数据。
+            "affordable_lots": max_lots_affordable(money, cost),
+            # T+1：当日买入的不可卖。这只标的我**现在**能卖几股。
+            "sellable_qty": int(pos_qty.get(str(code), 0)),
         }
     mins = [v["min_weight_pct"] for v in by_code.values()
             if v["min_weight_pct"] is not None]
-    return {"lot": int(lot), "min_weight_pct": (min(mins) if mins else None),
+    return {"lot": int(lot),
+            # 顶层 `cash` / `net_deposits`（P80 / D6）：`by_code` 里那个
+            # `affordable_lots` 的分母与「净收益」那条口径的分母。不写它们，
+            # 「为什么是 3 手」「赚的是哪部分钱」在输入侧就不可复核。
+            "cash": round(money, 4),
+            "net_deposits": (None if net_deposits is None
+                             else round(float(net_deposits), 4)),
+            "min_weight_pct": (min(mins) if mins else None),
             "by_code": by_code}
 
 
@@ -214,11 +257,19 @@ def build_decision_context(conn: sqlite3.Connection, *, arm: str, asof: str,
                            pool: Mapping[str, object], cash: float,
                            positions: Mapping[str, int],
                            marks: Mapping[str, object],
-                           total_assets: float) -> dict:
+                           total_assets: float,
+                           net_deposits: float | None = None,
+                           sellable_qty: Mapping[str, int] | None = None) -> dict:
     """喂给 AI 操盘手的 **PIT 上下文**（与 `build_context` 并列，键集不同）。
 
     只含 `<= asof` 的行（净值 / 持仓 / 收盘价 / 候选池快照）；候选池快照本身也按
     `asof <= 决策日` 取（`agent_pool.pool_snapshot`）。
+
+    `net_deposits`（P80 / D4）不给 ⇒ `tradability.net_deposits` 写 `None`
+    （**不猜一个数**：净入金是「净收益」的分母，看错它比看不到它更糟）。
+    实盘路径一律由 `engine.decision_context_for` 显式传入（含资本事件的真实净入金）；
+    只有测试直接拼上下文时才会是 `None`。`sellable_qty` 不给 ⇒ 逐只报 0
+    （T+1 可卖数量未知时报「一股都卖不了」比报「随便卖」安全）。
     """
     check_no_lookahead(asof, marks)
     idx = marks.get(INDEX_300_SYMBOL) or pit_close(conn, INDEX_300_SYMBOL, asof)
@@ -228,6 +279,7 @@ def build_decision_context(conn: sqlite3.Connection, *, arm: str, asof: str,
     # `instruments.type` 解析（未登记即报错，不默认成股票）。
     tradable = sorted(set(marks) & {str(c) for c in (pool.get("codes") or [])})
     asset_classes = {c: agent_decide.asset_class_for(conn, c) for c in tradable}
+    net_dep = None if net_deposits is None else round(float(net_deposits), 4)
     return {
         "arm": arm,
         "asof": asof,
@@ -249,9 +301,15 @@ def build_decision_context(conn: sqlite3.Connection, *, arm: str, asof: str,
         # 不再相同（它是 AI 看得见的输入，必须进指纹 —— 见 `DECISION_HASHED_KEYS`）。
         # 台账里**已有的**决策行的 sha 一律不改写（append-only）：D-49 的复核只对
         # 新写入的载荷生效，旧行读出来的是「它当时看到的那个输入」。
+        # P80 又扩了三个键（`affordable_lots` / `sellable_qty` / 顶层 cash、net_deposits）
+        # —— 同一条纪律：旧行的 sha 不动，新口径只对新写入生效。
         "tradability": _tradability_block(
             prices={c: marks[c] for c in tradable}, total_assets=float(total_assets),
-            asset_classes=asset_classes, lot=LOT),
+            cash=float(cash), net_deposits=net_dep,
+            asset_classes=asset_classes, sellable_qty=sellable_qty or {}, lot=LOT),
+        # 考核目标（D7）：**不是**护栏，是「为了什么」。与护栏并列放在顶层，
+        # 于是「不许做什么」与「为了什么」在输入侧是两条独立的声明。
+        "objective": dict(OBJECTIVE),
         "guardrails": list(GUARDRAILS),
         "disclosure": list(DISCLOSURE_ITEMS),
         "non_goals": list(NON_GOALS),
