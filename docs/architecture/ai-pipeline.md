@@ -160,6 +160,14 @@ A1 当前口径（v1.0.4）：`reserved = Σ 全部存量持仓占比`（不因 
 `rules.one_lot_cost`（复用 `CostModel.fill_price` ＋ `_fee_parts`）。⚠️ 它进指纹 ⇒ **同一输入在 P79 前后的
 `decision_context_sha256` 不同**，跨该版本的指纹/决策行不可直接比（旧行 append-only 不改写）。
 
+**`tradability` 的 P81 增量（D1，只增键）**：逐只增 `tradable` / `untradable_reason`，
+顶层增 `n_tradable` / `n_untradable` / `min_tradable_weight_pct` / `cheapest`。
+判据**只有一处实现**：`paper/engine.py::tradable_verdict`（`tradable = affordable_lots >= 1`），
+账户读数 `account_view.buying_power.by_code` 与这里调的是**同一个函数**（两处各写一份 ⇒ D-37 那类
+「同一页两个数」）。`untradable_reason` 把两种成因分开并各点名两个数：
+「一手 ¥X 已超过总资产 ¥Y」（这个账户无解）／「现金 ¥X 不足一手 ¥Y（先卖出其他标的可释放现金）」。
+⚠️ 它是「**现金口径的今天**」，不是「这标的不许交易」，更不许被任何写入口当成硬拒绝（L1 只增不减）。
+
 **台账两张表**（都 append-only、都靠触发器拒 `UPDATE`/`DELETE`）：`paper_agent_decisions`
 （AI 的**决策**，`UNIQUE(arm, asof)`）＋ `paper_agent_evals`（**未成交腿的理由**，`UNIQUE(arm, asof, code)`，
 P79 起由 `engine._step_all` 的 agent 分支落库 —— 原来那个 `_evals` 被下划线丢掉了）。
@@ -181,6 +189,33 @@ P79 起由 `engine._step_all` 的 agent 分支落库 —— 原来那个 `_evals
 `engine.account_view` 是**唯一**投影（CLI 与 AI 输入侧都调它）；输入侧 `tradability` 增
 `affordable_lots` / `sellable_qty`、顶层增 `cash` / `net_deposits`，并新增 `objective` 块
 （考核目标＝扣除全部成本后的净收益最大化）且**进指纹** ⇒ 与 P80 之前的 `context_sha256` 不可比。
+
+**未成交腿的读出口（P81 / D2）**：P79 把「AI 想动而没动成」的理由落进了 `paper_agent_evals`，
+但此前**没有任何消费者**。现在有只读命令（数据源只有 `store.load_agent_evals`，不重算任何理由）：
+
+```bash
+# AI 的意图 vs 落地：它想买什么、为什么没买成（缺省 = 该臂最后一个有腿的日子）
+.venv/bin/python -m stocklab.cli.main paper agent evals --arm arm-agent-ds-v2 --json
+```
+
+退出码：`0` = 读到（含「这台账还没有任何未成交腿」这种空结果，空列表**不是**「AI 没动过」）；
+`2` = 账户不存在（沿用 `paper account` 的口径点名，不静默返回空）。
+
+**意图 vs 落地对账（P81 / D3）**：`engine.agent_block` 增 `reconciliation`（**列表**，逐臂）＋
+`reconciliation_note`，`paper show` 与 `/lab/paper` **同源**。覆盖面是「`paper_accounts.arm`
+以 `agent` 开头且在 `paper_agent_decisions` 里有行」的**每一条臂**（各取自己最新的决策日，且
+`<= asof`）—— **不写死 `arm-agent`**：真库在跑的是 `arm-agent-ds-v1/-v2`，而 `arm-agent` 一条决策都没有。
+逐臂给 `n_legs_planned`（载荷条数）／`n_legs_filled`（当日 `paper_trades` 行数）／
+`n_legs_unfilled`（当日 `paper_agent_evals` 行数）／`n_evals`（与前者同值，**故意重复**：一个是腿数、
+一个是台账行数，不等本身就是信号，**不用 `min()` 抹平**）。
+
+**可下手域读数（P81 / D4）**：`account_view.buying_power` 增 `tradable_domain`
+（`n_pool_codes / n_priced / n_tradable / n_untradable / min_tradable_weight_pct /
+one_lot_cost_p50 / one_lot_cost_min / cheapest_code / untradable[]`），`build_report` 给**每条 AI 臂**
+补同一个块，`render_report` 第四节与 `/lab/paper` 各渲染一行
+（`池内可下手 10/11 只；最小可成交权重 4.18%；一手成本中位数 ¥3,856.97` ＋ 买不起的**点名**）。
+口径：`one_lot_cost_p50/min` 描述**池内可定价**的一手成本分布，`cheapest_code` 取**可下手子集**。
+取不到（缺价 / 无池 / 账户口径读不出来）一律写「取不到」**不填 0**。
 
 ### ⑥ 账本与对照臂
 
@@ -250,5 +285,8 @@ v1/v2/v3 的历史行一个字不改、读数**不可混引**。
 
 ## 变更记录
 
+- 2026-09-26: 补 P81 —— `tradability` 的「可下手」结论键（判据唯一：`engine.tradable_verdict`）、
+  `paper agent evals` 读出口、`agent_block.reconciliation` 逐臂对账、`buying_power.tradable_domain`
+  与报告/页面的一行读数（取不到写取不到，不填 0）。
 - 2026-09-26: 补 P79 —— 输入侧上下文键集（含 `tradability`）与台账两张表；随机臂 v4（可成交化）。
 - 2026-09-25: 首版（回答「准确率 + 全流程」）。
