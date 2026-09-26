@@ -166,6 +166,22 @@ P79 起由 `engine._step_all` 的 agent 分支落库 —— 原来那个 `_evals
 「不动的理由」是**结论不是日志**：`plan_orders` 早就算出来（如「目标市值与现市值差 < 1 手 → 不动」），
 此前只是没地方落。
 
+**本金与实时账户（P80 / ADR-032）**：AI 家族（`account_id LIKE 'arm-agent%'`）的本金口径由
+**事件**表达，不由账户行表达 —— 新表 `paper_capital_events`（append-only）里各挂一条 +30,000、
+**2026-09-28 生效** ⇒ 目标 50,000；`paper_accounts` / `paper_nav_daily` 的既有行一个字节都不改
+（就地改 `initial_cash` 会让 09-23/09-24 的净值行当场违反 P62 的不变量）。重放读法是
+「`date <= asof` 的带符号金额进现金与 `net_deposits`，`cum_cost` 不动」。
+
+```bash
+# 随时查「手上有多少钱、每只最多买几手」（只读，不等收盘链）
+.venv/bin/python -m stocklab.cli.main paper account --arm arm-agent-ds-v1 --json
+.venv/bin/python -m stocklab.cli.main paper capital list --arm arm-agent-ds-v1   # 资本事件台账
+```
+
+`engine.account_view` 是**唯一**投影（CLI 与 AI 输入侧都调它）；输入侧 `tradability` 增
+`affordable_lots` / `sellable_qty`、顶层增 `cash` / `net_deposits`，并新增 `objective` 块
+（考核目标＝扣除全部成本后的净收益最大化）且**进指纹** ⇒ 与 P80 之前的 `context_sha256` 不可比。
+
 ### ⑥ 账本与对照臂
 
 - 成交只有一个写入口 `paper/store.py::insert_trade`（append-only，唯一键；错了只能冲正）。
