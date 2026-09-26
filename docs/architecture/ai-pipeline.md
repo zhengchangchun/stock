@@ -153,6 +153,19 @@ A1 当前口径（v1.0.4）：`reserved = Σ 全部存量持仓占比`（不因 
 **资金闸门在执行层**：`paper/agent_decide.py::CashShortfall`（fail-closed、具名 `code="cash"`、整轮拒绝零写入）。
 脚本自己的口径就算再错一次，执行层也会整轮拒绝，而不是透支（P65/P68，ERROR_DIARY #73/#75）。
 
+**输入侧契约**（`paper/agent_context.py::build_decision_context`）：顶层键 = `arm / asof / account / marks /`
+`index_300 / pool / tradability / guardrails / disclosure / non_goals / counter_arm`，其中 11 个进指纹
+`decision_context_sha256`。**`tradability`（P79）** 是「一手够不够」的输入侧表达：
+`{lot, min_weight_pct, by_code{one_lot_cost, min_weight_pct}}`，键集 = `marks ∩ pool`，一手成本的唯一公式是
+`rules.one_lot_cost`（复用 `CostModel.fill_price` ＋ `_fee_parts`）。⚠️ 它进指纹 ⇒ **同一输入在 P79 前后的
+`decision_context_sha256` 不同**，跨该版本的指纹/决策行不可直接比（旧行 append-only 不改写）。
+
+**台账两张表**（都 append-only、都靠触发器拒 `UPDATE`/`DELETE`）：`paper_agent_decisions`
+（AI 的**决策**，`UNIQUE(arm, asof)`）＋ `paper_agent_evals`（**未成交腿的理由**，`UNIQUE(arm, asof, code)`，
+P79 起由 `engine._step_all` 的 agent 分支落库 —— 原来那个 `_evals` 被下划线丢掉了）。
+「不动的理由」是**结论不是日志**：`plan_orders` 早就算出来（如「目标市值与现市值差 < 1 手 → 不动」），
+此前只是没地方落。
+
 ### ⑥ 账本与对照臂
 
 - 成交只有一个写入口 `paper/store.py::insert_trade`（append-only，唯一键；错了只能冲正）。
@@ -166,6 +179,8 @@ A1 当前口径（v1.0.4）：`reserved = Σ 全部存量持仓占比`（不因 
 | `arm-discipline-05/10/15` | discipline | 19,381.94 / 19,381.04 / 19,364.77 | ETF 目标占比 5/10/15% |
 
 `arm-agent-random` 是**归因必需**：没有随机对照臂，一切「AI 有/没有用」的结论都算**不可归因**。
+P79 起它的抽样口径是 **v4**（可成交化：抽出的敞口按整手数归一、`S=∅` 重抽 ≤8 次），
+v1/v2/v3 的历史行一个字不改、读数**不可混引**。
 
 ### ⑦ 页面（`/lab/`）
 
@@ -219,4 +234,5 @@ A1 当前口径（v1.0.4）：`reserved = Σ 全部存量持仓占比`（不因 
 
 ## 变更记录
 
+- 2026-09-26: 补 P79 —— 输入侧上下文键集（含 `tradability`）与台账两张表；随机臂 v4（可成交化）。
 - 2026-09-25: 首版（回答「准确率 + 全流程」）。
