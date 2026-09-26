@@ -263,7 +263,9 @@ def test_page_shows_every_line_and_the_labels_that_matter(db):
         assert arm_id in html
     assert paper_render.arm_label({"account_id": "arm-now", "arm": "now"}) in html
     assert "沪深300" in html and "sh000300" in html
-    assert "AI 纪律臂 · ETF 目标 5%" in html
+    # P84 口径变更：标签改走 `paper/arm_names.py` 的唯一真源（旧文案「AI 纪律臂 ·
+    # ETF 目标 5%」→「纪律臂·ETF 目标 5%」）。**只改常量**，断言的形状不放宽。
+    assert "纪律臂·ETF 目标 5%" in html
     # 「我 − 大盘」这个口径要在首屏出现，并且与上游一致
     data = _track(db)
     assert paper_render.ratio_pct(_arm(data, "arm-now")["excess_vs_index_300"]) in html

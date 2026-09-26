@@ -199,12 +199,13 @@ def _cmp(data):
 # ══════════════════════════════════════════════════════════════════════
 
 def test_t3_the_existing_five_lines_keep_their_labels_and_styles(db):
+    # P84 / K7 口径变更：三条静态线的人名改走 `paper/arm_names.py` 的唯一真源
+    # （旧文案 → 显示名）。**只改常量**；下面「线型不许被动过」那几条一字未动。
     data = _track(db)
-    assert paper_render.arm_label(_arm(data, "arm-now")) == "我 · 实盘账本镜像"
-    assert paper_render.arm_label(_arm(data, "arm-hold")) == \
-        "什么都不做 · 起跑日冻结快照"
+    assert paper_render.arm_label(_arm(data, "arm-now")) == "你的实盘镜像"
+    assert paper_render.arm_label(_arm(data, "arm-hold")) == "什么都不做"
     assert paper_render.arm_label(_arm(data, "arm-discipline-10")) == \
-        "AI 纪律臂 · ETF 目标 10%"
+        "纪律臂·ETF 目标 10%"
     for aid in ("arm-now", "arm-hold", "arm-discipline-05",
                 "arm-discipline-10", "arm-discipline-15"):
         assert paper_render.arm_style(_arm(data, aid)) == \
