@@ -324,8 +324,9 @@ def test_t4_the_non_goal_is_the_verbatim_k5_text(db):
     assert agent_context.NON_GOALS[0] == K5_NON_GOAL_0
     ctx = _context(db)
     assert ctx["non_goals"][0] == K5_NON_GOAL_0
-    # 后两条一字未动
-    assert agent_context.NON_GOALS[1:] == (
+    # 后两条一字未动（P85 / K6 在其**之后**追加了第 4 条 ⇒ 这里按 P84 的那一段取，
+    # 判据仍是「这两条逐字没变」，不是「NON_GOALS 一共只有 3 条」）。
+    assert agent_context.NON_GOALS[1:3] == (
         "不动成本口径 / PIT 判据 / 整手口径 / 白名单 / append-only 纪律",
         "不扩大变更空间本身（`SPEC_SCHEMA` 的区间不是可以改的字段）",
     )

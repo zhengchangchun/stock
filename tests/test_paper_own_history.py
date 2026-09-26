@@ -9,13 +9,16 @@
 | `payload_json` 坏掉 ⇒ `n_orders = 0` ＋ 点名，**不抛** | 直接 `json.loads` 炸掉整条链 |
 | 空库 / 缺表 ⇒ 各计数 0，**不抛** | 夹具库上 `OperationalError` |
 | 块内没有任何前向字段名（K5） | 往里塞 `confidence` / `predicted_*` |
+
+P85 追加：`recent_reviews` / `facts` 两个子键（末尾追加、PIT、尺寸 ≤3 / ≤10，
+既有子键逐位不变）。
 """
 
 import json
 
 import pytest
 
-from stocklab.paper import own_history
+from stocklab.paper import own_history, review
 from stocklab.store.db import connect
 from stocklab.store.migrate import init_db
 
@@ -263,3 +266,112 @@ def test_t3_the_block_has_no_forward_looking_field_names(conn):
     for key in _all_keys(own_history.own_history_block(conn, arm=ARM, asof=ASOF)):
         for banned in _FORWARD_KEYS:
             assert banned not in key.lower(), f"自身历史块里出现了前向字段：{key}"
+
+
+# ---------- ⑦ P85 / K5：recent_reviews 与 facts（只增两个子键） ----------
+
+def _review(conn, asof, *, arm=ARM, lessons=()):
+    """落一条复盘（走写入口 —— 读侧看到的就是它写下的那份）。"""
+    return review.record_review(
+        conn, arm=arm, asof=asof,
+        payload={"asof": asof, "arm": arm, "kind": "daily", "items": [],
+                 "lessons": list(lessons)},
+        model_id="manual", prompt_sha256="p" * 64, context_sha256="e" * 64,
+        now=NOW)
+
+
+def test_p85_the_block_gains_exactly_two_new_keys_at_the_end(conn):
+    """K8：既有子键**逐位不变**，两个新子键追加在末尾。"""
+    _nav(conn, "2026-09-23")
+    _trade(conn, "2026-09-23")
+    _decision(conn, "2026-09-23", payload=[])
+    conn.commit()
+    blk = own_history.own_history_block(conn, arm=ARM, asof=ASOF)
+    assert list(blk) == [
+        "arm", "nav_series", "n_nav_days", "trades", "n_trades", "n_buy",
+        "n_sell", "realized_fees_total", "decisions", "n_decisions", "notes",
+        "recent_reviews", "facts"]
+    # 旧子键的值也逐位不变（不是「键还在、内容换了」）
+    assert blk["arm"] == ARM and blk["n_nav_days"] == 1 and blk["n_trades"] == 1
+    assert blk["decisions"][0]["n_orders"] == 0
+    assert len(blk["notes"]) == 3
+
+
+def test_p85_recent_reviews_are_capped_at_three_and_ascending(conn):
+    for i in range(1, 6):                        # 5 条复盘（09-21 … 09-25）
+        _review(conn, f"2026-09-2{i}", lessons=[{"key": f"k{i}_x", "kind": "fact",
+                                                 "text": "x"}])
+    conn.commit()
+    blk = own_history.own_history_block(conn, arm=ARM, asof=ASOF)   # ASOF = 09-24
+    assert own_history.REVIEW_LIMIT == 3
+    # 「最近 3 条」是在 `asof <= 09-24` 的四条里取尾部（09-25 那条看不见）
+    assert [r["asof"] for r in blk["recent_reviews"]] == \
+        ["2026-09-22", "2026-09-23", "2026-09-24"]
+    assert set(blk["recent_reviews"][0]) == {
+        "asof", "kind", "context_sha256", "n_items", "n_lessons",
+        "items", "lessons"}
+
+
+def test_p85_facts_are_capped_at_ten_and_only_for_the_own_arm(conn):
+    """facts 是**逐臂**的：别的臂的 12 个 key 一个都不该出现在这条臂里。"""
+    for d in ("2026-09-23", "2026-09-24"):
+        _review(conn, d, arm=OTHER,
+                lessons=[{"key": f"k{i:02d}", "kind": "fact", "text": "别的臂"}
+                         for i in range(12)])
+    conn.commit()
+    assert own_history.FACT_LIMIT == 10
+    assert own_history.own_history_block(conn, arm=ARM, asof=ASOF)["facts"] == []
+    other = own_history.own_history_block(conn, arm=OTHER, asof=ASOF)
+    assert len(other["facts"]) == 10 and other["recent_reviews"] != []
+
+
+def test_p85_a_review_after_asof_does_not_change_the_block(conn):
+    """PIT（K5）：在 `asof` **之后**插复盘 ⇒ 整块逐字节不变。"""
+    _review(conn, "2026-09-23", lessons=[{"key": "cash_drag", "kind": "fact",
+                                         "text": "旧"}])
+    conn.commit()
+    before = own_history.own_history_block(conn, arm=ARM, asof=ASOF)
+    assert [r["asof"] for r in before["recent_reviews"]] == ["2026-09-23"]
+    _review(conn, "2026-09-25", lessons=[{"key": "cash_drag", "kind": "fact",
+                                         "text": "后见之明"},
+                                        {"key": "later_only", "kind": "fact",
+                                         "text": "z"}])
+    conn.commit()
+    after = own_history.own_history_block(conn, arm=ARM, asof=ASOF)
+    assert json.dumps(after, ensure_ascii=False, sort_keys=True) \
+        == json.dumps(before, ensure_ascii=False, sort_keys=True)
+    # 反向对照：对 09-25 来说它是看得见的（不是「两条路都看不见」）
+    later = own_history.own_history_block(conn, arm=ARM, asof="2026-09-25")
+    assert [r["asof"] for r in later["recent_reviews"]] == \
+        ["2026-09-23", "2026-09-25"]
+
+
+def test_p85_an_empty_review_table_is_fine(conn):
+    conn.commit()
+    blk = own_history.own_history_block(conn, arm=ARM, asof=ASOF)
+    assert blk["recent_reviews"] == [] and blk["facts"] == []
+
+
+def test_p85_the_block_signature_gained_no_required_parameter(conn):
+    """T3：`own_history_block` 只许**增加可选参数** —— 老调用点一字不改仍成立。"""
+    import inspect
+    sig = inspect.signature(own_history.own_history_block)
+    required = [n for n, p in sig.parameters.items()
+                if p.default is inspect.Parameter.empty
+                and p.kind in (p.POSITIONAL_OR_KEYWORD, p.KEYWORD_ONLY)
+                and n != "conn"]
+    assert required == ["arm", "asof"]
+
+
+def test_p85_the_new_subkeys_carry_no_forward_looking_field_names(conn):
+    _review(conn, "2026-09-23", lessons=[{"key": "cash_drag", "kind": "fact",
+                                         "text": "现金拖累收益"}])
+    _review(conn, "2026-09-24", lessons=[{"key": "cash_drag", "kind": "fact",
+                                          "text": "现金拖累收益"}])
+    conn.commit()
+    blk = own_history.own_history_block(conn, arm=ARM, asof=ASOF)
+    assert blk["facts"]                                     # 确实有东西可扫
+    for key in _all_keys({"recent_reviews": blk["recent_reviews"],
+                          "facts": blk["facts"]}):
+        for banned in _FORWARD_KEYS:
+            assert banned not in key.lower(), f"复盘块里出现了前向字段：{key}"
