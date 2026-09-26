@@ -8,7 +8,16 @@
 ## 只描述，不预测（K5）
 
 放的全是**已经落下**的行（`paper_nav_daily` / `paper_trades` /
-`paper_agent_decisions`，都是 append-only、都有 `date <= asof` 的过滤）。
+`paper_agent_decisions`，都是 append-only）。**两种窗口**（P84 §0.7 修订）：
+
+- 净值 / 成交：`date <= asof`（沿用 `store.load_nav` / `load_trades`）；
+- 决策台账：**`asof` 严格早于决策日**（`asof < 决策日`）。
+
+决策窗口取严格早于决策日，是因为**当天那条决策模型自己还没生成** ——
+写进上下文既无用又自指；而且这样上下文只依赖「严格早于决策日、且已落定」的行，
+**每个决策日的上下文都可复算**，D-49 的「重放同一条决策 ⇒ 未写入」才成立
+（窗口含当天时，写下一行就改变同一天的上下文 ⇒ 重放必然 sha 不等）。
+
 块内不许出现预测价 / 目标价 / 概率 / 信号分 / 评级 / 买卖建议 / 仓位建议。
 
 ## 口径复用 `paper/store.py`
@@ -16,6 +25,8 @@
 `load_nav` / `load_trades` 已经是「只按 `date <= asof`、升序」的既有实现
 （PIT 语义在那里定死），本模块**切片取尾部**，不另写一条 SQL 去重述它 ——
 两份过滤条件迟早会漂移，而漂移的方向永远是「多看到一天」。
+决策台账不在 `store` 里（它不是净值/成交那种「账户状态重放」的输入），
+故本模块自带两条 SQL（`COUNT(*)` 与取行），窗口即上面那条**严格早于决策日**。
 
 ## 尺寸有界（K6）
 
@@ -39,11 +50,14 @@ DECISION_LIMIT = 5
 _TABLE_DECISIONS = "paper_agent_decisions"
 
 _NOTES: tuple[str, ...] = (
-    "本块只含 `arm` **自己**已经发生的历史（净值 / 成交 / 决策台账），全部 "
-    "`date <= asof`；不含任何前向字段（预测价/概率/信号分/评级/买卖建议）。",
-    "尺寸有界：净值 ≤20 行、成交 ≤10 笔、决策 ≤5 条（升序，最后一行 = asof 或"
-    "之前最近一行）；`n_nav_days` / `n_trades` / `n_decisions` 是**全量计数**，"
-    "不是切片长度。",
+    "本块只含 `arm` **自己**已经发生的历史（净值 / 成交 / 决策台账）。窗口分两种："
+    "净值与成交按 `date <= asof`（PIT 的唯一实现在 `store.load_nav` / `load_trades`），"
+    "决策台账按 **`asof` 严格早于决策日** —— 当天那条决策模型自己还没生成，"
+    "且这样每个决策日的上下文都可复算（重放同一天 ⇒ 幂等成立）。"
+    "不含任何前向字段（预测价/概率/信号分/评级/买卖建议）。",
+    "尺寸有界：净值 ≤20 行、成交 ≤10 笔、决策 ≤5 条（升序；净值/成交的最后一行 = "
+    "`asof` 或之前最近一行，决策的最后一条 = **严格早于决策日**的最近一条）；"
+    "`n_nav_days` / `n_trades` / `n_decisions` 是**全量计数**，不是切片长度。",
     "`realized_fees_total` 取最新一行净值的 `cum_cost`；没有净值行时由成交的 "
     "`fee_total` 求和 —— 两种口径都在这里写明，不静默换口径。",
 )
@@ -93,16 +107,19 @@ def _n_rejected(rejected_json: object) -> int:
 
 
 def _decisions_block(conn: sqlite3.Connection, *, arm: str, asof: str) -> tuple[list[dict], int, bool]:
-    """最近 `DECISION_LIMIT` 条决策（升序）＋ 全量条数 ＋ 「有行解析失败」标记。"""
+    """最近 `DECISION_LIMIT` 条决策（升序）＋ 全量条数 ＋ 「有行解析失败」标记。
+
+    窗口 = `asof < 决策日`（P84 §0.7 修订）：当天的决策还没生成，不算历史。
+    """
     if not _has_table(conn, _TABLE_DECISIONS):
         return [], 0, False
     total = int(conn.execute(
-        f"SELECT COUNT(*) FROM {_TABLE_DECISIONS} WHERE arm = ? AND asof <= ?",
+        f"SELECT COUNT(*) FROM {_TABLE_DECISIONS} WHERE arm = ? AND asof < ?",
         (arm, asof)).fetchone()[0])
     rows = conn.execute(
         f"SELECT decision_id, asof, decision_kind, context_sha256, n_trials,"
         f" payload_json, rejected_json FROM {_TABLE_DECISIONS}"
-        " WHERE arm = ? AND asof <= ? ORDER BY asof DESC, decision_id DESC LIMIT ?",
+        " WHERE arm = ? AND asof < ? ORDER BY asof DESC, decision_id DESC LIMIT ?",
         (arm, asof, DECISION_LIMIT)).fetchall()
     broken = False
     out: list[dict] = []
@@ -125,8 +142,9 @@ def _decisions_block(conn: sqlite3.Connection, *, arm: str, asof: str) -> tuple[
 def own_history_block(conn: sqlite3.Connection, *, arm: str, asof: str) -> dict:
     """`own_history` 块（字段照 P84 任务书 §0.6，逐字）。
 
-    `load_nav` / `load_trades` 自带 `date <= asof`（PIT 的唯一实现）；本函数
-    只做切片、取名、计数。缺表 / 空库 ⇒ 各列表为空、各计数为 0，**不抛**。
+    `load_nav` / `load_trades` 自带 `date <= asof`（PIT 的唯一实现），
+    决策台账自带 `asof < 决策日`（P84 §0.7 修订，见模块 docstring）；
+    本函数只做切片、取名、计数。缺表 / 空库 ⇒ 各列表为空、各计数为 0，**不抛**。
     """
     nav_rows = ([dict(r) for r in store.load_nav(conn, arm, asof=asof)]
                 if _has_table(conn, "paper_nav_daily") else [])

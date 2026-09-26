@@ -329,7 +329,8 @@ def build_decision_context(conn: sqlite3.Connection, *, arm: str, asof: str,
 
     `market` / `own_history`（P84 / K1）是**可选注入点**（与 `prices` 同款）：
     不给 ⇒ 本函数内部按 `asof` 现算（`market_view.market_block` /
-    `own_history.own_history_block`，都是只读、都自带 `<= asof` 过滤）。
+    `own_history.own_history_block`，都是只读、都自带 PIT 过滤 ——
+    净值/成交 `date <= asof`，决策台账 `asof < 决策日`，见 P84 §0.7）。
     注入什么就进什么 —— 「上下文里的市场/历史是哪个时刻的」只有参数化才钉得住。
     """
     check_no_lookahead(asof, marks)
