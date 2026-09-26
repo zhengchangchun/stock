@@ -21,9 +21,10 @@ from pathlib import Path
 from zoneinfo import ZoneInfo
 
 from stocklab.candidate import pools as candidate_pools
+from stocklab.candidate import replay
 from stocklab.config import paths
 from stocklab.plugin import sandbox
-from stocklab.research import xsec
+from stocklab.research import signal, xsec
 
 TZ = ZoneInfo("Asia/Shanghai")
 
@@ -99,4 +100,75 @@ def cmd_research_xsec_topn(args) -> int:
     print(f"json={json_path}")
     print(f"md={md_path}")
     print(xsec.summary_line(report))
+    return 0
+
+
+def cmd_research_rank_ic(args) -> int:
+    """`research rank-ic`（P78）：逐调仓日 rank IC ＋ 分 5 层，**只读**。
+
+    结构与 `xsec-topn` 逐条对齐：① 命令行实参 → ② 预注册（纯文件 IO） →
+    ③ 只读开库 → ④ 跑 → ⑤ 落盘 → ⑥ 打印。①② 全部发生在**开库之前**。
+    """
+    # ── ① 命令行实参（不碰库） ───────────────────────────────────────
+    if args.pool != signal.ONLY_POOL:
+        print(f"--pool 只能是 {signal.ONLY_POOL!r}（收到 {args.pool!r}）："
+              f"mid 需 32.6 年、long 需 97.9 年才够 "
+              f"{sandbox.MIN_VALID_PERIODS} 个验证周期",
+              file=sys.stderr)
+        return 2
+    if args.start < signal.MIN_START:
+        print(f"--start 不得早于 {signal.MIN_START}（收到 {args.start!r}）："
+              "窗口即结论，跑完不许改", file=sys.stderr)
+        return 2
+
+    # ── ② 预注册（纯文件 IO） ────────────────────────────────────────
+    prereg_path = Path(args.prereg)
+    try:
+        data, _sha = signal.load_prereg(prereg_path)
+        signal.validate_prereg(
+            data, pool=args.pool, start=args.start,
+            horizon=replay.REBALANCE_DAYS[args.pool],
+            universe=getattr(args, "universe", None))
+    except xsec.PreregError as exc:
+        print(f"预注册校验失败：{exc}", file=sys.stderr)
+        return 2
+
+    end = args.end or _today()
+    out_dir = Path(args.out) if args.out else signal.default_out_dir()
+    db_path = Path(args.db) if args.db else paths.DB_PATH
+
+    # ── ③ 只读开库 → ④ 跑 → ⑤ 落盘 ─────────────────────────────────
+    try:
+        conn = open_read_only(db_path)
+    except sqlite3.Error as exc:
+        print(f"打不开库（只读）：{exc}", file=sys.stderr)
+        return 2
+    try:
+        try:
+            report = signal.run_rank_ic(
+                conn, pool=args.pool, start=args.start, end=end,
+                prereg_path=prereg_path,
+                universe=getattr(args, "universe", None))
+        except xsec.PreregError as exc:
+            print(f"预注册校验失败：{exc}", file=sys.stderr)
+            return 2
+    finally:
+        conn.close()
+
+    json_path, md_path = signal.write_report(report, out_dir)
+    adj = report["ic"]["adj_score"]
+    cov = report["coverage"]
+    print(f"experiment={report['experiment']} pool={report['pool']} "
+          f"{report['start']}~{report['end']} "
+          f"universe={report['universe_id']} "
+          f"marks={report['n_marks']} periods={report['n_periods']} "
+          f"elapsed={report['elapsed_s']:.1f}s")
+    print(f"verdict={adj['verdict']} n_validate={adj['n_validate']} "
+          f"n_dates={adj['n_dates']} xsec_p50={cov['xsec_size_p50']} "
+          f"skipped={cov['n_dates_skipped']} fallback={cov['n_fwd_fallback']} "
+          f"n_no_fwd_ret={cov['n_no_fwd_ret']}")
+    print(adj["note"])
+    print(f"json={json_path}")
+    print(f"md={md_path}")
+    print(signal.summary_line(report))
     return 0

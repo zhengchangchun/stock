@@ -85,12 +85,20 @@ class PipelineResult:
     `members` 已经是「前 N 只」，截断前的集合在别处拿不到，而横截面实验的
     对照臂（持有集合 = 池内全部合格标的）需要它。这是**只增字段**：
     `members` / `rejects` / `params` 的取值与顺序一字未变。
+
+    `scored`：`{pool: [打分行…]}`，就是本模块内部**已经构造好的**那个列表
+    （含 `code` / `raw_score` / `adj_score`），`select_top` 与 `eligible` 都由它
+    派生。**这是给度量用的只读暴露，不是新的打分口径** —— `research rank-ic`
+    需要「该池全部已打分标的」（不只是前 N 只）来算 IC，而那条信息此前拿不到。
+    `score_pipeline` 的打分口径/顺序/公式一字未动。同样是**只增字段**：老构造点
+    不传即为空 dict（`frozen` ⇒ 必须给默认值）。
     """
 
     members: list
     rejects: list
     params: dict
     eligible: dict[str, list[str]] = field(default_factory=dict)
+    scored: dict[str, list[dict]] = field(default_factory=dict)
 
 
 def _hydrate(loaded: dict) -> tuple[list[snapshot.MemberRow], list[snapshot.RejectRow]]:
@@ -210,6 +218,10 @@ def score_pipeline(conn: sqlite3.Connection, *, asof: str,
     `scoring_price_mode` / `n_adj_fallback`（P77 D4，同样是只增键）：因子侧
     `ctx["bars"]` 走 PIT 复权价、判定侧（`screen`）走未复权价；后者是这一轮
     回退到未复权价的标的数（口径见 `_load_bars_adjusted`）。
+
+    `PipelineResult.scored`（P78 D2）把内部已构造好的完整打分行原样传出 ——
+    给 `research rank-ic` 度量用，**不是新的打分口径**：`select_top` 与
+    `eligible` 的派生逻辑、本函数的打分顺序与公式一字未动。
     """
     if universe_id is None:
         from stocklab.config.universes import SEED21_UNIVERSE_ID
@@ -286,7 +298,7 @@ def score_pipeline(conn: sqlite3.Connection, *, asof: str,
             members.append(snapshot.MemberRow(**row))
 
     return PipelineResult(members=members, rejects=rejects,
-                          eligible=eligible,
+                          eligible=eligible, scored=scored,
                           params={"seed_count": len(scan),
                                   "universe_id": universe_id,
                                   "members_sha256": members_sha256,
