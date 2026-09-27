@@ -20,6 +20,8 @@ docs/
 
 ### 调度与运维
 
+- [`decisions/2026-09-27-ADR-039-每周与季度调度.md`](decisions/2026-09-27-ADR-039-每周与季度调度.md) — **P89 补齐四层调度的后两层**：`ops weekly`（每周一 16:30）/ `ops quarterly`（5/1·9/1·11/1 **07:00**）两条链 + 两条 plist；asof = 最近已收盘交易日（取不到整轮拒绝）；两条链都不做非交易日跳过；`JOBS` 3→5，`/lab/ops` 页面按 `JOBS` 渲染（不再写死三条）
+
 - [`scheduling.md`](scheduling.md) — **调度链（P11）**：各时点跑什么（09:35/11:35/13:35/15:05
   `session tick`、15:30 `review daily`）、退出码含义、失败怎么办、如何补跑
   （含 `backfill-close` 用法与「历史 NULL 不碰」的语义）
