@@ -200,7 +200,368 @@ $ sqlite3 'file:/Users/zhengchangchun/Documents/Workspace/stock/data/stocklab.db
 
 ## 7. 实施记录（站填）
 
-（站填）
+开工 HEAD：`a3609e3`（与任务书写的 `a08991f` 相差 1 个 commit —— `a3609e3` 是本任务书
+自己的 docs 提交，代码侧无差异）。真库 sha 开工时 = `0f8231f0…`，与 §0.3 一致。
+
+### 7.1 落点（含行数）
+
+| 文件 | 落点 | 行 |
+|---|---|---|
+| `stocklab/candidate/run.py` | 模块 docstring：改对「`write_snapshot` 内部 commit」这句假描述（autocommit 下是空操作）＋新增「拒绝行按 `(code, stage)` 去重（在**写路径**上）」一节 | 18–21、23–30 |
+| `stocklab/candidate/run.py` | `score_pipeline` docstring：补一句「`rejects` 无损，折叠在写路径」 | 279–282 |
+| `stocklab/candidate/run.py` | **新增** `_dedup_rejects(rejects) -> (kept, dropped)`：按 `(code, stage)` 去重、保留流水线顺序第一条 | 375–399 |
+| `stocklab/candidate/run.py` | `run_candidate`：`_dedup_rejects(pipe.rejects)` ＋ `params = {**pipe.params, "n_reject_dups_dropped": n}`（420–423）；同一份 dict 落库（424–426）与返回（436） | 420–426、436 |
+| `stocklab/candidate/snapshot.py` | `from stocklab.store.db import transaction` | 28 |
+| `stocklab/candidate/snapshot.py` | `write_snapshot`：三条 INSERT 包进 `with transaction(conn):`（90），删掉裸 `conn.commit()`；docstring 写明原子性与「不能用 `with conn:`」 | 65–112 |
+| `tests/test_candidate_run_p90.py` | **新增文件**（223 行），9 条用例 | 全档 |
+| `tests/test_candidate_snapshot.py` | 新增 P90 段 4 条用例（原子性 ×2、事务不悬挂、三种 run_kind 并存） | 102–176 |
+| `tests/test_candidate_run.py` | `test_score_pipeline_matches_run_candidate_members` 的 rejects 断言改为「内核产物**按主键投影后**」 | 318–323 |
+| `tests/test_candidate_run_p77.py` | `test_p77_snapshot_params_has_two_new_keys_and_history_untouched` 的「老键」排除集合 +1 个新键（判据本身仍是「老键逐位未变」） | 254–258 |
+| `docs/decisions/2026-09-27-ADR-040-*.md` + `README.md` | 新增 ADR-040 ＋ 索引一行 | — |
+
+一份合同证据：**唯一**的 `write_snapshot` 调用方是 `run_candidate`（`run.py:424`）与
+`tests/test_labweb_candidate.py:115` 的 `_snap`，两者都**没有**先开事务 ⇒
+D3 的「若调用方已在事务里就停下」不成立、`transaction()` 不会嵌套。
+
+### 7.2 TDD 红 → 绿
+
+RED 用**最终那套用例**对**修前的两个源文件**跑：只把这两份恢复成 HEAD
+（`git stash push -- stocklab/candidate/run.py stocklab/candidate/snapshot.py`），
+测试文件保持现状；跑完 `git stash pop` 复原，`git diff --stat`
+（`run.py` 55 / `snapshot.py` 52 行改动）前后逐位一致。
+
+```
+$ .venv/bin/python -m pytest -o addopts="" -q tests/test_candidate_run_p90.py tests/test_candidate_snapshot.py
+FAILED tests/test_candidate_run_p90.py::test_kernel_keeps_both_rows_and_write_path_folds_them
+FAILED tests/test_candidate_run_p90.py::test_dedup_count_reaches_run_params
+FAILED tests/test_candidate_run_p90.py::test_dedup_count_is_zero_without_duplicates
+FAILED tests/test_candidate_run_p90.py::test_dedup_is_per_code - AttributeErr...
+FAILED tests/test_candidate_run_p90.py::test_other_stages_are_not_dropped - A...
+FAILED tests/test_candidate_run_p90.py::test_run_candidate_writes_deduped_rejects
+FAILED tests/test_candidate_run_p90.py::test_run_candidate_dedup_count_reaches_snapshot_params
+FAILED tests/test_candidate_snapshot.py::test_mid_write_failure_rolls_back_everything
+FAILED tests/test_candidate_snapshot.py::test_failure_leaves_no_fake_completed_snapshot
+9 failed, 11 passed in 2.78s
+```
+
+失败原因分档（**没有一条**是「断言写错」）：
+
+- `test_dedup_is_per_code` / `test_other_stages_are_not_dropped`：`AttributeError`
+  —— 修前根本没有 `_dedup_rejects`；
+- 其余 5 条 p90 用例：`KeyError: 'n_reject_dups_dropped'` / 计数对不上；
+- 2 条原子性用例：`{'candidate_snapshots': 1} != {…: 0}`、`assert 1 is None`
+  —— **半截快照与「假已完成」原样复现**（修前 autocommit 下 `conn.commit()`
+  是空操作，抛错也不 ROLLBACK）。
+
+端到端那一条是**真 bug 原样复现**（同一 `(code, stage)` 两行被送进 `write_snapshot`）：
+
+```
+tests/test_candidate_run_p90.py:190: in test_run_candidate_writes_deduped_rejects
+    result = candidate_run.run_candidate(conn, asof=ASOF, run_kind="weekly", now=NOW, universe=(BANK,))
+stocklab/candidate/run.py:379: in run_candidate
+    snapshot_id = snapshot.write_snapshot(
+rejects = [RejectRow(code='600036', stage='score', reason='mid池打分未通过：可用财务因子不足 2 个', plugin_id='2'),
+           RejectRow(code='600036', stage='score', reason='long池打分未通过：可用财务因子不足 2 个', plugin_id='3')]
+```
+
+GREEN（全部用例，含被波及的既有用例）：
+
+```
+$ .venv/bin/python -m pytest -o addopts="" -q tests/test_candidate_run_p90.py \
+    tests/test_candidate_snapshot.py tests/test_candidate_run.py \
+    tests/test_candidate_run_p77.py tests/test_research_factor.py \
+    tests/test_research_signal.py tests/test_candidate_replay.py
+156 passed in 9.73s
+```
+
+### 7.3 G1–G9 原始输出
+
+**G1 全量 pytest**（基线与修后，两次都真跑）
+
+```
+$ .venv/bin/python -m pytest -o addopts="" -q          # 开工前（基线，代码未改）
+3704 passed, 2 skipped in 244.95s (0:04:04)
+
+$ .venv/bin/python -m pytest -o addopts="" -q          # 修后
+3717 passed, 2 skipped in 243.18s (0:04:03)
+rc=0
+```
+
+新增用例 = 3717 − 3704 = **13** 条（`tests/test_candidate_run_p90.py` 9 条 ＋
+`tests/test_candidate_snapshot.py` 的 P90 段 4 条），≥ 8 ✓。
+
+**G2 `bash scripts/verify.sh`**（代码改完跑一次、文档写完再跑一次，两次都 rc=0；下面贴交付态那次）
+
+```
+$ bash scripts/verify.sh
+--- 4. 项目测试 ---
+  ▶ .venv/bin/python -m pytest
+3717 passed, 2 skipped in 236.63s (0:03:56)
+--- 4c. 回归红线 ---
+  ✅ predict_synthetic / predict_real_2026-09-14 / backfill_real_2013-12-23_2026-09-14
+✅ 回归红线全部成立
+--- 5. git 工作区状态 ---
+  ⚠️  有未提交改动：            ← 本轮提交前，预期
+✅ 验证通过: all
+rc=0
+（同一次末尾的 `shasum -a 256 data/stocklab.db` =
+ 0f8231f03dc3ca80b3b46cd13e16885a456a4536b835ab426f0a5c5231ae33f4）
+```
+
+**G3 `scripts/check_redlines.py`（未加 `--regen`）**
+
+```
+$ .venv/bin/python scripts/check_redlines.py
+  ✅ predict_synthetic
+       sha256 0acf35c90f54ab6a… == 基线；叶子 175 项一致（leaves_sha256 a59e8c1906bc4ce2…）
+  ✅ predict_real_2026-09-14
+       sha256 73ffbfb136e8620d… == 基线；叶子 1330 项一致（leaves_sha256 3af6008903703950…）
+  ✅ backfill_real_2013-12-23_2026-09-14
+       sha256 ddac0a889c623d75… == 基线；叶子 171 项一致（leaves_sha256 06bf461ef1234b4e…）
+✅ 回归红线全部成立
+rc=0
+```
+
+三目标 sha 前缀与叶子数与判据给的 `0acf35c9…(175)` / `73ffbfb1…(1330)` /
+`ddac0a88…(171)` 逐位相符。
+
+**G4 真库零写入**
+
+```
+跑前 / 跑后（G3 前后各一次、全部实测结束后再一次）：
+0f8231f03dc3ca80b3b46cd13e16885a456a4536b835ab426f0a5c5231ae33f4  data/stocklab.db
+```
+
+**G5 端到端（`/tmp/p90` 副本，真跑）**
+
+```
+$ cp -c data/stocklab.db /tmp/p90/copy_g5b.db
+$ .venv/bin/python -m stocklab.cli.main candidate run --run-kind weekly --asof 2026-09-24 --db /tmp/p90/copy_g5b.db
+snapshot_id=3 asof=2026-09-24 kind=weekly
+入池：短期 6 / 中期 8 / 长期 5；淘汰 4
+rc=0                                        ← 修前 rc=1（IntegrityError）
+```
+
+落库读回：
+
+```
+members=19
+rejects=4
+distinct_keys=4
+code    stage       reason_head                                        plugin_id
+------  ----------  -------------------------------------------------  ---------
+002032  pre_screen  consecutive_limit_down
+600036  score       mid池打分未通过：可用财务因子不足 2 个（缺：opera  2
+601318  score       mid池打分未通过：可用财务因子不足 2 个（缺：opera  2
+601398  score       mid池打分未通过：可用财务因子不足 2 个（缺：opera  2
+600036|1   601318|1   601398|1        ← 三家银行各恰好一行（D1 顺序判据：mid 在前）
+params_json：
+{"members_sha256": "b77cd49e…", "n_adj_fallback": 9, "n_reject_dups_dropped": 3,
+ "scoring_price_mode": "adjusted_factor_side+raw_screen", "seed_count": 21,
+ "topn": {"long": 5, "mid": 8, "short": 6}, "universe_id": "seed21"}
+```
+
+幂等重跑：
+
+```
+$ shasum -a 256 /tmp/p90/copy_g5b.db
+4208e95d6c4ede743b6e804b03fee169435e50d7e41f60d801525b3a297c4fa4
+$ .venv/bin/python -m stocklab.cli.main candidate run --run-kind weekly --asof 2026-09-24 --db /tmp/p90/copy_g5b.db
+⏭ 快照已存在（snapshot_id=3），跳过重跑        ← 走的是「已存在」路径
+snapshot_id=3 asof=2026-09-24 kind=weekly
+入池：短期 6 / 中期 8 / 长期 5；淘汰 4
+rc=0
+$ shasum -a 256 /tmp/p90/copy_g5b.db
+4208e95d6c4ede743b6e804b03fee169435e50d7e41f60d801525b3a297c4fa4   ← 逐位不变
+snapshot_id=3  members=19  rejects=4  snapshots_total=3               ← 行数不变、id 不变
+```
+
+**G6 原子性（另开一张干净副本，真制造一次写 members 中途的失败）**
+
+失败点刻意选 **`pool` 撞 `candidate_members.pool` 的 CHECK**，不用 `status` 非法 ——
+后者被 `write_snapshot` 的 pre-flight 在**开事务之前**拦掉，只能证明 pre-flight、
+证不到回滚（任务书 §G6 的原话）。探针脚本 `/tmp/p90/g6_probe.py`：先 `[GOOD, BAD]`
+两名成员（第 1 个入得了、第 2 个炸），再打印读数。
+
+```
+$ cp -c data/stocklab.db /tmp/p90/copy_g6b.db
+$ .venv/bin/python /tmp/p90/g6_probe.py /tmp/p90/copy_g6b.db
+✅ 已制造失败：sqlite3.IntegrityError: CHECK constraint failed: pool IN ('short','mid','long')
+   失败前：snapshots(2026-09-24,weekly)=0 members=0 rejects=0  [全表 members=38]
+   失败后：snapshots(2026-09-24,weekly)=0 members=0 rejects=0  [全表 members=38]
+   find_snapshot=None  conn.in_transaction=False
+probe_rc=0
+
+$ .venv/bin/python -m stocklab.cli.main candidate run --run-kind weekly --asof 2026-09-24 --db /tmp/p90/copy_g6b.db
+snapshot_id=3 asof=2026-09-24 kind=weekly
+入池：短期 6 / 中期 8 / 长期 5；淘汰 4
+rc=0
+snapshots=3
+members(2026-09-24,weekly)=19      ← 与 G5 读数逐位相同（不留「假已完成」）
+rejects(2026-09-24,weekly)=4
+params_json：… "n_reject_dups_dropped": 3 …
+```
+
+**G7 三种 `run_kind` 互不覆盖**（同一张副本，同 `asof`）
+
+```
+=== before ===            3|weekly|19|4
+$ … candidate run --run-kind light     --asof 2026-09-24 --db /tmp/p90/copy_g5b.db
+snapshot_id=4 asof=2026-09-24 kind=light      rc=0
+$ … candidate run --run-kind quarterly --asof 2026-09-24 --db /tmp/p90/copy_g5b.db
+snapshot_id=5 asof=2026-09-24 kind=quarterly  rc=0
+=== after ===             3|weekly|19|4
+                          4|light|19|4
+                          5|quarterly|19|4
+distinct_ids=3
+```
+
+**G8 反目标**
+
+```
+$ git diff --name-only
+stocklab/candidate/run.py
+stocklab/candidate/snapshot.py
+tests/test_candidate_run.py
+tests/test_candidate_run_p77.py
+tests/test_candidate_snapshot.py
+（＋新增未跟踪：tests/test_candidate_run_p90.py、docs/decisions/2026-09-27-ADR-040-*.md）
+$ git diff -- stocklab/store/schema.sql
+（空输出）
+$ git diff --stat -- stocklab/store/db.py stocklab/candidate/screen.py \
+      stocklab/candidate/score.py stocklab/candidate/risk_adjust.py \
+      stocklab/candidate/pools.py stocklab/candidate/report.py
+（空输出）
+```
+
+打分循环里两处调用**逐字未变**（`git diff` 里没有任何一行触及它们）：
+
+```
+$ grep -n "score\.score_pool(\|risk_adjust\.adjust(" stocklab/candidate/run.py
+346:            outcome = score.score_pool(conn, inst, pool, pool_ctx,
+354:            final, risks = risk_adjust.adjust(conn, outcome, pool_ctx,
+```
+
+`candidate_rejects` 的 DDL（主键 / CHECK）与两条 append-only 触发器：`schema.sql`
+整文件 diff 为空（见上）。
+
+**G9 真库现状核实（只读）**
+
+开工时**按判据原命令**跑过一次，输出就是判据给的 `2` / `0`：
+
+```
+$ sqlite3 'file:/…/data/stocklab.db?mode=ro' \
+    'SELECT count(*) FROM candidate_snapshots; SELECT count(*) FROM candidate_rejects;'
+2
+0
+```
+
+全部实测结束后再跑**同一条命令**却退出 14：
+
+```
+Error: in prepare, unable to open database file (14)
+```
+
+**这是环境行为、不是库被改动**：真库是 WAL 模式，`mode=ro` 且**不存在 `-shm`**
+时 SQLite 拒绝开库（只读连接不允许创建 `-shm`）。开工那一刻有别的进程持有
+`-shm` 所以能开；现在没有就开不了（`/tmp/p90/copy.db` 上同一个现象、同一条命令
+同样 `rc=14`）。改走 `immutable=1`（只读、不建 `-shm`、不加锁）读回同一答案，
+并以 sha 钉住库未被改动：
+
+```
+$ sqlite3 'file:/…/data/stocklab.db?mode=ro&immutable=1' \
+    'SELECT count(*) FROM candidate_snapshots; SELECT count(*) FROM candidate_rejects;'
+2
+0
+$ shasum -a 256 data/stocklab.db
+0f8231f03dc3ca80b3b46cd13e16885a456a4536b835ab426f0a5c5231ae33f4   （== 基线）
+```
+
+结论：`candidate_snapshots` 2 行（`snapshot_id=1,2`，`candidate_members` 38 行 = 19×2）、
+`candidate_rejects` 0 行，与 §0.3 的只读复核一致，**无异常**。
+
+### 7.4 `git diff --stat`
+
+```
+ docs/decisions/README.md         |  1 +
+ stocklab/candidate/run.py        | 55 ++++++++++++++++++++++++---
+ stocklab/candidate/snapshot.py   | 52 +++++++++++++++----------
+ tests/test_candidate_run.py      |  6 ++-
+ tests/test_candidate_run_p77.py  |  5 ++-
+ tests/test_candidate_snapshot.py | 82 ++++++++++++++++++++++++++++++++++++++++
+ 6 files changed, 173 insertions(+), 28 deletions(-)
+（另：新增未跟踪 tests/test_candidate_run_p90.py（9 用例）、docs/decisions/2026-09-27-ADR-040-*.md）
+```
+
+### 7.5 坑
+
+1. **`pytest -q` 与 `addopts` 叠加**会把汇总行吃掉（`verify.sh` 里已有注释）；
+   本站一律用 `-o addopts=""` 明确关掉，读数才可比。
+2. **`| tail` 会吃掉退出码**：`.venv/bin/python -m pytest … | tail -6` 的 `$?`
+   是 `tail` 的。凡要报 rc 的地方一律重定向到文件再 `echo rc=$?`。
+3. **`mode=ro` 在这台机器上对 WAL 库不可靠**（见 G9）：判据里那条命令今天能跑、
+   明天可能 `rc=14`。要么用 `immutable=1`，要么先确认有别的进程持有 `-shm`。
+4. **`sqlite3` 的 `count(*)` 要按 `snapshot_id` 过滤**：`candidate_members` 没有
+   `asof` 列，直接 `count(*)` 会把老快照的 38 行算进来（我用 `JOIN candidate_snapshots`）。
+
+### 7.6 偏离与未决
+
+**偏离 1（需要裁决，最重要）：D1 的去重落在了写路径 `run_candidate`，没有进内核
+`score_pipeline`。**
+
+任务书有两处硬约束在这里**互相矛盾**：
+
+- D2 要求把 `n_reject_dups_dropped` 写进快照 `params`；而该键只可能在
+  `score_pipeline` 里算出来（`params` 是它构造的）。
+- 但 P83 的三条**既有红线**把内核 `params` 的键集/digest 逐一钉死：
+  `test_research_factor.py::test_params_keys_unchanged`（`set(res.params)` 精确相等）、
+  `test_research_factor.py::test_default_path_digest_is_unchanged_from_head`
+  （五字段 digest == 常量）、`test_research_signal.py::
+  test_pipeline_result_exposes_scored_without_changing_derivation`（同键集）。
+  键进内核 ⇒ 三条必红；要让它们绿就得改这两个文件，而它们**不在 §1 的允许改动面**
+  （「超出即停」）。
+- 另外 `PipelineResult` 的字段列表也被 `test_research_factor.py::
+  test_pipeline_result_field_order_and_defaults_are_only_additive` 精确钉死
+  ⇒ **不能**只增一个「丢弃数」字段把计数从内核递出来。
+
+按「先找同时满足的落点」的办法，唯一能同时满足 D1/D2/G1/§1 的落点是：内核**保持
+无损**（同一 `(code, stage)` 有几行就是几行，`params` 键集真的没变 —— 三条红线
+**仍然有效，不是被放宽**），折叠与计数放在写路径 `run_candidate`。
+代价如实记：内核 rejects（真库 7 行）与落库 rejects（4 行）在有重复时**不等**。
+若派单人更想要「内核即落库形状」（代价＝改上述三个测试文件、并放宽 P83 红线的
+键集断言），请在 §8 裁决，本站按裁决改。
+
+**偏离 2（在允许面内，但改了既有用例）**：`tests/test_candidate_run.py::
+test_score_pipeline_matches_run_candidate_members` 的 rejects 断言改为
+「内核产物**按主键投影后**」与落库行相等（`_dedup_rejects(pipe.rejects)`）。
+该用例的保证（回测跑的就是生产逻辑）不变，只是把「按主键投影」这一步显式化。
+
+**偏离 3（在允许面内）**：`tests/test_candidate_run_p77.py` 的「老键」排除集合
++1 个新键。该用例的判据（`scoring_price_mode`/`n_adj_fallback` 之外的老键逐位未变）
+未被放宽，注释写明了原因。
+
+**偏离 4（口径解释）**：§1 写「`snapshot.py`（`write_snapshot` 原子化 ＋ 去重入参/计数）」。
+本站把「去重入参/计数」实现为「计数随**已有的** `params` 入参进快照」，
+`write_snapshot` 的**形参一个没加**。理由：若在 `write_snapshot` 内部去重并把计数
+注入 `params_json`，则 `RunResult.params` 的首跑路径（`= pipe.params`，无该键）会与
+幂等重跑路径（`= 读回快照`，有该键）**不一致**。`write_snapshot` 保持「写什么就是
+什么」的纯写入语义。
+
+**未决 1**：**错误日记**。CLAUDE.md 的 DoD 要求「有新教训已写入错误日记」，
+但本任务书 §1 的允许改动面**不含 `docs/errors/`**（「超出即停」）⇒ 本轮**未写**。
+两个根因都属 ERROR_DIARY #48 同型的「文档/结构在说谎」类教训
+（① 主键意图是「一个 `(code, stage)` 一行」，产出侧却产两行；
+② autocommit 连接下 `conn.commit()` 是空操作、`with conn:` 同理，
+`run.py` 的 docstring 还写着「`write_snapshot` 内部 commit」）。
+建议 nanobot 在 §8 决定是否补一条（或授权本站补）。
+
+**未决 2**：`G5` 判据里的 `rejects=4` 与 D1 的「丢的是『另一个池也拒了它』」——
+若将来报告/labweb 需要「同一标的被几个池拒了」，现在这条信息只在
+`n_reject_dups_dropped`（一个总数）里，**不再能按标的还原**。本档按 D1/D2 只增
+计数键，不新增明细字段（那要动 schema 或再加键）。
+
+**未决 3**：G9 的 `mode=ro` 环境问题（见 7.3/G9）。本站没有为了让那条命令成功而
+在真库旁边创建 `-shm`（那是对真库目录的写副作用），改用 `immutable=1` ＋ sha 对账。
 
 ---
 
