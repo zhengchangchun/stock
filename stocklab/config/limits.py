@@ -29,6 +29,13 @@ VALIDATION_MAX_DAYS: int = 30
 #: 策略冻结的最长天数（需求 02 §5 / D-28）。
 FREEZE_MAX_DAYS: int = 90
 
+#: **强制归档**的连续优化失败次数阈值（需求 00 §全局硬性约束 6 / 06 §D-6；P87 的 D5）：
+#: 「同一策略版本连续 3 次优化验证失败，强制归档，不再迭代」。
+#: 它是**读出口的判据**（`m2/lifecycle.py` 从 append-only 的判定台账 fold 出连续失败
+#: 次数），不新增任何列、不改 `branch` 的取值域 —— 归档动作仍走人工 `approve`
+#: （D-1 / D-24），本常量只决定「提示提不提」。
+STRATEGY_FAIL_STREAK_LIMIT: int = 3
+
 
 class PlanOutOfBounds(ValueError):
     """AI / 调用方给的周期或冻结方案不满足主干边界。**不 clamp**，直接拒绝。"""

@@ -43,6 +43,7 @@ import sqlite3
 
 from stocklab.config import limits
 from stocklab.m2 import config as m2_config
+from stocklab.m2 import lifecycle
 from stocklab.m2 import selfeval
 from stocklab.m2 import store as m2_store
 from stocklab.paper import store as paper_store
@@ -294,6 +295,15 @@ def judge(conn: sqlite3.Connection, *, cycle_id: int, asof: str, fix_kind: str,
     `--freeze-days` 的边界校验在**入口**、在进任何分支之前：与 `--fix-kind` 无关、
     与「是否已有判定行」无关（P59 收的两个口子都出在这里）。越界 ⇒ 退出码 2 ＋
     **零写入**；`FREEZE_MAX_DAYS` 的数值一个字不改 —— 改的只是这道校验的位置。
+
+    ## 生命周期是**附加读**，不是改判（P87 / D6 + D8）
+
+    `evidence.lifecycle` 是 `m2/lifecycle.py` 从既有判定台账 fold 出来的
+    （连续优化失败次数 / 冻结到期日）。它的**唯一作用**是：`fail_streak` 达到
+    `STRATEGY_FAIL_STREAK_LIMIT` 时，在 `evidence` 里置 `force_archive` 并往
+    `actions` **追加一句**归档建议。`branch` / `conclusion` 的计算路径**逐位不变**
+    （`archive` 不是新分支，D-44 的规则表与 `branch` 的 CHECK 一个字不改），
+    归档动作仍然要人 `approve`（D-1/D-24）—— 本函数**绝不自动归档**。
     """
     from stocklab.labweb import m2_data
 
@@ -316,11 +326,16 @@ def judge(conn: sqlite3.Connection, *, cycle_id: int, asof: str, fix_kind: str,
         excess=readings["excess_vs_index_300"], cases=cases,
         fix_kind=str(fix_kind),
         freeze_days=(None if freeze_days is None else int(freeze_days)))
+    life = lifecycle.evidence_block(conn, int(cycle["script_id"]), date)
+    actions = list(verdict["actions"])          # D8：只许**追加**，不改既有元素
+    if life["force_archive"]:
+        actions.append(life["archive_action"])
     evidence = {**verdict["evidence"], "reason": verdict["reason"],
-                "actions": list(verdict["actions"]),
+                "actions": actions,
                 "conclusion": bool(verdict["conclusion"]),
                 "readings_window": list(readings["window"]),
-                "criteria_text": str(cycle["criteria_text"])}
+                "criteria_text": str(cycle["criteria_text"]),
+                "lifecycle": life}
     try:
         judgement_id = m2_store.insert_judgement(
             conn, cycle_id=int(cycle["cycle_id"]),
@@ -338,7 +353,7 @@ def judge(conn: sqlite3.Connection, *, cycle_id: int, asof: str, fix_kind: str,
         "asof": date, "branch": verdict["branch"],
         "branch_label": verdict["branch_label"],
         "conclusion": bool(verdict["conclusion"]), "reason": verdict["reason"],
-        "actions": list(verdict["actions"]), "evidence": evidence,
+        "actions": actions, "evidence": evidence,
         "criteria_text": str(cycle["criteria_text"]),
         "note": ("**建议不是执行**：本命令不改策略版本状态、不改账户、不改参数；"
                  "三个分支的落地动作一律要人 `approve`（D-1/D-24）"),

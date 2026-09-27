@@ -3736,6 +3736,32 @@ def _m2_conn(args):
     return conn, None
 
 
+def _m2_ro_conn(args):
+    """**只读**打开模块2 的库（`file:…?mode=ro`）：不前滚 schema、不建文件。
+
+    P87 的两条 `m2 lifecycle` 命令是纯读出口。走 `_m2_conn` 会先调
+    `ensure_schema` —— 那是一次写库（真库本次零写入），而且会把「库不存在」
+    变成「库被建出来」（一个读命令不该有建文件的副作用）。
+    URI 必须是**绝对路径**：`mode=ro` 对相对路径会受 CWD 影响，读错库比报错更糟。
+    """
+    db = Path(args.db) if args.db else paths.DB_PATH
+    if not db.exists():
+        print(json.dumps({"error": "db not found; run `stocklab db init`"},
+                         ensure_ascii=False), file=sys.stderr)
+        return None, 2
+    conn = sqlite3.connect(f"file:{db.resolve()}?mode=ro", uri=True)
+    conn.row_factory = sqlite3.Row
+    exists = conn.execute(
+        "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name = ?",
+        ("m2_judgements",)).fetchone()[0]
+    if not exists:
+        conn.close()
+        print(json.dumps({"error": "m2_judgements 表不存在 —— 先跑 `stocklab db init`"
+                                   " 前滚 schema"}, ensure_ascii=False), file=sys.stderr)
+        return None, 2
+    return conn, None
+
+
 def _m2_exit(result: dict) -> int:
     status = result.get("status")
     if status in ("ran", "already"):
@@ -4184,7 +4210,86 @@ def cmd_m2_cycle_status(args: argparse.Namespace) -> int:
     return 0
 
 
+def _lifecycle_show_text(payload: dict) -> str:
+    """`m2 lifecycle show` 的人话摘要（`--json` 之外那一面）。"""
+    due = "（无）" if payload["freeze_due"] is None else payload["freeze_due"]
+    lines = [
+        f"策略版本 {payload['script_id']}（asof {payload['asof']}）",
+        f"  连续优化失败：{payload['fail_streak']} / 阈值 {payload['limit']}"
+        + ("  ⇒ 建议强制归档" if payload["force_archive"] else ""),
+        f"  冻结到期日：{due}",
+        f"  说明：{payload['note']}",
+    ]
+    if payload["archive_reason"]:
+        lines.append(f"  ⚠ {payload['archive_reason']}")
+    if payload["tail"]:
+        lines.append("  尾部判定（最新在前）：")
+        lines += [f"    {row['asof_date']}  {row['branch_label']}（{row['branch']}）"
+                  f"  冻结期={row['freeze_days']}" for row in payload["tail"]]
+    else:
+        lines.append("  尾部判定：无（该策略版本还没有任何判定行）")
+    return "\n".join(lines) + "\n"
+
+
+def _lifecycle_due_text(payload: dict) -> str:
+    """`m2 lifecycle due` 的人话摘要。"""
+    rows = payload["due"]
+    if not rows:
+        return f"asof {payload['asof']}：没有到期的冻结版本（n_due=0）\n"
+    lines = [f"asof {payload['asof']}：{payload['n_due']} 个冻结版本已到点"]
+    lines += [f"  策略版本 {row['script_id']}：冻结判定 {row['asof_date']}"
+              f"（{row['freeze_days']} 天）⇒ 到期 {row['due']}，"
+              f"已过期 {row['overdue_days']} 天" for row in rows]
+    lines.append("  说明：到期只表示「该重评了」—— 开启新一轮验证周期要人工发起"
+                 "（P87 不自动建周期）")
+    return "\n".join(lines) + "\n"
+
+
+def cmd_m2_lifecycle_show(args: argparse.Namespace) -> int:
+    """某策略版本的派生生命周期（**只读**）：连续优化失败次数 + 冻结到期日。"""
+    from stocklab.m2 import lifecycle as m2_lifecycle
+
+    conn, code = _m2_ro_conn(args)
+    if conn is None:
+        return code
+    try:
+        payload = m2_lifecycle.snapshot(
+            conn, args.script_id, args.asof or _show_today(args))
+    except ValueError as exc:
+        return _cycle_fail(exc)
+    finally:
+        conn.close()
+    if args.json:
+        print(json.dumps(payload, ensure_ascii=False, sort_keys=True, indent=2))
+        return 0
+    sys.stdout.write(_lifecycle_show_text(payload))
+    return 0
+
+
+def cmd_m2_lifecycle_due(args: argparse.Namespace) -> int:
+    """到期或已过期的冻结版本清单（**只读**，按 `script_id` 去重）。"""
+    from stocklab.m2 import lifecycle as m2_lifecycle
+
+    conn, code = _m2_ro_conn(args)
+    if conn is None:
+        return code
+    try:
+        asof = args.asof or _show_today(args)
+        rows = m2_lifecycle.due_freezes(conn, asof)
+    except ValueError as exc:
+        return _cycle_fail(exc)
+    finally:
+        conn.close()
+    payload = {"asof": asof, "n_due": len(rows), "due": rows}
+    if args.json:
+        print(json.dumps(payload, ensure_ascii=False, sort_keys=True, indent=2))
+        return 0
+    sys.stdout.write(_lifecycle_due_text(payload))
+    return 0
+
+
 # ---------- parser ----------
+
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="stocklab", description="stock-lab CLI")
@@ -5170,6 +5275,30 @@ def build_parser() -> argparse.ArgumentParser:
     m2_cyc_status.add_argument("--cycle", type=int, required=True)
     m2_cyc_status.add_argument("--db")
     m2_cyc_status.set_defaults(func=cmd_m2_cycle_status)
+
+    m2_life = m2_sub.add_parser(
+        "lifecycle", help="策略生命周期（P87）：连续优化失败次数 / 冻结到期 —— "
+                          "**派生只读**，数据全部从判定台账 fold 出来")
+    m2_life_sub = m2_life.add_subparsers(dest="m2_lifecycle_action", required=True)
+
+    m2_life_show = m2_life_sub.add_parser(
+        "show", help="某策略版本的失败连胜 + 冻结到期日（只读；无冻结记录时 "
+                     "freeze_due=null）")
+    m2_life_show.add_argument("--script", dest="script_id", type=int, required=True,
+                              help="策略版本（`plugin_scripts.script_id`）")
+    m2_life_show.add_argument("--asof", help="PIT 截止日 YYYY-MM-DD（默认：今天）")
+    m2_life_show.add_argument("--json", action="store_true", help="打完整载荷（JSON）")
+    m2_life_show.add_argument("--db")
+    m2_life_show.add_argument("--now", help="覆盖当前时刻（测试用；不带 --asof 时推今天）")
+    m2_life_show.set_defaults(func=cmd_m2_lifecycle_show)
+
+    m2_life_due = m2_life_sub.add_parser(
+        "due", help="到期或已过期的冻结版本清单（只读；按 script_id 去重）")
+    m2_life_due.add_argument("--asof", help="PIT 截止日 YYYY-MM-DD（默认：今天）")
+    m2_life_due.add_argument("--json", action="store_true", help="打完整载荷（JSON）")
+    m2_life_due.add_argument("--db")
+    m2_life_due.add_argument("--now", help="覆盖当前时刻（测试用；不带 --asof 时推今天）")
+    m2_life_due.set_defaults(func=cmd_m2_lifecycle_due)
 
     m2_attr = m2_sub.add_parser(
         "attribute", help="误差归因（P50 / D-31）：程序只给候选，结论只能人工确认")
