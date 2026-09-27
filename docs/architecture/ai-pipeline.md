@@ -329,3 +329,48 @@ disclosure, non_goals, counter_arm` ＋ **P84 末尾追加** `market, own_histor
   **`asof` 严格早于决策日**（`asof < 决策日`）；净值 / 成交仍 `date <= asof`
   （唯一实现在 `store.load_nav` / `load_trades`，未改）。理由：窗口含当天会与 D-49 的
   「重放同一条决策 ⇒ 未写入」互斥（详见 ADR-035 修订段）。
+
+## 7. 复盘闭环（P85 / ADR-036）
+
+P84 让 AI **看得见**市场与自己的历史；P85 让它**写得下**复盘，并把反复出现的教训
+回注下一轮。三个命令、一张表、两个子键：
+
+```
+paper agent review  --asof <日> --arm <臂> --file <review.json>   # 写（证据必须能在库里核到）
+paper agent reviews --arm <臂> [--limit N]                        # 只读列出（含 payload 全文）
+paper agent facts   --arm <臂> [--asof <日>]                      # 只读打印已确认教训（纯函数）
+```
+
+新表 `paper_agent_reviews`（append-only，两只触发器，幂等键 `(arm, asof, kind)`；
+重复写 ⇒ exit 1、零写入）。载荷里每条 `claim` 必须挂一条证据指针，写入口**回库核对**：
+
+| kind | 校验 | 落空 |
+|---|---|---|
+| `decision` | `decision_id` 存在 + `arm` 相符 + `asof <= 复盘日` | exit 2 |
+| `trade` | `trade_id` 存在 + `account_id == arm` + `date <= 复盘日` | exit 2 |
+| `metric` | 七列白名单之一 + 该臂该日有净值行 + **`value` 与库里读数差 ≤ 1e-6** | exit 2 |
+| `market` | `field` 在**当日 `market` 块**的标量路径里（动态枚举）+ **`value` 与块里一致** | exit 2 |
+
+**读数不许编**：`value` 差 0.01、引用不存在的 `decision_id`/`trade_id`、引用
+`asof` 之后的行、`market.field` 不存在、载荷多一个未知键 —— 全部 exit 2、**一行都不写**。
+载荷是**结构白名单**（`additionalProperties: false`）⇒ 「改参数」这种字段
+**在结构上就写不进来**（`NON_GOALS` 末尾那条把这个边界也写进给模型看的输入）。
+
+回注（`own_history` 末尾**追加两个子键**，既有子键逐位不变）：
+
+| 子键 | 内容 | 规则 |
+|---|---|---|
+| `recent_reviews` | `{asof,kind,context_sha256,n_items,n_lessons,items,lessons}` | 最近 **≤3** 条，升序，原样搬运 |
+| `facts` | `{key,text,seen_at,conflict[,texts]}` | 同一 `key` 在 **≥2 条不同 `asof`** 的复盘里出现过才进；`text` 取最新；`text` 不一致 ⇒ `conflict:true` 且原文全列；**≤10** 条（超出按 `seen_at` 条数降序、再按 `key` 字典序截断） |
+
+两块都受 PIT 约束（`asof <= 决策日`）：**给 `asof` 之后加一条复盘 ⇒ `own_history`
+与 `decision_context_sha256` 逐字节不变**。`derive_facts` 是**纯函数**（无时间戳、
+无自增 id），同库两次调用逐字节相同。`DECISION_HASHED_KEYS` 与 `build_context`
+**零改动**（两块挂在已有的 `own_history` 里，自动进指纹）。
+
+`context_sha256` 记的是**写这条复盘之前**的上下文指纹 —— 写完之后这条复盘自己就在
+`own_history.recent_reviews` 里，事后现算必然是另一个值（自指）。
+
+- 2026-09-27: 补 P85 —— 复盘台账 `paper_agent_reviews` ＋ `paper agent review/reviews/facts`
+  ＋ `own_history.recent_reviews/facts`（ADR-036）。执行层（`rules.py` / `config.py` 常量 /
+  `engine.py` 的执行函数）零改动；`NON_GOALS` 末尾追加 K6 那一条。
