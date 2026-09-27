@@ -1,4 +1,17 @@
-"""`ops close` / `ops monthly`（P38）：把定时任务的**执行顺序**也搬进项目。
+"""`ops close` / `ops monthly`（P38）＋ `ops weekly` / `ops quarterly`（P89）：
+把定时任务的**执行顺序**也搬进项目。
+
+## 四条链的 asof 语义（P89 加的两条与收盘链**刻意不同**）
+
+| 链 | asof | 为什么 |
+|---|---|---|
+| `close` | **运行当天** | 它负责把当天数据落地；收盘前拒绝执行（半截 bar 是 append-only） |
+| `monthly` / `weekly` / `quarterly` | **最近已收盘交易日** | 维护/汇总活：读某一天的数据做汇总，运行当天可能休市（10-05 恰好是周一、国庆） |
+
+`weekly` / `quarterly` 的 asof **取不到就整轮拒绝**（exit 2，`resolve_asof` 的
+fail-closed）：猜一个日期跑会得到一份**看起来正常的空报告**，而且不报错。
+两条链都**不做非交易日跳过**（与 `monthly` 同构）：休市周跑出来的是与上周同样的
+读数 —— 无害、可复核；跳过反而会「连续两周没扫」。详见 D2 / D3。
 
 ## 为什么要搬（还有一次真出过的事故）
 
@@ -52,18 +65,20 @@
 from __future__ import annotations
 
 import sqlite3
+import time
 from datetime import datetime
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
 from stocklab.config import paths
-from stocklab.ops import journal
+from stocklab.ops import journal, window_report
 from stocklab.ops.patrol import check_db, ro_connect, session_day
 from stocklab.ops.runner import (EXIT_ANOMALY, EXIT_BLOCKED, EXIT_OK, Step,
                                  cross_db_refusal, default_runner, run_steps,
                                  worst_code)
 from stocklab.session.tick import is_trade_date_closed
 from stocklab.store.migrate import backup_db
+from stocklab.verify.pending import CLOSED_RULE, latest_closed_session
 
 TZ = ZoneInfo("Asia/Shanghai")
 
@@ -154,6 +169,95 @@ MONTHLY_STEPS: tuple[Step, ...] = (
 MONTHLY_STEP_BY_NAME: dict[str, Step] = {s.name: s for s in MONTHLY_STEPS}
 MONTHLY_STEP_ORDER: tuple[str, ...] = tuple(s.name for s in MONTHLY_STEPS)
 
+#: 周/季度链整轮预算（P89）：候选池全量重打分 + 财报复核都是长跑，给 30 分钟。
+WEEKLY_TIMEOUT_S = 1800.0
+QUARTERLY_TIMEOUT_S = 1800.0
+
+#: 汇总报告那一步的**名字**（它不是子进程，由链自己渲染 —— 见 `_render_step`）。
+WEEKLY_REPORT_STEP = "weekly_report"
+QUARTERLY_REPORT_STEP = "quarterly_report"
+
+#: 每周全量扫描（B3，07 需求任务 3）＝ 5 步 + 汇总报告。
+#:
+#: **与收盘链的关键区别是 asof**：收盘链写**运行当天**（它负责把当天数据落地），
+#: 周链是**读**当天数据做汇总 ⇒ `asof = 最近已收盘交易日`（D2）。理由是运行当天
+#: 可能休市：10-05 恰好是周一、国庆休市，拿当天当 asof 会让「全量扫描」扫一个
+#: 没有数据的日期。**两条链都不做非交易日跳过**（D3，与 `ops monthly` 同构）：
+#: 休市周跑出来的是与上周同样的读数 —— 无害、可复核；跳过反而会「连续两周没扫」。
+WEEKLY_STEPS: tuple[Step, ...] = (
+    Step("candidate_run", ("candidate", "run", "--run-kind", "weekly",
+                           "--asof", "{asof}"), True,
+         "模块1 全流程 → 新快照（PIT：只用 <= asof 的数据）。**阻断** —— "
+         "它没跑成，这一周的「新增/剔除合格标的」就没发生"),
+    Step("candidate_review", ("candidate", "review", "--asof", "{asof}"), True,
+         "插桩5「定期复盘分析」（P58）：错判案例回流台账，落 "
+         "`reports/plugin-review/<asof>.md`。**非阻断**（同月链：派生读数，"
+         "失败不该把整条扫描判红，但仍逐条记进回执的 steps/anomalies）",
+         blocking=False),
+    Step("m2_report", ("m2", "report", "--asof", "{asof}"), True,
+         "双账户 + 双基准绩效读数（**只读**；与 `/lab/m2` 同一个取数函数）。"
+         "**实测**：长文本走 stdout、那一行紧凑 JSON 走 **stderr 末尾** ——"
+         "汇总报告直接引用那一行（见 `ops/window_report.py`），不重算"),
+    Step("m2_lifecycle_due", ("m2", "lifecycle", "due", "--asof", "{asof}"), True,
+         "冻结到期 / 已过期的策略版本清单（P87，只读）。**阻断** —— 失败说明"
+         "判定台账读不了，季度复盘的前提就不成立"),
+    Step("plugin_list", ("plugin", "list"), True,
+         "在飞版本清单与状态（只读）。季度报告据此列出「待人工决定是否跑 "
+         "`plugin sandbox`」，本档**不自动**跑批"),
+    Step(WEEKLY_REPORT_STEP, (), True,
+         "汇总报告（本档新增的**渲染**步骤，不是子进程）：把上面 5 步的 stdout 载荷 "
+         "+ `m2 report` 的 JSON 汇总成 `<报告根>/weekly/<asof>-weekly.md`。"
+         "**只汇总，不重算**；写不出来只记 exit 1，不把「链跑完了」改写成「链挂了」"),
+)
+
+WEEKLY_STEP_BY_NAME: dict[str, Step] = {s.name: s for s in WEEKLY_STEPS}
+WEEKLY_STEP_ORDER: tuple[str, ...] = tuple(s.name for s in WEEKLY_STEPS)
+
+#: 季度深度复盘（B4，07 需求任务 4）＝ 6 步 + 汇总报告。
+#:
+#: 与周链的区别：多**基本面复核**（财报复核 → 重估基本面）与**全量重打分**
+#: （`--run-kind quarterly`），以及归因候选扫描（`m2 attribute scan`，落库但只给候选）。
+#: 时刻表在法定披露截止日之后（4/30、8/31、10/31 的次日），见 `ops/schedule.py`。
+#:
+#: **本档刻意不做**（D7，都不是遗漏）：① 自动开新验证周期（P87 留待用户拍板，
+#: 这里只出到期清单）；② 全量 `plugin sandbox` 跑批（一次一个 script_id、离线回放，
+#: 很贵且是人工判断）；③ 集中度打分（新口径，只出 `portfolio show` 原始读数）。
+QUARTERLY_STEPS: tuple[Step, ...] = (
+    Step("ingest_financials", ("ingest", "financials"), False,
+         "东财三表全量复核（已入库的期数 rows=0）→ 重估基本面。**阻断** —— "
+         "它是本链与周链唯一的实质差别"),
+    Step("candidate_run", ("candidate", "run", "--run-kind", "quarterly",
+                           "--asof", "{asof}"), True,
+         "模块1 **全量重打分**（`--run-kind quarterly`）→ 新快照。**阻断**"),
+    Step("m2_report", ("m2", "report", "--asof", "{asof}"), True,
+         "双账户 + 双基准绩效读数（只读；读数 JSON 在 stderr 末尾，见 window_report）"),
+    Step("m2_lifecycle_due", ("m2", "lifecycle", "due", "--asof", "{asof}"), True,
+         "冻结到期 / 已过期清单（只读）。**阻断**"),
+    Step("m2_attribute_scan", ("m2", "attribute", "scan", "--asof", "{asof}"), True,
+         "误差归因**候选**扫描（P50：程序只给候选、**不写结论**；结论只能人工确认）。"
+         "**非阻断** —— 归因候选是派生读数", blocking=False),
+    Step("plugin_list", ("plugin", "list"), True,
+         "在飞版本清单与状态（只读）；报告据此列出「待人工决定是否跑 "
+         "`plugin sandbox`」"),
+    Step("portfolio_show", ("portfolio", "show", "--asof", "{asof}"), True,
+         "持仓**原始读数**（只读）。D7：07 任务4 item4 的「行业集中度 / 单票仓位风险」"
+         "本档**只出原始读数**，不做集中度打分（那是新口径，须另立任务书）。"
+         "**非阻断** —— 它 exit 1 的含义是「缺现价或纪律 FAIL，要人来看」（见 `--help`），"
+         "不是链断", blocking=False),
+    Step(QUARTERLY_REPORT_STEP, (), True,
+         "汇总报告（**渲染**步骤）：`<报告根>/quarterly/<asof>-quarterly.md`。"
+         "**只汇总，不重算**"),
+)
+
+QUARTERLY_STEP_BY_NAME: dict[str, Step] = {s.name: s for s in QUARTERLY_STEPS}
+QUARTERLY_STEP_ORDER: tuple[str, ...] = tuple(s.name for s in QUARTERLY_STEPS)
+
+#: `job` → 这条链的完整步骤数（`summary_line` 的 `steps=n/total` 用）。
+STEP_TOTALS: dict[str, int] = {
+    "close": len(CLOSE_STEPS), "monthly": len(MONTHLY_STEPS),
+    "weekly": len(WEEKLY_STEPS), "quarterly": len(QUARTERLY_STEPS),
+}
+
 
 def _as_datetime(value: datetime | str) -> datetime:
     dt = value if isinstance(value, datetime) else datetime.fromisoformat(str(value))
@@ -175,6 +279,167 @@ def _bars_rows(db_path: Path, trade_date: str) -> int | None:
     return int(row[0]) if row else 0
 
 
+def resolve_asof(db_path: Path | str, now: str) -> tuple[str | None, dict]:
+    """`(最近已收盘交易日, 证据)`；判不出 / 读不了 → `(None, 证据)`。
+
+    **fail-closed**（D2）：取不到就整轮拒绝，不许猜一个日期跑 —— 周/季度链是
+    「读某一天的数据做汇总」，猜错日期得到的是一份**看起来正常的空报告**，
+    而它不会报错（ERROR_DIARY #83 同族：不报错、不丢数据，只是数字没意义）。
+
+    判定**复用** `verify.pending.latest_closed_session` —— 与 `patrol.check_db`
+    是**同一个函数**（不是同一套规则的两次实现）：它已经在算「最新已收盘交易日」，
+    并且拿 `session.tick.load_calendar` / `is_trade_date_closed` 做两侧证据
+    （日历侧 `closed_through`、行情侧 `bars_daily` 且已收盘）。再写一遍就多一处会分叉。
+    """
+    try:
+        conn = ro_connect(Path(db_path))
+    except sqlite3.Error as exc:
+        return None, {"rule": CLOSED_RULE, "now": now,
+                      "error": f"{type(exc).__name__}: {exc}"}
+    try:
+        return latest_closed_session(conn, now)
+    except sqlite3.Error as exc:                # 表不存在（老库未前滚）等
+        return None, {"rule": CLOSED_RULE, "now": now,
+                      "error": f"{type(exc).__name__}: {exc}"}
+    finally:
+        conn.close()
+
+
+def _render_step(steps_out: list[dict], *, step: Step, kind: str, db: Path,
+                 asof: str, now: str, report_dir: Path | str | None,
+                 asof_evidence: dict) -> dict:
+    """跑「汇总报告」这一步，返回一个与 `runner` 同形的步骤结果（**不抛异常**）。
+
+    它不是子进程：`run_steps` 是给 CLI 命令用的（见 `ops/runner.py` 的模块
+    docstring），而汇总报告是**本档新增的渲染**，没有对应的命令可调（D1 不许为
+    「凑齐需求条目」新写业务命令）。所以它写在链里，但结果形状与别的步**逐字段一致**
+    —— 页面、回执、`summary_line` 都按同一种形状读，不为它开一个特例。
+    """
+    started = time.monotonic()
+    try:
+        out = window_report.write_report(
+            kind=kind, asof=asof, now=now, db=str(db), steps=steps_out,
+            report_dir=report_dir, asof_evidence=asof_evidence)
+    except OSError as exc:              # write_report 已兜住，这里是最后一道
+        out = {"path": None, "error": f"{type(exc).__name__}: {exc}"}
+    duration = round(time.monotonic() - started, 3)
+    written = out.get("path") is not None
+    return {"name": step.name, "why": step.why, "blocking": step.blocking,
+            "args": [], "exit_code": EXIT_OK if written else EXIT_ANOMALY,
+            "timeout": False, "duration_s": duration,
+            "report_path": out.get("path"),
+            "stdout_tail": (f"报告已写入 {out['path']}" if written else ""),
+            "stderr_tail": (out.get("error") or "")}
+
+
+def _run_window_chain(*, job: str, kind: str, order: tuple[str, ...],
+                      step_by_name: dict[str, Step], report_step: str,
+                      timeout_s: float, db_path: Path | str | None, now: str | None,
+                      runner, report_dir: Path | str | None) -> dict:
+    """周/季度链的公共骨架（**顺序：asof → 跨库守卫 → 逐步 → 渲染 → 事后体检 → 回执**）。
+
+    两条链逐字段同构，差别只在 `order` / `kind` —— 所以骨架共用，步骤表分开。
+    这正是 `ops close` / `ops monthly` 的关系，不是新抽象。
+    """
+    started_at = datetime.now(TZ).isoformat(timespec="seconds")
+    stamp = now or started_at
+    db = Path(db_path) if db_path else paths.DB_PATH
+    runner = runner or default_runner
+    payload: dict = {"job": job, "now": stamp, "db": str(db)}
+
+    if not db.exists():
+        payload.update({
+            "error": f"库不存在（{db}）；先跑 `stocklab db init`", "steps": [],
+            "anomalies": [{"kind": "db_missing", "detail": f"{db} 不存在"}],
+            "exit_code": EXIT_BLOCKED, "ok": False,
+        })
+        return payload
+
+    asof, evidence = resolve_asof(db, stamp)
+    payload["asof"], payload["asof_evidence"] = asof, evidence
+    if asof is None:
+        reason = ("取不到「最近已收盘交易日」→ 整轮拒绝（fail-closed）："
+                  f"{evidence.get('error') or '日历与行情两侧都没有证据'}。"
+                  "本链是读某一天的数据做汇总，猜一个日期跑会得到一份**看起来正常的"
+                  "空报告**，且不会报错")
+        anomalies = [{"kind": "asof_unavailable", "detail": reason}]
+        payload.update({"error": reason, "steps": [], "anomalies": anomalies,
+                        "exit_code": EXIT_BLOCKED, "ok": False})
+        return _seal(payload, db=db, stamp=stamp, started_at=started_at,
+                     report_dir=report_dir, job=job)
+
+    refusal = cross_db_refusal(db, list(order), step_by_name, what=f"ops {job}")
+    if refusal:
+        payload.update({
+            "refused": refusal, "steps": [],
+            "anomalies": [{"kind": "cross_db_refused", "detail": refusal}],
+            "exit_code": EXIT_BLOCKED, "ok": False,
+        })
+        return _seal(payload, db=db, stamp=stamp, started_at=started_at,
+                     report_dir=report_dir, job=job)
+
+    run_names = [name for name in order if name != report_step]
+    steps_out, aborted = run_steps(run_names, registry=step_by_name, runner=runner,
+                                   db_path=db, now=stamp, asof=asof,
+                                   timeout_s=timeout_s)
+    if aborted:
+        payload["aborted"] = aborted
+    steps_out.append(_render_step(steps_out, step=step_by_name[report_step],
+                                  kind=kind, db=db, asof=asof, now=stamp,
+                                  report_dir=report_dir, asof_evidence=evidence))
+
+    after = check_db(db, stamp, report_dir=report_dir)
+    anomalies = _step_anomalies(steps_out)
+    if steps_out[-1].get("report_path") is None:
+        anomalies.append({"kind": "report_failed", "step": report_step,
+                          "detail": steps_out[-1].get("stderr_tail")
+                          or "汇总报告没写出来"})
+    payload.update({
+        "steps": steps_out,
+        "report": steps_out[-1].get("report_path"),
+        "after": {k: after[k] for k in ("checks", "titles", "verdict",
+                                        "calendar", "latest_closed_session",
+                                        "anomalies", "exit_code", "ok")},
+        "anomalies": anomalies,
+        "exit_code": max(worst_code(steps_out, aborted), after["exit_code"]),
+    })
+    payload["ok"] = payload["exit_code"] == EXIT_OK
+    return _seal(payload, db=db, stamp=stamp, started_at=started_at,
+                 report_dir=report_dir, job=job)
+
+
+def run_weekly(*, db_path: Path | str | None = None, now: str | None = None,
+               runner=None, timeout_s: float = WEEKLY_TIMEOUT_S,
+               report_dir: Path | str | None = None) -> dict:
+    """每周全量扫描（B3，周一 16:30）＝ 5 步 + 汇总报告；`asof = 最近已收盘交易日`。
+
+    退出码与既有链同构（D9）：0 全绿（含**休市日照跑**）/ 1 链跑完但有非 0 步或
+    事后体检 `missing`/`stale` / 2 断链（库不在 / **取不到 asof** / 某步 ≥2 /
+    预算用尽 / 跨库守卫拒）。
+
+    `runner` 是注入点（测试用假执行器，绝不真起子进程）。
+    """
+    return _run_window_chain(
+        job="weekly", kind="weekly", order=WEEKLY_STEP_ORDER,
+        step_by_name=WEEKLY_STEP_BY_NAME, report_step=WEEKLY_REPORT_STEP,
+        timeout_s=timeout_s, db_path=db_path, now=now, runner=runner,
+        report_dir=report_dir)
+
+
+def run_quarterly(*, db_path: Path | str | None = None, now: str | None = None,
+                  runner=None, timeout_s: float = QUARTERLY_TIMEOUT_S,
+                  report_dir: Path | str | None = None) -> dict:
+    """季度深度复盘（B4，5/1 + 9/1 + 11/1 09:00）＝ 6 步 + 汇总报告。
+
+    退出码语义、asof 取法与 `run_weekly` **逐字相同**（同一条骨架）。
+    """
+    return _run_window_chain(
+        job="quarterly", kind="quarterly", order=QUARTERLY_STEP_ORDER,
+        step_by_name=QUARTERLY_STEP_BY_NAME,
+        report_step=QUARTERLY_REPORT_STEP, timeout_s=timeout_s, db_path=db_path,
+        now=now, runner=runner, report_dir=report_dir)
+
+
 def _seal(payload: dict, *, db: Path, stamp: str, started_at: str,
           report_dir: Path | str | None, job: str) -> dict:
     """写回执（`<报告根>/ops/latest-<job>.json` + `job_runs` 一行）并把结果塞回载荷。"""
@@ -192,7 +457,7 @@ def summary_line(payload: dict) -> str:
         return (f"{job}: blocked exit={payload.get('exit_code')}"
                 f"（{payload.get('error') or payload.get('refused')}）")
     steps = payload.get("steps") or []
-    total = len(CLOSE_STEPS if job == "close" else MONTHLY_STEPS)
+    total = STEP_TOTALS.get(job, 0)
     bad = [f"{s['name']}={s.get('exit_code')}" for s in steps
            if s.get("exit_code") != 0]
     after = (payload.get("after") or {}).get("exit_code")
@@ -390,4 +655,9 @@ def run_monthly(*, db_path: Path | str | None = None, now: str | None = None,
 __all__ = ["CLOSE_STEPS", "CLOSE_STEP_BY_NAME", "CLOSE_STEP_ORDER",
            "CLOSE_TIMEOUT_S", "MONTHLY_STEPS", "MONTHLY_STEP_BY_NAME",
            "MONTHLY_STEP_ORDER", "MONTHLY_TIMEOUT_S",
-           "run_close", "run_monthly", "summary_line"]
+           "QUARTERLY_REPORT_STEP", "QUARTERLY_STEPS", "QUARTERLY_STEP_BY_NAME",
+           "QUARTERLY_STEP_ORDER", "QUARTERLY_TIMEOUT_S", "STEP_TOTALS",
+           "WEEKLY_REPORT_STEP", "WEEKLY_STEPS", "WEEKLY_STEP_BY_NAME",
+           "WEEKLY_STEP_ORDER", "WEEKLY_TIMEOUT_S",
+           "resolve_asof", "run_close", "run_monthly", "run_quarterly",
+           "run_weekly", "summary_line"]

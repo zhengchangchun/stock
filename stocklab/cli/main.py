@@ -3862,6 +3862,33 @@ def cmd_ops_monthly(args: argparse.Namespace) -> int:
     return _print_ops_payload(payload, chain.summary_line)
 
 
+def cmd_ops_weekly(args: argparse.Namespace) -> int:
+    """每周全量扫描（B3，P89）：5 步 + 汇总报告；asof = **最近已收盘交易日**（D2）。
+
+    退出码：0 全绿（含**休市日照跑**）/ 1 链跑完但有异常 / 2 断链或**取不到 asof**
+    （fail-closed：不许猜一个日期跑）。
+    """
+    from stocklab.ops import chain
+
+    payload = chain.run_weekly(
+        db_path=args.db, now=args.now, timeout_s=args.timeout_seconds,
+        report_dir=args.report_dir)
+    return _print_ops_payload(payload, chain.summary_line)
+
+
+def cmd_ops_quarterly(args: argparse.Namespace) -> int:
+    """季度深度复盘（B4，P89）：6 步 + 汇总报告；asof 与退出码语义同 `ops weekly`。
+
+    **不**自动开新验证周期、**不**跑全量 plugin sandbox、**不**做集中度打分（D7）。
+    """
+    from stocklab.ops import chain
+
+    payload = chain.run_quarterly(
+        db_path=args.db, now=args.now, timeout_s=args.timeout_seconds,
+        report_dir=args.report_dir)
+    return _print_ops_payload(payload, chain.summary_line)
+
+
 def cmd_ops_schedule(args: argparse.Namespace) -> int:
     """调度（launchd）：`generate` 只看不写，`install/uninstall/status/kickstart` 动系统。
 
@@ -5196,7 +5223,8 @@ def build_parser() -> argparse.ArgumentParser:
     doctor = sub.add_parser("doctor", help="数据健康度报告（离线）")
     doctor.set_defaults(func=lambda _a: cmd_doctor())
 
-    from stocklab.ops.chain import CLOSE_TIMEOUT_S, MONTHLY_TIMEOUT_S
+    from stocklab.ops.chain import (CLOSE_TIMEOUT_S, MONTHLY_TIMEOUT_S,
+                                    QUARTERLY_TIMEOUT_S, WEEKLY_TIMEOUT_S)
     from stocklab.ops.patrol import DEFAULT_TIMEOUT_S as PATROL_TIMEOUT_S
     from stocklab.ops import schedule
 
@@ -5247,6 +5275,35 @@ def build_parser() -> argparse.ArgumentParser:
                                   "回执写 <它>/ops/latest-monthly.json")
     ops_monthly.set_defaults(func=cmd_ops_monthly)
 
+    ops_weekly = ops_sub.add_parser(
+        "weekly", help="每周全量扫描（B3，P89）：5 步 + 汇总报告；asof = 最近已收盘交易日")
+    ops_weekly.add_argument("--db", help="数据库路径（默认 data/stocklab.db）")
+    ops_weekly.add_argument("--now", help="覆盖当前时刻（ISO8601；仅供测试/补跑）")
+    ops_weekly.add_argument(
+        "--timeout-seconds", dest="timeout_seconds", type=float,
+        default=WEEKLY_TIMEOUT_S,
+        help=f"整轮预算（默认 {WEEKLY_TIMEOUT_S:.0f}s；用完即停并记 aborted）")
+    ops_weekly.add_argument("--report-dir", dest="report_dir",
+                            help="报告根目录（默认 reports/）：汇总报告写 "
+                                 "<它>/weekly/<asof>-weekly.md，回执写 "
+                                 "<它>/ops/latest-weekly.json")
+    ops_weekly.set_defaults(func=cmd_ops_weekly)
+
+    ops_quarterly = ops_sub.add_parser(
+        "quarterly", help="季度深度复盘（B4，P89）：6 步 + 汇总报告；"
+                          "**不**自动开周期、**不**跑 sandbox（D7）")
+    ops_quarterly.add_argument("--db", help="数据库路径（默认 data/stocklab.db）")
+    ops_quarterly.add_argument("--now", help="覆盖当前时刻（ISO8601；仅供测试/补跑）")
+    ops_quarterly.add_argument(
+        "--timeout-seconds", dest="timeout_seconds", type=float,
+        default=QUARTERLY_TIMEOUT_S,
+        help=f"整轮预算（默认 {QUARTERLY_TIMEOUT_S:.0f}s；用完即停并记 aborted）")
+    ops_quarterly.add_argument("--report-dir", dest="report_dir",
+                               help="报告根目录（默认 reports/）：汇总报告写 "
+                                    "<它>/quarterly/<asof>-quarterly.md，回执写 "
+                                    "<它>/ops/latest-quarterly.json")
+    ops_quarterly.set_defaults(func=cmd_ops_quarterly)
+
     ops_sched = ops_sub.add_parser(
         "schedule", help="调度（launchd）：plist 的生成 / 安装 / 卸载 / 查看")
     ops_sched_sub = ops_sched.add_subparsers(dest="schedule_action", required=True)
@@ -5254,7 +5311,7 @@ def build_parser() -> argparse.ArgumentParser:
             ("generate", "只打印将要写入的 plist（不碰文件系统）"),
             ("install", "写 plist 到 ~/Library/LaunchAgents 并 bootstrap"),
             ("uninstall", "bootout 并删掉 plist"),
-            ("status", "看三条任务加载了没 / 上次退出码"),
+            ("status", "看各条任务加载了没 / 上次退出码"),
             ("kickstart", "立刻跑一次（安装后的自证）")):
         sp = ops_sched_sub.add_parser(_name, help=_help)
         sp.add_argument("--job", action="append", default=None,
