@@ -1056,6 +1056,32 @@ CREATE TRIGGER IF NOT EXISTS trg_plugin_backtests_no_delete
 BEFORE DELETE ON plugin_backtests
 BEGIN SELECT RAISE(ABORT, 'plugin_backtests is append-only'); END;
 
+-- ---------- 插桩资源事件（P93；append-only） ----------
+-- 需求：P61 §0.7 的 G1 判据（插桩执行把进程顶到高内存）⇒ 最小档资源上限。
+-- 为什么是**事件表**而不是给 plugin_backtests 加列：一次越界是一个**时刻**
+-- （哪个插件、哪次调用、增量多少），与 `plugin_audit` 同族 —— 追加一行，不 UPDATE。
+-- `outcome` 的三个取值与 `plugin/runtime.py::load_script(on_call=...)` 的取值域
+-- **必须逐字相同**（多一个词就只能靠这张表的 CHECK 兜，而那时已经在抛异常了）。
+-- 写入口只有一个：`plugin/store.py::record_resource_event`。
+CREATE TABLE IF NOT EXISTS plugin_resource_events (
+    event_id        INTEGER PRIMARY KEY AUTOINCREMENT,
+    plugin_id       TEXT NOT NULL,
+    at              TEXT NOT NULL,
+    outcome         TEXT NOT NULL CHECK (outcome IN ('ok', 'timeout', 'resource')),
+    rss_delta_bytes INTEGER NOT NULL,
+    rss_peak_bytes  INTEGER NOT NULL,
+    duration_ms     REAL,
+    detail          TEXT
+);
+
+CREATE TRIGGER IF NOT EXISTS trg_plugin_resource_no_update
+BEFORE UPDATE ON plugin_resource_events
+BEGIN SELECT RAISE(ABORT, 'plugin_resource_events is append-only'); END;
+
+CREATE TRIGGER IF NOT EXISTS trg_plugin_resource_no_delete
+BEFORE DELETE ON plugin_resource_events
+BEGIN SELECT RAISE(ABORT, 'plugin_resource_events is append-only'); END;
+
 CREATE TRIGGER IF NOT EXISTS trg_candidate_snapshots_no_update
 BEFORE UPDATE ON candidate_snapshots
 BEGIN SELECT RAISE(ABORT, 'candidate_snapshots is append-only'); END;

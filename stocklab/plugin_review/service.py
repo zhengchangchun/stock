@@ -53,6 +53,7 @@ def run_review(conn: sqlite3.Connection, *, asof: str, now: str,
     失败面（由 CLI 映射成退出码）：
     - `lifecycle.NoActivePlugin` ⇒ 没有在役版本（exit 2，零写入）；
     - `guard.PluginGuardError` / `runtime.PluginTimeout` /
+      `runtime.PluginResourceError` /
       `contract.PluginContractError` ⇒ 有版本但跑不出来（exit 1，零写入）。
     """
     script_id = lifecycle.active_script_id(conn, PLUGIN_ID, required=True)

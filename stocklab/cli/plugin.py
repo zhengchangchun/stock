@@ -72,11 +72,26 @@ def _run_sandbox(conn, *, script_id: int, plugin_id: str, source_text: str,
     `store.list_audit(conn, script_id)` 查到失败原因。
     """
     # ── 契约预检：先探针，后沙盒 ────────────────────────────────────
+    # P93：预检是**唯一**会执行未审脚本的地方 ⇒ 每次探针调用落一条资源读数
+    # （D5 点名要求覆盖这条路径）。读数由 `runtime.load_script(on_call=...)`
+    # 给出，本函数只负责把它转成 `plugin_resource_events` 的写入口调用。
+    def _record_call(rec: dict) -> None:
+        store.record_resource_event(
+            conn, plugin_id=rec["plugin_id"], outcome=rec["outcome"],
+            rss_delta_bytes=rec["rss_delta_bytes"],
+            rss_peak_bytes=rec["rss_peak_bytes"],
+            duration_ms=rec["duration_ms"],
+            detail=f"plugin submit 契约预检 script_id={script_id}", now=now)
+
     try:
-        fn = runtime.load_script(source_text, plugin_id=plugin_id)
+        fn = runtime.load_script(source_text, plugin_id=plugin_id,
+                                 on_call=_record_call)
         fn(contract.PROBE_CTX)   # 契约定义的完整空探针 ctx；让读 ctx key 的正常脚本能运行
     except contract.PluginContractError as exc:
         return False, f"契约预检未通过：{exc}"
+    except runtime.PluginResourceError as exc:
+        # **点名**：资源越界与超时是兄弟，都走同一条「脚本没跑出来」的通道。
+        return False, f"脚本资源越界（PluginResourceError）：{exc}"
     except Exception as exc:                       # noqa: BLE001
         return False, f"脚本加载/执行失败：{type(exc).__name__}: {exc}"
 

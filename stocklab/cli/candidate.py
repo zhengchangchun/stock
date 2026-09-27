@@ -81,7 +81,8 @@ def cmd_candidate_review(args) -> int:
     - 0 = 跑完（**含现役桩**：桩的输出是事实，台账照记、报告第 1 行自报「尚未实现」）；
     - 2 = 结构性拒绝（库不存在 / asof 不是 YYYY-MM-DD / **插桩5 没有 active 版本**）
       —— **零写入**：没有台账行、没有报告文件；
-    - 1 = 有 active 版本但脚本跑不出来（预检 / 超时 / 契约校验不过）—— 同样零写入。
+    - 1 = 有 active 版本但脚本跑不出来（预检 / 超时 / 资源越界 / 契约校验不过）
+      —— 同样零写入。
 
     复盘**不是每日动作**，所以这条命令不进 `candidate run` 的 12 步主干、不进
     `ops close`；月度链上那一步是非阻断的。
@@ -108,6 +109,7 @@ def cmd_candidate_review(args) -> int:
         print(f"❌ 插桩5 没有 active 版本，拒绝执行：{exc}", file=sys.stderr)
         return 2
     except (guard.PluginGuardError, runtime.PluginTimeout,
+            runtime.PluginResourceError,
             contract.PluginContractError) as exc:
         print(f"❌ 插桩5 的执行没跑出来（{type(exc).__name__}）：{exc}",
               file=sys.stderr)

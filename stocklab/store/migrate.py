@@ -1224,6 +1224,50 @@ _P85_INDEX = ("CREATE INDEX IF NOT EXISTS idx_paper_agent_reviews_arm_asof"
 _P85_INDEX_NAME = "idx_paper_agent_reviews_arm_asof"
 
 
+# ---------------------------------------------------------------------------
+# P93：插桩资源事件 `plugin_resource_events`（**新表**，P93 / D5）。
+#
+# 与 P79/P80/P85 同档：表由 `schema.sql` 的 `CREATE TABLE IF NOT EXISTS` 建出，
+# 因此**不挂** `_pending_column_migrations`（表不存在 ⇒ 无需备份），结构前滚
+# （触发器漂移）走 `_apply_schema`。这里只让 doctor 只读报告
+# 「资源事件表与它的 append-only 触发器还在不在」。
+# 真库前滚由 nanobot 另做（任务书 §4：站不动 `data/stocklab.db`）。
+# ---------------------------------------------------------------------------
+
+_P93_TABLE = "plugin_resource_events"
+
+#: 与 `schema.sql` **同文**（改一处须同步两处）。
+_P93_TRIGGERS = (
+    "CREATE TRIGGER IF NOT EXISTS trg_plugin_resource_no_update"
+    " BEFORE UPDATE ON plugin_resource_events"
+    " BEGIN SELECT RAISE(ABORT, 'plugin_resource_events is append-only'); END;\n"
+    "CREATE TRIGGER IF NOT EXISTS trg_plugin_resource_no_delete"
+    " BEFORE DELETE ON plugin_resource_events"
+    " BEGIN SELECT RAISE(ABORT, 'plugin_resource_events is append-only'); END;"
+)
+
+_P93_TRIGGER_NAMES = ("trg_plugin_resource_no_update",
+                      "trg_plugin_resource_no_delete")
+
+
+def resource_events_need_p93(conn) -> bool:
+    """资源事件表在、但 append-only 触发器缺席吗？（只读探测，供 doctor 用）
+
+    表**不存在**时返回 False —— 那不是「待迁移」，是「等着被建出来」（同 P58/P79/P80）。
+    """
+    if not _table_exists(conn, _P93_TABLE):
+        return False
+    return any(not _trigger_exists(conn, name) for name in _P93_TRIGGER_NAMES)
+
+
+def migrate_p93_resource_events(conn) -> list[str]:
+    """补回资源事件表的 append-only 触发器（P93）。**可重入**、老库上零动作。"""
+    if not resource_events_need_p93(conn):
+        return []
+    conn.executescript(_P93_TRIGGERS)
+    return ["plugin_resource_events.triggers"]
+
+
 def _index_exists(conn, name: str) -> bool:
     return conn.execute(
         "SELECT COUNT(*) FROM sqlite_master WHERE type='index' AND name=?",
@@ -1328,6 +1372,11 @@ _KNOWN_MARKERS: list[tuple[str, str, object]] = [
     # 「复盘台账、两触发器与索引还在不在」。
     ("p85_agent_reviews", "paper_agent_reviews",
      lambda conn: not agent_reviews_need_p85(conn)),
+    # P93：插桩资源事件是**新表**，与 P79/P80/P85 同档 —— 不挂
+    # `_pending_column_migrations`（表不存在 ⇒ 无需备份），结构前滚走 `_apply_schema`。
+    # 这里让 doctor 只读报告「资源事件表与它的 append-only 触发器还在不在」。
+    ("p93_plugin_resource_events", "plugin_resource_events",
+     lambda conn: not resource_events_need_p93(conn)),
 ]
 
 
@@ -1398,6 +1447,7 @@ def _apply_schema(conn, sql: str) -> list[str]:
     changes += migrate_p58_plugin_reviews(conn)
     changes += migrate_p80_capital_events(conn)
     changes += migrate_p85_agent_reviews(conn)
+    changes += migrate_p93_resource_events(conn)
     return changes
 
 

@@ -27,6 +27,7 @@ import sqlite3
 TABLE_SCRIPTS = "plugin_scripts"
 TABLE_AUDIT = "plugin_audit"
 TABLE_BACKTESTS = "plugin_backtests"
+TABLE_RESOURCE_EVENTS = "plugin_resource_events"
 
 #: `plugin_audit.action` 的白名单 —— 与 `schema.sql` 的 CHECK **必须逐字相同**
 #: （`tests/test_plugin_lifecycle_module2.py::test_action_whitelist_matches_schema_check`
@@ -142,3 +143,53 @@ def load_backtests(conn: sqlite3.Connection,
         d["metrics"] = json.loads(d.pop("metrics_json"))
         out.append(d)
     return out
+
+
+# ---------- 资源事件（P93） ----------
+
+#: `plugin_resource_events.outcome` 的白名单 —— 与 `schema.sql` 的 CHECK **必须
+#: 逐字相同**，也与 `plugin/runtime.py::load_script(on_call=...)` 的取值域相同
+#: （`ALLOWED_ACTIONS` 的同一条纪律：写入侧的校验不该依赖读取侧）。
+ALLOWED_OUTCOMES: frozenset[str] = frozenset({"ok", "timeout", "resource"})
+
+
+#: INSERT 语句写成**裸字面量**（不用 `TABLE_RESOURCE_EVENTS` 插件）：D5 要求
+#: 「写入口只有一个」，而 `tests/test_plugin_resource_store.py` 用源码扫描钉住
+#: 「`INSERT INTO plugin_resource_events` 只出现在本文件」—— 拼成 f-string 会让
+#: 那条扫描扫不到，等于把唯一的护栏变成空转。
+_INSERT_RESOURCE_EVENT_SQL = (
+    "INSERT INTO plugin_resource_events (plugin_id, at, outcome,"
+    " rss_delta_bytes, rss_peak_bytes, duration_ms, detail)"
+    " VALUES (?,?,?,?,?,?,?)")
+
+
+def record_resource_event(conn: sqlite3.Connection, *, plugin_id: str,
+                          outcome: str, rss_delta_bytes: int,
+                          rss_peak_bytes: int, duration_ms: float | None,
+                          detail: str | None, now: str) -> int:
+    """**唯一**写入口：插桩调用结束的一条资源读数（P93 / D5）。
+
+    `outcome` 走 `ALLOWED_OUTCOMES` 白名单（未知词直接抛，不静默忽略）——
+    schema 的 CHECK 是最后一道，不是第一道。
+    """
+    if outcome not in ALLOWED_OUTCOMES:
+        raise ValueError(
+            f"未知资源结局 {outcome!r} —— 必须先在 store.ALLOWED_OUTCOMES 与 "
+            "schema.sql 的 CHECK 里登记（不许静默忽略：这张表是资源越界唯一的事后证据）")
+    cur = conn.execute(
+        _INSERT_RESOURCE_EVENT_SQL,
+        (plugin_id, now, outcome, int(rss_delta_bytes), int(rss_peak_bytes),
+         duration_ms, detail))
+    conn.commit()
+    return int(cur.lastrowid)
+
+
+def list_resource_events(conn: sqlite3.Connection,
+                         *, limit: int | None = None) -> list[dict]:
+    """最近的事件（`event_id` **降序** = 最新在前）。供巡检的 `sandbox_guard` 用。"""
+    sql = f"SELECT * FROM {TABLE_RESOURCE_EVENTS} ORDER BY event_id DESC"
+    params: tuple = ()
+    if limit is not None:
+        sql += " LIMIT ?"
+        params = (int(limit),)
+    return [dict(r) for r in conn.execute(sql, params)]

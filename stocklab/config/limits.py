@@ -36,6 +36,19 @@ FREEZE_MAX_DAYS: int = 90
 #: （D-1 / D-24），本常量只决定「提示提不提」。
 STRATEGY_FAIL_STREAK_LIMIT: int = 3
 
+#: 单次插桩调用的**峰值增量**上限（P93，P61 §0.7 的 G1 最小档）。
+#: 超了 ⇒ 该次调用结果**作废**（`plugin/runtime.py` 抛 `PluginResourceError`）
+#: 并留一条 `plugin_resource_events`。**不做中途 kill** —— 单次 C 调用不可中断
+#: （P61 §0.6 实测），所以本档只声称「判废 ＋ 留痕 ＋ 后续调用被挡」。
+#: 与 `CIRCUIT_BREAKER_DRAWDOWN` 同级：AI 不可改、不做参数搜索、不自动调参。
+PLUGIN_CALL_RSS_LIMIT_BYTES: int = 512 * 1024 ** 2
+
+#: 插桩进程**已用峰值**上限（P93，P61 §0.7 的 G1 最小档）：超了**连脚本都不执行**。
+#: 为什么是 1.5GB 而不是 G1 判据的 2GB：**要在被打死之前先停** —— 2GB 是 P61 §0.7
+#: 的**事后**判据（进程已被顶到那么高、再去看日志有没有 `MemoryError`），
+#: 本常量是**事前**闸门，两者不是一回事。同样 AI 不可改。
+PLUGIN_PROCESS_RSS_LIMIT_BYTES: int = 1536 * 1024 ** 2
+
 
 class PlanOutOfBounds(ValueError):
     """AI / 调用方给的周期或冻结方案不满足主干边界。**不 clamp**，直接拒绝。"""
