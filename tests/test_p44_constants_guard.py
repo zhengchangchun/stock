@@ -23,6 +23,9 @@ CONSTANTS = (
     "VALIDATION_ROUNDS_MAX",
     "VALIDATION_MAX_DAYS",
     "FREEZE_MAX_DAYS",
+    # P93：插桩资源上限（D2 的「唯一真源，AI 不可改」）—— 与上面 5 个同级。
+    "PLUGIN_CALL_RSS_LIMIT_BYTES",
+    "PLUGIN_PROCESS_RSS_LIMIT_BYTES",
 )
 
 
@@ -99,7 +102,7 @@ def _dynamic_write_sites(root: pathlib.Path) -> list[str]:
 # ---------- 保证 1：单一真源 ----------
 
 def test_constants_are_defined_only_in_config_limits():
-    """保证 1：这 5 个名字在整个 `stocklab/` 里只被绑定一次（在 limits.py）。"""
+    """保证 1：这些名字在整个 `stocklab/` 里只被绑定一次（在 limits.py）。"""
     assert _py_files(ROOT), "扫描零个文件 = 无效实验（ERROR_DIARY #50）"
     offenders = _files_rebinding(ROOT)
     assert offenders == [], f"这些常量只允许在 {LIMITS_REL} 里定义，违规：{offenders}"

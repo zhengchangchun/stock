@@ -47,6 +47,8 @@ EXPECTED_TABLES = {
                                        #      frequency CHECK 恒 'quarterly' —— 日度公开源已不存在）
     "candidate_status_events",         # P91：标的状态事件（append-only，PIT 锚=asof_date；
                                        #      UNIQUE(code,asof_date,status) ⇒ 同键重跑零写入）
+    "plugin_resource_events",          # P93：插桩资源事件（append-only，P61 §0.7 的 G1 最小档；
+                                       #      outcome ∈ ok/timeout/resource）
 }
 
 

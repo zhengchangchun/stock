@@ -2,7 +2,8 @@
 
 五条主张要在这里被钉死：
 
-1. **形状固定、只增不减**：`business` 只有四个子键，每个都有 `reason`（人话）；
+1. **形状固定、只增不减**：`business` 只有五个子键，每个都有 `reason`（人话）
+   （P92 四块 ＋ P93 的 `sandbox_guard`）；
 2. **熔断只读**：只用 `m2.selfeval.fuse_verdict`，**绝不**调 `m2 cycle fuse-check`
    —— 那条命令会往 append-only 台账追加事件，30 分钟一轮会把台账写花；
 3. **候选池状态默认只算不写**：`--update-status` 没开时 `candidate_status_events`
@@ -29,9 +30,11 @@ from tests.test_ops_patrol import NOW, FakeRunner, _db as green_db
 L = "2026-09-21"
 TODAY = "2026-09-22"
 
-BLOCK_KEYS = ("risk_screen", "fuse", "candidate_status", "freshness")
+BLOCK_KEYS = ("risk_screen", "fuse", "candidate_status", "freshness",
+              "sandbox_guard")            # P93 追加第五块（键只增不减）
 STATUSES = frozenset({patrol.OK, patrol.MISSING, patrol.STALE, patrol.SKIPPED,
-                      patrol.UNKNOWN, patrol.LAG, patrol.TRIPPED, patrol.RISKY})
+                      patrol.UNKNOWN, patrol.LAG, patrol.TRIPPED, patrol.RISKY,
+                      patrol.HIGH})
 
 
 # ---------- 夹具 ----------
@@ -178,7 +181,7 @@ def _tables(path: Path) -> dict[str, int]:
 
 # ---------- 主张 1：形状固定 ----------
 
-def test_business_has_exactly_four_blocks(tmp_path):
+def test_business_has_exactly_the_five_blocks(tmp_path):
     out = _read(_db(tmp_path))
     assert tuple(out) == BLOCK_KEYS
 
@@ -197,7 +200,7 @@ def test_every_block_has_a_non_empty_human_reason(tmp_path):
 
 
 def test_shapes_are_fixed_key_sets(tmp_path):
-    """键**只增不减**：这四个键集是页面与简报的契约。"""
+    """键**只增不减**：这五个键集是页面与简报的契约。"""
     out = _read(_db(tmp_path))
     assert set(out["risk_screen"]) == {
         "status", "n_members", "n_checked", "n_risky", "risky", "reason"}
@@ -207,6 +210,9 @@ def test_shapes_are_fixed_key_sets(tmp_path):
         "status", "counts", "would_set", "applied", "reason"}
     assert set(out["freshness"]) == {
         "status", "announcements", "northbound", "reason"}
+    assert set(out["sandbox_guard"]) == {
+        "status", "n_events", "max_delta_bytes", "max_peak_bytes", "limits",
+        "reason"}
 
 
 def test_risky_members_are_plain_dicts_with_code_and_note(tmp_path):
