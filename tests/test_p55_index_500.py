@@ -317,7 +317,10 @@ def test_t6_the_plists_are_still_byte_identical():
     for job in schedule.JOBS:
         blob = schedule.render_plist(job, project_root="/proj", python="/py",
                                      logs="/logs")
-        assert hashlib.sha256(blob).hexdigest() == golden[job.name], job.name
+        # P89：`JOBS` 从 3 条变 5 条；golden 只覆盖接线前就存在的那三条
+        # （同 `test_m2_daily.py::test_t1_...`），所以按名字取。
+        if job.name in golden:
+            assert hashlib.sha256(blob).hexdigest() == golden[job.name], job.name
         assert b"steps" not in blob and b"CLOSE_STEPS" not in blob
 
 

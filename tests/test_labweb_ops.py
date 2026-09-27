@@ -307,7 +307,7 @@ def _html(tmp_path, *, runs: tuple = (), plist: bool = False) -> str:
     return ops_render.ops_page(view, base="/lab", built_at=NOW)
 
 
-def test_page_shows_the_three_windows_and_the_receipt(tmp_path):
+def test_page_shows_all_the_windows_and_the_receipt(tmp_path):
     html = _html(tmp_path)
     for job in schedule.JOBS:
         assert job.window in html and job.name in html
@@ -317,18 +317,19 @@ def test_page_shows_the_three_windows_and_the_receipt(tmp_path):
     # 逐步表在
     assert "ingest_index" in html and "predict_run" in html
     assert "1.25 s" in html
-    # 没跑过的两条写「还没有回执」，而不是 0（统计的句子只出现在任务段里）
-    assert html.count("还没有回执 —— 这条任务在本机还没跑过") == 2
+    # 没跑过的任务写「还没有回执」，而不是 0（统计的句子只出现在任务段里）。
+    # P89：条数**跟着 `schedule.JOBS` 走**（只有 close 写了回执），不再是写死的 2。
+    assert html.count("还没有回执 —— 这条任务在本机还没跑过") == len(schedule.JOBS) - 1
 
 
 def test_plist_pill_follows_the_injected_dir(tmp_path):
     """「文件在位 / 还没写」只看**注入的**目录，不看开发机真装没装（错误日记 #56）。"""
     empty = _html(tmp_path / "empty", plist=False)
-    assert empty.count("还没写（跑 ops schedule install）") == 3
+    assert empty.count("还没写（跑 ops schedule install）") == len(schedule.JOBS)
     assert "文件在位" not in empty
 
     installed = _html(tmp_path / "installed", plist=True)
-    assert installed.count("文件在位") == 3
+    assert installed.count("文件在位") == len(schedule.JOBS)
     assert "还没写" not in installed
 
 

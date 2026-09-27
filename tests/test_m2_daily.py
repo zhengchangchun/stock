@@ -204,7 +204,10 @@ def test_t1_the_plists_are_byte_identical_to_the_pre_wiring_ones(tmp_path):
     for job in schedule.JOBS:
         blob = schedule.render_plist(job, project_root="/proj", python="/py",
                                      logs="/logs")
-        assert hashlib.sha256(blob).hexdigest() == golden[job.name], job.name
+        # P89：`JOBS` 从 3 条变 5 条。golden 只覆盖**接线前就存在**的那三条
+        # （新两条没有「接线前的字节」可比），所以按名字取，不按 `JOBS` 全取。
+        if job.name in golden:
+            assert hashlib.sha256(blob).hexdigest() == golden[job.name], job.name
         # 判据非空转：plist 里确实没有「步骤」这个概念（有的话上面那句才是空转）
         assert b"steps" not in blob and b"CLOSE_STEPS" not in blob
 
