@@ -42,6 +42,9 @@ EXPECTED_TABLES = {
     "paper_agent_evals",               # P79：AI 臂的**未成交腿**留痕（D3；append-only 触发器）
     "paper_capital_events",            # P80：资本事件（入金/出金；append-only，本金口径靠事件改）
     "paper_agent_reviews",             # P85：AI 操盘手的复盘台账（append-only，UNIQUE(arm,asof,kind)）
+    "announcements",                   # P88：公告（append-only，(code,art_code) 主键；PIT 锚=notice_date）
+    "northbound_holdings",             # P88：北向**季度**持股（append-only，(code,trade_date) 主键；
+                                       #      frequency CHECK 恒 'quarterly' —— 日度公开源已不存在）
 }
 
 

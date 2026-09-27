@@ -273,3 +273,106 @@ def ingest_financial_reports(conn, reports, raw_refs, *, now: str) -> IngestResu
     conn.commit()
     return IngestResultF(code=code, ok=True, rows_written=written,
                          conflicts=conflicts, issues=tuple(issues))
+
+
+# ---------------------------------------------------------------------------
+# P88：公告 / 北向季度持股落库（幂等、首写保留、`resp_sha256` 溯源）
+#
+# 两张表都 append-only（`schema.sql` 的 trg_*_no_update/_no_delete）。与
+# `ingest_financial_reports` 同一条纪律：**唯一键命中即跳过**、**首写保留**
+# （同键重采值变了只计 `conflicts`，**不覆盖**）。
+# 输入是**规范化行字典**（源客户端产出，每行带它来自哪份原始响应的 `resp_sha256`）。
+# ---------------------------------------------------------------------------
+
+#: 公告表列（顺序 = D2 的列序，也是 INSERT 的绑定顺序）。
+_ANN_COLS = ("code", "art_code", "notice_date", "display_time", "title",
+             "column_name", "ann_type", "source", "fetched_at", "created_at",
+             "resp_sha256")
+
+#: 溯源/时间列不参与「值变了」的判定（它们每次采集都不同，比它们必然全冲突）。
+#: ⚠️ `display_time` **刻意不在**比较集里：实测（P88 真源，同一 `art_code`
+#: 两次抓取）它的**毫秒后缀会变**（`19:35:36:855` → `:753`，服务端抖动）。
+#: 拿它比冲突 ⇒ 每次重跑都报「9 行全冲突」，`conflicts` 就再也不能回答
+#: 「源站改没改内容」这个唯一该由它回答的问题。落库仍然照存（D2 要求留痕）。
+_ANN_COMPARE = ("notice_date", "title", "column_name", "ann_type")
+
+
+def ingest_announcements(conn, rows, *, now: str) -> IngestResultF:
+    """把一批公告写入 `announcements`。
+
+    - **幂等**：`(code, art_code)` 已存在即跳过（`art_code` 是源站稳定唯一号）
+    - **首写保留**：同键重采值变了 → 保留旧值、`conflicts += 1`，**不覆盖**
+    - 空批次是**合法空**（这轮没有新公告），不是失败
+    """
+    if not rows:
+        return IngestResultF(code="", ok=True, rows_written=0)
+    written = conflicts = 0
+    for r in rows:
+        existing = conn.execute(
+            "SELECT " + ", ".join(_ANN_COMPARE) + " FROM announcements"
+            " WHERE code=? AND art_code=?",
+            (r["code"], r["art_code"])).fetchone()
+        if existing is not None:
+            if any(existing[c] != r.get(c) for c in _ANN_COMPARE):
+                conflicts += 1
+            continue
+        conn.execute(
+            f"INSERT INTO announcements ({', '.join(_ANN_COLS)})"
+            f" VALUES ({', '.join('?' * len(_ANN_COLS))})",
+            tuple({**r, "fetched_at": now, "created_at": now}[c] for c in _ANN_COLS))
+        written += 1
+    conn.commit()
+    return IngestResultF(code=rows[0]["code"], ok=True, rows_written=written,
+                         conflicts=conflicts)
+
+
+#: 北向表列（顺序 = D3 的列序，也是 INSERT 的绑定顺序）。
+_NB_COLS = ("code", "trade_date", "hold_shares", "hold_market_cap",
+            "a_shares_ratio", "hold_shares_ratio", "free_shares_ratio",
+            "close_price", "frequency", "source", "fetched_at", "created_at",
+            "resp_sha256")
+
+#: 不参与「值变了」判定的列（同公告表的理由）。
+_NB_COMPARE = ("hold_shares", "hold_market_cap", "a_shares_ratio",
+               "hold_shares_ratio", "free_shares_ratio", "close_price", "frequency")
+
+#: 北向频率的**唯一**合法值（D3）。这里与 `schema.sql` 的 CHECK 是双保险：
+#: 前者在**写任何一行之前**响亮失败，后者兜住任何绕过本函数的写入方。
+_NB_FREQUENCY = "quarterly"
+
+
+def ingest_northbound_holdings(conn, rows, *, now: str) -> IngestResultF:
+    """把一批北向**季度**持股写入 `northbound_holdings`。
+
+    - **幂等**：`(code, trade_date)` 已存在即跳过
+    - **首写保留**：同键重采值变了 → 保留旧值、`conflicts += 1`，**不覆盖**
+    - 频率**必须**是 `'quarterly'`：任一行不是 ⇒ `ValueError` 且**一行都不写**
+      （D3/§0.3：公开源上北向日度已不存在，编日度序列是禁区）
+    """
+    if not rows:
+        return IngestResultF(code="", ok=True, rows_written=0)
+    bad = [r["trade_date"] for r in rows
+           if r.get("frequency") != _NB_FREQUENCY]
+    if bad:
+        raise ValueError(
+            f"北向持股频率只允许 {_NB_FREQUENCY!r}（公开源上日度已不存在，"
+            f"见任务书 §0.3）；收到 {sorted({r.get('frequency') for r in rows})!r}"
+            f"（{bad[:3]} …）—— 拒绝写入，一行都不落")
+    written = conflicts = 0
+    for r in rows:
+        existing = conn.execute(
+            "SELECT " + ", ".join(_NB_COMPARE) + " FROM northbound_holdings"
+            " WHERE code=? AND trade_date=?",
+            (r["code"], r["trade_date"])).fetchone()
+        if existing is not None:
+            if any(existing[c] != r.get(c) for c in _NB_COMPARE):
+                conflicts += 1
+            continue
+        conn.execute(
+            f"INSERT INTO northbound_holdings ({', '.join(_NB_COLS)})"
+            f" VALUES ({', '.join('?' * len(_NB_COLS))})",
+            tuple({**r, "fetched_at": now, "created_at": now}[c] for c in _NB_COLS))
+        written += 1
+    conn.commit()
+    return IngestResultF(code=rows[0]["code"], ok=True, rows_written=written,
+                         conflicts=conflicts)

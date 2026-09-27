@@ -1175,6 +1175,74 @@ CREATE TRIGGER IF NOT EXISTS trg_financial_reports_no_delete
 BEFORE DELETE ON financial_reports
 BEGIN SELECT RAISE(ABORT, 'financial_reports is append-only'); END;
 
+-- ---------- 公告（P88；append-only）----------
+-- 源 = 东财 `np-anotice-stock` 的 `security/ann`（A 股公告列表）。
+-- **PIT 锚 = `notice_date`**（公告日）。`display_time` 只作留痕 —— 它是发布时刻，
+-- **不得**进任何时间轴筛选（D2）。`art_code` 是源站的**稳定唯一号** ⇒ 与 `code`
+-- 一起做主键，幂等＝同键命中即跳过、首写保留（源站改公告标题不覆盖历史行）。
+-- `resp_sha256` 指回该行来自哪一份原始响应（可复现、可溯源）。
+-- ⚠️ 该接口**不支持** `begin_time`/`end_time`（一加 total_hits=0）⇒ 增量靠翻页到
+-- `notice_date < cutoff` 即停，见 `data/sources/eastmoney_ann.py`。
+CREATE TABLE IF NOT EXISTS announcements (
+    code         TEXT NOT NULL,
+    art_code     TEXT NOT NULL,      -- 源站稳定唯一号（如 AN202609151829423536）
+    notice_date  TEXT NOT NULL,      -- 公告日 YYYY-MM-DD（PIT 锚）
+    display_time TEXT,               -- 发布时刻（**只作留痕**，不进时间轴筛选）
+    title        TEXT NOT NULL,
+    column_name  TEXT,               -- columns[].column_name（如「调研活动」）
+    ann_type     TEXT,               -- 请求口径的公告类型（本档恒 'A' = A 股）
+    source       TEXT NOT NULL,
+    fetched_at   TEXT NOT NULL,
+    created_at   TEXT NOT NULL,
+    resp_sha256  TEXT NOT NULL,
+    PRIMARY KEY (code, art_code)
+);
+
+CREATE INDEX IF NOT EXISTS idx_announcements_code_notice
+    ON announcements (code, notice_date);
+
+CREATE TRIGGER IF NOT EXISTS trg_announcements_no_update
+BEFORE UPDATE ON announcements
+BEGIN SELECT RAISE(ABORT, 'announcements is append-only'); END;
+
+CREATE TRIGGER IF NOT EXISTS trg_announcements_no_delete
+BEFORE DELETE ON announcements
+BEGIN SELECT RAISE(ABORT, 'announcements is append-only'); END;
+
+-- ---------- 北向个股持股（P88；append-only）----------
+-- 源 = 东财 datacenter `RPT_MUTUAL_HOLDSTOCKNORTH_STA`（host 已在白名单）。
+-- ⚠️ **公开源只剩季度持仓**（2024-08 交易所取消实时/每日披露后）：日度资金流
+-- （`kamt.kline` 净额列实测恒 0）与日度持股（`RPT_MUTUAL_DEAL_HISTORY` 的
+-- `FUND_INFLOW` 等实测全 null）**都已不存在**。⇒ `frequency` 恒 `'quarterly'`，
+-- DDL 层用 CHECK 堵死 `daily`：**不许**为了凑日度序列把额度余额/南向值/null 当净额落库
+-- （那是编数据，见任务书 §0.3）。
+-- `hold_shares` 单位「股」；`hold_market_cap` / `close_price` 单位「元」；三个 ratio 单位「%」。
+CREATE TABLE IF NOT EXISTS northbound_holdings (
+    code              TEXT NOT NULL,
+    trade_date        TEXT NOT NULL,   -- TRADE_DATE 裁剪为 YYYY-MM-DD
+    hold_shares       REAL,            -- HOLD_SHARES 股
+    hold_market_cap   REAL,            -- HOLD_MARKET_CAP 元
+    a_shares_ratio    REAL,            -- A_SHARES_RATIO %
+    hold_shares_ratio REAL,            -- HOLD_SHARES_RATIO %
+    free_shares_ratio REAL,            -- FREE_SHARES_RATIO %
+    close_price       REAL,            -- CLOSE_PRICE 元
+    frequency         TEXT NOT NULL
+                      CHECK (frequency IN ('quarterly')),
+    source            TEXT NOT NULL,
+    fetched_at        TEXT NOT NULL,
+    created_at        TEXT NOT NULL,
+    resp_sha256       TEXT NOT NULL,
+    PRIMARY KEY (code, trade_date)
+);
+
+CREATE TRIGGER IF NOT EXISTS trg_northbound_holdings_no_update
+BEFORE UPDATE ON northbound_holdings
+BEGIN SELECT RAISE(ABORT, 'northbound_holdings is append-only'); END;
+
+CREATE TRIGGER IF NOT EXISTS trg_northbound_holdings_no_delete
+BEFORE DELETE ON northbound_holdings
+BEGIN SELECT RAISE(ABORT, 'northbound_holdings is append-only'); END;
+
 -- ---------- 模块2 验证周期台账（P44，append-only）----------
 -- 口径：D-26（每策略版本一个隔离账户）/ D-27（熔断）/ D-28（自评估边界）。
 -- 三张表 + `plugin_audit` 共同回答：「这一轮用的是**哪个策略版本**、

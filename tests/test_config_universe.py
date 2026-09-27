@@ -50,6 +50,11 @@ def test_whitelist_is_exact():
             # 仍然**有意**扩白名单，不是偷偷加：本断言是精确相等，改它必留痕迹。
             "ifzq.gtimg.cn",
             "proxy.finance.qq.com",
+            # P88 新增：公告源 = 东财 np-anotice-stock（`security/ann`）——
+            # 与 push2*/datacenter-web 不是同一台主机，只能单独放行。
+            # 北向持股用**已在白名单**的 datacenter-web.eastmoney.com，**不**新开 host
+            # （§0.2：本档只允许 +1）。精确相等断言照旧，改它必须留下痕迹。
+            "np-anotice-stock.eastmoney.com",
         }
     )
 

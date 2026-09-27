@@ -20,6 +20,11 @@ ALLOWED_HOSTS: frozenset[str] = frozenset(
         # 改它必须留下痕迹（见 ADR-028）。
         "ifzq.gtimg.cn",
         "proxy.finance.qq.com",
+        # P88 新增：公告源 = 东财 `np-anotice-stock`（`security/ann`，A 股公告列表）——
+        # 与 `push2*`/`datacenter-web` **不是同一台**，故必须单独放行。
+        # 北向持股走的是**已在白名单**的 `datacenter-web.eastmoney.com`，不新开 host。
+        # 仍然**有意**扩白名单，不是偷偷加：`test_whitelist_is_exact` 是精确相等断言。
+        "np-anotice-stock.eastmoney.com",
     }
 )
 
