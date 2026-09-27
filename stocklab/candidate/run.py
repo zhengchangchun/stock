@@ -16,8 +16,18 @@
 ## 缺插桩就整体不产出
 
 任一环节找不到 active 版本 → `NoActivePlugin` 直接抛出，**不留半截快照**。
-快照写在一个事务边界内（`write_snapshot` 内部 commit），前置步骤全部
-完成之后才写。
+快照写在一个**显式事务**里（`write_snapshot` 内部用
+`store.db.transaction()`；连接是 `isolation_level=None` 的 autocommit，
+裸 `conn.commit()` 在这里是空操作 —— P90 修正），前置步骤全部完成之后才写。
+
+## 拒绝行按 (code, stage) 去重（在**写路径**上）
+
+`candidate_rejects` 的主键是 `(snapshot_id, code, stage)`，而打分循环对
+`eligible_pools(inst)` 的每个池各判一次、`stage` 恒为 `'score'`（不带池名）。
+一只标的在 mid 与 long 两池都拒 ⇒ **内核产出两行同键行**。`score_pipeline`
+（回放/度量也用）保持无损原样；`run_candidate`（唯一写路径）按**流水线顺序**
+保留第一条（即 `short→mid→long` 里最靠前的那个池那条），丢弃数写进快照 params
+的 `n_reject_dups_dropped`（P90 D1/D2）。
 
 ## 步骤12 只记标志
 
@@ -265,6 +275,11 @@ def score_pipeline(conn: sqlite3.Connection, *, asof: str,
     `want_factors`（P83 D3）：`True` 时额外填 `PipelineResult.factor_inputs`
     （短池打分插桩这一次看到的输入因子）。默认 `False` ⇒ 一行都不多算、
     既有字段逐位不变；**打分口径与本函数的流转一字未动**。
+
+    `rejects` 是**无损**的（P90）：同一 `(code, stage)` 可能出现多行 —— 一只标的
+    在多个池都打分不通过时 `stage` 恒为 `'score'`。`candidate_rejects` 的主键是
+    `(snapshot_id, code, stage)`，折叠发生在**写路径** `run_candidate`
+    （`_dedup_rejects`）；本函数（回放/度量也用）与 `params` 的键集一字未动。
     """
     if universe_id is None:
         from stocklab.config.universes import SEED21_UNIVERSE_ID
@@ -357,6 +372,32 @@ def score_pipeline(conn: sqlite3.Connection, *, asof: str,
                                   "n_adj_fallback": n_adj_fallback})
 
 
+def _dedup_rejects(
+        rejects: list[snapshot.RejectRow]) -> tuple[list[snapshot.RejectRow], int]:
+    """按 `(code, stage)` 去重，保留**流水线顺序**里的第一条；返回 (保留, 丢弃数)。
+
+    为什么需要（P90 D1）：`candidate_rejects` 的主键是 `(snapshot_id, code, stage)`，
+    而打分循环对 `eligible_pools(inst)` 的每个池各判一次、`stage` 恒为 `'score'`
+    （不带池名 —— D1 明确不改 stage 词汇，那要动 schema 的 CHECK 与报告口径）。
+    一只标的在 mid 与 long 两池都打分不通过 ⇒ 两行同 `(code, 'score')` ⇒ 撞主键。
+
+    去重放在**写路径**上、不放进 `score_pipeline`：内核是回放与度量共用的只读
+    产物，保持**无损**（每个池各自一行）；折叠只发生在「映射到表结构」这一步。
+
+    丢的是「另一个池也拒了它」这条信息，**不丢任何买卖决策** —— 该标的在任一池
+    不通过就不会进那一池的 `scored`（D1）。
+    """
+    seen: set[tuple[str, str]] = set()
+    kept: list[snapshot.RejectRow] = []
+    for row in rejects:
+        key = (row.code, row.stage)
+        if key in seen:
+            continue
+        seen.add(key)
+        kept.append(row)
+    return kept, len(rejects) - len(kept)
+
+
 def run_candidate(conn: sqlite3.Connection, *, asof: str, run_kind: str,
                   now: str, universe=None, universe_id: str | None = None,
                   members_sha256: str | None = None) -> RunResult:
@@ -376,9 +417,13 @@ def run_candidate(conn: sqlite3.Connection, *, asof: str, run_kind: str,
 
     pipe = score_pipeline(conn, asof=asof, universe=universe,
                           universe_id=universe_id, members_sha256=members_sha256)
+    rejects, n_reject_dups_dropped = _dedup_rejects(pipe.rejects)
+    # D2「只增键」：内核 params 一个键不动，写路径补上丢弃计数 —— 落库与
+    # `RunResult.params` 用的是**同一份** dict，首跑与幂等重跑读回逐位相同。
+    params = {**pipe.params, "n_reject_dups_dropped": n_reject_dups_dropped}
     snapshot_id = snapshot.write_snapshot(
-        conn, asof=asof, run_kind=run_kind, params=pipe.params,
-        members=pipe.members, rejects=pipe.rejects, now=now)
+        conn, asof=asof, run_kind=run_kind, params=params,
+        members=pipe.members, rejects=rejects, now=now)
 
     loaded = snapshot.load_snapshot(conn, snapshot_id)
     md = report.render_report(asof=asof, run_kind=run_kind, loaded=loaded,
@@ -388,4 +433,4 @@ def run_candidate(conn: sqlite3.Connection, *, asof: str, run_kind: str,
     members_obj, rejects_obj = _hydrate(loaded)
     return RunResult(snapshot_id=snapshot_id, asof=asof, run_kind=run_kind,
                      members=members_obj, rejects=rejects_obj,
-                     report_md=md, skipped=False, params=pipe.params)
+                     report_md=md, skipped=False, params=params)

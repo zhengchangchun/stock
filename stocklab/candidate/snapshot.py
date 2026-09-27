@@ -25,6 +25,8 @@ import json
 import sqlite3
 from dataclasses import dataclass
 
+from stocklab.store.db import transaction
+
 TABLE_SNAPSHOTS = "candidate_snapshots"
 TABLE_MEMBERS = "candidate_members"
 TABLE_REJECTS = "candidate_rejects"
@@ -66,6 +68,14 @@ def write_snapshot(conn: sqlite3.Connection, *, asof: str, run_kind: str,
     """写快照 + 成员 + 淘汰记录，返回 `snapshot_id`。
 
     已存在同 `(asof, run_kind)` 的快照时**直接返回既有 id，不再写**。
+
+    **原子性（P90 D3）**：三条 INSERT 全部包在 `store.db.transaction()` 里 ——
+    快照行 ＋ members ＋ rejects 要么全落、要么全不落。抛错 ⇒ `ROLLBACK` 后重抛
+    ⇒ 不留「半截快照」（否则再跑会被 `find_snapshot` 当成「已做过」而**静默**
+    返回残缺快照）。**不能用 `with conn:`** —— `connect()` 是
+    `isolation_level=None`（autocommit），`with conn:` 与裸 `conn.commit()`
+    在这里都是空操作。`transaction()` 禁止嵌套 ⇒ 本函数必须是事务的最外层，
+    调用方**不得**自己先开事务。
     """
     existing = find_snapshot(conn, asof=asof, run_kind=run_kind)
     if existing is not None:
@@ -77,28 +87,28 @@ def write_snapshot(conn: sqlite3.Connection, *, asof: str, run_kind: str,
             raise ValueError(
                 f"非法状态 {m.status!r}；允许：{list(STATUSES)}")
 
-    cur = conn.execute(
-        f"INSERT INTO {TABLE_SNAPSHOTS} (asof, run_kind, params_json, created_at)"
-        " VALUES (?,?,?,?)",
-        (asof, run_kind,
-         json.dumps(params, ensure_ascii=False, sort_keys=True), now))
-    snapshot_id = int(cur.lastrowid)
+    with transaction(conn):
+        cur = conn.execute(
+            f"INSERT INTO {TABLE_SNAPSHOTS} (asof, run_kind, params_json,"
+            " created_at) VALUES (?,?,?,?)",
+            (asof, run_kind,
+             json.dumps(params, ensure_ascii=False, sort_keys=True), now))
+        snapshot_id = int(cur.lastrowid)
 
-    for m in members:
-        conn.execute(
-            f"INSERT INTO {TABLE_MEMBERS} (snapshot_id, code, pool, raw_score,"
-            " adj_score, reason, risk_json, status, entered_at)"
-            " VALUES (?,?,?,?,?,?,?,?,?)",
-            (snapshot_id, m.code, m.pool, m.raw_score, m.adj_score, m.reason,
-             m.risk_json, m.status, now))
+        for m in members:
+            conn.execute(
+                f"INSERT INTO {TABLE_MEMBERS} (snapshot_id, code, pool,"
+                " raw_score, adj_score, reason, risk_json, status, entered_at)"
+                " VALUES (?,?,?,?,?,?,?,?,?)",
+                (snapshot_id, m.code, m.pool, m.raw_score, m.adj_score,
+                 m.reason, m.risk_json, m.status, now))
 
-    for r in rejects:
-        conn.execute(
-            f"INSERT INTO {TABLE_REJECTS} (snapshot_id, code, stage, reason,"
-            " plugin_id) VALUES (?,?,?,?,?)",
-            (snapshot_id, r.code, r.stage, r.reason, r.plugin_id))
+        for r in rejects:
+            conn.execute(
+                f"INSERT INTO {TABLE_REJECTS} (snapshot_id, code, stage,"
+                " reason, plugin_id) VALUES (?,?,?,?,?)",
+                (snapshot_id, r.code, r.stage, r.reason, r.plugin_id))
 
-    conn.commit()
     return snapshot_id
 
 

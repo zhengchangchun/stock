@@ -315,7 +315,11 @@ def test_score_pipeline_matches_run_candidate_members(tmp_db):
 
     key = lambda ms: sorted((m.code, m.pool, round(m.adj_score, 9)) for m in ms)
     assert key(pipe.members) == key(prod.members)
-    assert sorted((r.code, r.stage, r.reason) for r in pipe.rejects) == \
+    # rejects：内核无损（同一 `(code, stage)` 可能多行），写路径按
+    # `candidate_rejects` 的主键折叠（P90 D1）—— 比的是**折叠后**的内核产物，
+    # 即「落库的就是内核产出的（按主键投影后）」。
+    kept, _ = candidate_run._dedup_rejects(pipe.rejects)
+    assert sorted((r.code, r.stage, r.reason) for r in kept) == \
            sorted((r.code, r.stage, r.reason) for r in prod.rejects)
 
 

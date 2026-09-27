@@ -252,7 +252,10 @@ def test_p77_snapshot_params_has_two_new_keys_and_history_untouched(tmp_db):
     assert params["scoring_price_mode"] == "adjusted_factor_side+raw_screen"
     assert params["n_adj_fallback"] == 2
     old = {k: v for k, v in params.items()
-           if k not in ("scoring_price_mode", "n_adj_fallback")}
+           if k not in ("scoring_price_mode", "n_adj_fallback",
+                        # P90 D2 新增的计数键（同样是「只增键」）——
+                        # 本判据是「**老键**逐位未变」，不是「键集合被冻结」。
+                        "n_reject_dups_dropped")}
     from stocklab.config.universes import seed21_sha256
     assert old == {"seed_count": 2, "topn": dict(pools.POOL_TOPN),
                    "universe_id": "seed21",
