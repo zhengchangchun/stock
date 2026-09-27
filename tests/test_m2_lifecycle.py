@@ -9,7 +9,7 @@ append-only（`schema.sql` 的 `trg_validation_cycles_no_update`），列根本�
 
 | 判据 | 用例 |
 |---|---|
-| G2 | `test_summarize_*` / `test_cli_show_*`：无 `freeze` 行 ⇒ `freeze_due is None` 且文案说「无冻结记录」 |
+| G2 | `test_snapshot_*` / `test_cli_show_*`：无 `freeze` 行 ⇒ `freeze_due is None` 且文案说「无冻结记录」 |
 | G3 | `test_judge_flags_force_archive_on_a_three_fail_streak`（＋ `branch` 不被改写） |
 | G4 | `test_fail_streak_skips_insufficient_rows_in_the_tail`（穿透）/ `test_fail_streak_stops_at_freeze` / `test_fail_streak_stops_at_tune`（归零） |
 | G5 | `test_due_freezes_boundary_is_exact` |
@@ -466,29 +466,29 @@ def test_due_freezes_ignores_non_freeze_branches(tmp_path):
 
 
 # ══════════════════════════════════════════════════════════════════════
-# summarize —— D7 的载荷形状（键名与顺序固定）
+# snapshot —— D7 的载荷形状（键名与顺序固定）
 # ══════════════════════════════════════════════════════════════════════
 
-#: `summarize` 的**键序**（下游按位置读也成立；改这个顺序 = 改接口）。
+#: `snapshot` 的**键序**（下游按位置读也成立；改这个顺序 = 改接口）。
 SHAPE = ("script_id", "asof", "fail_streak", "limit", "force_archive", "tail",
          "freeze_due", "overdue", "archive_reason", "note")
 
 
-def test_summarize_has_the_fixed_key_order(tmp_path):
+def test_snapshot_has_the_fixed_key_order(tmp_path):
     path = _db(tmp_path)
     c = _conn(path)
     try:
-        assert tuple(lifecycle.summarize(c, SCRIPT_ID, _day(20))) == SHAPE
+        assert tuple(lifecycle.snapshot(c, SCRIPT_ID, _day(20))) == SHAPE
     finally:
         c.close()
 
 
-def test_summarize_says_there_is_no_freeze_record(tmp_path):
+def test_snapshot_says_there_is_no_freeze_record(tmp_path):
     """G2 的文案要求：无冻结记录要**显式说出来**（不许印 0 / 空串 / 省略键）。"""
     path = _db(tmp_path)
     c = _conn(path)
     try:
-        out = lifecycle.summarize(c, SCRIPT_ID, _day(20))
+        out = lifecycle.snapshot(c, SCRIPT_ID, _day(20))
         assert out["freeze_due"] is None and out["overdue"] is None
         assert "无冻结记录" in out["note"]
         assert out["archive_reason"] is None
@@ -496,37 +496,37 @@ def test_summarize_says_there_is_no_freeze_record(tmp_path):
         c.close()
 
 
-def test_summarize_says_the_due_date_and_how_late_it_is(tmp_path):
+def test_snapshot_says_the_due_date_and_how_late_it_is(tmp_path):
     path = _db(tmp_path)
     _row(path, asof=_day(1), branch=m2_config.BRANCH_FREEZE, freeze_days=10)
     c = _conn(path)
     try:
-        out = lifecycle.summarize(c, SCRIPT_ID, _day(20))
+        out = lifecycle.snapshot(c, SCRIPT_ID, _day(20))
         assert out["freeze_due"] == _day(11) and out["overdue"] is True
         assert _day(11) in out["note"] and "9" in out["note"]
     finally:
         c.close()
 
 
-def test_summarize_limit_comes_from_the_config_limits(tmp_path):
+def test_snapshot_limit_comes_from_the_config_limits(tmp_path):
     """阈值只有一个真源（`config/limits.py`）—— 读出口不另抄一个字面量。"""
     path = _db(tmp_path)
     c = _conn(path)
     try:
-        assert lifecycle.summarize(c, SCRIPT_ID, _day(20))["limit"] == LIMIT == 3
+        assert lifecycle.snapshot(c, SCRIPT_ID, _day(20))["limit"] == LIMIT == 3
     finally:
         c.close()
 
 
 @pytest.mark.parametrize("n_fail,expected", [(0, False), (2, False), (3, True), (4, True)])
-def test_summarize_force_archive_is_at_the_threshold(tmp_path, n_fail, expected):
+def test_snapshot_force_archive_is_at_the_threshold(tmp_path, n_fail, expected):
     """`fail_streak >= 阈值` ⇒ `force_archive`（D6：只提示，不执行）。"""
     path = _db(tmp_path)
     for n in range(1, n_fail + 1):
         _row(path, asof=_day(n), branch=m2_config.BRANCH_OPTIMIZE)
     c = _conn(path)
     try:
-        out = lifecycle.summarize(c, SCRIPT_ID, _day(20))
+        out = lifecycle.snapshot(c, SCRIPT_ID, _day(20))
         assert out["fail_streak"] == n_fail
         assert out["force_archive"] is expected
         assert (out["archive_reason"] is None) is not expected
@@ -534,27 +534,27 @@ def test_summarize_force_archive_is_at_the_threshold(tmp_path, n_fail, expected)
         c.close()
 
 
-def test_summarize_archive_reason_quotes_the_streak_and_the_limit(tmp_path):
+def test_snapshot_archive_reason_quotes_the_streak_and_the_limit(tmp_path):
     """归档建议要带**数字与阈值**（「看起来像个结论」必须能被核对）。"""
     path = _db(tmp_path)
     for n in (1, 2, 3):
         _row(path, asof=_day(n), branch=m2_config.BRANCH_OPTIMIZE)
     c = _conn(path)
     try:
-        reason = lifecycle.summarize(c, SCRIPT_ID, _day(20))["archive_reason"]
+        reason = lifecycle.snapshot(c, SCRIPT_ID, _day(20))["archive_reason"]
         assert "3" in reason and str(LIMIT) in reason
         assert "归档" in reason
     finally:
         c.close()
 
 
-def test_summarize_tail_is_the_tail_of_the_ledger(tmp_path):
+def test_snapshot_tail_is_the_tail_of_the_ledger(tmp_path):
     path = _db(tmp_path)
     for n in (10, 11, 12):
         _row(path, asof=_day(n), branch=m2_config.BRANCH_OPTIMIZE)
     c = _conn(path)
     try:
-        tail = lifecycle.summarize(c, SCRIPT_ID, _day(12))["tail"]
+        tail = lifecycle.snapshot(c, SCRIPT_ID, _day(12))["tail"]
         assert [r["asof_date"] for r in tail] == [_day(12), _day(11), _day(10)]
     finally:
         c.close()
@@ -573,7 +573,7 @@ def test_cli_show_json_prints_null_freeze_due_on_an_empty_ledger(tmp_path, capsy
     assert code == 0, err
     payload = json.loads(out)
     # CLI 的 JSON 走 `sort_keys=True`（键序由它在载荷里的定义处钉住，见
-    # `test_summarize_has_the_fixed_key_order`）—— 这里钉**键集合**与值。
+    # `test_snapshot_has_the_fixed_key_order`）—— 这里钉**键集合**与值。
     assert set(payload) == set(SHAPE)
     assert payload["freeze_due"] is None and payload["fail_streak"] == 0
     assert payload["limit"] == LIMIT
@@ -768,14 +768,14 @@ def test_cli_on_a_missing_db_creates_nothing(monkeypatch, capsys, tmp_path):
     assert guards == [] and not missing.exists()
 
 
-def test_summarize_never_writes_even_when_a_write_would_be_tempting(monkeypatch, tmp_path):
-    """数据层直接钉一遍（CLI 之外的第二条路径）：`summarize` 的 SQL 全是 SELECT。"""
+def test_snapshot_never_writes_even_when_a_write_would_be_tempting(monkeypatch, tmp_path):
+    """数据层直接钉一遍（CLI 之外的第二条路径）：`snapshot` 的 SQL 全是 SELECT。"""
     day = _day(20)
     path = _db(tmp_path)
     _row(path, asof=_day(1), branch=m2_config.BRANCH_FREEZE, freeze_days=10)
     c = _WriteGuard(connect(path), "file:test")
     try:
-        assert lifecycle.summarize(c, SCRIPT_ID, day)["freeze_due"] == _day(11)
+        assert lifecycle.snapshot(c, SCRIPT_ID, day)["freeze_due"] == _day(11)
         assert lifecycle.due_freezes(c, day)[0]["overdue_days"] == 9
         assert c.writes == []
     finally:
