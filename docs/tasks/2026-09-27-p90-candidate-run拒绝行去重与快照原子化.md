@@ -580,4 +580,59 @@ test_score_pipeline_matches_run_candidate_members` 的 rejects 断言改为
 
 ## 8. nanobot 独立复核
 
-（我填）
+**结论：通过**（G1–G9 逐条自跑复现；4 条偏离全部接受；1 条未决由我补做）。
+复核时间 2026-09-27 13:00–13:40，复核基线 HEAD `db93013`、工作区 clean。
+
+### 8.1 我自跑的读数（唯一可引版本）
+
+| 判据 | 我的实测 | 判定 |
+|---|---|---|
+| G1 全量 pytest | **3717 passed / 2 skipped in 240.05s**，rc=0（基线 3704/2 ⇒ **+13**，任务书要求 ≥8） | ✅ |
+| G2 `verify.sh` | `✅ 验证通过: all`，rc=0（末节「✅ 工作区干净」） | ✅ |
+| G3 `check_redlines.py`（未 regen） | rc=0；`0acf35c9…`(175) / `73ffbfb1…`(1330) / `ddac0a88…`(171) 逐位 == 基线 | ✅ |
+| G4 真库零写入 | 跑前 == 跑后 `0f8231f03dc3ca80b3b46cd13e16885a456a4536b835ab426f0a5c5231ae33f4`（全量 pytest ＋ verify ＋ 红线之后复读） | ✅ |
+| G5 端到端（`/tmp/p90rev/copy.db`） | **rc=0**（修前 rc=1）；`snapshot_id=3`「入池：短期 6 / 中期 8 / 长期 5；淘汰 **4**」；落库 `candidate_members`=**19**、`candidate_rejects`=**4**；`params_json` 含 `"n_reject_dups_dropped": 3`；三家银行各**恰好一行**且 `reason` 以 `mid池打分未通过` 开头 | ✅ |
+| G5 幂等 | 同命令再跑 ⇒ 打印「⏭ 快照已存在（snapshot_id=3），跳过重跑」，rc=0；`members 19 / rejects 4 / snapshots 3` 逐位不变 | ✅ |
+| G6 原子性（`/tmp/p90rev/copy2.db`） | 在 members 插入中途真抛 `IntegrityError`（第 2 行 `risk_json` NOT NULL，**发生在 snapshot 行已 INSERT 之后**）⇒ `candidate_snapshots where asof='2026-09-24'` = **0**、该快照下 members = **0**、总快照数仍 **2**、`conn.in_transaction` = **False**；紧接重跑正常路径 ⇒ `snapshot_id=3`、members=1 | ✅ |
+| G8 反目标 | `git diff --name-only a3609e3..HEAD` = 9 文件（2 源 + 4 测试 + 3 docs），**全部落在 §1 允许面内**；`stocklab/store/` 与 `candidate/{screen,score,risk_adjust,pools,report}.py` **零改动**；打分循环里 `score_pool`/`risk_adjust` 调用行**无任何 ±** | ✅ |
+| G9 真库现状（只读） | `candidate_snapshots` = **2** 行（id 1 `2026-09-18` weekly / id 2 `2026-06-15` weekly）、`candidate_rejects` = **0**、`candidate_members` = 38。**与任务书 §0.3 一致，真库未被污染、我没有清理任何东西** | ✅ |
+
+### 8.2 偏离裁决（§7.6 四条）
+
+1. **偏离 1（D1 去重落在写路径 `run_candidate`、没进内核 `score_pipeline`）——接受，且我确认这是硬约束下的唯一解。**
+   站的推理我逐条复核过：`params` 是 `score_pipeline` 构造的，键只可能在核心里算出来；而 P83 的三条既有红线
+   （`test_research_factor.py::test_params_keys_unchanged` / `test_default_path_digest_is_unchanged_from_head` /
+   `test_research_signal.py::test_pipeline_result_exposes_scored_without_changing_derivation`）对内核 `params` 键集
+   **做精确相等断言**，`PipelineResult` 字段表也被 `…field_order_and_defaults_are_only_additive` 钉死，
+   而这三个文件**不在 §1 的允许改动面**。⇒ 让内核保持无损、把折叠放在唯一写路径上，是**同时满足
+   D1/D2/G1/§1** 的落点；代价（内核 7 行 ≠ 落库 4 行）已如实记进 §7.6 与模块 docstring，**不是被藏起来**。
+   我另核了 `_dedup_rejects` 的实现在真库形状上给出 D1 要的顺序判据（保 `mid` 那条），
+   且 `transaction()` 在本轮候选链上**只在 `write_snapshot` 一处被用**（`grep` 全仓：`candidate/` ＋ `cli/main.py` 无第二处），
+   不存在嵌套 ⇒ D3 的「必须最外层」成立。
+2. **偏离 2（`test_candidate_run.py` 的 rejects 断言改成「按主键投影后相等」）——接受**。
+   该用例的保证（回测跑的就是生产逻辑）没被放宽，只是把「映射到表结构」这一步显式化。
+3. **偏离 3（`test_candidate_run_p77.py` 的老键排除集合 +1）——接受**。判据（其余老键逐位未变）未被放宽。
+4. **偏离 4（`write_snapshot` 形参一个没加，计数随已有 `params` 入参进快照）——接受**。
+   站给的理由成立：若在 `write_snapshot` 内部注入，首跑（`params = pipe.params`）与幂等重跑（读回快照）两条路径的
+   `RunResult.params` 会**不一致**；保持「写什么就是什么」的纯写入语义是对的。我实测首跑与重跑读回的 `params` 逐位相同。
+
+### 8.3 未决处置（§7.6 三条）
+
+| # | 处置 |
+|---|---|
+| 1 错误日记（§1 允许面不含 `docs/errors/` ⇒ 站未写） | **由我补做**：已写 ERROR_DIARY **#84**（见下方 §8.4 的两条根因）。
+| 2 `n_reject_dups_dropped` 只有总数、不能按标的还原「被几个池拒了」 | **接受，记账**。要还原得动 schema 或再加键，超出本档允许面；列入候选，等报告/labweb 真需要时另立任务书。
+| 3 G9 的 `mode=ro` 在本机对 WAL 库不可靠 | **接受**。我复核时用 `immutable=1` ＋ sha 对账，读数与站一致（2 / 0）；站没有为让命令成功而在真库目录造 `-shm`，这点尤其对。
+
+### 8.4 我补做的落位
+
+- `docs/errors/ERROR_DIARY.md` 新增 **#84**：① 主键意图是「一个 `(code, stage)` 一行」，产出侧却
+  在多个池各产一行（同 #48 同型的「文档/结构在说谎」）；② `isolation_level=None` 的 autocommit 连接下
+  `conn.commit()` 与 `with conn:` **都是空操作**，`run.py` 的 docstring 还写着「`write_snapshot` 内部 commit」。
+- 本档 §8（本文件）。
+
+### 8.5 待办：P89 的 weekly 链现在可用了吗
+
+**可用，且已在真库语义上验过**：G5 的 `asof=2026-09-24 / run_kind=weekly` 正是 2026-10-05 16:30
+那轮的形状（全新 `(asof, run_kind)`、首次执行），实测 **rc=0**。⇒ 「weekly 第 1 步必红」这条阻塞级缺陷**已解除**。
+下一步（巡检业务化 B5+B7）照审计 §6 派。

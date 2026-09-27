@@ -4272,3 +4272,66 @@ _ANN_COMPARE = ("notice_date", "title", "column_name", "ann_type")
    含义。与 ERROR_DIARY #71（判据与被测对象同源）、#79（凭记忆枚举）同族 ——
    共同点是**看起来一切正常**。所以真源实测（G1/G2 那一轮）不能只跑一次：
    **同一命令连跑两次，逐个数读一遍**，才有可能看见它。
+
+## #84 2026-09-27：主键说「一行」，产出侧给两行；而 autocommit 让 `commit()` 只是安慰剂（P90）
+
+### 现象
+
+P89 给 `WEEKLY_STEPS` 的第 1 步是 `candidate run --run-kind weekly`（阻断步），
+**2026-10-05 16:30 是它第一次真跑**。复核时在副本上一跑就红：
+
+```
+rc=1（耗时 1 s —— 是首次跑，不是重跑）
+❌ IntegrityError: UNIQUE constraint failed:
+   candidate_rejects.snapshot_id, candidate_rejects.code, candidate_rejects.stage
+```
+
+### 根本原因（两个，各自都独立成立）
+
+**A. 同一个 `(code, stage)` 被流水线产出两行。**
+`candidate_rejects` 的主键是 `(snapshot_id, code, stage)`，`stage` 的 CHECK 只有
+`('pre_screen','industry_screen','score')`（**不带池名**）。而 `candidate/run.py` 的打分循环对
+`eligible_pools(inst)` 的**每个池各判一次**、拒绝时 `stage` 恒为 `'score'`
+⇒ 一只标的在 `mid` 与 `long` 两池都拒，就写两行同 `(code, 'score')` ⇒ 撞主键。
+真库形状实测：21 只种子里 `600036`/`601318`/`601398` **三家银行**在 `mid` 与 `long`
+各被拒一次（原因都是「金融股报表结构无营业成本/存货」）⇒ **种子里永远有这 3 家，这不是偶发**。
+
+**B. 写快照不是原子的，失败留半截快照，且再跑被当成「已完成」。**
+`store/db.py::connect()` 用 `sqlite3.connect(..., isolation_level=None)` ⇒ 连接处于
+**autocommit**，`snapshot.py::write_snapshot` 末尾的 `conn.commit()` 是**空操作**，
+每条 `INSERT` 立即提交、抛错时**没有 ROLLBACK**。实测副本留下
+`candidate_snapshots.snapshot_id=3`（`asof=2026-09-24, run_kind=weekly`）＋ 2 行 rejects，
+而它本应有 **19 members ＋ 4 rejects**。更糟的是**再跑一次**会被 `find_snapshot` 命中并
+**静默**返回这份残缺快照（`skipped=True`、不报错）—— 比直接报错危险得多。
+
+第三件事：`candidate/run.py:19` 的 docstring 写着「快照写在一个事务边界内
+（`write_snapshot` 内部 commit）」—— 在 autocommit 连接下这句话**是假的**。
+
+### 修法
+
+- `_dedup_rejects()`（写路径 `run_candidate`，不碰内核）：按 `(code, stage)` 保留
+  **流水线顺序第一条**，丢弃数写进快照 `params` 的 `n_reject_dups_dropped`（只增键）。
+  内核 `score_pipeline` **保持无损**（回放/度量也用它）—— P83 的三条红线对内核 `params`
+  键集做精确相等断言，进内核就得放宽那三条，代价更大。
+- `write_snapshot` 三条 INSERT 包进 `store.db.transaction()`（显式 `BEGIN`/`COMMIT`，
+  异常 `ROLLBACK` 并重抛）。**不能用 `with conn:`** —— 在 autocommit 连接下它与
+  `conn.commit()` 一样是空操作。`transaction()` 禁嵌套 ⇒ `write_snapshot` 必须是最外层。
+- 顺手把 docstring 改对。
+
+### 教训
+
+1. **「主键」是产出侧必须遵守的契约，不是留给数据库去撞的。** 判据是这句：
+   **「我这一列在产出侧有几个来源？」** 主键里没有池名 ⇒ 产出侧就**必须**
+   先把「多池」折成一维。设计时写「一行一个 `(code, stage)`」，代码里就得有人真的做这一步。
+2. **`isolation_level=None` 的连接上，`conn.commit()` / `with conn:` 都是安慰剂。**
+   凡「先写 A 再写 B，中途失败要全不落」的地方，必须用**显式** `BEGIN`——
+   本仓的落点就是 `store.db.transaction()`（`conn.in_transaction` 会拒绝嵌套，
+   顺手挡住「调用方已经开了事务」这种更难查的错）。同型的假保证还有
+   `conn.commit()` 后 `except` 里没有 `rollback()`：错误信息会**看起来**是干净的失败。
+3. **「再跑一次就自愈」是最坏的形状。** 这里失败后留下的半截快照会被幂等键
+   `(asof, run_kind)` 认成「已做过」，于是**下一轮静默拿到残缺数据**。
+   判据：**幂等键命中之前，先确认那份东西是完整的** —— 要么靠事务保证，
+   要么把「完成」写成显式状态，不能靠「行存在」推断。
+4. **「首次执行就失败」和「重跑才失败」是两种病。** 复核时第一句要问清是哪一种
+   （这里耗时 1 s ⇒ 首次）——它决定了修法在写路径还是在幂等判据上。
+   与 #48（文档在说谎）、#66（勾了没做）同族：**看代码不如跑一遍，跑一遍不如在新键上跑一遍。**
