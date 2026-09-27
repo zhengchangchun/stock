@@ -588,6 +588,228 @@ def cmd_ingest_financials(args) -> int:
         conn.close()
 
 
+# ---------- ingest announcements / northbound（P88：公告 + 北向季度持股） ----------
+
+def cmd_ingest_announcements(args) -> int:
+    """采集公告并落 `announcements`（联网；东财 `np-anotice-stock`）。
+
+    **增量＝翻页到 cutoff 即停**（D5）：该接口**不支持** `begin_time`/`end_time`
+    （一加就 `total_hits=0`，§0.2 实测），所以只能从第 1 页往后翻，某页出现
+    `notice_date < cutoff` 就停。`--page-limit` 是硬上限：跑满仍未见 cutoff
+    ⇒ 该只记 `truncated`（**不报错**，下轮继续）。
+
+    幂等 / 首写保留 / 单只失败不拖累整批（D6 沿用 P75：`warn` 留痕 + `continue`
+    + 收尾 `failed` + `return 1`，**不写裸 abort**）。
+
+    `--universe <id>`：取数范围（默认 `None` ⇒ `SEED_UNIVERSE` 21 只，**逐字沿用**
+    P72 的 fail-closed；坏 id ⇒ exit 2 且**零写入** —— 先解析宇宙再碰库）。
+    """
+    from stocklab.config.universes import UniverseError, resolve_universe
+    from stocklab.data.http import HttpClient
+    from stocklab.data.ingest import ingest_announcements
+    from stocklab.data.sources.eastmoney_ann import fetch_announcements
+    from stocklab.store.migrate import ensure_schema
+
+    try:
+        # 先解析宇宙**再**碰库：用法错误必须零写入（`ensure_schema` 会写库）。
+        universe_id, members, _sha = resolve_universe(getattr(args, "universe", None))
+    except UniverseError as exc:
+        print(f"❌ --universe：{exc}", file=sys.stderr)
+        return 2
+
+    db_path = Path(args.db) if args.db else paths.DB_PATH
+    ensure_schema(db_path)
+    now = datetime.now(timezone.utc).isoformat()
+    cutoff = (date.today() - timedelta(days=args.days)).isoformat()
+    wanted = set(args.code) if args.code else {i.code for i in members}
+    client = HttpClient()
+    conn = connect(db_path)
+    written = conflicts = failed = truncated = 0
+    print(f"宇宙={universe_id}（{len(members)} 只；取数集合 {len(wanted)} 只；"
+          f"cutoff={cutoff}）")
+    try:
+        for inst in members:
+            if inst.code not in wanted:
+                continue
+            try:
+                rows, _refs, trunc = fetch_announcements(
+                    client, code=inst.code, cutoff=cutoff, page_limit=args.page_limit)
+            except Exception as exc:                       # noqa: BLE001 — 必须留痕
+                failed += 1
+                print(f"❌ {inst.code} {type(exc).__name__}: {exc}", file=sys.stderr)
+                repo.log_event(conn, "ingest", "warn",
+                               f"ingest announcements {inst.code} 失败: {exc}",
+                               context={"code": inst.code, "job": "ingest_announcements"},
+                               now=now)
+                continue
+            r = ingest_announcements(conn, rows, now=now)
+            written += r.rows_written
+            conflicts += r.conflicts
+            truncated += 1 if trunc else 0
+            print(f"{inst.code} 抓到 {len(rows)} 条 新写 {r.rows_written}"
+                  f" 冲突 {r.conflicts} 截断 {'是' if trunc else '否'}")
+        print(f"合计：新写 {written} 行 / 首写保留冲突 {conflicts} / "
+              f"截断 {truncated} 只 / 失败 {failed} 只")
+        return 1 if failed else 0
+    finally:
+        conn.close()
+
+
+def cmd_ingest_northbound(args) -> int:
+    """采集北向**季度**持股并落 `northbound_holdings`（联网；东财 datacenter）。
+
+    ⚠️ 公开源上只剩季度持仓（§0.3：2024-08 起交易所取消实时/每日披露，日度资金流
+    的净额列实测恒 0、日度持股字段实测全 null）⇒ 本命令**只**落 `frequency='quarterly'`
+    的行，**绝不**编日度序列。
+
+    幂等 / 首写保留 / 单只失败不拖累整批，与 `ingest announcements` 同款（D6）。
+    `--universe` 语义同款（fail-closed，坏 id ⇒ exit 2 且零写入）。
+    """
+    from stocklab.config.universes import UniverseError, resolve_universe
+    from stocklab.data.http import HttpClient
+    from stocklab.data.ingest import ingest_northbound_holdings
+    from stocklab.data.sources.northbound import fetch_northbound_holdings
+    from stocklab.store.migrate import ensure_schema
+
+    try:
+        universe_id, members, _sha = resolve_universe(getattr(args, "universe", None))
+    except UniverseError as exc:
+        print(f"❌ --universe：{exc}", file=sys.stderr)
+        return 2
+
+    db_path = Path(args.db) if args.db else paths.DB_PATH
+    ensure_schema(db_path)
+    now = datetime.now(timezone.utc).isoformat()
+    start = (date.today() - timedelta(days=args.days)).isoformat()
+    wanted = set(args.code) if args.code else {i.code for i in members}
+    client = HttpClient()
+    conn = connect(db_path)
+    written = conflicts = failed = 0
+    print(f"宇宙={universe_id}（{len(members)} 只；取数集合 {len(wanted)} 只；"
+          f"start={start}）")
+    try:
+        for inst in members:
+            if inst.code not in wanted:
+                continue
+            try:
+                rows, _refs = fetch_northbound_holdings(
+                    client, code=inst.code, start=start)
+            except Exception as exc:                       # noqa: BLE001 — 必须留痕
+                failed += 1
+                print(f"❌ {inst.code} {type(exc).__name__}: {exc}", file=sys.stderr)
+                repo.log_event(conn, "ingest", "warn",
+                               f"ingest northbound {inst.code} 失败: {exc}",
+                               context={"code": inst.code, "job": "ingest_northbound"},
+                               now=now)
+                continue
+            r = ingest_northbound_holdings(conn, rows, now=now)
+            written += r.rows_written
+            conflicts += r.conflicts
+            span = (f"{rows[0]['trade_date']}~{rows[-1]['trade_date']}"
+                    if rows else "（无持股行，合法空）")
+            print(f"{inst.code} 抓到 {len(rows)} 期 {span}"
+                  f" 新写 {r.rows_written} 冲突 {r.conflicts}")
+        print(f"合计：新写 {written} 行 / 首写保留冲突 {conflicts} / 失败 {failed} 只")
+        return 1 if failed else 0
+    finally:
+        conn.close()
+
+
+# ---------- data（P88：已采数据的**只读**出口） ----------
+
+def _data_ro_conn(args, table: str):
+    """`data` 命令组的**只读**连接（`file:绝对路径?mode=ro`）。
+
+    三件事**刻意不做**：不 `ensure_schema`（那是一次写库）、不建文件（读命令不该有
+    建库的副作用）、不联网。表不存在 ⇒ exit 2 并把原因打出来 —— 而不是顺手前滚。
+    """
+    db = Path(args.db) if getattr(args, "db", None) else paths.DB_PATH
+    if not db.exists():
+        print(f"❌ 库不存在（{db}）；先跑 stocklab db init", file=sys.stderr)
+        return None, 2
+    conn = sqlite3.connect(f"file:{db.resolve()}?mode=ro", uri=True)
+    conn.row_factory = sqlite3.Row
+    exists = conn.execute(
+        "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name=?",
+        (table,)).fetchone()[0]
+    if not exists:
+        conn.close()
+        print(f"❌ 表 {table} 不存在 —— 先跑 stocklab db init 前滚 schema",
+              file=sys.stderr)
+        return None, 2
+    return conn, None
+
+
+#: `data` 命令组只吐这些列（**不** SELECT *：`schema.sql` 加列不该改变读出口的载荷）。
+_ANN_READ_COLS = ("code", "art_code", "notice_date", "display_time", "title",
+                  "column_name", "ann_type", "source", "resp_sha256")
+_NB_READ_COLS = ("code", "trade_date", "hold_shares", "hold_market_cap",
+                 "a_shares_ratio", "hold_shares_ratio", "free_shares_ratio",
+                 "close_price", "frequency", "source", "resp_sha256")
+
+
+def _ann_text(payload: dict) -> str:
+    head = (f"{payload['code']} 公告 {payload['n']} 条"
+            f"（notice_date >= {payload['cutoff']}，最多 {payload['limit']} 条）\n")
+    if not payload["rows"]:
+        return head + "（无）\n"
+    lines = [f"{r['notice_date']}  {r['column_name'] or '-'}  "
+             f"{r['art_code']}  {r['title']}" for r in payload["rows"]]
+    return head + "\n".join(lines) + "\n"
+
+
+def _nb_text(payload: dict) -> str:
+    head = f"{payload['code']} 北向持股 {payload['n']} 行（季度口径）\n"
+    if not payload["rows"]:
+        return head + "（无）\n"
+    lines = [f"{r['trade_date']}  持股 {r['hold_shares']} 股 / "
+             f"市值 {r['hold_market_cap']} 元 / 频率 {r['frequency']}"
+             for r in payload["rows"]]
+    return head + "\n".join(lines) + "\n"
+
+
+def cmd_data_announcements(args) -> int:
+    """看某只标的的公告（**只读、零写入、零联网**）。"""
+    conn, err = _data_ro_conn(args, "announcements")
+    if err:
+        return err
+    try:
+        cutoff = (date.today() - timedelta(days=args.days)).isoformat()
+        rows = [dict(r) for r in conn.execute(
+            f"SELECT {', '.join(_ANN_READ_COLS)} FROM announcements"
+            " WHERE code=? AND notice_date>=?"
+            " ORDER BY notice_date DESC, art_code DESC LIMIT ?",
+            (args.code, cutoff, args.limit))]
+    finally:
+        conn.close()
+    payload = {"code": args.code, "days": args.days, "limit": args.limit,
+               "cutoff": cutoff, "n": len(rows), "rows": rows}
+    if args.json:
+        print(json.dumps(payload, ensure_ascii=False, sort_keys=True, indent=2))
+        return 0
+    sys.stdout.write(_ann_text(payload))
+    return 0
+
+
+def cmd_data_northbound(args) -> int:
+    """看某只标的的北向**季度**持股（**只读、零写入、零联网**）。"""
+    conn, err = _data_ro_conn(args, "northbound_holdings")
+    if err:
+        return err
+    try:
+        rows = [dict(r) for r in conn.execute(
+            f"SELECT {', '.join(_NB_READ_COLS)} FROM northbound_holdings"
+            " WHERE code=? ORDER BY trade_date DESC", (args.code,))]
+    finally:
+        conn.close()
+    payload = {"code": args.code, "n": len(rows), "rows": rows}
+    if args.json:
+        print(json.dumps(payload, ensure_ascii=False, sort_keys=True, indent=2))
+        return 0
+    sys.stdout.write(_nb_text(payload))
+    return 0
+
+
 # ---------- adj rebuild（离线重算因子链 + 缺口） ----------
 
 def cmd_adj_rebuild(args: argparse.Namespace) -> int:
@@ -4363,6 +4585,48 @@ def build_parser() -> argparse.ArgumentParser:
     ing_fin.add_argument("--universe", default=None, help=UNIVERSE_SCOPE_HELP)
     ing_fin.add_argument("--db")
     ing_fin.set_defaults(func=cmd_ingest_financials)
+
+    # P88：公告 + 北向季度持股（两条都**必须**有 --db —— 写实测才能走 /tmp 副本）
+    ing_ann = ing_sub.add_parser(
+        "announcements", help="采集公告（东财 np-anotice；翻页到 cutoff 即停）")
+    ing_ann.add_argument("--code", action="append", default=None,
+                         help="只采指定 6 位代码，可重复；默认全部种子标的")
+    ing_ann.add_argument("--days", type=int, default=30,
+                         help="增量窗口天数（默认 30；接口不支持时间窗，"
+                              "靠翻页到 notice_date < cutoff 即停）")
+    ing_ann.add_argument("--page-limit", type=int, default=5,
+                         help="单只标的最多翻几页（默认 5，**硬上限**；"
+                              "跑满仍未见 cutoff ⇒ 记 truncated，不报错）")
+    ing_ann.add_argument("--universe", default=None, help=UNIVERSE_SCOPE_HELP)
+    ing_ann.add_argument("--db")
+    ing_ann.set_defaults(func=cmd_ingest_announcements)
+
+    ing_nb = ing_sub.add_parser(
+        "northbound", help="采集北向季度持股（东财 datacenter；frequency=quarterly）")
+    ing_nb.add_argument("--code", action="append", default=None,
+                        help="只采指定 6 位代码，可重复；默认全部种子标的")
+    ing_nb.add_argument("--days", type=int, default=400,
+                        help="回看天数（默认 400 ≈ 4-5 个季度；公开源只有季度口径）")
+    ing_nb.add_argument("--universe", default=None, help=UNIVERSE_SCOPE_HELP)
+    ing_nb.add_argument("--db")
+    ing_nb.set_defaults(func=cmd_ingest_northbound)
+
+    # P88：`data` 只读出口（不 ensure_schema、不建文件、不联网）
+    data = sub.add_parser("data", help="已采数据的只读出口（离线；不写库、不联网）")
+    data_sub = data.add_subparsers(dest="data_target")
+    d_ann = data_sub.add_parser("announcements", help="看某只标的的公告（只读）")
+    d_ann.add_argument("--code", required=True, help="6 位标的代码，如 000333")
+    d_ann.add_argument("--days", type=int, default=90,
+                       help="只看最近 N 个自然日的公告（默认 90）")
+    d_ann.add_argument("--limit", type=int, default=50, help="最多打几条（默认 50）")
+    d_ann.add_argument("--json", action="store_true", help="打完整 JSON 载荷")
+    d_ann.add_argument("--db")
+    d_ann.set_defaults(func=cmd_data_announcements)
+    d_nb = data_sub.add_parser("northbound", help="看某只标的的北向季度持股（只读）")
+    d_nb.add_argument("--code", required=True, help="6 位标的代码，如 000333")
+    d_nb.add_argument("--json", action="store_true", help="打完整 JSON 载荷")
+    d_nb.add_argument("--db")
+    d_nb.set_defaults(func=cmd_data_northbound)
 
     adj = sub.add_parser("adj", help="复权因子链（离线，只读 bars_daily + corp_actions）")
     adj_sub = adj.add_subparsers(dest="adj_action")

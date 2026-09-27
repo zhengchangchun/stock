@@ -128,6 +128,19 @@ MONTHLY_STEPS: tuple[Step, ...] = (
          "同批 —— 日链只跑默认窗口，深历史是月度的事"),
     Step("ingest_financials", ("ingest", "financials"), False,
          "东财三表全量复核（季报频率，月度一次足够；已入库的期数 rows=0）"),
+    # P88：公告 + 北向季度持股。**只挂月链**（D7）：日链 13 步已有预算，
+    # 800 只逐只翻页会把它拖死；两者都是**非阻断**（失败不挡后续步）——
+    # 它们补的是「以后要用的数据」，不是当天链路的依赖。
+    Step("ingest_announcements", ("ingest", "announcements", "--days", "90",
+                                  "--page-limit", "3"), False,
+         "公告增量（东财 np-anotice；接口不支持时间窗 ⇒ 翻页到 cutoff 即停，"
+         "page-limit=3 是硬上限，跑满记 truncated 不报错）。**非阻断**："
+         "公告本档只落表、不进任何消费路径（D8），失败不该把维护链判红",
+         blocking=False),
+    Step("ingest_northbound", ("ingest", "northbound", "--days", "120"), False,
+         "北向**季度**持股（东财 datacenter）。⚠️ 公开源上日度早已不存在（§0.3）——"
+         "本步只落 frequency='quarterly' 的行，不编日度序列。**非阻断**（同上一句）",
+         blocking=False),
     Step("candidate_review", ("candidate", "review", "--asof", "{asof}"), True,
          "插桩5「定期复盘分析」（P58）：读历史快照 / 回测台账 / 模块2 回流，"
          "落 `reports/plugin-review/<asof>.md` ＋ append-only 台账。**非阻断** —— "
