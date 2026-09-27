@@ -20,6 +20,7 @@ import pytest
 from stocklab.candidate import replay
 from stocklab.config.costs import CostModel
 from stocklab.data import adjust
+from stocklab.research import xsec
 from stocklab.store.db import connect
 from stocklab.store.migrate import init_db
 
@@ -383,6 +384,33 @@ def test_sandbox_injected_path_is_untouched(tmp_db):
     assert a == pytest.approx(0.5 - 0.0), "池 +50%、基准持平 ⇒ 超额 +50%"
 
 
+def test_sandbox_call_sites_never_pass_price_mode():
+    """T5 ⑤/D8：`plugin/sandbox.py` 的**调用点**一个都不传 `price_mode`。
+
+    与上一条（源码里不出现字符串）互补：这条按 AST 钉住每个 `ast.Call` 的
+    关键字 —— 沙盒读数是插件版本间的对照基线，默认口径一变、历史
+    `source_sha256` 的对照关系就漂（D2）。注入的两个函数
+    （`_benchmark_excess` / `_rebalance_marks`）必须存在，否则这条钉不住。
+    """
+    import ast
+
+    import stocklab.plugin.sandbox as sandbox_mod
+
+    tree = ast.parse(Path(sandbox_mod.__file__).read_text(encoding="utf-8"))
+    calls = [n for n in ast.walk(tree) if isinstance(n, ast.Call)]
+    assert calls
+    offenders = [ast.unparse(c) for c in calls
+                 if any(kw.arg == "price_mode" for kw in c.keywords)]
+    assert offenders == [], f"sandbox 的调用点传了 price_mode：{offenders}"
+
+    injected = [c for c in calls
+                if getattr(c.func, "id", None) in
+                {"_benchmark_excess", "_rebalance_marks"}]
+    assert injected, "沙盒的注入调用点必须在（否则本用例钉不住基线）"
+    for c in injected:
+        assert all(kw.arg != "price_mode" for kw in c.keywords)
+
+
 def test_no_price_mode_kwarg_removed_from_existing_signature():
     """`price_mode` / `price_stats` 都是**带默认值的新增关键字**（D1/D5）。
 
@@ -424,55 +452,128 @@ def _xsec_run(tmp_db, prereg, out, *extra):
     return _run_cli(tmp_db, out, prereg, *extra)
 
 
-def test_xsec_raw_mode_matches_default_and_only_adds_keys(tmp_db, tmp_path):
-    """T2/D5：`--price-mode raw` 与**不传**时逐字段一致（只多三个新键）。
+def test_xsec_default_mode_is_adj(tmp_db, tmp_path):
+    """T5 ①/D1：不传 `--price-mode` ⇒ **adj**（PIT 复权价），产物名带 `-adj`。
 
-    新键在**两档都出现**（`price_mode` 要能自证这次跑的是哪个口径）；
-    `arms_adj` / `delta_adj` 只在 adj/both 档出现 —— raw 档不许有。
+    P94 把研究命令的默认口径从 `raw` 切成 `adj`：不传 == 显式 `adj`（逐字段
+    相同，只差 `elapsed_*`），且**不再**产出无后缀的 raw 产物。
     """
     import json
 
     prereg = _xsec_seed(tmp_db, tmp_path)
     rc_a = _xsec_run(tmp_db, prereg, tmp_path / "a")
-    rc_b = _xsec_run(tmp_db, prereg, tmp_path / "b", "--price-mode", "raw")
+    rc_b = _xsec_run(tmp_db, prereg, tmp_path / "b", "--price-mode", "adj")
     assert (rc_a, rc_b) == (0, 0)
 
-    ja = json.loads((tmp_path / "a" / "2016-06-30-xsec-topn-seed21.json")
-                    .read_text())
-    jb = json.loads((tmp_path / "b" / "2016-06-30-xsec-topn-seed21.json")
-                    .read_text())
-    assert {"price_mode", "n_adj_fallback", "price_mode_note"} <= set(jb)
-    # 新键只在 adj/both 档出现 —— raw 档连 `arms_adj` 都不该有。
-    assert "arms_adj" not in jb and "delta_adj" not in jb
-    assert jb["price_mode"] == "raw" and jb["n_adj_fallback"] == 0
-    # 其余字段**逐字段相同**（含两臂序列与 Δ）—— `elapsed_*` 除外。
-    # 这是「不传 == 传 raw == 现状」的机器判据（与 HEAD 产物的全窗比对是 §6 的事）。
+    pa = tmp_path / "a" / "2016-06-30-xsec-topn-seed21-adj.json"
+    pb = tmp_path / "b" / "2016-06-30-xsec-topn-seed21-adj.json"
+    assert pa.is_file(), "默认档的产物名必须带 -adj 后缀（D4）"
+    assert not (tmp_path / "a" / "2016-06-30-xsec-topn-seed21.json").exists()
+
+    ja = json.loads(pa.read_text())
+    jb = json.loads(pb.read_text())
+    assert ja["price_mode"] == "adj" == jb["price_mode"]
+    assert "arms_adj" not in ja and "delta_adj" not in ja
     volatile = {"elapsed_s", "scan_s", "replay_s"}
     assert {k: v for k, v in ja.items() if k not in volatile} == \
            {k: v for k, v in jb.items() if k not in volatile}
+    # adj 就是默认档 ⇒ 复现命令里**不出现** `--price-mode adj`（出现反而误导）。
+    md_a = (tmp_path / "a" / "2016-06-30-xsec-topn-seed21-adj.md").read_text()
+    assert "--price-mode adj" not in md_a
 
 
-def test_xsec_both_mode_emits_two_readings_without_touching_raw_product(
-        tmp_db, tmp_path):
-    """T4/D6：`both` 一次扫描出两套读数，且 **不覆盖** 既有 raw 产物。"""
+def test_cmd_research_fallback_price_mode_is_adj(tmp_db, tmp_path):
+    """T1：直接调 `cmd_research_xsec_topn()`（args 里**没有** `price_mode`）⇒ 兜底 `adj`。
+
+    argparse 那条路（默认值）由 `test_xsec_default_mode_is_adj` 钉；这条钉
+    `getattr(args, "price_mode", …)` 的**兜底常量** —— 只有直接调处理函数、
+    不经过 argparse 的路径会走到它（P94 · D1 要求两处都改）。
+    """
+    import json
+    from types import SimpleNamespace
+
+    from stocklab.cli.research import cmd_research_xsec_topn
+
+    prereg = _xsec_seed(tmp_db, tmp_path)
+    out = tmp_path / "out"
+    args = SimpleNamespace(pool="short", start="2015-01-01", end="2016-06-30",
+                           prereg=str(prereg), out=str(out), db=str(tmp_db),
+                           arm="both", universe=None)
+    assert cmd_research_xsec_topn(args) == 0, "args 缺 price_mode 不该被拒"
+    r = json.loads(
+        (out / "2016-06-30-xsec-topn-seed21-adj.json").read_text())
+    assert r["price_mode"] == "adj"
+
+
+def test_xsec_raw_mode_keeps_no_suffix_product(tmp_db, tmp_path):
+    """T5 ④/D4：显式 `--price-mode raw` ⇒ 无后缀产物、`price_mode=raw`、无 adj 读数。
+
+    默认已切成 adj（D1），但 raw 档必须**仍可显式指定**且产物名与改动前一致
+    （`reports/research/` 里既有的 raw 产物靠这个后缀区分）。
+    """
     import json
 
     prereg = _xsec_seed(tmp_db, tmp_path)
     out = tmp_path / "out"
-    assert _xsec_run(tmp_db, prereg, out) == 0
+    assert _xsec_run(tmp_db, prereg, out, "--price-mode", "raw") == 0
     raw_json = out / "2016-06-30-xsec-topn-seed21.json"
-    before = raw_json.read_text(encoding="utf-8")
+    assert raw_json.is_file() and not (
+        out / "2016-06-30-xsec-topn-seed21-adj.json").exists()
+    jb = json.loads(raw_json.read_text())
+    assert jb["price_mode"] == "raw" and jb["n_adj_fallback"] == 0
+    assert "arms_adj" not in jb and "delta_adj" not in jb
+    assert {"price_mode", "n_adj_fallback", "price_mode_note",
+            "benchmark_price_mode"} <= set(jb)
+    # 显式 raw 的复现命令必须带上 `--price-mode raw`，否则照抄会跑成默认档 adj。
+    md = (out / "2016-06-30-xsec-topn-seed21.md").read_text()
+    assert "--price-mode raw" in md
 
-    # 第二次跑 `both`，同一个 out 目录。
+
+def test_xsec_benchmark_price_mode_is_raw_in_every_mode(tmp_db, tmp_path):
+    """T5 ③/D3：`benchmark_price_mode` 键出现且**恒 `raw`**（指数不可复权）。
+
+    raw / adj / both 三档都要有，且 md 的口径段（§3）原样点名。
+    """
+    import json
+
+    prereg = _xsec_seed(tmp_db, tmp_path)
+    assert xsec.BENCHMARK_PRICE_MODE == "raw"
+    for mode, stem in (("raw", ""), ("adj", "-adj"), ("both", "-both")):
+        out = tmp_path / f"out-{mode}"
+        assert _xsec_run(tmp_db, prereg, out, "--price-mode", mode) == 0
+        r = json.loads(
+            (out / f"2016-06-30-xsec-topn-seed21{stem}.json").read_text())
+        assert r["benchmark_price_mode"] == "raw"
+        md = (out / f"2016-06-30-xsec-topn-seed21{stem}.md").read_text()
+        assert "benchmark_price_mode" in md
+
+
+def test_xsec_both_mode_emits_two_readings_without_touching_other_products(
+        tmp_db, tmp_path):
+    """T4/D6＋T5 ②：`both` 一次扫描出两套读数；产物名 `-both`，不覆盖 raw/adj。"""
+    import json
+
+    prereg = _xsec_seed(tmp_db, tmp_path)
+    out = tmp_path / "out"
+    assert _xsec_run(tmp_db, prereg, out, "--price-mode", "raw") == 0
+    assert _xsec_run(tmp_db, prereg, out, "--price-mode", "adj") == 0
+    raw_json = out / "2016-06-30-xsec-topn-seed21.json"
+    adj_json = out / "2016-06-30-xsec-topn-seed21-adj.json"
+    raw_before = raw_json.read_text(encoding="utf-8")
+    adj_before = adj_json.read_text(encoding="utf-8")
+
+    # 第三次跑 `both`，同一个 out 目录。
     assert _xsec_run(tmp_db, prereg, out, "--price-mode", "both") == 0
 
-    assert raw_json.read_text(encoding="utf-8") == before, \
+    assert raw_json.read_text(encoding="utf-8") == raw_before, \
         "both 档盖掉了既有的 raw 产物（D6 明确禁止）"
-    adj_json = out / "2016-06-30-xsec-topn-seed21-adj.json"
-    assert adj_json.is_file(), "both 档的产物名必须带 -adj 后缀"
+    assert adj_json.read_text(encoding="utf-8") == adj_before, \
+        "both 档盖掉了 adj 档的产物（D4：-both 是独立后缀）"
+    both_json = out / "2016-06-30-xsec-topn-seed21-both.json"
+    assert both_json.is_file(), "both 档的产物名必须带 -both 后缀（D4）"
 
-    r_raw = json.loads(before)
-    r = json.loads(adj_json.read_text(encoding="utf-8"))
+    r_raw = json.loads(raw_before)
+    r = json.loads(both_json.read_text(encoding="utf-8"))
     assert r["price_mode"] == "both"
     assert set(r["arms_adj"]) == {"topn", "all"}
     assert r["delta_adj"] is not None
@@ -511,11 +612,11 @@ def test_xsec_both_single_arm_keeps_adj_readings(tmp_db, tmp_path):
     rc = _xsec_run(tmp_db, prereg, out, "--arm", "topn", "--price-mode", "both")
     assert rc == 0
     r = json.loads(
-        (out / "2016-06-30-xsec-topn-seed21-adj.json").read_text())
+        (out / "2016-06-30-xsec-topn-seed21-both.json").read_text())
     assert set(r["arms"]) == {"topn"} and set(r["arms_adj"]) == {"topn"}
     assert r["delta"] is None and r["delta_adj"] is None
     assert r["arms_adj"]["topn"]["period_returns"]
-    md = (out / "2016-06-30-xsec-topn-seed21-adj.md").read_text()
+    md = (out / "2016-06-30-xsec-topn-seed21-both.md").read_text()
     assert "价格口径对照" in md and "没有 Δ" in md
 
 

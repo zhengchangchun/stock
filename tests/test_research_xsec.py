@@ -410,7 +410,8 @@ def test_cli_end_to_end_writes_reports_and_no_table(tmp_db, tmp_path):
     days = _seed_pipeline_db(tmp_db, n_weekdays=300)
     before = _counts(tmp_db)
     out = tmp_path / "out"
-    rc = _run_cli(tmp_db, out, PREREG)
+    # 本用例比的是 raw 档产物名与零写库（P94 起默认口径已切 adj ⇒ 显式指定）。
+    rc = _run_cli(tmp_db, out, PREREG, "--price-mode", "raw")
     assert rc == 0
 
     json_p = out / "2016-06-30-xsec-topn-seed21.json"
@@ -439,7 +440,7 @@ def test_report_carries_required_caliber_strings(tmp_db, tmp_path):
     """硬约束 6：三条非 PIT 项、成本口径偏差、选择偏差限定句必须进报告。"""
     _seed_pipeline_db(tmp_db, n_weekdays=300)
     out = tmp_path / "out"
-    assert _run_cli(tmp_db, out, PREREG) == 0
+    assert _run_cli(tmp_db, out, PREREG, "--price-mode", "raw") == 0
     md = (out / "2016-06-30-xsec-topn-seed21.md").read_text(encoding="utf-8")
     for s in xsec.NON_PIT_ITEMS:
         assert s in md
@@ -488,7 +489,8 @@ def test_cli_arm_single_reports_no_delta(tmp_db, tmp_path):
     """`--arm topn` 只跑单臂：没有 Δ，也就没有 verdict（不假装有对照）。"""
     _seed_pipeline_db(tmp_db, n_weekdays=300)
     out = tmp_path / "out"
-    assert _run_cli(tmp_db, out, PREREG, "--arm", "topn") == 0
+    assert _run_cli(tmp_db, out, PREREG, "--arm", "topn",
+                    "--price-mode", "raw") == 0
     report = json.loads(
         (out / "2016-06-30-xsec-topn-seed21.json").read_text(encoding="utf-8"))
     assert set(report["arms"]) == {"topn"}
