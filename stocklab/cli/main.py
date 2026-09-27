@@ -3812,7 +3812,8 @@ def cmd_ops_patrol(args: argparse.Namespace) -> int:
 
     payload = patrol.run_patrol(
         db_path=args.db, now=args.now, fix=args.fix,
-        timeout_s=args.timeout_seconds, report_dir=args.report_dir)
+        timeout_s=args.timeout_seconds, report_dir=args.report_dir,
+        update_status=args.update_status)
     print(json.dumps(payload, ensure_ascii=False, sort_keys=True, indent=2))
     for a in payload.get("anomalies") or []:
         print(f"⚠️  {a['kind']}: {a.get('detail') or a.get('step') or ''}",
@@ -5246,7 +5247,12 @@ def build_parser() -> argparse.ArgumentParser:
         help=f"整轮预算（默认 {PATROL_TIMEOUT_S:.0f}s；用完即停并记 aborted）")
     ops_patrol.add_argument("--report-dir", dest="report_dir",
                             help="报告根目录（默认 reports/；体检只读：读 <它>/<date>-review.md"
-                                 "、回执写 <它>/ops/latest-patrol.json）")
+                                 "、回执写 <它>/ops/latest-patrol.json、简报写 <它>/ops/"
+                                 "brief/<date>.md 与 <它>/ops/latest-patrol-brief.md）")
+    ops_patrol.add_argument(
+        "--update-status", dest="update_status", action="store_true",
+        help="打开候选池状态的**自动推导写入**（P92：池内成员被任一 live 账户实际持有 ⇒ "
+             "「已建仓」）；**默认关**（只算不写），写路径走子进程调 candidate status set")
     ops_patrol.set_defaults(func=cmd_ops_patrol)
 
     ops_close = ops_sub.add_parser(

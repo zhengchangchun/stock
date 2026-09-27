@@ -66,6 +66,11 @@ SKIPPED = "skipped"      # 本轮不该要求它（非交易日 / 未 paper init
 UNKNOWN = "unknown"      # **判不了**（证据不足）→ 只在点名的地方计异常，见 verdict()
 LAG = "lag"              # 落后**恰好一个交易日**且有「源站 T-1 发布」的证据
                          # （P67 T2）→ **不计异常**，但补步照排。刻意不在下面那个集合里。
+TRIPPED = "tripped"      # 业务块专用（P92）：熔断已触发。**只有它**进退出码（D2）——
+                         # 其余三条业务读数（排雷 / 状态 / 新鲜度）只展示、不计异常。
+RISKY = "risky"          # 业务块专用（P92）：插桩0 排雷命中。同上，只展示。
+                         # 这两个刻意**不在** ANOMALY_STATUSES 里：业务块不进 `checks`，
+                         # 它的异常由 `_anomalies()` 显式露面（kind="business_fuse"）。
 
 ANOMALY_STATUSES = frozenset({MISSING, STALE})
 
@@ -240,11 +245,18 @@ def _money_flow_verdict(conn: sqlite3.Connection, cal, mf: str | None,
 
 
 def check_chain(conn: sqlite3.Connection, now: str, *, report_dir: Path | str | None = None,
-                model_version: str = MODEL_VERSION) -> dict:
-    """7 项体检 + 日历项。**本函数一行都不写**（连接由调用方保证只读）。
+                model_version: str = MODEL_VERSION, db_path: Path | str | None = None,
+                update_status: bool = False, runner=None,
+                with_business: bool = True) -> dict:
+    """7 项体检 + 日历项 + `business` 业务块。**本函数一行都不写**（连接由调用方保证只读）。
 
     返回的 `exit_code` / `anomalies` 是**体检当时的**结论；`--fix` 之后要重跑一次
     再定稿（补步有没有把它修好，只能看补完之后的库）。
+
+    业务块（P92 / `stocklab/ops/business.py`）挂在 `business` 键下 —— **键只增不减**，
+    既有键一字不动。`update_status=True` 是那条唯一的写路径（走子进程调 P91 的 CLI），
+    默认关。`with_business=False` 给**复检**那一趟用：业务读数与「补步有没有修好」
+    无关，跑两遍只是白烧插桩0 的沙盒。
     """
     dt = _as_datetime(now)
     today = dt.date().isoformat()
@@ -462,6 +474,13 @@ def check_chain(conn: sqlite3.Connection, now: str, *, report_dir: Path | str | 
         "checks": {name: checks[name] for name in CHECK_ORDER},
         "titles": {**CHECK_TITLE, "calendar": CALENDAR_TITLE},
     }
+    if with_business:
+        # 惰性 import：`business` 反过来要用本模块的状态常量（同一个词汇表，
+        # 不新造第二套），模块级互相 import 会成环。见 business.py 模块 docstring。
+        from stocklab.ops import business as business_mod
+        out["business"] = business_mod.build_business(
+            conn, latest=latest, db_path=db_path, update_status=update_status,
+            runner=runner)
     v = verdict(out)
     out["verdict"] = v
     out["anomalies"] = _anomalies(out, v)
@@ -471,11 +490,15 @@ def check_chain(conn: sqlite3.Connection, now: str, *, report_dir: Path | str | 
 
 
 def check_db(db_path: Path | str, now: str, *,
-             report_dir: Path | str | None = None) -> dict:
+             report_dir: Path | str | None = None,
+             with_business: bool = True, update_status: bool = False,
+             runner=None) -> dict:
     """`check_chain` 的只读入口（自开自关连接）。"""
     conn = ro_connect(Path(db_path))
     try:
-        return check_chain(conn, now, report_dir=report_dir)
+        return check_chain(conn, now, report_dir=report_dir, db_path=Path(db_path),
+                           with_business=with_business, update_status=update_status,
+                           runner=runner)
     finally:
         conn.close()
 
@@ -502,6 +525,11 @@ def verdict(snap: dict) -> dict:
            for name in CHECK_ORDER if checks[name]["status"] in ANOMALY_STATUSES]
     if snap.get("calendar", {}).get("status") in ANOMALY_STATUSES:
         bad.append(f"{CALENDAR_TITLE}={snap['calendar']['status']}")
+    # P92 / D2：业务块里**只有熔断**进退出码。其余三条读数（排雷 / 状态 / 新鲜度）
+    # 只展示 —— 盘中每 30 分钟报一次假警会把巡检变成噪音（同 ② 的 `unknown` 待遇）。
+    fuse = (snap.get("business") or {}).get("fuse") or {}
+    if fuse.get("tripped"):
+        bad.append(f"业务熔断：{fuse.get('reason') or '回撤触及阈值'}")
     if bad:
         return {"exit_code": EXIT_ANOMALY, "reasons": bad}
     return {"exit_code": EXIT_OK, "reasons": []}
@@ -509,6 +537,13 @@ def verdict(snap: dict) -> dict:
 
 def _anomalies(snap: dict, v: dict) -> list[dict]:
     out: list[dict] = []
+    # 熔断异常**放在最前**：它是唯一进退出码的业务读数，`EXIT_BLOCKED` 那条早退
+    # 也不能把它吞掉（断链与熔断是两件事，两个都要看得见）。
+    fuse = (snap.get("business") or {}).get("fuse") or {}
+    if fuse.get("tripped"):
+        out.append({"kind": "business_fuse", "item": "业务巡检·熔断",
+                    "status": TRIPPED,
+                    "detail": fuse.get("reason") or "回撤触及阈值"})
     if v["exit_code"] == EXIT_BLOCKED:
         out.append({"kind": "undetermined" if
                     (snap["latest_closed_session"] or {}).get("date") else "no_closed_session",
@@ -653,7 +688,15 @@ def _seal(payload: dict, *, db: Path, stamp: str,
 
     只在**跑过体检**之后调：库不存在时不写（那条路连库都没建，回执本身
     会先把库文件造出来——“库不存在”就不该留下痕迹）。
+
+    顺带写巡检简报（P92 / D4）：两个文件，**失败只记 `brief_error`、不改退出码**
+    （同 P58 的非阻断步纪律）。简报放在 `_seal` 里而不是调用点：两条收尾路径
+    （正常 / `--fix` 被跨库守卫拒）都要有简报，写两遍迟早漏一处。
     """
+    from stocklab.ops import business as business_mod
+    brief = business_mod.write_brief(payload, report_dir=report_dir)
+    if brief.get("error"):
+        payload["brief_error"] = brief["error"]
     return journal.seal(payload, db_path=db, job_name="patrol", stamp=stamp,
                         detail=summary_line(payload), report_dir=report_dir)
 
@@ -661,13 +704,16 @@ def _seal(payload: dict, *, db: Path, stamp: str,
 def run_patrol(*, db_path: Path | str | None = None, now: str | None = None,
                fix: bool = False, runner=None,
                timeout_s: float = DEFAULT_TIMEOUT_S,
-               report_dir: Path | str | None = None) -> dict:
-    """一轮巡检 = 体检 → 计划 → （可选）补步 → **复检** → 定稿退出码。
+               report_dir: Path | str | None = None,
+               update_status: bool = False) -> dict:
+    """一轮巡检 = 体检（＋业务块）→ 计划 → （可选）补步 → **复检** → 定稿退出码。
 
     复检不能省：补步有没有把它修好，只能看**补完之后**的库。
     退出码取「复检结论」与「补步结果」的**较大者**（2 > 1 > 0，越大越严重）。
 
-    `runner` 是注入点（测试用假执行器，绝不真起子进程）。
+    `runner` 是注入点（测试用假执行器，绝不真起子进程）；它也转给业务块的
+    状态写入口 —— 两条路径共用同一个「起子进程」的口子。
+    `update_status` 默认 **关**（D5：launchd 里那条 `ops patrol --fix` 逐字节不变）。
     """
     db = Path(db_path) if db_path else paths.DB_PATH
     stamp = now or datetime.now(TZ).isoformat(timespec="seconds")
@@ -683,7 +729,8 @@ def run_patrol(*, db_path: Path | str | None = None, now: str | None = None,
         })
         return payload
 
-    before = check_db(db, stamp, report_dir=report_dir)
+    before = check_db(db, stamp, report_dir=report_dir,
+                      update_status=update_status, runner=runner)
     payload.update(before)
     p = plan(before)
     payload["plan"] = p
@@ -705,10 +752,21 @@ def run_patrol(*, db_path: Path | str | None = None, now: str | None = None,
             asof=before["latest_closed_session"]["date"], now=stamp,
             timeout_s=timeout_s)
 
-    after = check_db(db, stamp, report_dir=report_dir) if steps_out else before
-    final = max(after["exit_code"], worst_code(steps_out, aborted))
+    # 复检**不**重跑业务块：业务读数与「补步有没有修好」无关，重跑只是白烧
+    # 插桩0 的沙盒。于是 `business` 永远是**本轮第一趟**的读数（下面不再覆盖）。
+    after = (check_db(db, stamp, report_dir=report_dir, with_business=False)
+             if steps_out else before)
+
+    # 熔断是唯一进退出码的业务读数，而它**不会被补步修好** ⇒ 即使复检那一趟
+    # 没算业务块，也要把它带进最终退出码与 anomalies（D2）。
+    fuse_anomaly = [a for a in (before.get("anomalies") or [])
+                    if a.get("kind") == "business_fuse"]
+    final = max(after["exit_code"], worst_code(steps_out, aborted),
+                EXIT_ANOMALY if fuse_anomaly else EXIT_OK)
 
     anomalies = list(after["anomalies"])
+    if not any(a.get("kind") == "business_fuse" for a in anomalies):
+        anomalies += fuse_anomaly
     for s in steps_out:
         if s.get("exit_code") != 0:
             anomalies.append({
