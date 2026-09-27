@@ -54,7 +54,7 @@ def cmd_research_xsec_topn(args) -> int:
         print(f"--start 不得早于 {xsec.MIN_START}（收到 {args.start!r}）："
               "窗口即结论，短池在 3 年窗上会翻符号", file=sys.stderr)
         return 2
-    price_mode = getattr(args, "price_mode", xsec.PRICE_MODE_RAW)
+    price_mode = getattr(args, "price_mode", xsec.PRICE_MODE_ADJ)
     if price_mode not in xsec.PRICE_MODE_CHOICES:
         print(f"未知 --price-mode {price_mode!r}；已知 "
               f"{list(xsec.PRICE_MODE_CHOICES)}", file=sys.stderr)

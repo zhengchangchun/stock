@@ -5720,10 +5720,11 @@ def build_parser() -> argparse.ArgumentParser:
                          help="宇宙 id（默认 None ⇒ seed21 主干常量）；"
                               "带 `universe` 字段的预注册必须与它逐字一致，否则 exit 2")
     rsrch_x.add_argument(
-        "--price-mode", default="raw", choices=("raw", "adj", "both"),
-        help="收益侧价格口径（P82；默认 raw = 现状，逐位不变）。raw=未复权价；"
-             "adj=PIT 复权价（只换收益分子/分母，成本侧成交价与涨跌停判定不动）；"
-             "both=一次扫描同时出两套读数。非 raw 时产物名带 -adj，不覆盖既有 raw 产物")
+        "--price-mode", default="adj", choices=("raw", "adj", "both"),
+        help="收益侧价格口径（P94；**默认 adj = PIT 复权价，与 ADR-030 对齐**）。"
+             "raw=未复权价；adj=PIT 复权价（只换收益分子/分母，成本侧成交价与"
+             "涨跌停判定不动）；both=一次扫描同时出两套读数。产物名：raw 无后缀 / "
+             "adj 带 -adj / both 带 -both，三档互不覆盖")
     rsrch_x.add_argument("--db")
     rsrch_x.set_defaults(func=cmd_research_xsec_topn)
 

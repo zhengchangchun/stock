@@ -74,8 +74,8 @@ PRICE_MODE_CHOICES: tuple[str, ...] = (PRICE_MODE_RAW, PRICE_MODE_ADJ,
 
 #: D5 的口径披露句。`n_adj_fallback` 与「成本侧仍用未复权价」必须并列写出。
 PRICE_MODE_NOTE = (
-    "价格口径（P82）：`raw`（默认）＝收益侧直读未复权 `bars_daily.close`，"
-    "与加开关之前**逐位一致**；`adj` ＝收益侧换 **PIT 复权收盘价**"
+    "价格口径（P82；**P94 起研究命令默认 `adj`**）：`raw` ＝收益侧直读未复权 "
+    "`bars_daily.close`，与加开关之前**逐位一致**；`adj` ＝收益侧换 **PIT 复权收盘价**"
     "（`data/adjust.py::load_bars_adjusted`，`as_of` 取该周期的 `d1` ⇒ 只累乘 "
     "`cqr <= d1` 的事件，`start` 取该只链的 `usable_from` ⇒ 主动放弃跨越不可定价"
     "事件的那段历史）。**只有收益侧变、成本侧一字不动**：成交价、`_qty_for` 整手、"
@@ -84,6 +84,18 @@ PRICE_MODE_NOTE = (
     "缺口表过期 / `d0` 落在不可用段 / 该日无 bar）。`excess_index300` **仍是 raw 口径**"
     "（`benchmark_excess` 内部那次 `period_returns` 未传 `price_mode`，本站未改该函数）"
     "⇒ adj 臂的该字段与 raw 臂相同，**不得**读成「adj 口径的超额」。"
+)
+
+#: 基准口径（P82 披露① ／ P94 · D3）：`excess_index300` 用的是指数**自身价格**，
+#: 指数没有除权概念 ⇒ **不可复权**。此值恒 `"raw"`、只作报告里的显式披露 ——
+#: 不把指数塞进复权链、不编造复权基准；不随 `--price-mode` 变。
+BENCHMARK_PRICE_MODE = "raw"
+
+#: 上面这条披露在 md 口径段（§3）的原样文字。必须与 `benchmark_price_mode` 键一致。
+BENCHMARK_PRICE_MODE_NOTE = (
+    "基准口径（P94 · D3）：`excess_index300` 用指数**自身价格**"
+    f"（`benchmark_price_mode` = `{BENCHMARK_PRICE_MODE}`）—— 指数不可复权，"
+    "本项**恒为 raw**、不随 `--price-mode` 变，也**不得**读成「adj 口径的超额」。"
 )
 
 #: 预注册里对两臂的命名（逐字，取自任务书 T1 的 json）。
@@ -374,7 +386,9 @@ def run_xsec_topn(conn: sqlite3.Connection, *, pool: str, start: str,
     `universe`：宇宙 id（`None` ⇒ `seed21`，主干常量）。非 `seed21` 走
     `resolve_universe`（**fail-closed**：文件缺失即抛 `PreregError`，不回退）。
 
-    `price_mode`（P82 · D1/D6）：`raw`（默认）｜`adj`｜`both`。
+    `price_mode`（P82 · D1/D6）：`raw` ｜ `adj` ｜ `both`。本函数的**形参默认**是
+    `PRICE_MODE_RAW`（契约层，本站不动）；**研究命令**的默认档由 CLI 决定
+    —— P94 起是 `adj`（PIT 复权价，与 ADR-030 对齐）。
       - `raw`  ⇒ `arms` / `delta` 是未复权读数（与加开关之前逐字段一致）；
       - `adj`  ⇒ `arms` / `delta` 是 PIT 复权读数（`arms` 仍是「两臂读数」这个
         语义，具体口径由 `price_mode` 字段钉住）；
@@ -486,6 +500,7 @@ def run_xsec_topn(conn: sqlite3.Connection, *, pool: str, start: str,
         "price_mode": price_mode,
         "n_adj_fallback": n_adj_fallback,
         "price_mode_note": PRICE_MODE_NOTE,
+        "benchmark_price_mode": BENCHMARK_PRICE_MODE,
         "non_pit_items": list(NON_PIT_ITEMS),
         "non_pit_universe_items": list(NON_PIT_UNIVERSE_ITEMS),
         "universe_note": (
@@ -606,7 +621,9 @@ def render_md(report: Mapping) -> str:
 
     lines += ["## 3. 必须并列披露的口径（三条非 PIT ＋ 成本偏差）", ""]
     lines += [f"- {item}" for item in report["non_pit_items"]]
-    lines += [f"- {report['cost_caliber_note']}", ""]
+    lines += [f"- {report['cost_caliber_note']}",
+              f"- {report.get('benchmark_price_mode_note') or BENCHMARK_PRICE_MODE_NOTE}",
+              ""]
     lines += [f"- {report['selection_bias_note']}", "",
               f"> {report.get('seed_scope_note') or SEED_SCOPE_NOTE}、短池 topn 只有 "
               f"{report['topn']}，所以「选前 {report['topn']} vs 持全部」"
@@ -662,12 +679,13 @@ def render_md(report: Mapping) -> str:
                   "（缺席 ⇒ 语义为 `seed21`；命令行与它不一致则 exit 2，"
                   "**换宇宙必须新预注册**）。", ""]
 
-    # 复现命令：`--price-mode` 只在**非默认**档出现 —— raw 档的 md 必须与
-    # 加开关之前逐字一致（§2 判据）。
+    # 复现命令：`--price-mode` 只在**非默认档**出现 —— P94 起默认档是 `adj`，
+    # 所以 `raw` / `both` 的产物会把该参数打进复现命令（否则照抄跑出来是 adj，
+    # 复现不了这份 raw 读数）；`adj` 档省略（它就是默认）。
     repro = [".venv/bin/python -m stocklab.cli.main research xsec-topn \\",
              f"    --pool {report['pool']} --start {report['start']} \\"]
-    if report.get("price_mode", PRICE_MODE_RAW) != PRICE_MODE_RAW:
-        repro.append(f"    --price-mode {report['price_mode']} \\")
+    if report.get("price_mode", PRICE_MODE_RAW) != PRICE_MODE_ADJ:
+        repro.append(f"    --price-mode {report.get('price_mode', PRICE_MODE_RAW)} \\")
     repro.append(f"    --prereg {report['prereg_path']} --out reports/research/")
     lines += [
         "## 4. 复现与耗时",
@@ -690,22 +708,24 @@ def render_md(report: Mapping) -> str:
 
 
 def write_report(report: Mapping, out_dir: Path) -> tuple[Path, Path]:
-    """落 `<out>/<end>-xsec-topn-<universe_id>[-adj].{json,md}`，返回两个路径。
+    """落 `<out>/<end>-xsec-topn-<universe_id>[-adj|-both].{json,md}`，返回两个路径。
 
     **文件名必须带宇宙 id**（P77 T7）：不带时「换宇宙重跑同一个 end」会**覆盖**
     上一份产物 —— 2026-09-25 的扩池重跑就是这样把 P60 的
     `reports/research/2026-09-24-xsec-topn.{md,json}` 覆盖掉的（已不可恢复）。
     `seed21` 也带上 id ⇒ 与旧名不同是**有意的**：旧名本身就是碰撞源。
 
-    **非 raw 档再加 `-adj` 后缀**（P82 · D6）：`--price-mode adj|both` 的产物
-    绝不能盖掉 `reports/research/` 里既有的 raw 产物。`both` 的内容是 raw + adj
-    **两套**，是 `adj` 档的超集（`adj` 档的 `arms` 换成 adj 读数），所以两档同名
-    时后跑的 `both` 不会丢掉 `adj` 档的数值。
+    **口径后缀一档一名**（P82 · D6 ／ P94 · D4）：`raw` → 无后缀、`adj` → `-adj`、
+    `both` → `-both`。三档**互不覆盖** ⇒ 一次扫描出的两套读数（`both`）不会盖掉
+    单独跑的 `adj` 档，更不会盖掉 `reports/research/` 里既有的 raw 产物。
     """
     out_dir.mkdir(parents=True, exist_ok=True)
     stem = f"{report['end']}-xsec-topn-{report['universe_id']}"
-    if report.get("price_mode", PRICE_MODE_RAW) != PRICE_MODE_RAW:
+    mode = report.get("price_mode", PRICE_MODE_RAW)
+    if mode == PRICE_MODE_ADJ:
         stem += "-adj"
+    elif mode == PRICE_MODE_BOTH:
+        stem += "-both"
     json_path = out_dir / f"{stem}.json"
     md_path = out_dir / f"{stem}.md"
     json_path.write_text(
