@@ -44,6 +44,17 @@ launchd 没有 cron 表达式，`StartCalendarInterval` **一次只能描述一�
 
 `Weekday` 的取值是 launchd 的约定：`0` 与 `7` 都是周日，`1` = 周一 … `5` = 周五。
 
+## 四层任务之间**没有**优先级队列（07 约束 1 的落地方式）
+
+07 需求要求「串行优先级」。launchd **没有**优先级队列（这是 D-7 已修正过的认知），
+所以这里用**时间不重叠 + 各自幂等**代替排队：`quarterly` 07:00 / `monthly` 08:00 /
+`patrol` 09:00–14:30 / `close` 15:30 / `weekly` 周一 16:30 —— 五条两两不同分钟。
+
+**这是替代方案，不是排队**：两个任务若真的同分钟起跑，launchd 不会让谁等谁，两者
+会同时写同一个 SQLite 库（`database is locked` 会把链判成 exit 2，P42 的教训）。
+所以护栏是「时刻表本身不重叠」（`test_no_two_jobs_fire_at_the_same_moment`），
+不是「跑的时候会排队」—— 任何报告都不许声称有队列。
+
 ## 机器睡了怎么办
 
 `StartCalendarInterval` 错过的触发点**会在唤醒后补跑一次**（launchd 自己合并）。
@@ -66,7 +77,7 @@ from stocklab.config import paths
 #: LaunchAgent 的落地目录（用户级，不需要 root）。
 LAUNCH_AGENTS_DIR = Path.home() / "Library" / "LaunchAgents"
 
-#: 三条任务的 label 前缀（反查/清理时靠它识别「是本项目的」）。
+#: 任务 label 的前缀（反查/清理时靠它识别「是本项目的」；P89 起是**五条**）。
 LABEL_PREFIX = "com.stocklab"
 
 #: launchd 的星期约定：1 = 周一 … 5 = 周五。
@@ -119,7 +130,13 @@ class Job:
         return log_dir() / f"{self.name}.err.log"
 
 
-#: 三条任务（顺序 = 页面/`status` 的展示顺序）。
+#: 五条任务（顺序 = 页面/`status` 的展示顺序）。
+#:
+#: P89 加了 `weekly`（B3）/ `quarterly`（B4）两条。**加任务时唯一要小心的是撞点**：
+#: `test_ops_close.py::test_no_two_jobs_fire_at_the_same_moment` 会把任意两条任务的
+#: 触发时刻集合求交（缺 `Weekday` 的 entry 展开成 7 天，**保守**），非空就当场红。
+#: 这一轮它就是靠这条护栏抓出了「`quarterly` 09:00 与 `patrol` 09:00 撞点」
+#: （见 `quarterly` 的 `window` 注释与 `docs/decisions/` 的 ADR-039）。
 JOBS: tuple[Job, ...] = (
     Job(
         name="close", label=f"{LABEL_PREFIX}.close", args=("ops", "close"),
@@ -145,6 +162,34 @@ JOBS: tuple[Job, ...] = (
         window="每月 1 日 08:00",
         why="月度刷新：休市公告 → 长窗行情回补 → 财报复核 → 体检",
         calendar=({"Day": 1, "Hour": 8, "Minute": 0},),
+    ),
+    Job(
+        name="weekly", label=f"{LABEL_PREFIX}.weekly", args=("ops", "weekly"),
+        # 5 槽**同一时刻**：launchd 的数组语义是「命中任一条即触发」（缺的键 = 通配），
+        # 所以 5 条相同的 entry 与 1 条等价 —— 不是「周一到周五」，更不是 5 次。
+        # 之所以写成 5 条，是为了与 `close` 的 5 条同形（P89 §G8 逐字要求
+        # 「5 槽全 Weekday=1,16:30」），语义由测试钉住（`len(cal)==5` 且
+        # `{(Hour,Minute,Weekday)} == {(16,30,1)}`）。
+        window="周一 16:30（非交易日**照跑**，不跳过）",
+        why="每周全量扫描（B3）：candidate run weekly → 插桩5 复盘 → m2 读数 → 冻结到期 "
+            "→ 版本清单 → 汇总报告。asof = **最近已收盘交易日**（不是运行当天）",
+        calendar=tuple({"Hour": 16, "Minute": 30, "Weekday": 1} for _ in range(5)),
+    ),
+    Job(
+        name="quarterly", label=f"{LABEL_PREFIX}.quarterly", args=("ops", "quarterly"),
+        # ⚠️ **07:00，不是 09:00**。需求原文（P89 §D4）写的是 09:00，但它与 `patrol`
+        # 的 09:00 槽**真的撞点**：`patrol` 覆盖工作日 09:00–14:30，而
+        # `quarterly` 的 entry 不含 `Weekday`（= 每天都命中）⇒ 5/1、9/1、11/1 只要
+        # 落在工作日就与巡检同分钟起跑，两条链都会写同一个 SQLite 库。
+        # 2026-05-01 正是周五（§G8 的护栏当场红）。所以挪到 07:00：
+        # 距 `monthly` 的 08:00 仍是 1 小时（与 D4 给 09:00 的理由一致），距 `patrol`
+        # 的 09:00 两小时。**日期不动**（5/1、9/1、11/1 = 法定披露截止日的次日）。
+        window="每年 5/1、9/1、11/1 07:00（法定披露截止日之后；休市日照跑）",
+        why="季度深度复盘（B4）：财报复核 → 全量重打分 → m2 读数 → 冻结到期 → 归因候选 "
+            "→ 版本清单 → 持仓原始读数 → 汇总报告。**不**自动开验证周期、**不**跑"
+            "全量 sandbox（D7）",
+        calendar=tuple({"Month": m, "Day": 1, "Hour": 7, "Minute": 0}
+                       for m in (5, 9, 11)),
     ),
 )
 
