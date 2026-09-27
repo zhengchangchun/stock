@@ -39,10 +39,11 @@ from __future__ import annotations
 
 import json
 import sqlite3
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 
 from stocklab.candidate import pools, report, risk_adjust, score, screen, snapshot
 from stocklab.candidate import cross_section, indicators
+from stocklab.candidate import status as cand_status
 from stocklab.candidate.seeds import SEED_UNIVERSE
 from stocklab.data import adjust
 from stocklab.data.models import Bar
@@ -421,9 +422,17 @@ def run_candidate(conn: sqlite3.Connection, *, asof: str, run_kind: str,
     # D2「只增键」：内核 params 一个键不动，写路径补上丢弃计数 —— 落库与
     # `RunResult.params` 用的是**同一份** dict，首跑与幂等重跑读回逐位相同。
     params = {**pipe.params, "n_reject_dups_dropped": n_reject_dups_dropped}
+    # P91 D4（B7）：成员状态取**事件 overlay**（`asof_date <= asof` 的最新一行），
+    # 不再硬编码 `观察中`。落点就在 `pools`/`scored` 之后的**组装**这一步：
+    # 打分口径、`select_top` 的排序与截断一字未动，只换 `status` 一个字段。
+    # 无任何事件时 `status_map` 给的就是 `DEFAULT_STATUS`（逐位等于 dataclass 默认值）
+    # ⇒ 既有用例（`test_candidate_run*.py` / `test_candidate_snapshot.py`）逐位不变。
+    statuses = cand_status.status_map(conn, [m.code for m in pipe.members],
+                                      asof=asof)
+    members = [replace(m, status=statuses[m.code]) for m in pipe.members]
     snapshot_id = snapshot.write_snapshot(
         conn, asof=asof, run_kind=run_kind, params=params,
-        members=pipe.members, rejects=rejects, now=now)
+        members=members, rejects=rejects, now=now)
 
     loaded = snapshot.load_snapshot(conn, snapshot_id)
     md = report.render_report(asof=asof, run_kind=run_kind, loaded=loaded,

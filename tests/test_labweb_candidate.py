@@ -34,6 +34,7 @@ from stocklab.labweb.tokens import TokenSigner
 from stocklab.plugin import lifecycle, store
 from stocklab.store.db import connect
 from stocklab.store.migrate import init_db
+from tests.test_labweb_paper_agent import FORBIDDEN_WORDS  # P91：措辞纪律同源
 
 NOW = "2026-09-18T16:00:00+08:00"
 ASOF = "2026-09-17"
@@ -491,3 +492,118 @@ def test_page_and_cli_produce_same_members(tmp_path):
     a, b = rows(db_a), rows(db_b)
     assert a["members"] and a["rejects"]
     assert a == b
+
+
+# ---------- P91：状态列取 overlay + 「状态变更」一节（只读，零写入口） ----------
+
+def _status_event(db_path: Path, *, code: str, asof: str, status: str,
+                  reason: str = "人工设置", actor: str = "nanobot",
+                  created_at: str = NOW) -> int:
+    conn = connect(db_path)
+    try:
+        cur = conn.execute(
+            "INSERT INTO candidate_status_events (code, asof_date, status,"
+            " reason, actor, created_at) VALUES (?,?,?,?,?,?)",
+            (code, asof, status, reason, actor, created_at))
+        return int(cur.lastrowid)
+    finally:
+        conn.close()
+
+
+def test_status_column_takes_overlay_not_snapshot(server, db):
+    """快照里那份可能已过时（D5）⇒ 状态列取事件 overlay。
+
+    夹具刻意让**快照**写 `等待买点`、**事件**写 `已建仓` —— 页面显示后者
+    才证明它读的是 overlay，不是 `candidate_members.status`。
+    """
+    _snap(db, asof=ASOF, run_kind="weekly", created_at=NOW,
+          members=[_member("000333", "short", 82.14, 77.14, status="等待买点")])
+    _status_event(db, code="000333", asof=ASOF, status="已建仓", reason="手动建仓")
+    status, html, _ = request(server, "GET", f"{BASE}/candidate")
+    assert status == 200
+    short = section_of(html, "短期池")
+    assert "已建仓" in short and "等待买点" not in short
+
+
+def test_status_column_overlay_respects_snapshot_asof(server, db):
+    """as of **当前选中快照的 asof**：更晚的事件不许泄漏进来。"""
+    _snap(db, asof=ASOF, run_kind="weekly", created_at=NOW,
+          members=[_member("000333", "short", 82.14, 77.14)])
+    _status_event(db, code="000333", asof="2026-10-01", status="已建仓")
+    status, html, _ = request(server, "GET", f"{BASE}/candidate")
+    assert status == 200
+    assert "已建仓" not in section_of(html, "短期池")
+
+
+def test_status_history_empty_shows_hint(server, db):
+    _snap(db, asof=ASOF, run_kind="weekly", created_at=NOW,
+          members=[_member("000333", "short", 82.14, 77.14)])
+    status, html, _ = request(server, "GET", f"{BASE}/candidate")
+    assert status == 200
+    hist = section_of(html, "状态变更")
+    assert "暂无状态变更记录" in hist
+    assert "candidate status set" in hist
+
+
+def test_status_history_lists_events_with_name_and_actor(server, db):
+    _snap(db, asof=ASOF, run_kind="weekly", created_at=NOW,
+          members=[_member("000333", "short", 82.14, 77.14)])
+    _status_event(db, code="000333", asof=ASOF, status="已建仓",
+                  reason="手动建仓", actor="郑长春")
+    status, html, _ = request(server, "GET", f"{BASE}/candidate")
+    assert status == 200
+    hist = section_of(html, "状态变更")
+    for want in ("000333", "标的000333", "已建仓", "手动建仓", "郑长春", ASOF):
+        assert want in hist
+
+
+def test_status_history_shows_latest_ten_desc(server, db):
+    """按 `(asof_date, event_id)` 降序取最近 10 条（不多不少）。"""
+    _snap(db, asof=ASOF, run_kind="weekly", created_at=NOW,
+          members=[_member("000333", "short", 82.14, 77.14)])
+    for day in range(1, 13):
+        _status_event(db, code="000333", asof=f"2026-08-{day:02d}",
+                      status="观察中")
+    status, html, _ = request(server, "GET", f"{BASE}/candidate")
+    assert status == 200
+    hist = section_of(html, "状态变更")
+    assert "2026-08-12" in hist and "2026-08-03" in hist
+    assert "2026-08-02" not in hist and "2026-08-01" not in hist
+
+
+def test_status_history_visible_without_any_snapshot(server, db):
+    """一条快照都没有时也要能看状态流水（事件与快照无关，D1 的理由之一）。"""
+    _status_event(db, code="000333", asof=ASOF, status="已建仓", reason="手动建仓")
+    status, html, _ = request(server, "GET", f"{BASE}/candidate")
+    assert status == 200
+    assert "还没有跑过候选池" in html
+    assert "已建仓" in section_of(html, "状态变更")
+
+
+def test_post_candidate_status_paths_are_404_and_write_nothing(server, db, ctx):
+    """页面**零写入口**：状态只能从 CLI 追加（D5）。"""
+    for path in (f"{BASE}/candidate/status", f"{BASE}/candidate/status/set"):
+        status, html, _ = request(server, "POST", path,
+                                  {"_token": token(ctx), "code": "000333",
+                                   "status": "已建仓", "asof": ASOF})
+        assert status == 404, path
+        assert "没有这个页面" in html
+    c = connect(db)
+    try:
+        assert c.execute("SELECT COUNT(*) FROM candidate_status_events"
+                         ).fetchone()[0] == 0
+        assert snapshots(db) == []
+    finally:
+        c.close()
+
+
+def test_status_sections_have_no_forbidden_words(server, db):
+    """新增/改动段落的措辞纪律（与 `test_labweb_paper_agent.py` 同源）。"""
+    _snap(db, asof=ASOF, run_kind="weekly", created_at=NOW,
+          members=[_member("000333", "short", 82.14, 77.14)])
+    _status_event(db, code="000333", asof=ASOF, status="已建仓", reason="手动建仓")
+    _, html, _ = request(server, "GET", f"{BASE}/candidate")
+    for title in ("状态变更", "短期池"):
+        block = section_of(html, title)
+        for word in FORBIDDEN_WORDS:
+            assert word not in block, f"{title} 段出现禁词 {word}"

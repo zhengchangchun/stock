@@ -1011,6 +1011,26 @@ CREATE TABLE IF NOT EXISTS candidate_rejects (
     PRIMARY KEY (snapshot_id, code, stage)
 );
 
+-- ---------- 候选池标的状态（P91，B7；append-only） ----------
+-- 需求：01 §候选池标的状态枚举 / 07 任务1-6「更新候选池标的状态」。
+-- 为什么是**事件表**而不是给 candidate_members 加列：
+--   ① candidate_members 挂在 (asof, run_kind) 的快照上，写它就会改写已封存的快照；
+--   ② 状态变更的时刻与快照的 asof **无关**（人可以周三改、快照是上周的）；
+--   ③ 本仓 append-only 纪律：变更一律「追加一行」，不 UPDATE。
+CREATE TABLE IF NOT EXISTS candidate_status_events (
+    event_id   INTEGER PRIMARY KEY AUTOINCREMENT,
+    code       TEXT NOT NULL,
+    asof_date  TEXT NOT NULL,   -- PIT 锚：该状态**从这一天起**生效（YYYY-MM-DD）
+    status     TEXT NOT NULL
+               CHECK (status IN ('观察中','等待买点','已建仓','逻辑证伪移出')),
+    reason     TEXT NOT NULL,
+    actor      TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    UNIQUE (code, asof_date, status)   -- 同一天同一状态**只许一行**（可重跑）
+);
+CREATE INDEX IF NOT EXISTS idx_cand_status_code_asof
+    ON candidate_status_events (code, asof_date, event_id);
+
 -- ---------- 新表的 append-only 触发器 ----------
 CREATE TRIGGER IF NOT EXISTS trg_plugin_scripts_no_update
 BEFORE UPDATE ON plugin_scripts
@@ -1059,6 +1079,16 @@ BEGIN SELECT RAISE(ABORT, 'candidate_rejects is append-only'); END;
 CREATE TRIGGER IF NOT EXISTS trg_candidate_rejects_no_delete
 BEFORE DELETE ON candidate_rejects
 BEGIN SELECT RAISE(ABORT, 'candidate_rejects is append-only'); END;
+
+-- P91：状态事件 append-only。改错只能**再追加一行**（读侧按
+-- `(asof_date, event_id)` 取最后一行 ⇒ 后写赢），历史因此可读而不是被抹掉。
+CREATE TRIGGER IF NOT EXISTS trg_cand_status_no_update
+BEFORE UPDATE ON candidate_status_events
+BEGIN SELECT RAISE(ABORT, 'candidate_status_events is append-only'); END;
+
+CREATE TRIGGER IF NOT EXISTS trg_cand_status_no_delete
+BEFORE DELETE ON candidate_status_events
+BEGIN SELECT RAISE(ABORT, 'candidate_status_events is append-only'); END;
 
 -- ---------- 宇宙成员表：**投影**（P71 / ADR-026）----------
 -- 真源是 repo 文件 `config/universes/<id>.csv`（＋ `.meta.json` 的 sha），本表是它的

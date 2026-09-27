@@ -45,6 +45,8 @@ EXPECTED_TABLES = {
     "announcements",                   # P88：公告（append-only，(code,art_code) 主键；PIT 锚=notice_date）
     "northbound_holdings",             # P88：北向**季度**持股（append-only，(code,trade_date) 主键；
                                        #      frequency CHECK 恒 'quarterly' —— 日度公开源已不存在）
+    "candidate_status_events",         # P91：标的状态事件（append-only，PIT 锚=asof_date；
+                                       #      UNIQUE(code,asof_date,status) ⇒ 同键重跑零写入）
 }
 
 
@@ -112,3 +114,13 @@ def test_trading_calendar_unique(conn):
     conn.execute(sql, row)
     with pytest.raises(sqlite3.IntegrityError):
         conn.execute(sql, row)
+
+
+def test_candidate_status_events_starts_empty(conn):
+    """P91：新表刚建出来必须是**空**的（状态变更全部来自显式事件）。
+
+    真库前滚由 nanobot 在 §8 做；本档只保证「建表不会带出任何一行」
+    —— 带出来就意味着有人写死了推导规则（D6 明确不做）。
+    """
+    assert conn.execute(
+        "SELECT COUNT(*) FROM candidate_status_events").fetchone()[0] == 0

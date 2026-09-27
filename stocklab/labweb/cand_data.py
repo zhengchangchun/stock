@@ -43,6 +43,7 @@ from pathlib import Path
 from typing import Mapping
 
 from stocklab.candidate import snapshot
+from stocklab.candidate import status as cand_status
 from stocklab.candidate.pools import ALL_POOLS
 from stocklab.candidate.report import report_path
 from stocklab.candidate.seeds import SEED_CODES
@@ -62,6 +63,11 @@ class SnapshotKey:
     @property
     def label(self) -> str:
         return f"{self.asof} · {self.run_kind}"
+
+
+#: 页面「状态变更」一节取最近几条（D5）。写在这里而不是渲染层：
+#: 取数与渲染的分工与本模块其它地方一致（渲染层不碰库）。
+HISTORY_LIMIT = 10
 
 
 def to_local(ts: str | None) -> str | None:
@@ -173,6 +179,7 @@ class CandLab:
             "snapshot": None,
             "pools": [],
             "rejects": [],
+            "status_events": [],
             "n_members": 0,
             "n_rejects": 0,
             "n_seed": len(SEED_CODES),
@@ -186,6 +193,16 @@ class CandLab:
         with self.conn() as c:
             keys = [SnapshotKey(a, k) for a, k in snapshot.list_snapshot_keys(c)]
             out["keys"] = keys
+
+            names = {r["code"]: r["name"]
+                     for r in c.execute("SELECT code, name FROM instruments")}
+            # P91 D5：状态流水与快照无关（人可以周三改、快照是上周的），
+            # 所以它在**两个分支**里都要有 —— 特别是「一条快照都没有」时，
+            # 那正是刚跑完 `candidate status set` 的人会来看的页面。
+            out["status_events"] = [
+                {**r, "name": names.get(r["code"])}
+                for r in cand_status.history(c, limit=HISTORY_LIMIT)]
+
             if not keys:
                 return out
 
@@ -211,14 +228,18 @@ class CandLab:
             out["snapshot"] = snap
             out["report_path"] = str(self.report_path(chosen))
 
-            names = {r["code"]: r["name"]
-                     for r in c.execute("SELECT code, name FROM instruments")}
+            # P91 D5：状态列取**事件 overlay**（as of 本快照的 `asof`），
+            # **不取** `candidate_members.status` —— 快照里那份是当时的值，
+            # 之后有人改过状态的话它就是过时的（这正是事件表的理由之一）。
+            overlay = cand_status.status_map(
+                c, [m["code"] for m in loaded["members"]], asof=chosen.asof)
 
             members = []
             for m in loaded["members"]:
                 items, state = risk_items(m["risk_json"])
                 members.append({
                     **m,
+                    "status": overlay[m["code"]],
                     "name": names.get(m["code"]),
                     "risk_items": items,
                     "risk_state": state,
@@ -241,4 +262,4 @@ class CandLab:
         return out
 
 
-__all__ = ["CandLab", "SnapshotKey", "risk_items", "to_local"]
+__all__ = ["CandLab", "HISTORY_LIMIT", "SnapshotKey", "risk_items", "to_local"]

@@ -44,7 +44,9 @@ from stocklab.paper.config import (ARM_AGENT, ARM_AGENT_RANDOM,
 from stocklab.cli.plugin import (cmd_plugin_approve, cmd_plugin_list,
                                  cmd_plugin_reject, cmd_plugin_sandbox,
                                  cmd_plugin_submit)
-from stocklab.cli.candidate import cmd_candidate_review, cmd_candidate_run
+from stocklab.cli.candidate import (STATUS_CHOICES, cmd_candidate_review,
+                                    cmd_candidate_run, cmd_candidate_status_set,
+                                    cmd_candidate_status_show)
 from stocklab.cli.research import (cmd_research_factor_ic, cmd_research_rank_ic,
                                    cmd_research_xsec_topn)
 from stocklab.cli.universe import (cmd_universe_build, cmd_universe_doctor,
@@ -5471,6 +5473,37 @@ def build_parser() -> argparse.ArgumentParser:
                              help="报告根目录（默认 paths.REPORT_DIR）")
     cand_review.add_argument("--db")
     cand_review.set_defaults(func=cmd_candidate_review)
+
+    # P91（B7）：标的状态流转。**append-only** —— 只有 set / show，
+    # 刻意**没有** delete / update（写错了只能再追加一行，读侧后写赢）。
+    cand_status = cand_sub.add_parser(
+        "status", help="标的状态（P91，B7）：追加事件 / 看流水（append-only）")
+    cand_status_sub = cand_status.add_subparsers(
+        dest="candidate_status_action", required=True)
+
+    cand_status_set = cand_status_sub.add_parser(
+        "set", help="追加一条状态事件（幂等：同 (code,asof,status) 已有则零写入）")
+    cand_status_set.add_argument("--code", required=True, help="6 位标的代码")
+    cand_status_set.add_argument("--status", required=True, choices=STATUS_CHOICES,
+                                 help="四选一（非法值由 argparse 拒，exit 2）")
+    cand_status_set.add_argument("--asof", required=True,
+                                 help="该状态**从这一天起**生效 YYYY-MM-DD（PIT 锚）")
+    cand_status_set.add_argument("--reason", default="人工设置",
+                                 help="为什么改（不许空串；默认 人工设置）")
+    cand_status_set.add_argument("--actor", default="nanobot",
+                                 help="谁改的（默认 nanobot）")
+    cand_status_set.add_argument("--now", help="覆盖写入时刻（测试用）")
+    cand_status_set.add_argument("--db")
+    cand_status_set.set_defaults(func=cmd_candidate_status_set)
+
+    cand_status_show = cand_status_sub.add_parser(
+        "show", help="看状态流水（只读；一行一条，最新在前）")
+    cand_status_show.add_argument("--code", help="只看某只标的")
+    cand_status_show.add_argument("--asof", help="只看 asof_date <= 这一天的（PIT）")
+    cand_status_show.add_argument("--limit", type=int, default=10,
+                                  help="最多几条（默认 10）")
+    cand_status_show.add_argument("--db")
+    cand_status_show.set_defaults(func=cmd_candidate_status_show)
 
     m2 = sub.add_parser(
         "m2", help="模块2 双通路（P47）：通路 A 纯模拟 / 通路 B 人工镜像")

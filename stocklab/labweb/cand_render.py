@@ -178,6 +178,37 @@ def _rejects_block(data: Mapping) -> str:
                    detail=more(tables, label="逐条明细"))
 
 
+def _status_history_block(data: Mapping) -> str:
+    """「状态变更」一节（P91 D5）：`asof_date / code / 名称 / 状态 / 理由 / 记录人`。
+
+    **只读展示**：页面没有任何写入口（状态只能从 CLI 追加，D5）。
+    排序沿用 `candidate/status.py::history` 的 `(asof_date, event_id)` 降序 ——
+    这里**不重排**（重排就是第二个口径）。
+    """
+    rows = data.get("status_events") or []
+    note = ("状态是 **append-only 事件**：同一标的同一天可以有**多条**，"
+            "**最后一条**（同一个生效日按写入先后）有效 —— 所以这里看到旧行"
+            "不代表它现在生效。改状态只能追加、**没有删除入口**。")
+    if not rows:
+        return section(
+            "状态变更",
+            '<p>' + rich("暂无状态变更记录（用 `candidate status set` 追加）")
+            + '</p>',
+            note=note)
+    body = "".join(
+        f'<tr><td class="l">{esc(r["asof_date"])}</td>'
+        f'<td class="l">{esc(r["code"])}</td>'
+        f'<td class="l">{_name_cell(r)}</td>'
+        f'<td class="l">{esc(r["status"])}</td>'
+        f'<td class="l">{esc(r["reason"])}</td>'
+        f'<td class="l">{esc(r["actor"])}</td></tr>'
+        for r in rows)
+    table = ('<div class="scroll-x"><table class="tbl">'
+             '<tr><th>生效日</th><th>代码</th><th>名称</th><th>状态</th>'
+             '<th>理由</th><th>记录人</th></tr>' + body + '</table></div>')
+    return section(f"状态变更（{len(rows)} 条）", table, note=note)
+
+
 def _missing_block(data: Mapping) -> str:
     missing = data["missing"]
     note = ("这是**差额，不是原因**：它们既没入池、也没有淘汰记录。"
@@ -312,6 +343,8 @@ def candidate_page(data: Mapping, *, base: str, built_at: str, token: str,
                 "用上面「跑一次」写入第一条；或走 CLI："
                 "`stocklab candidate run --asof <日期> --run-kind weekly`。")
             + '</p>'))
+        # 状态流水与快照无关（D1 的理由之一）⇒ 没快照时照样要有
+        body.append(_status_history_block(data))
         return layout(base=base, title="候选池", body="".join(body),
                       asof=default_asof, built_at=built_at, current="/candidate")
 
@@ -332,6 +365,7 @@ def candidate_page(data: Mapping, *, base: str, built_at: str, token: str,
 
     body.append(_rejects_block(data))
     body.append(_missing_block(data))
+    body.append(_status_history_block(data))
 
     return layout(base=base, title="候选池", body="".join(body),
                   asof=default_asof, built_at=built_at, current="/candidate")
