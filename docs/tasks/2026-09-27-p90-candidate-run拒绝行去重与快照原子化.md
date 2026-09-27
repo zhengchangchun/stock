@@ -482,16 +482,29 @@ $ shasum -a 256 data/stocklab.db
 
 ### 7.4 `git diff --stat`
 
+分两笔提交（**代码/测试**一笔、**docs** 一笔；只用显式路径，未用 `git add -A`）：
+
 ```
- docs/decisions/README.md         |  1 +
- stocklab/candidate/run.py        | 55 ++++++++++++++++++++++++---
- stocklab/candidate/snapshot.py   | 52 +++++++++++++++----------
- tests/test_candidate_run.py      |  6 ++-
- tests/test_candidate_run_p77.py  |  5 ++-
- tests/test_candidate_snapshot.py | 82 ++++++++++++++++++++++++++++++++++++++++
- 6 files changed, 173 insertions(+), 28 deletions(-)
-（另：新增未跟踪 tests/test_candidate_run_p90.py（9 用例）、docs/decisions/2026-09-27-ADR-040-*.md）
+$ git show --stat --oneline 8d73a86          # 代码 + 测试
+ stocklab/candidate/run.py        |  55 +++++++++-
+ stocklab/candidate/snapshot.py   |  52 +++++----
+ tests/test_candidate_run.py      |   6 +-
+ tests/test_candidate_run_p77.py  |   5 +-
+ tests/test_candidate_run_p90.py  | 223 +++++++++++++++++++++++++++++++++++++++
+ tests/test_candidate_snapshot.py |  82 ++++++++++++++
+ 6 files changed, 395 insertions(+), 28 deletions(-)
+
+$ git show --stat --oneline 8e39d43          # docs
+ docs/decisions/2026-09-27-ADR-040-*.md                    | 110 +++++++
+ docs/decisions/README.md                                  |   1 +
+ docs/tasks/2026-09-27-p90-candidate-run…化.md             | 363 ++++++++++++-
+ 3 files changed, 473 insertions(+), 1 deletion(-)
+
+$ git diff --stat a3609e3 HEAD                # 合计（相对开工 HEAD）
+ 9 files changed, 868 insertions(+), 29 deletions(-)
 ```
+
+提交后 `git status --porcelain` 为空，`data/stocklab.db` sha 仍是 `0f8231f0…`。
 
 ### 7.5 坑
 
