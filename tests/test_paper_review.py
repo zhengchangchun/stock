@@ -12,7 +12,7 @@
 | `text` 不一致 ⇒ `conflict: true` 且两条都列 | 取平均 / 猜一条 |
 | >10 条按 K4 截断 ＋ `n_facts_truncated` | 静默截断 |
 | 同库两次调用逐字节相同（确定性） | 混进时间戳 / 自增 id |
-| `recent_reviews` / `facts` 受 PIT 约束 | 少了 `asof <=` 过滤 |
+| `recent_reviews` / `facts` 受 PIT 约束（决策上下文只看**早于**决策日的复盘） | 少了 `asof <` 过滤 / 把当天写的复盘也塞进当天上下文 |
 | `own_history` 既有子键逐位不变（K8） | 顺手重排 / 改掉旧子键 |
 | `NON_GOALS` 末尾是 K6 的**逐字**文案 | 只改实现、没改「写给它看的禁令」 |
 """
@@ -542,14 +542,39 @@ def test_t3_own_history_keeps_its_old_keys_verbatim(conn):
 def test_t3_recent_reviews_are_capped_and_ascending(conn):
     for i, d in enumerate((D1, D2, D3)):
         _write(conn, d, lessons=[_lesson(f"k{i}_x", d)])
+    # P86 修订：决策**日**的复盘不进当天的上下文 ⇒ 补一条更早的，凑出「尾部 3 条」。
+    conn.execute(
+        "INSERT INTO paper_agent_reviews (arm, asof, kind, model_id,"
+        " prompt_sha256, context_sha256, n_items, n_lessons, payload_json,"
+        " created_at) VALUES (?,'2026-09-18','daily','m','p','c',0,0,'{}',?)",
+        (ARM, NOW))
+    conn.commit()
     block = own_history.own_history_block(conn, arm=ARM, asof=D3)
     assert len(block["recent_reviews"]) == own_history.REVIEW_LIMIT == 3
-    assert [r["asof"] for r in block["recent_reviews"]] == [D1, D2, D3]
-    entry = block["recent_reviews"][0]
+    assert [r["asof"] for r in block["recent_reviews"]] == ["2026-09-18", D1, D2]
+    entry = block["recent_reviews"][1]
     assert set(entry) == {"asof", "kind", "context_sha256", "n_items",
                           "n_lessons", "items", "lessons"}
     assert entry["context_sha256"] == "c" * 64
     assert entry["items"][0]["evidence"]["kind"] == "decision"
+
+
+def test_p86_a_same_day_review_is_invisible_to_that_days_decision_context(conn):
+    """P86 修订（生成器「先复盘、再决策」的前提）：当天写的复盘**不进**当天上下文。
+
+    否则 ② 里取的 `context_sha256` 会立即失效 ⇒ `paper agent decide` 的 D-49
+    指纹闸门必拒（该现象在 P86 演练里逐条复现过，见任务书 §7）。
+    """
+    before = agent_context.decision_context_sha256(
+        engine.decision_context_for(conn, arm=ARM, asof=D3))
+    _write(conn, D3, lessons=[_lesson("cash_drag", "当天写的")])
+    after = agent_context.decision_context_sha256(
+        engine.decision_context_for(conn, arm=ARM, asof=D3))
+    assert after == before                       # 当天写入不改当天上下文
+    assert own_history.own_history_block(conn, arm=ARM, asof=D3)["recent_reviews"] == []
+    # 次日（「下一轮」）看得见 —— 不是「永远看不见」
+    later = own_history.own_history_block(conn, arm=ARM, asof="2026-09-25")
+    assert [r["asof"] for r in later["recent_reviews"]] == [D3]
 
 
 def test_t3_recent_reviews_take_the_latest_three(conn):
@@ -568,7 +593,7 @@ def test_t3_recent_reviews_take_the_latest_three(conn):
             " created_at) VALUES (?,?,'daily','m','p','c',0,0,'{}',?)", (ARM, d, NOW))
     c.commit()
     block = own_history.own_history_block(conn, arm=ARM, asof="2026-08-06")
-    assert [r["asof"] for r in block["recent_reviews"]] == days[1:]
+    assert [r["asof"] for r in block["recent_reviews"]] == days[:3]
 
 
 def test_t3_own_history_facts_are_capped_at_ten(conn):
@@ -580,20 +605,20 @@ def test_t3_own_history_facts_are_capped_at_ten(conn):
 
 def test_t3_a_review_after_asof_leaves_the_block_and_the_sha_untouched(conn):
     """PIT：在 `asof` **之后**插复盘 ⇒ 块与指纹逐字节不变（K5 的硬判据）。"""
-    _write(conn, D2, lessons=[_lesson("cash_drag", "x")])
+    _write(conn, D1, lessons=[_lesson("cash_drag", "x")])
     before = own_history.own_history_block(conn, arm=ARM, asof=D2)
     before_sha = agent_context.decision_context_sha256(
         engine.decision_context_for(conn, arm=ARM, asof=D2))
-    _write(conn, D3, lessons=[_lesson("cash_drag", "后见之明"), _lesson("later", "z")])
+    _write(conn, D2, lessons=[_lesson("cash_drag", "后见之明"), _lesson("later", "z")])
     after = own_history.own_history_block(conn, arm=ARM, asof=D2)
     after_sha = agent_context.decision_context_sha256(
         engine.decision_context_for(conn, arm=ARM, asof=D2))
     assert json.dumps(after, ensure_ascii=False, sort_keys=True) \
         == json.dumps(before, ensure_ascii=False, sort_keys=True)
     assert after_sha == before_sha
-    # 反向对照：对 **D3** 来说那条复盘是看得见的（不是「永远看不见」）
-    assert own_history.own_history_block(
-        conn, arm=ARM, asof=D3)["recent_reviews"][-1]["asof"] == D3
+    # 反向对照：D1/D2 的复盘在 **D3** 的上下文里看得见（P86 修订后＝「早于决策日」）
+    later = own_history.own_history_block(conn, arm=ARM, asof=D3)
+    assert [r["asof"] for r in later["recent_reviews"]] == [D1, D2]
 
 
 def test_t3_the_two_blocks_enter_the_fingerprint(conn):
@@ -624,8 +649,8 @@ def _review_file(tmp_path, payload, name="r.json"):
 
 
 def test_t4_review_writes_and_prints_the_k7_receipt(db, tmp_path, capsys, conn):
-    # 指纹是**写之前**算的（K7「现算」的落点）：先按 `decision_context_for` 取一份，
-    # 再跑 CLI —— 落地之后这条复盘自己会进 `own_history.recent_reviews`，事后现算必然不同。
+    # 指纹取的是**该决策日的上下文**。P86 把复盘窗口收紧成 `asof < 决策日` 之后，
+    # 当天写的复盘不进当天上下文 ⇒ 落地前后现算**逐位相同**，回执里那串是可复算的。
     expected = agent_context.decision_context_sha256(
         engine.decision_context_for(conn, arm=ARM, asof=D2))
     payload = _payload(conn, D2, lessons=[_lesson("cash_drag", "x")])
@@ -639,10 +664,13 @@ def test_t4_review_writes_and_prints_the_k7_receipt(db, tmp_path, capsys, conn):
     assert receipt["written"] is True and receipt["n_items"] == 4
     assert receipt["facts"] == 0
     assert receipt["context_sha256"] == expected
-    # 反向对照：写完之后现算 **必然不同**（自指），所以它记的只能是写之前那一份。
+    # 写完之后现算 **还是同一份**（当天写入不改当天上下文 ⇒ 指纹可复算）。
     after = agent_context.decision_context_sha256(
         engine.decision_context_for(conn, arm=ARM, asof=D2))
-    assert after != expected
+    assert after == expected
+    # 反向对照：次日（「下一轮」）它就在上下文里了 —— 复盘照旧是下一轮的输入。
+    later = engine.decision_context_for(conn, arm=ARM, asof=D3)
+    assert [r["asof"] for r in later["own_history"]["recent_reviews"]] == [D2]
 
 
 def test_t4_review_prints_one_line_of_json(db, tmp_path, capsys, conn):
@@ -791,10 +819,11 @@ def test_k6_the_payload_schema_has_no_parameter_path(conn):
 
 
 def test_k6_facts_reach_the_context_as_text_only(db):
+    # P86 修订：上下文只看**早于**决策日的复盘 ⇒ 两条复盘都得排在 D3 之前。
     c = connect(db)
     try:
-        _write(c, D2, lessons=[_lesson("cash_drag", "现金拖累收益", kind="habit")])
-        _write(c, D3, lessons=[_lesson("cash_drag", "现金拖累收益")])
+        _write(c, D1, lessons=[_lesson("cash_drag", "现金拖累收益", kind="habit")])
+        _write(c, D2, lessons=[_lesson("cash_drag", "现金拖累收益")])
     finally:
         c.close()
     c = connect(db)

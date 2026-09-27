@@ -843,6 +843,41 @@ CREATE TRIGGER IF NOT EXISTS trg_paper_capital_events_no_delete
 BEFORE DELETE ON paper_capital_events
 BEGIN SELECT RAISE(ABORT, 'paper_capital_events is append-only'); END;
 
+-- ---------- AI 操盘手的**复盘台账**（P85：K1–K4） ----------
+-- AI 操盘手「复盘总结自己」的落点：一条 `(arm, asof, kind)` 一行，载荷里每条 `claim`
+-- 必须挂一条**能在库里核到**的证据指针（`decision` / `trade` / `metric` / `market`）——
+-- 复查是**下一轮的输入**，一句「我这周回撤 3%」如果与 `paper_nav_daily` 对不上，
+-- 它就会作为一个**假事实**进入模型自己的历史叙事。能编的读数比没有读数更糟。
+--
+-- append-only：改错请**再审一版**（同一 `(arm, asof, kind)` 不许改写 —— 幂等键）。
+-- 表由本文件（`CREATE TABLE IF NOT EXISTS`）在 `init_db` / `ensure_schema` 时建出，
+-- `migrate.py::migrate_p85_agent_reviews` 只处理**结构漂移**（同 P58/P79/P80）。
+CREATE TABLE IF NOT EXISTS paper_agent_reviews (
+    review_id      INTEGER PRIMARY KEY AUTOINCREMENT,
+    arm            TEXT NOT NULL,        -- 账户 id：'arm-agent-ds-v3' …
+    asof           TEXT NOT NULL,        -- 复盘日（PIT：只能引用 <= 该日的行）
+    kind           TEXT NOT NULL,        -- 本期只有 'daily'（K1 留的扩展位）
+    model_id       TEXT NOT NULL,        -- 产出这条复盘的模型；人工补录记 'manual'
+    prompt_sha256  TEXT NOT NULL,
+    context_sha256 TEXT NOT NULL,        -- 写之前算的上下文指纹（事后现算必然不同 —— 它自己会进上下文）
+    n_items        INTEGER NOT NULL,
+    n_lessons      INTEGER NOT NULL,
+    payload_json   TEXT NOT NULL,        -- canonical JSON（同载荷 ⇒ 逐字节同串）
+    created_at     TEXT NOT NULL,
+    UNIQUE (arm, asof, kind)
+);
+
+CREATE TRIGGER IF NOT EXISTS trg_paper_agent_reviews_no_update
+BEFORE UPDATE ON paper_agent_reviews
+BEGIN SELECT RAISE(ABORT, 'paper_agent_reviews is append-only (改错请再审一版)'); END;
+
+CREATE TRIGGER IF NOT EXISTS trg_paper_agent_reviews_no_delete
+BEFORE DELETE ON paper_agent_reviews
+BEGIN SELECT RAISE(ABORT, 'paper_agent_reviews is append-only'); END;
+
+CREATE INDEX IF NOT EXISTS idx_paper_agent_reviews_arm_asof
+ON paper_agent_reviews (arm, asof);
+
 -- ---------- 基金日净值（P52：D-36 的第三条对照臂） ----------
 -- 净值源＝天天基金 `https://fund.eastmoney.com/pingzhongdata/<code>.js` 的
 -- `Data_netWorthTrend`（**非官方接口**，页面与报告必须标注「近似 / 非官方」）。

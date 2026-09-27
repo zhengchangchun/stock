@@ -500,17 +500,29 @@ def _project_lessons(payload: object) -> list[dict]:
 
 
 def _iter_reviews(conn: sqlite3.Connection, *, arm: str, asof: str | None = None,
-                  kind: str | None = None):
+                  kind: str | None = None, strict: bool = False):
     """该臂的复盘行，**升序**（`asof`, `review_id`）。表不存在 ⇒ 空。
 
     `asof` 给了 ⇒ 只取 `asof <= asof`（PIT：复盘只能引用复盘日及之前的行）。
+
+    `strict=True`（P86 修订）⇒ 改取 `asof **<** asof`：**决策上下文专用的窗口**。
+    理由（2026-09-27 实测）：`own_history` 拿的是「决策**日**」的 asof，而同一批
+    运行里生成器要**先写当天的复盘、再写当天的决策** —— 当天的复盘若进当天决策的
+    上下文，② 里取的 `context_sha256` 会立刻失效，`paper agent decide` 的 D-49
+    指纹闸门**必拒**（逐条复现见 P86 任务书 §7），同日重放也会因指纹变化而报冲突。
+    收紧到「**只看早于决策日的复盘**」后：当天的上下文在当天所有写入之后保持
+    一字不变（可重放、闸门与写序无关），而复盘照旧在**次日**成为决策输入 ——
+    这正是「复盘是**下一轮**的输入」（ADR-036 §2）的字面意思。
+
+    列出口（`paper agent reviews` / `facts`）**不传** `strict`：那是「看到某日为止
+    的全部复盘」的陈列语义，包含当天是应该的。
     """
     if not _has_table(conn, TABLE):
         return []
     sql = f"SELECT * FROM {TABLE} WHERE arm = ?"
     args: list = [arm]
     if asof is not None:
-        sql += " AND asof <= ?"
+        sql += " AND asof < ?" if strict else " AND asof <= ?"
         args.append(asof)
     if kind is not None:
         sql += " AND kind = ?"
@@ -531,24 +543,27 @@ def _iter_reviews(conn: sqlite3.Connection, *, arm: str, asof: str | None = None
 
 
 def load_reviews(conn: sqlite3.Connection, *, arm: str, asof: str | None = None,
-                 limit: int | None = None) -> list[dict]:
+                 limit: int | None = None, strict: bool = False) -> list[dict]:
     """读该臂的复盘台账（**只读**）。
 
     `limit` 给了 ⇒ 取**最近** N 条，仍以**升序**返回（与 `own_history` 的
     「最近 ≤3 条、升序」同一口径：「最近」是选法，「升序」是呈现顺序）。
+    `strict=True` ⇒ 只取 **严格早于** `asof` 的（决策上下文的窗口，见 `_iter_reviews`）。
     `payload_json` 坏掉的行照出（`payload=None`），**不抛** —— 读出口不替写入口兜底。
     """
-    rows = _iter_reviews(conn, arm=arm, asof=asof)
+    rows = _iter_reviews(conn, arm=arm, asof=asof, strict=strict)
     return rows[-int(limit):] if limit else rows
 
 
-def derive_facts(conn: sqlite3.Connection, *, arm: str, asof: str) -> dict:
+def derive_facts(conn: sqlite3.Connection, *, arm: str, asof: str,
+                 strict: bool = False) -> dict:
     """K4 的**纯函数**：已确认教训（`facts`）。返回
     `{"facts": [...], "n_facts_truncated": N, "n_reviews": N}`。
 
     规则（逐字照 K4）：
 
-    - 汇总范围 = 该臂 `kind='daily'` 且 `asof <= 复盘日` 的**全部**复盘；
+    - 汇总范围 = 该臂 `kind='daily'` 且 `asof <= 复盘日` 的**全部**复盘
+      （`strict=True` ⇒ `asof <`，决策上下文用的窗口，见 `_iter_reviews`）；
     - 同一个 `key` 出现在 **≥2 条不同 `asof`** 的复盘里 ⇒ 进 `facts`（出现 1 次不算数：
       单次陈述是**观察**，反复出现才是**模式**——这正是「确认」二字的可执行定义）；
     - `text` 取**最新**一条；`seen_at` 列**全部** `asof` 升序；
@@ -559,7 +574,7 @@ def derive_facts(conn: sqlite3.Connection, *, arm: str, asof: str) -> dict:
 
     输出**不含**时间戳、不含自增 id ⇒ 同库两次调用逐字节相同。
     """
-    rows = _iter_reviews(conn, arm=arm, asof=asof, kind=KIND_DAILY)
+    rows = _iter_reviews(conn, arm=arm, asof=asof, kind=KIND_DAILY, strict=strict)
     agg: dict[str, dict] = {}
     for rec in rows:
         for lesson in rec["lessons"]:

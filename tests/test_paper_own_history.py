@@ -304,9 +304,9 @@ def test_p85_recent_reviews_are_capped_at_three_and_ascending(conn):
     conn.commit()
     blk = own_history.own_history_block(conn, arm=ARM, asof=ASOF)   # ASOF = 09-24
     assert own_history.REVIEW_LIMIT == 3
-    # 「最近 3 条」是在 `asof <= 09-24` 的四条里取尾部（09-25 那条看不见）
+    # 「最近 3 条」是在 `asof < 09-24` 的三条里取尾部（P86 修订：当天的复盘不进当天上下文）
     assert [r["asof"] for r in blk["recent_reviews"]] == \
-        ["2026-09-22", "2026-09-23", "2026-09-24"]
+        ["2026-09-21", "2026-09-22", "2026-09-23"]
     assert set(blk["recent_reviews"][0]) == {
         "asof", "kind", "context_sha256", "n_items", "n_lessons",
         "items", "lessons"}
@@ -321,7 +321,8 @@ def test_p85_facts_are_capped_at_ten_and_only_for_the_own_arm(conn):
     conn.commit()
     assert own_history.FACT_LIMIT == 10
     assert own_history.own_history_block(conn, arm=ARM, asof=ASOF)["facts"] == []
-    other = own_history.own_history_block(conn, arm=OTHER, asof=ASOF)
+    # P86 修订：复盘窗口是 `asof < 决策日` ⇒ 换个更晚的决策日才看得见那两条。
+    other = own_history.own_history_block(conn, arm=OTHER, asof="2026-09-25")
     assert len(other["facts"]) == 10 and other["recent_reviews"] != []
 
 
@@ -340,8 +341,8 @@ def test_p85_a_review_after_asof_does_not_change_the_block(conn):
     after = own_history.own_history_block(conn, arm=ARM, asof=ASOF)
     assert json.dumps(after, ensure_ascii=False, sort_keys=True) \
         == json.dumps(before, ensure_ascii=False, sort_keys=True)
-    # 反向对照：对 09-25 来说它是看得见的（不是「两条路都看不见」）
-    later = own_history.own_history_block(conn, arm=ARM, asof="2026-09-25")
+    # 反向对照：对 09-26 来说它们是看得见的（P86 修订后＝早于决策日的都看得见）
+    later = own_history.own_history_block(conn, arm=ARM, asof="2026-09-26")
     assert [r["asof"] for r in later["recent_reviews"]] == \
         ["2026-09-23", "2026-09-25"]
 
@@ -369,7 +370,7 @@ def test_p85_the_new_subkeys_carry_no_forward_looking_field_names(conn):
     _review(conn, "2026-09-24", lessons=[{"key": "cash_drag", "kind": "fact",
                                           "text": "现金拖累收益"}])
     conn.commit()
-    blk = own_history.own_history_block(conn, arm=ARM, asof=ASOF)
+    blk = own_history.own_history_block(conn, arm=ARM, asof="2026-09-25")   # P86：早于决策日
     assert blk["facts"]                                     # 确实有东西可扫
     for key in _all_keys({"recent_reviews": blk["recent_reviews"],
                           "facts": blk["facts"]}):

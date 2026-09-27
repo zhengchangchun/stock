@@ -1249,6 +1249,15 @@ def migrate_p85_agent_reviews(conn) -> list[str]:
 
     只加表与触发器，**不改任何既有表**（真库前滚由 nanobot 做，见任务书 §5）。
     第二次调用返回 `[]`（三样都在位即跳过）。
+
+    ⚠️ 2026-09-27（nanobot 复核收口）：三件 DDL **同时也在 `schema.sql` 里**（`CREATE
+    TABLE/TRIGGER/INDEX IF NOT EXISTS`）—— `ensure_schema` 先跑 `executescript(sql)`
+    再跑本函数，所以老库/夹具库上的**建表由 schema.sql 完成**，本函数在那种库上返回
+    `[]`。这是 P58/P79/P80 的约定（「新表不挂 `_pending_column_migrations`、不计入
+    变更列表 ⇒ 不需要为此备份」）；本站原先把 DDL 只放在本文件里，会让
+    `ensure_schema` 在**任何**老库上报三件变更（`tests/test_store_migrate.py::
+    test_ensure_schema_backs_up_once_when_migrating` 钉住了这条）。下面三件 DDL 保留
+    作防守：只在「表/触发器/索引莫名缺一件」时动手。
     """
     changes: list[str] = []
     if not _table_exists(conn, _P85_TABLE):

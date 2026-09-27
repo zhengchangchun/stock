@@ -42,8 +42,14 @@
   才进来（≤10 条）。这是「我反复看到的那件事」。
 
 两块都**只增子键**（既有子键的名字/顺序/语义一字不动，K8），都受 PIT 约束
-（`asof <= 决策日`）、都不含时间戳/自增 id ⇒ 在 `asof` 之后插一条复盘，
+（`asof` 过滤）、都不含时间戳/自增 id ⇒ 在 `asof` 之后插一条复盘，
 决策日的 `own_history` 与 `decision_context_sha256` **逐字节不变**。
+
+**P86 修订（2026-09-27）**：窗口由 `asof <= 决策日` 收紧为 **`asof < 决策日`**。
+原因见 `review._iter_reviews`：生成器要先写当天的复盘、再写当天的决策，而「当天的复盘
+进当天决策的上下文」会让 ② 取的指纹立即失效（D-49 闸门必拒、同日重放报冲突）。
+收紧后当天的上下文在当天所有写入之后一字不变，复盘仍照旧成为**次日**（也是「下一轮」）
+的输入。**列出口**（`paper agent reviews` / `facts`）仍按 `<=` 陈列（不传 `strict`）。
 
 判别 `recent_reviews`（原话）与 `facts`（归纳）是刻意的：原话可被引用、归纳可被检验，
 把两者合成一块，「我说过什么」与「我得出的结论是什么」就再也分不开了。
@@ -220,7 +226,8 @@ def own_history_block(conn: sqlite3.Connection, *, arm: str, asof: str) -> dict:
             "n_decisions": n_decisions,
             "notes": notes[:4],
             # P85 / K5：**末尾**追加两个子键（既有子键逐位不变，K8）。
-            # 都自带 PIT（`review.load_reviews` / `derive_facts` 的 `asof <=` 过滤），
+            # 都自带 PIT（`review.load_reviews` / `derive_facts` 的 `asof` 过滤；
+            # **严格早于决策日** —— P86 修订，理由见 `review._iter_reviews`），
             # 都尺寸有界，都不含时间戳 / 自增 id。
             "recent_reviews": [
                 {"asof": str(r["asof"]), "kind": str(r["kind"]),
@@ -228,8 +235,9 @@ def own_history_block(conn: sqlite3.Connection, *, arm: str, asof: str) -> dict:
                  "n_items": int(r["n_items"]), "n_lessons": int(r["n_lessons"]),
                  "items": r["items"], "lessons": r["lessons"]}
                 for r in review.load_reviews(conn, arm=arm, asof=asof,
-                                             limit=REVIEW_LIMIT)],
-            "facts": review.derive_facts(conn, arm=arm, asof=asof)["facts"]}
+                                             limit=REVIEW_LIMIT, strict=True)],
+            "facts": review.derive_facts(conn, arm=arm, asof=asof,
+                                         strict=True)["facts"]}
 
 
 __all__: list[str] = ["own_history_block", "NAV_LIMIT", "TRADE_LIMIT",
