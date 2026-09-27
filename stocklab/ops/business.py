@@ -11,6 +11,7 @@ P38 把其中的「数据链体检」搬进了 `ops/patrol.py`，剩下的**业�
 | ⑤ 熔断检测 | `fuse` —— **只读**复用 `m2.selfeval.fuse_verdict` |
 | ⑥ 更新候选池标的状态 | `candidate_status` —— 默认只算不写，`--update-status` 才调 P91 的 CLI |
 | ① 北向 / 公告的新鲜度 | `freshness` —— 只看两张 P88 表的 `max(日期)/行数`（**采集**属 P88） |
+| —（P93 追加） | `sandbox_guard` —— 只读 `plugin_resource_events` 最近 N 条（P61 §0.7 的 G1 监控） |
 
 ④（A3/B1 刷新收益概率）**刻意不做**：盘中 `bars` 未定型（P46 口径＝当天
 `fetched_at ≥ 15:00` 才算定型），30 分钟重复跑会拿半天数据反复写 append-only 台账，
@@ -18,14 +19,14 @@ P38 把其中的「数据链体检」搬进了 `ops/patrol.py`，剩下的**业�
 
 ## 五条纪律
 
-1. **只读**：四个子块都不写业务表。唯一例外是 `--update-status` 打开时的
+1. **只读**：五个子块都不写业务表。唯一例外是 `--update-status` 打开时的
    `candidate_status_events` 追加 —— 而那也不是本模块写的，是**子进程**调
    `candidate status set`（本仓 `ops` 纪律：补步一律子进程复用现成 CLI）。
 2. **熔断绝不调 `m2 cycle fuse-check`**：那条命令往 append-only 台账追加
    `circuit_breaker` + `validation_end` 两行 —— 30 分钟一轮会把台账写花。
    只读路径＝「未收尾周期」＋ `fuse_verdict`（**复用**，不重写回撤算法）。
-3. **只有熔断计入退出码**（`tripped=True` ⇒ `verdict()` 给 1）。其余三块只展示：
-   盘中每 30 分钟报一次假警会把巡检变成噪音。
+3. **只有熔断计入退出码**（`tripped=True` ⇒ `verdict()` 给 1）。其余四块只展示：
+   盘中每 30 分钟报一次假警会把巡检变成噪音（`sandbox_guard` 的 `high` 也在内）。
 4. **判不了就说判不了**：插桩0 没有 active 版本、净值窗口为空 ⇒ `unknown` /
    `reason` 里写清「判不了」，**不**给 `ok`（ERROR_DIARY #36 的同一条）。
 5. **不阻断**：业务块里任何一条读数炸了（沙盒抛错、表未前滚），记进 `reason`／
@@ -51,16 +52,20 @@ from stocklab.candidate import score as cand_score
 from stocklab.candidate import snapshot as cand_snapshot
 from stocklab.candidate import status as cand_status
 from stocklab.config.universe import Instrument
+from stocklab.config import limits
 from stocklab.m2 import selfeval
 from stocklab.m2.cycle import KIND_VALIDATION_END
 from stocklab.ops import journal, patrol
 from stocklab.ops.runner import DEFAULT_TIMEOUT_S, Step, build_argv, default_runner
 from stocklab.paper import engine as paper_engine
 from stocklab.paper import store as paper_store
+from stocklab.plugin import store as plugin_store
 from stocklab.store import validation as ledger
 
-#: 四个子块的固定顺序与键集（D1：**只增不减**；页面与简报都按它读）。
-BLOCK_ORDER: tuple[str, ...] = ("risk_screen", "fuse", "candidate_status", "freshness")
+#: 五个子块的固定顺序与键集（D1：**只增不减**；页面与简报都按它读）。
+#: P92 四块在前（顺序与读数一字不动），P93 的 `sandbox_guard` 追加在末尾。
+BLOCK_ORDER: tuple[str, ...] = ("risk_screen", "fuse", "candidate_status",
+                                "freshness", "sandbox_guard")
 
 #: 状态推导的**白名单只有一条**（D3）：池内成员若被**任一 live 账户实际持有**，
 #: 目标状态 = 已建仓。其余三个状态（观察中 / 等待买点 / 逻辑证伪移出）**不可自动推导**。
@@ -377,12 +382,69 @@ def freshness_block(conn: sqlite3.Connection, *, asof: str | None) -> dict:
     }
 
 
+# ---------- ⑧ 插桩资源越界（P93；**只展示**） ----------
+
+#: 默认只看最近多少条事件（D6）。表是 append-only 且每轮 submit 预检最多几条，
+#: 20 条够看出「最近有没有越界」，又不会把巡检拖成一次全表扫。
+SANDBOX_GUARD_WINDOW = 20
+
+
+def sandbox_guard(conn: sqlite3.Connection, *,
+                  limit: int = SANDBOX_GUARD_WINDOW) -> dict:
+    """⑧ 插桩资源越界读数（P93）。**只展示**（D6：与熔断同一个纪律，不进退出码）。
+
+    读 `plugin_resource_events` 最近 `limit` 条（**只读**，写入口只有
+    `plugin/store.py::record_resource_event`）：
+
+    - 表不存在 / 空表 ⇒ `skipped`，`reason` 写明「空是预期」，**不算异常**
+      （真库现在就是空表）；
+    - 有 `outcome="resource"` ⇒ `high`；否则 `ok`。
+    - `high` **不进退出码**：盘中每 30 分钟报一次假警会把巡检变成噪音
+      （D2/P92 那条）—— `fuse` 仍是**唯一**进退出码的业务读数。
+    """
+    base = {"n_events": 0, "max_delta_bytes": None, "max_peak_bytes": None,
+            "limits": {"call": limits.PLUGIN_CALL_RSS_LIMIT_BYTES,
+                       "process": limits.PLUGIN_PROCESS_RSS_LIMIT_BYTES}}
+    try:
+        rows = plugin_store.list_resource_events(conn, limit=limit)
+    except sqlite3.Error:
+        return {**base, "status": patrol.SKIPPED,
+                "reason": ("plugin_resource_events 表不存在（老库未前滚）—— "
+                           "本轮跳过，不计异常")}
+    if not rows:
+        return {**base, "status": patrol.SKIPPED,
+                "reason": (f"最近 {limit} 条插桩资源事件为空（还没有调用被记录，"
+                           f"空是预期）—— 本轮跳过，不计异常")}
+    max_delta = max(int(r["rss_delta_bytes"]) for r in rows)
+    max_peak = max(int(r["rss_peak_bytes"]) for r in rows)
+    n_resource = sum(1 for r in rows if r["outcome"] == "resource")
+    n = len(rows)
+    if n_resource:
+        return {**base, "n_events": n, "max_delta_bytes": max_delta,
+                "max_peak_bytes": max_peak, "status": patrol.HIGH,
+                "reason": (f"最近 {n} 条插桩资源事件里有 {n_resource} 次越界"
+                           f"（outcome=resource）：最大单次增量 {max_delta} 字节、"
+                           f"最大进程峰值 {max_peak} 字节；上限 call="
+                           f"{base['limits']['call']} / process="
+                           f"{base['limits']['process']} —— "
+                           "只展示、不计异常（D6：只有熔断进退出码）")}
+    return {**base, "n_events": n, "max_delta_bytes": max_delta,
+            "max_peak_bytes": max_peak, "status": patrol.OK,
+            "reason": (f"最近 {n} 条插桩资源事件全部在限内"
+                       f"（最大单次增量 {max_delta} 字节、最大进程峰值 "
+                       f"{max_peak} 字节）—— 只展示、不计异常")}
+
+
 # ---------- 组装 ----------
 
 def build_business(conn: sqlite3.Connection, *, latest: str | None, db_path=None,
                    update_status: bool = False, runner=None, screen_fn=None,
                    timeout_s: float = DEFAULT_TIMEOUT_S) -> dict:
-    """`check_chain()` 的 `business` 顶层键：四个子块，形状固定（D1）。"""
+    """`check_chain()` 的 `business` 顶层键：五个子块，形状固定（D1）。
+
+    P92 的四块（`risk_screen` / `fuse` / `candidate_status` / `freshness`）
+    **一字不动**；P93 追加第五块 `sandbox_guard`（键**只增不减**）。
+    """
     members = latest_snapshot(conn)
     return {
         "risk_screen": risk_screen(conn, asof=latest, members=members,
@@ -392,6 +454,7 @@ def build_business(conn: sqlite3.Connection, *, latest: str | None, db_path=None
             conn, asof=latest, members=members, update_status=update_status,
             db_path=db_path, runner=runner, timeout_s=timeout_s),
         "freshness": freshness_block(conn, asof=latest),
+        "sandbox_guard": sandbox_guard(conn),
     }
 
 

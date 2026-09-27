@@ -71,6 +71,8 @@ TRIPPED = "tripped"      # 业务块专用（P92）：熔断已触发。**只有
 RISKY = "risky"          # 业务块专用（P92）：插桩0 排雷命中。同上，只展示。
                          # 这两个刻意**不在** ANOMALY_STATUSES 里：业务块不进 `checks`，
                          # 它的异常由 `_anomalies()` 显式露面（kind="business_fuse"）。
+HIGH = "high"            # 业务块专用（P93）：插桩资源越界事件存在（`sandbox_guard`）。
+                         # 同上，**只展示**、不进退出码、不进 `_anomalies()`。
 
 ANOMALY_STATUSES = frozenset({MISSING, STALE})
 
