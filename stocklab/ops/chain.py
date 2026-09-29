@@ -73,9 +73,9 @@ from zoneinfo import ZoneInfo
 from stocklab.config import paths
 from stocklab.ops import journal, window_report
 from stocklab.ops.patrol import check_db, ro_connect, session_day
-from stocklab.ops.runner import (EXIT_ANOMALY, EXIT_BLOCKED, EXIT_OK, Step,
-                                 cross_db_refusal, default_runner, run_steps,
-                                 worst_code)
+from stocklab.ops.runner import (EXIT_ANOMALY, EXIT_BLOCKED, EXIT_OK,
+                                 RETRY_ATTEMPTS, Step, cross_db_refusal,
+                                 default_runner, run_steps, worst_code)
 from stocklab.session.tick import is_trade_date_closed
 from stocklab.store.migrate import backup_db
 from stocklab.verify.pending import CLOSED_RULE, latest_closed_session
@@ -131,6 +131,34 @@ CLOSE_STEPS: tuple[Step, ...] = (
 CLOSE_STEP_BY_NAME: dict[str, Step] = {s.name: s for s in CLOSE_STEPS}
 CLOSE_STEP_ORDER: tuple[str, ...] = tuple(s.name for s in CLOSE_STEPS)
 
+
+def _ingest_retry_plan(steps: tuple[Step, ...]) -> dict[str, int]:
+    """计划的「可重试」标记：**只有** `ingest *` 步（P100 L3）。
+
+    判据取自步骤自己的 argv 第一段（`ingest`），不是手抄一份命令名清单：清单每加一条
+    采集就得手工跟一次，漏跟的那一步会**静默地**没有重试 —— 而重试缺席只有在下一次
+    瞬时故障那天才看得出来（P55 的 `ingest_index_500` 就是这么漏过一次的同类形状）。
+
+    **为什么只有采集步可重试**：它们**幂等**（首写保留 / `INSERT OR IGNORE` / 按
+    `--days` 增量）且**联网络** —— 2026-09-28 那次事故的形状正是一次瞬时 DNS 失败。
+    `session_*` / `predict_run` / `verify_pending` / `review_daily` / `paper_step` /
+    `m2_daily` / `doctor` 一律**不重试**：重试它们只会掩盖真问题（它们不是网络故障的
+    形状，失败说明「库里/口径上有事」），而且 `predictions` 是 append-only，
+    盲目重试撞上冲突只会多写几条噪声。
+    """
+    return {s.name: RETRY_ATTEMPTS for s in steps
+            if s.args and s.args[0] == "ingest"}
+
+
+#: 收盘链的可重试步骤 = 6 条 `ingest *`（次数取 `runner.RETRY_ATTEMPTS`，不手抄 3）。
+#:
+#: 2026-09-28 的事故形状：15:30 那一刻 DNS 挂了 ⇒ `ingest_index` exit 1 ⇒
+#: **交易日历没有前滚**（`ingest index` 是日历唯一的来源）⇒ `predict run` 判
+#: 「非交易日」拒绝出预测 ⇒ 下班链停在 9/14 步，那一天的预测/验证/复盘/AI 决策
+#: 全部丢掉，且次日自愈也**补不回那一天**。重试三次、间隔 15 s，正是为了让
+#: 一个「十几秒就恢复」的瞬时故障不再判死一整天。
+CLOSE_RETRY_PLAN: dict[str, int] = _ingest_retry_plan(CLOSE_STEPS)
+
 #: 月度刷新步骤。它替代 nanobot 侧原来的「C 月度刷新（日历+财报+长窗行情）」。
 MONTHLY_STEPS: tuple[Step, ...] = (
     Step("calendar_holidays_fetch", ("calendar", "holidays", "fetch"), True,
@@ -168,6 +196,11 @@ MONTHLY_STEPS: tuple[Step, ...] = (
 
 MONTHLY_STEP_BY_NAME: dict[str, Step] = {s.name: s for s in MONTHLY_STEPS}
 MONTHLY_STEP_ORDER: tuple[str, ...] = tuple(s.name for s in MONTHLY_STEPS)
+
+#: 月度链的可重试步骤 = 它的 5 条 `ingest *`（长窗行情 / sh000905 长窗 / 财报 /
+#: 公告 / 北向）—— 与收盘链**用同一条规则**取（`_ingest_retry_plan`），不是另抄一份。
+#: 月度链是长跑（预算 1800 s），30 s 的重试开销比日链更不值一提。
+MONTHLY_RETRY_PLAN: dict[str, int] = _ingest_retry_plan(MONTHLY_STEPS)
 
 #: 周/季度链整轮预算（P89）：候选池全量重打分 + 财报复核都是长跑，给 30 分钟。
 WEEKLY_TIMEOUT_S = 1800.0
@@ -448,6 +481,42 @@ def _seal(payload: dict, *, db: Path, stamp: str, started_at: str,
                         report_dir=report_dir)
 
 
+def _retried_steps(steps: list[dict]) -> list[dict]:
+    """回执顶层键 `retried_steps`（P100 T3.3，**只增**）：重试过的步骤及其退出码序列。
+
+    无重试 ⇒ `[]`（不是缺键）。这一步是给读者用的：回执里 `bad=` 只看**最后一次**
+    退出码，所以「重试后成功」的步在摘要里与「一次就跑成」长得一样 —— 想看出
+    「这一轮抖过」只能看这里（与 `anomalies` 的 `step_retried` 条目同源）。
+    """
+    return [{"name": s["name"], "attempts": s.get("attempts"),
+             "exit_codes": s.get("exit_codes")}
+            for s in steps if s.get("retried")]
+
+
+def _calendar_anomaly(*, asof: str, session_day: dict, after_calendar: dict) -> list[dict]:
+    """`asof` 没进交易日历 ⇒ 一条点名因果的 anomaly（P100 T3.2，**只增**）。
+
+    2026-09-28 的因果链在回执里是**看不见**的：`ingest_index` 失败、日历停在
+    2026-09-24，而 `predict run` 报的是「非交易日」—— 两句都对，但没人把它们串起来。
+    这里让收盘链自己的回执说出那句话：**`ingest_index` 是交易日历的唯一来源**
+    （ADR-001 B4），它失败就会连带 `predict_run` 判非交易日、后面每一步（验证/复盘/
+    模拟盘）跟着停摆。巡检侧有同义检查（`patrol.plan`：日历 STALE ⇒ 补 `ingest_index`），
+    那条不动 —— 这一条是给「只看收盘链回执」的读者看的。
+    """
+    cal_max = after_calendar.get("max_date")
+    if session_day.get("why") != "calendar_not_covered" and not (
+            cal_max and cal_max < asof):
+        return []
+    return [{
+        "kind": "calendar_not_forward_rolled", "date": asof,
+        "calendar_max": cal_max,
+        "detail": (f"交易日历没有前滚到 {asof}（日历 max={cal_max}）："
+                   "`ingest_index` 是交易日历的**唯一**来源（ADR-001 B4），"
+                   "它失败就会连带 `predict_run` 判非交易日，"
+                   "当天的验证/复盘/模拟盘全部停摆 —— 先补 `ingest index` 再重跑本链"),
+    }]
+
+
 def summary_line(payload: dict) -> str:
     """**一行**回执（launchd 日志与 `/lab/ops` 页面用同一份）。"""
     job = payload.get("job") or "ops"
@@ -461,15 +530,31 @@ def summary_line(payload: dict) -> str:
     bad = [f"{s['name']}={s.get('exit_code')}" for s in steps
            if s.get("exit_code") != 0]
     after = (payload.get("after") or {}).get("exit_code")
+    # P100：只有真的重试过才追加这一段 —— 没重试时这一行**逐字节不变**（L2），
+    # 重试过则 launchd 日志/页面上多一个数（L6：不静默）。
+    retried = len(payload.get("retried_steps") or [])
     return (f"{job}: exit={payload.get('exit_code')} asof={payload.get('asof')}"
             f" steps={len(steps)}/{total} bad={','.join(bad) or '-'}"
-            f" after={after} anomalies={len(payload.get('anomalies') or [])}")
+            f" after={after} anomalies={len(payload.get('anomalies') or [])}"
+            + (f" retried={retried}" if retried else ""))
 
 
 def _step_anomalies(steps: list[dict]) -> list[dict]:
-    """跑过的步骤里非 0 的 → 异常条目（1 = 如实报了异常，≥2 = 链断在这里）。"""
+    """跑过的步骤里非 0 的 → 异常条目（1 = 如实报了异常，≥2 = 链断在这里）。
+
+    P100 只增一类：**重试过**的步骤（`step_retried`）—— 哪怕它最后成功了。重试后成功
+    不该把整条链判红（`exit_code` 是最后一次的值，0），但**必须看得出它重试过**：
+    否则「今天这轮抖了一下、耗了 30 s」这件事在读回执时完全不存在。
+    """
     out: list[dict] = []
     for s in steps:
+        if s.get("retried"):
+            out.append({
+                "kind": "step_retried", "step": s["name"],
+                "attempts": s.get("attempts"), "exit_codes": s.get("exit_codes"),
+                "detail": (f"{s['name']} 重试过：共 {s.get('attempts')} 次尝试，"
+                           f"每次退出码 {s.get('exit_codes')}"),
+            })
         if s.get("exit_code") == 0:
             continue
         code = s.get("exit_code")
@@ -563,7 +648,8 @@ def run_close(*, db_path: Path | str | None = None, now: str | None = None,
 
     steps_out, aborted = run_steps(
         list(CLOSE_STEP_ORDER), registry=CLOSE_STEP_BY_NAME, runner=runner,
-        db_path=db, now=stamp, asof=asof, timeout_s=timeout_s)
+        db_path=db, now=stamp, asof=asof, timeout_s=timeout_s,
+        retry_plan=CLOSE_RETRY_PLAN)
 
     after = check_db(db, stamp, report_dir=report_dir)
     rows = _bars_rows(db, asof)
@@ -573,6 +659,8 @@ def run_close(*, db_path: Path | str | None = None, now: str | None = None,
                   "要么源站没给，要么这根本不是交易日（但判定说它是）")
         anomalies.append({"kind": "bars_missing_after_ingest",
                           "date": asof, "detail": reason})
+    anomalies += _calendar_anomaly(
+        asof=asof, session_day=sday, after_calendar=after.get("calendar") or {})
     if aborted:
         payload["aborted"] = aborted
 
@@ -584,6 +672,7 @@ def run_close(*, db_path: Path | str | None = None, now: str | None = None,
     payload.update({
         "steps": steps_out,
         "bars_rows": rows,
+        "retried_steps": _retried_steps(steps_out),
         "after": {k: after[k] for k in ("checks", "titles", "verdict",
                                         "calendar", "latest_closed_session",
                                         "anomalies", "exit_code", "ok")},
@@ -633,7 +722,7 @@ def run_monthly(*, db_path: Path | str | None = None, now: str | None = None,
     steps_out, aborted = run_steps(
         list(MONTHLY_STEP_ORDER), registry=MONTHLY_STEP_BY_NAME, runner=runner,
         db_path=db, now=stamp, asof=_as_datetime(stamp).date().isoformat(),
-        timeout_s=timeout_s)
+        timeout_s=timeout_s, retry_plan=MONTHLY_RETRY_PLAN)
 
     after = check_db(db, stamp, report_dir=report_dir)
     if aborted:
@@ -641,6 +730,7 @@ def run_monthly(*, db_path: Path | str | None = None, now: str | None = None,
     codes = [worst_code(steps_out, aborted), after["exit_code"]]
     payload.update({
         "steps": steps_out,
+        "retried_steps": _retried_steps(steps_out),
         "after": {k: after[k] for k in ("checks", "titles", "verdict",
                                         "calendar", "latest_closed_session",
                                         "anomalies", "exit_code", "ok")},
@@ -652,8 +742,9 @@ def run_monthly(*, db_path: Path | str | None = None, now: str | None = None,
                  report_dir=report_dir, job=job)
 
 
-__all__ = ["CLOSE_STEPS", "CLOSE_STEP_BY_NAME", "CLOSE_STEP_ORDER",
-           "CLOSE_TIMEOUT_S", "MONTHLY_STEPS", "MONTHLY_STEP_BY_NAME",
+__all__ = ["CLOSE_RETRY_PLAN", "CLOSE_STEPS", "CLOSE_STEP_BY_NAME",
+           "CLOSE_STEP_ORDER", "CLOSE_TIMEOUT_S", "MONTHLY_RETRY_PLAN",
+           "MONTHLY_STEPS", "MONTHLY_STEP_BY_NAME",
            "MONTHLY_STEP_ORDER", "MONTHLY_TIMEOUT_S",
            "QUARTERLY_REPORT_STEP", "QUARTERLY_STEPS", "QUARTERLY_STEP_BY_NAME",
            "QUARTERLY_STEP_ORDER", "QUARTERLY_TIMEOUT_S", "STEP_TOTALS",

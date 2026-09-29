@@ -21,6 +21,20 @@
 而 1 的含义是「跑完了但有异常」—— 把没跑完读成 1，launchd 侧就会看到「绿了一天」
 （真出过这个形状：预算用尽的链报 0，见 ERROR_DIARY #54）。
 
+## 可选重试（P100）：只给「瞬时故障形状」的步骤用
+
+2026-09-28 的事故不是「某一步判错了」，而是「一次瞬时失败（15:30 那一刻 DNS 挂了）
+把一整天的链判死」：`ingest index` 失败 ⇒ 交易日历没前滚 ⇒ `predict run` 判非交易日
+⇒ 预测/验证/复盘/模拟盘全部没跑，且那一天的数据**回不来**。
+
+所以 `run_steps` 多了一个**可选**的 `retry_plan`（`step 名 → 最多尝试次数`）。
+它**缺省为 `None` ⇒ 一次尝试都不多**（调用方、巡检与全部既有测试逐字节不变）：
+重试是链自己声明出来的（见 `ops/chain.py` 的 `CLOSE_RETRY_PLAN`），不是执行器的默认行为。
+
+重试的三条边界都在代码里：只重试**失败形状**（非 0 或子进程没起来）、`timeout` 不重试
+（超时说明预算/挂死，重试只会更糟）、且**等待必须装得进整轮 deadline**（否则按
+`budget_exhausted` 收尾，见 L4）。
+
 ## 为什么走子进程而不是 import
 
 「主干固定不可修改」（07 §调度约束 5）在这里是**结构性**的：本模块连调用业务函数的机会
@@ -33,6 +47,7 @@ import os
 import subprocess
 import sys
 import time
+from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import date, timedelta
 from pathlib import Path
@@ -44,6 +59,22 @@ DEFAULT_TIMEOUT_S = 480.0
 
 #: 单条补步留多少字符进 JSON（够定位问题即可，不把整份报告塞进摘要）。
 TAIL_CHARS = 800
+
+#: 两次尝试之间等多久（秒）。
+#:
+#: 2026-09-28 15:30 的实测形状是**DNS 解析失败**（`proxy.finance.qq.com`
+#: `NameResolutionError`），次日复核三台 K 线 host 的 DNS 全部正常 —— 这类瞬时故障
+#: （resolver 抖动 / 代理重启 / 网关重置）的恢复时间在「几秒到十几秒」。等太短会在
+#: 同一个坏窗口里连撞三次（三次尝试共用一个窗口 ≈ 一次尝试），太长则整轮预算
+#: （收盘链 900 s）撑不住：2 次重试 × 15 s = 30 s，占预算 3.3%。
+RETRY_DELAY_S = 15.0
+
+#: 每步最多尝试几次（首次 + 2 次重试）。
+#:
+#: 两次重试足以跨过一个十几秒的瞬时窗口；「三次都失败」基本可以判定为真故障，
+#: 再多的尝试只是把预算耗在一件已经确定失败的事上（而预算耗尽会让整条链以 2 收场，
+#: 那正是要避免的第二重伤害）。
+RETRY_ATTEMPTS = 3
 
 EXIT_OK = 0
 EXIT_ANOMALY = 1
@@ -115,10 +146,22 @@ def actions_start(now: str, *, days: int = ACTIONS_LOOKBACK_DAYS) -> str:
 
 def run_steps(steps: list[str], *, registry: dict[str, Step], runner,
               db_path: Path, now: str, timeout_s: float,
-              asof: str | None = None) -> tuple[list[dict], dict | None]:
+              asof: str | None = None,
+              retry_plan: Mapping[str, int] | None = None,
+              retry_delay_s: float = RETRY_DELAY_S
+              ) -> tuple[list[dict], dict | None]:
     """按给定顺序跑步骤；返回 `(每步结果, 中止原因)`。
 
     `registry` 由调用方给（巡检与收盘链各有一张表），本函数只管跑。
+
+    `retry_plan` = `{step 名: 最多尝试次数}`；**缺省 `None` ⇒ 完全走原来的路径**：
+    每步只被调用一次、不 sleep、结果里没有一个新键（L2）。声明过的步骤在「失败形状」
+    时可再试，最多 `retry_plan[name]` 次（`1` 与缺省等价）。
+
+    结果 dict 的新键（**只在 `retry_plan is not None` 时出现**，L5）：`attempts`
+    （实际尝试次数）、`retried`（是否重试过）、`exit_codes`（每次尝试的退出码）。
+    `exit_code` 仍然是**最后一次**尝试的值 —— `worst_code` / 回执摘要 / `bad=` 的
+    既有语义因此逐字不变。`duration_s` 是**全部尝试的累计耗时**（不是最后一次）。
     """
     start = actions_start(now)
     deadline = time.monotonic() + float(timeout_s)
@@ -130,9 +173,44 @@ def run_steps(steps: list[str], *, registry: dict[str, Step], runner,
             return out, {"kind": "budget_exhausted", "limit_s": timeout_s,
                          "note": "整轮预算用尽 → 停在这里，下轮幂等重跑兜底"}
         argv = build_argv(step, db_path=db_path, asof=asof, action_start=start)
-        res = runner(step, argv, remaining)
-        out.append({"name": name, "why": step.why, "blocking": step.blocking,
-                    "args": argv[3:], **res})
+        max_attempts = 1
+        if retry_plan is not None:
+            max_attempts = max(1, int(retry_plan.get(name, 1)))
+        exit_codes: list[int | None] = []
+        spent_s = 0.0
+        starved = False              # 「想再试，但预算装不下这次等待」
+        while True:
+            # 第一次进循环时 remaining > 0（上面刚判过）；后面几次也 > 0 —— 只有
+            # 「等待装得进 deadline」才会走到 sleep，所以这里不可能拿到非正预算。
+            remaining = deadline - time.monotonic()
+            res = runner(step, argv, remaining)
+            exit_codes.append(res.get("exit_code"))
+            spent_s += float(res.get("duration_s") or 0.0)
+            # 失败形状 = 非 0 退出码，或子进程根本没起来；`timeout` **不重试**
+            # （超时说明预算/挂死，重试只会更糟）。
+            failed_shape = (not res.get("timeout")
+                            and (res.get("exit_code") is None
+                                 or res["exit_code"] != 0))
+            if not failed_shape or len(exit_codes) >= max_attempts:
+                break
+            remaining = deadline - time.monotonic()
+            if remaining <= 0 or retry_delay_s >= remaining:
+                starved = True       # 睡这一觉会把整轮拖过预算 → 不重试
+                break
+            time.sleep(retry_delay_s)
+        step_out = {"name": name, "why": step.why, "blocking": step.blocking,
+                    "args": argv[3:], **res}
+        if retry_plan is not None:
+            step_out["duration_s"] = round(spent_s, 3)
+            step_out["attempts"] = len(exit_codes)
+            step_out["retried"] = len(exit_codes) > 1
+            step_out["exit_codes"] = list(exit_codes)
+        out.append(step_out)
+        if starved:
+            return out, {"kind": "budget_exhausted", "step": name,
+                         "limit_s": timeout_s,
+                         "note": "重试要等的时间装不进整轮预算 → 停在这里，"
+                                 "下轮幂等重跑兜底"}
         if res.get("timeout"):
             return out, {"kind": "step_timeout", "step": name,
                          "limit_s": round(remaining, 3)}
