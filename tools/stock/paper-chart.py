@@ -34,7 +34,11 @@ LINES = [
     ("arm-agent-ds-v2",  (200,  40,  40), 5, False, True),
     ("arm-agent-ds-v1",  (120,  60, 170), 5, False, True),
     ("arm-agent-ds-v3",  ( 20, 130, 130), 5, False, True),
+    ("arm-agent-ds-v4",  ( 30,  80, 210), 5, False, True),
 ]
+# 成交明细只列这些臂（其余＝起跑种子 / 纪律臂 ETF 定投）
+AI_ARMS = {"arm-agent", "arm-agent-v1", "arm-agent-ds-v1", "arm-agent-ds-v2",
+           "arm-agent-ds-v3", "arm-agent-ds-v4", "arm-agent-random"}
 NAMES_FILE = Path("/Users/zhengchangchun/.nanobot/workspace/tools/stock/arm-names.json")
 
 
@@ -137,7 +141,9 @@ def main() -> int:
     navs, index, trades, accounts, dates = load(a.db)
     start = min(accounts.values(), key=lambda r: r["start_date"])["start_date"]
     xs = sorted({start} | set(dates))
-    W, H = 1920, 1540
+    ai_trades = [t for t in trades if t["account_id"] in AI_ARMS]
+    # 高度跟着成交明细行数长，别让表格压到页脚说明上
+    W, H = 1920, max(1540, 1000 + 60 + len(ai_trades) * 38 + 170)
     img = Image.new("RGB", (W, H), BG)
     d = ImageDraw.Draw(img)
 
@@ -243,9 +249,7 @@ def main() -> int:
 
     # ---------- 下图：成交明细 ----------
     ty = 1000
-    AI_ARMS = {"arm-agent", "arm-agent-v1", "arm-agent-ds-v1", "arm-agent-ds-v2",
-               "arm-agent-ds-v3", "arm-agent-random"}
-    shown = [t for t in trades if t["account_id"] in AI_ARMS]
+    shown = ai_trades
     skipped = len(trades) - len(shown)
     d.text((70, ty - 68), f"成交明细（AI 臂 {len(shown)} 笔 · paper_trades append-only）",
            fill=INK, font=font(32))

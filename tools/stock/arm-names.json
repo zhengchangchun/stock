@@ -1,12 +1,19 @@
 {
   "_comment": "模拟盘各臂的对外显示名（单一真源）。页面/图表只改显示名，账户 id 一律不动（台账 append-only）。wired_from 记录该臂的机制出处。",
-  "updated": "2026-09-26",
+  "updated": "2026-09-29",
   "arms": {
+    "arm-agent-ds-v4": {
+      "name": "AI操盘手·四版（现役）",
+      "short": "AI四版",
+      "who": "同一模型 + 提示词 v4（先交 3 条复盘再交决策；复盘落 paper_agent_reviews）",
+      "status": "现役 · 2026-09-28 起以 5 万本金跑",
+      "kind": "llm"
+    },
     "arm-agent-ds-v3": {
-      "name": "AI操盘手·三版（现役）",
+      "name": "AI操盘手·三版（对照）",
       "short": "AI三版",
       "who": "DeepSeek V4 Pro + 提示词 v3（读上下文里的 tradability / 购买力结论）",
-      "status": "现役 · 2026-09-28 起以 5 万本金跑",
+      "status": "在跑（与四版平行对照）",
       "kind": "llm"
     },
     "arm-agent-ds-v2": {
