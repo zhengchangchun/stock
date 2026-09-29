@@ -53,7 +53,8 @@ P83 的因子值一律**来自打分用的同一个 `ctx`**。P97 起多了一�
 （ADR-045）：研究侧因子的取数口径、PIT 锚、缺失语义由取值器自己负责，**与打分路径
 无关** —— 因此它们的读数**不能说「这就是插桩用的因子」**（`mom20`/`vr15` 才能说）。
 
-- `RESEARCH_FACTORS`：**只有需要新取值器的**才登记在这里（当前只有 `mf_ratio_5d`）。
+- `RESEARCH_FACTORS`：**只有需要新取值器的**才登记在这里（当前 `mf_ratio_5d` ＋
+  P101 补的 `ep_ttm`）。
   **不许**塞进 `FACTOR_FEATURE_KEYS` —— 那个常量是**打分载荷**（`ctx["features"]`）的
   形状真源，往里加名字等于改生产载荷形状（`tests/test_research_factor.py:233-234` 钉死）。
 - `PROMOTABLE_FACTORS`：值**已经在 `ctx` 里**、只是当前只报不判的因子（`gm_yoy_pp`）。
@@ -116,10 +117,11 @@ MAIN_FACTORS: tuple[str, ...] = ("mom20", "vr15")
 SECONDARY_FACTORS: tuple[str, ...] = FACTOR_FEATURE_KEYS
 
 #: 研究侧新因子（P97 / L3）：**值不来自 `ctx`**、走研究侧取值器的那一类。
-#: 只有**需要新取值器**的因子才登记在这里（本档只实现 P95 §5.1 的 MF-A）。
+#: 只有**需要新取值器**的因子才登记在这里。P97 落了 P95 §5.1 的 MF-A
+#: （`mf_ratio_5d`）；本档（P101）再补 P95 §5.2 的 VAL-A（`ep_ttm`）。
 #: **不许**塞进 `FACTOR_FEATURE_KEYS`：那是打分载荷（`ctx["features"]`）的形状真源，
 #: 往里加名字 = 改生产路径的载荷形状（`tests/test_research_factor.py:233-234` 钉死）。
-RESEARCH_FACTORS: tuple[str, ...] = ("mf_ratio_5d",)
+RESEARCH_FACTORS: tuple[str, ...] = ("mf_ratio_5d", "ep_ttm")
 
 #: 可升格的既有因子（P97 / L3）：值**已经在 `ctx` 里**、当前只报不判的因子。
 #: 升格 = 换 `kind`（`secondary` → `main`），**取值器零新增**（复用 `secondary_value`）。
@@ -408,6 +410,48 @@ def mf_ratio_5d(conn: sqlite3.Connection, code: str, asof: str) -> float | None:
     return _mf_ratio_5d_map(conn, asof).get(code)
 
 
+def _ep_ttm_map(conn: sqlite3.Connection, asof: str) -> dict[str, float]:
+    """`{code: 1 / pe_ttm}`（P95 §5.2 VAL-A）。
+
+    出处：`docs/plans/2026-09-27-p95-新信号源-设计稿.md` §5.2（VAL-A，逐字公式与
+    覆盖实测）。**逐字公式**：`ep_ttm = 1 / pe_ttm`，**仅当 `pe_ttm > 0`**；
+    `pe_ttm <= 0` 或 `NULL` ⇒ 该标的**不进结果集**（= `None`，**不补 0**）。
+    PIT 锚 = `valuation_daily.date == asof`（**等式**，不是 `<=`；估值表按日，
+    P95 §5.2 明写「对齐时刻 = `date == asof`」）。日历/窗口一律不参与本因子。
+
+    负 PE（亏损）**判为缺失**：不截断、不取绝对值（取绝对值 = 把亏损公司排成
+    「极便宜」，方向错）。**不做横截面 winsorize**（rank IC 对单调变换不变）。
+
+    已知事实（**只作注释，不作断言**）：实测宇宙内 `pe_ttm` 取值域
+    **[−114,501.7, +27,816.5]** ⇒ 不处理必然被极端值主导 —— 所以 `pe_ttm <= 0`
+    判缺失是公式的一部分，不是可选的清洗。宇宙内 2018+ **800/800 只、1,530,952 行
+    100% 非空**，但 **2018-01-02 之前零行**（早于该日的 `asof` 一律空结果集）。
+
+    复杂度：每个 `asof` 只发 **1 条 SQL**，一次覆盖该 `asof` 下**全部**标的 ⇒
+    `O(该日行数)`。调用方要一次性取 800 只就调本函数（**不要**逐只调 `ep_ttm`）。
+    """
+    rows = conn.execute(
+        "SELECT code, pe_ttm FROM valuation_daily WHERE date = ?",
+        (asof,)).fetchall()
+    out: dict[str, float] = {}
+    for code, pe in rows:
+        if pe is None:
+            continue                      # NULL ⇒ 算不出（不补 0）
+        v = float(pe)
+        if v > 0.0:
+            out[str(code)] = 1.0 / v      # pe_ttm <= 0 ⇒ 判缺失，不进结果集
+    return out
+
+
+def ep_ttm(conn: sqlite3.Connection, code: str, asof: str) -> float | None:
+    """单只标的的 `ep_ttm`（`None` = 算不出）。
+
+    便捷封装；批量取数请直接调 `_ep_ttm_map`（同一 `asof` 一次 SQL）。
+    口径见 `_ep_ttm_map`（P95 §5.2 VAL-A：`1 / pe_ttm`，仅当 `pe_ttm > 0`）。
+    """
+    return _ep_ttm_map(conn, asof).get(code)
+
+
 def _research_map(conn: sqlite3.Connection, asof: str,
                   name: str) -> Mapping[str, float]:
     """研究侧因子的**批量**取值：`{code: value}`（`None` 的标的**不在**结果里）。
@@ -417,6 +461,8 @@ def _research_map(conn: sqlite3.Connection, asof: str,
     """
     if name == "mf_ratio_5d":
         return _mf_ratio_5d_map(conn, asof)
+    if name == "ep_ttm":
+        return _ep_ttm_map(conn, asof)
     raise PreregError(f"研究侧因子 {name!r} 没有取值器（登记在 RESEARCH_FACTORS 的"
                       f"名字必须在这里有分支）：{list(RESEARCH_FACTORS)}")
 
