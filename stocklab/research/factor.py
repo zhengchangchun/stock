@@ -42,6 +42,29 @@
 连库由调用方走 `stocklab/cli/research.py::open_read_only`（`file:…?mode=ro`）；
 本模块**不写任何表、不写任何文件**（落盘交调用方）。产物只落 `reports/research/`。
 
+## 研究侧因子注册表（P97，口径披露）
+
+P83 的因子值一律**来自打分用的同一个 `ctx`**。P97 起多了一条路：`--factor NAME` 可以
+把**研究侧因子**当主读数评，而这类因子的值**不来自 `ctx`**，来自研究侧取值器
+`_research_value(conn, code, asof, name)` —— 它**只读库**（`money_flow_daily` 等），
+**只被 `research/` 调用**，`candidate/` / `plugin/` 一行不碰（ADR-038 决定五继续成立）。
+
+这是 P83 之后**第一次「因子值不来自 `ctx`」**，所以它是一条**口径扩增**，必须披露
+（ADR-045）：研究侧因子的取数口径、PIT 锚、缺失语义由取值器自己负责，**与打分路径
+无关** —— 因此它们的读数**不能说「这就是插桩用的因子」**（`mom20`/`vr15` 才能说）。
+
+- `RESEARCH_FACTORS`：**只有需要新取值器的**才登记在这里（当前只有 `mf_ratio_5d`）。
+  **不许**塞进 `FACTOR_FEATURE_KEYS` —— 那个常量是**打分载荷**（`ctx["features"]`）的
+  形状真源，往里加名字等于改生产载荷形状（`tests/test_research_factor.py:233-234` 钉死）。
+- `PROMOTABLE_FACTORS`：值**已经在 `ctx` 里**、只是当前只报不判的因子（`gm_yoy_pp`）。
+  升格 = 换 `kind`（`secondary` → `main`），**取值器零新增**（复用 `secondary_value`）。
+  它**不许**同时出现在 `RESEARCH_FACTORS`（同一条路只留一个入口）。
+- `FACTOR_SOURCES`：`name -> "ctx" | "research"`，是「这个名字走哪条路」的**唯一真源**
+  （`--factor` 校验、报告里的 `source` 键都从它取）。
+
+`--factor` 缺省时这一切**一个字都不生效**：因子名单、报告 JSON、`render_md`、
+`summary_line` 逐字节不变（这是本任务的第一判据，用例钉住）。
+
 ## fail-closed 预注册
 
 `--prereg` 指向一份**跑之前就提交**的 md（内含 ```json``` 块），命令行实参必须与它
@@ -51,6 +74,7 @@
 from __future__ import annotations
 
 import json
+import re
 import sqlite3
 import statistics
 import time
@@ -90,6 +114,32 @@ MAIN_FACTORS: tuple[str, ...] = ("mom20", "vr15")
 #: 名单从 `candidate/run.py::FACTOR_FEATURE_KEYS` import（载荷形状的单一真源），
 #: 不在本模块重抄一遍。
 SECONDARY_FACTORS: tuple[str, ...] = FACTOR_FEATURE_KEYS
+
+#: 研究侧新因子（P97 / L3）：**值不来自 `ctx`**、走研究侧取值器的那一类。
+#: 只有**需要新取值器**的因子才登记在这里（本档只实现 P95 §5.1 的 MF-A）。
+#: **不许**塞进 `FACTOR_FEATURE_KEYS`：那是打分载荷（`ctx["features"]`）的形状真源，
+#: 往里加名字 = 改生产路径的载荷形状（`tests/test_research_factor.py:233-234` 钉死）。
+RESEARCH_FACTORS: tuple[str, ...] = ("mf_ratio_5d",)
+
+#: 可升格的既有因子（P97 / L3）：值**已经在 `ctx` 里**、当前只报不判的因子。
+#: 升格 = 换 `kind`（`secondary` → `main`），**取值器零新增**（复用 `secondary_value`）。
+#: 与 `RESEARCH_FACTORS` 语义并列而不重叠：同一个因子**只留一个取值入口**，
+#: 所以 `gm_yoy_pp` 在 `SECONDARY_FACTORS` ＋ `PROMOTABLE_FACTORS` 里，
+#: 但**不在** `RESEARCH_FACTORS` 里。
+PROMOTABLE_FACTORS: tuple[str, ...] = ("gm_yoy_pp",)
+
+#: 「这个名字走哪条路」的**唯一真源**：`"ctx"` = 值来自打分用的 `ctx`（既有路径）；
+#: `"research"` = 值来自研究侧取值器 `_research_value`（P97 新增）。`--factor` 的合法性
+#: 校验、报告里的 `source` 键、缺省逐位不变的自证**都从这里取**，不许另抄名单。
+FACTOR_SOURCES: dict[str, str] = {
+    **{name: "ctx" for name in MAIN_FACTORS},
+    **{name: "ctx" for name in SECONDARY_FACTORS},
+    **{name: "ctx" for name in PROMOTABLE_FACTORS},
+    **{name: "research" for name in RESEARCH_FACTORS},
+}
+
+#: 资金流窗口（P95 §5.1 MF-A）：**最近 5 个交易日**（不是 5 自然日）。
+MF_WINDOW_TRADING_DAYS = 5
 
 #: 预注册 json 的**必填字段**，与 `docs/experiments/2026-09-26-factor-ic-short-csi300-500.md`
 #: §0 那段 json 的键**逐字一致**（比 `rank-ic` 多 `factors` / `secondary_factors` /
@@ -161,6 +211,30 @@ VERDICT_VOCAB_NOTE = (
 
 #: 窗口即结论（同 `signal`）。
 WINDOW_IS_CONCLUSION_NOTE = signal.WINDOW_IS_CONCLUSION_NOTE
+
+#: 研究侧取值器的口径说明（P95 §5.1 / ADR-045）。缺省路径**不出现**。
+RESEARCH_SOURCE_NOTE = (
+    "研究侧因子（`source=research`）的值**不来自打分用的 `ctx`**，来自研究侧取值器"
+    "`_research_value(conn, code, asof, name)`——它只读库（`money_flow_daily` 等）、"
+    "只被 `research/` 调用，`candidate/` / `plugin/` 一行不碰。这是 P83 之后**第一次"
+    "「因子值不来自 `ctx`」**（口径扩增，见 ADR-045）⇒ 它的读数**不能说「这就是插桩"
+    "用的因子」**，只能说「这个定义在这段历史上与收益的关系是这样」。"
+)
+
+#: 同一条路两种 kind 的说明（L4：「既有键只增不改」的代价要写明）。
+TWO_KINDS_NOTE = (
+    "被选因子若同时是 `SECONDARY_FACTORS` 成员，**不从次读数段删掉**——"
+    "于是同一条取值路出两份读数（`kind=secondary` 只报不判 / `kind=main` 出 verdict）。"
+    "这不矛盾：升格 = 换 kind，不是换因子值。"
+)
+
+#: 多被选因子的聚合规则（L4：取最保守的一个）。
+CONSERVATIVE_VERDICT_NOTE = (
+    "本报告选了多个因子 ⇒ 顶层 `verdict` 取**最保守**的一个，"
+    "保守序（左 = 最保守）：`LOW_COVERAGE` > `INCONCLUSIVE` > "
+    "`IC_NOT_SIGNIFICANT` > `IC_SIGNIFICANT`。**不做多重比较校正**："
+    "被选因子的 CI 与 verdict 都是**未校正**的单因子读数，族大小见 `family_size`。"
+)
 
 
 def _selection_bias_note(universe_id: str, n: int) -> str:
@@ -279,6 +353,85 @@ def clip_diag(scored_by_mark: Mapping[str, list[dict]]) -> dict:
 
 
 # ---------------------------------------------------------------------------
+# 研究侧取值器层（P97 / L5：**只读库**、只被 `research/` 调用）
+# ---------------------------------------------------------------------------
+
+def _recent_trading_dates(conn: sqlite3.Connection, *, asof: str,
+                          n: int) -> list[str]:
+    """`trading_calendar` 里 `is_open = 1 AND date <= asof` 的最后 `n` 个交易日（倒序）。
+
+    **不是** `asof − n 自然日`（P95 §5.1 的逐字口径：窗口按交易日数）。
+    """
+    rows = conn.execute(
+        "SELECT date FROM trading_calendar WHERE is_open = 1 AND date <= ?"
+        " ORDER BY date DESC LIMIT ?", (asof, int(n))).fetchall()
+    return [str(r[0]) for r in rows]
+
+
+def _mf_ratio_5d_map(conn: sqlite3.Connection, asof: str) -> dict[str, float]:
+    """`{code: mean(ratio_amount over 最近 5 个交易日 <= asof)}`（P95 §5.1 MF-A）。
+
+    **逐字公式**：`mean( money_flow_daily.ratio_amount for t in 最近 5 个交易日, t <= asof )`。
+    口径与出处：P95 §5.1 MF-A ／ 对齐时刻 = `asof` 当日收盘后 ／ **PIT 锚 =
+    `money_flow_daily.date`**（一律 `date <= asof`）／ **5 日中任一为 `NULL` 或行缺失
+    ⇒ 该标的**不进结果集**（= `None`，**不补 0**）／**不做横截面 winsorize**（rank IC
+    对单调变换不变，winsorize 只制造并列）。
+
+    **批量友好**（L6 的复杂度要求）：每个 `asof` 只发 **2 条 SQL**（日历 1 条 ＋ 该窗口
+    1 条），一次覆盖该 `asof` 下**全部**标的 —— 不是「每只标的一条 SQL」。复杂度
+    `O(窗口行数)`（窗口 = 5 个交易日 × 全市场标的）＋ `O(标的数)` 的 Python 归并。
+    调用方要一次性取 800 只就调本函数（**不要**逐只调 `mf_ratio_5d`）。
+    """
+    window = _recent_trading_dates(conn, asof=asof, n=MF_WINDOW_TRADING_DAYS)
+    if len(window) < MF_WINDOW_TRADING_DAYS:
+        # 不足 5 个交易日 ⇒ 算不出（不拿「有几日算几日」顶替）。
+        return {}
+    placeholders = ",".join("?" * len(window))
+    rows = conn.execute(
+        f"SELECT code, date, ratio_amount FROM money_flow_daily"
+        f" WHERE date IN ({placeholders})", window).fetchall()
+    acc: dict[str, dict[str, float]] = {}
+    for code, date_, value in rows:
+        if value is None:
+            continue                      # NULL 的行等于「没有这一天」
+        acc.setdefault(str(code), {})[str(date_)] = float(value)
+    return {code: sum(by_date.values()) / MF_WINDOW_TRADING_DAYS
+            for code, by_date in acc.items()
+            if len(by_date) == MF_WINDOW_TRADING_DAYS}
+
+
+def mf_ratio_5d(conn: sqlite3.Connection, code: str, asof: str) -> float | None:
+    """单只标的的 `mf_ratio_5d`（`None` = 算不出）。
+
+    便捷封装；批量取数请直接调 `_mf_ratio_5d_map`（同一 `asof` 一次 SQL）。
+    """
+    return _mf_ratio_5d_map(conn, asof).get(code)
+
+
+def _research_map(conn: sqlite3.Connection, asof: str,
+                  name: str) -> Mapping[str, float]:
+    """研究侧因子的**批量**取值：`{code: value}`（`None` 的标的**不在**结果里）。
+
+    `name` 必须是 `RESEARCH_FACTORS` 里登记过、且**有取值器**的那个；否则 `PreregError`
+    （fail-closed：未登记的名字不许悄悄走到这里）。
+    """
+    if name == "mf_ratio_5d":
+        return _mf_ratio_5d_map(conn, asof)
+    raise PreregError(f"研究侧因子 {name!r} 没有取值器（登记在 RESEARCH_FACTORS 的"
+                      f"名字必须在这里有分支）：{list(RESEARCH_FACTORS)}")
+
+
+def _research_value(conn: sqlite3.Connection, code: str, asof: str,
+                    name: str) -> float | None:
+    """研究侧取值器的**单只**入口：`(conn, code, asof, name) -> float | None`（L5）。
+
+    `None` = 算不出（**不补 0**），与 `factor_values` 同规：不进截面。
+    批量路径请用 `_research_map`（本函数内部就是它 + 一次 `.get`）。
+    """
+    return _research_map(conn, asof, name).get(code)
+
+
+# ---------------------------------------------------------------------------
 # 预注册（fail-closed）
 # ---------------------------------------------------------------------------
 
@@ -295,13 +448,37 @@ def load_prereg(path: Path) -> tuple[dict, str]:
     return data, sha
 
 
+def selected_factors(factors: Sequence[str] | None) -> list[str]:
+    """`--factor` 的规范化：去重、保序（先给先评）＋ 每个名字都在 `FACTOR_SOURCES` 里。
+
+    未登记的名字 ⇒ `PreregError`（exit 2、零输出）—— 它既不是既有因子，也没有取值器，
+    放它过去只会得到一个假的空读数。
+    """
+    out: list[str] = []
+    for name in factors or ():
+        if name not in FACTOR_SOURCES:
+            raise PreregError(
+                f"未登记的因子名 {name!r}；可选 = {sorted(FACTOR_SOURCES)}"
+                f"（MAIN_FACTORS ∪ SECONDARY_FACTORS ∪ PROMOTABLE_FACTORS ∪ "
+                f"RESEARCH_FACTORS）—— exit 2，零输出、不跑度量")
+        if name not in out:
+            out.append(name)
+    return out
+
+
 def validate_prereg(data: Mapping, *, pool: str, start: str, horizon: int,
-                    universe: str | None = None) -> None:
+                    universe: str | None = None,
+                    factors: Sequence[str] | None = None) -> None:
     """命令行实参 ＋ 代码常量 vs 预注册：**任一不一致即拒跑**（fail-closed）。
 
     与 `signal.validate_prereg` 同一套逐字段比对，外加本站独有的三个字段：
     `factors` / `secondary_factors` / `min_xsec_n`。**每一处比较的期望值都
     来自 import 的常量**（`sandbox` / `signal`），没有一个数字是手抄的。
+
+    `factors` = 本次 `--factor` 选定的研究侧因子（缺省 `None` ⇒ 期望值就是
+    `MAIN_FACTORS`，**与 P83 逐位相同**）。给了就表示「这份预注册声明的主因子名单
+    = `MAIN_FACTORS` ＋ 被选因子」—— 于是 P98 那类「一次一个因子」的预注册
+    （`factors` 里多写一个被选因子）能走**同一条** fail-closed 链，不必新加字段。
     """
     def _mismatch(field: str, got, want) -> PreregError:
         return PreregError(
@@ -310,13 +487,26 @@ def validate_prereg(data: Mapping, *, pool: str, start: str, horizon: int,
 
     if data["experiment"] != EXPERIMENT:
         raise _mismatch("experiment", EXPERIMENT, data["experiment"])
-    if list(data["factors"]) != list(MAIN_FACTORS):
-        raise _mismatch("factors", list(MAIN_FACTORS), list(data["factors"]))
+
+    expected_main = list(MAIN_FACTORS)
+    for name in selected_factors(factors):
+        if name not in expected_main:
+            expected_main.append(name)
+    if list(data["factors"]) != expected_main:
+        raise _mismatch("factors", expected_main, list(data["factors"]))
     if list(data["secondary_factors"]) != list(SECONDARY_FACTORS):
         raise _mismatch("secondary_factors", list(SECONDARY_FACTORS),
                         list(data["secondary_factors"]))
     if data["min_xsec_n"] != MIN_XSEC_N:
         raise _mismatch("min_xsec_n", MIN_XSEC_N, data["min_xsec_n"])
+
+    # 被选因子名必须**已经**出现在预注册的 factors / secondary_factors 里（L7）。
+    declared = set(data["factors"]) | set(data["secondary_factors"])
+    for name in selected_factors(factors):
+        if name not in declared:
+            raise PreregError(
+                f"被选因子 {name!r} 不在预注册的 factors/secondary_factors 里"
+                f"（预注册＝跑之前提交的判据，选它等于事后加判据）—— exit 2，零输出")
 
     # 共有字段：把 `experiment` 换成本站的短名后走同一套比对。
     common = dict(data)
@@ -333,15 +523,32 @@ def _keep(values: Sequence[float | None]) -> list[float]:
     return [v for v in values if v is not None]
 
 
-def one_factor(name: str, *, kind: str, value_of: Callable[[Mapping], float | None],
+def _identity(value: float | None) -> float | None:
+    return value
+
+
+def one_factor(name: str, *, kind: str,
+               value_of: Callable[[Mapping], float | None] | None = None,
                payloads_by_mark: Mapping[str, dict],
                periods: Sequence[tuple[str, str]],
                fwd_by_period: Sequence[Mapping[str, float]],
-               val_idx: Sequence[int]) -> dict:
+               val_idx: Sequence[int],
+               values_by_mark: Mapping[str, Mapping[str, float | None]] | None = None
+               ) -> dict:
     """一个因子的全套读数（IC / 分层 / 判定 / 覆盖度）。
 
     门槛、切分、CI、verdict 全部走 `signal` 的既有实现与 `sandbox` 的常量；
     本函数只负责「喂哪个因子值」与「LOW_COVERAGE 的覆盖度口径」。
+
+    取值来源**参数化**（P97 / L6）：
+
+    - `values_by_mark is None` ⇒ **P83 的行为逐位不变**：值从
+      `factor_values(payloads_by_mark[d0], value_of)` 取（`ctx` 那一路）；
+    - `values_by_mark` 给了 ⇒ 该因子的逐调仓日 `{code: value}` 从**外部来源**取
+      （研究侧取值器预计算），`None` 的标的不进截面（与 `factor_values` 同规）。
+
+    **禁止**把研究侧因子值注进 `payloads_by_mark[*]["feats"]`：那是伪造 `ctx` 形状，
+    会让覆盖度 / 裁剪读数说谎（L6）。
     """
     ic_series: list[float | None] = []
     pearson_series: list[float | None] = []
@@ -354,7 +561,10 @@ def one_factor(name: str, *, kind: str, value_of: Callable[[Mapping], float | No
     steps_per_day: list[int] = []
 
     for k, (d0, _d1) in enumerate(periods):
-        values = factor_values(payloads_by_mark.get(d0, {}), value_of)
+        if values_by_mark is None:
+            values = factor_values(payloads_by_mark.get(d0, {}), value_of)
+        else:
+            values = factor_values(values_by_mark.get(d0, {}), _identity)
         cov_counts.append(len(values))          # 非空覆盖度（LOW_COVERAGE 判据）
         fwd = fwd_by_period[k]
         usable = sorted(set(values) & set(fwd))
@@ -453,10 +663,16 @@ def one_factor(name: str, *, kind: str, value_of: Callable[[Mapping], float | No
 # ---------------------------------------------------------------------------
 
 def run_factor_ic(conn: sqlite3.Connection, *, pool: str, start: str, end: str,
-                  prereg_path: Path, universe: str | None = None) -> dict:
+                  prereg_path: Path, universe: str | None = None,
+                  factors: Sequence[str] | None = None) -> dict:
     """跑因子级 IC 分解，返回报告 dict（**不写任何文件**，落盘交给调用方）。
 
     失败一律 `PreregError`（调用方 exit 2、零输出）。
+
+    `factors` = `--factor` 选定的研究侧因子（缺省 `None` ⇒ 逐位不变：`MAIN_FACTORS`
+    出 verdict、`SECONDARY_FACTORS` 只报不判）。给了就**升格**：被选因子走
+    `FACTOR_SOURCES[name]` 那条取值路、**以 `kind="main"` 评**（出 verdict），
+    并落 `research` 段；`MAIN_FACTORS` 的既有读数**照旧出现**（只增键）。
     """
     if pool != ONLY_POOL:
         raise PreregError(
@@ -466,6 +682,7 @@ def run_factor_ic(conn: sqlite3.Connection, *, pool: str, start: str, end: str,
         raise PreregError(
             f"窗口起点不得早于 {MIN_START}（收到 {start!r}）—— 窗口即结论")
     horizon = replay.REBALANCE_DAYS[pool]          # 读，不手抄
+    chosen = selected_factors(factors)             # 未登记名在这里 exit 2（零输出）
 
     try:
         universe_id, members, members_sha256 = resolve_universe(universe)
@@ -474,7 +691,7 @@ def run_factor_ic(conn: sqlite3.Connection, *, pool: str, start: str, end: str,
 
     prereg, prereg_sha = load_prereg(prereg_path)
     validate_prereg(prereg, pool=pool, start=start, horizon=horizon,
-                    universe=universe_id)
+                    universe=universe_id, factors=chosen)
 
     marks = replay.rebalance_marks(conn, pool=pool, start=start, end=end)
     if len(marks) < 2:
@@ -534,11 +751,36 @@ def run_factor_ic(conn: sqlite3.Connection, *, pool: str, start: str, end: str,
                          fwd_by_period=fwd_by_period, val_idx=val_idx)
         for name in SECONDARY_FACTORS}
 
+    #: 被选因子按 `FACTOR_SOURCES` 那条路取值、**以 `kind="main"` 评**（升格）。
+    #: `research` 那一路的值在**每个调仓日预计算一次**（`_research_map` 一次 SQL
+    #: 覆盖该日全部标的，不许逐只查），并按**宇宙成员**裁剪 —— 否则
+    #: `value_coverage_p50`（= 当日取到值的标的数）会算进宇宙外的标的，
+    #: 与 `ctx` 那一路（载荷本来就只有宇宙成员）**不同规**，
+    #: 且会把 `LOW_COVERAGE` 闸门（口径是「**在短池上**基本取不到值」）放松。
+    #: `ctx` 那一路复用既有 `accessors`（零新增）。
+    member_codes = {inst.code for inst in members}
+    research_values: dict[str, dict[str, Mapping[str, float]]] = {}
+    for name in chosen:
+        if FACTOR_SOURCES[name] == "research":
+            research_values[name] = {
+                d0: {code: value
+                     for code, value in _research_map(conn, d0, name).items()
+                     if code in member_codes}
+                for d0, _d1 in periods}
+    promoted = {
+        name: one_factor(
+            name, kind="main",
+            value_of=accessors.get(name),
+            payloads_by_mark=payloads_by_mark, periods=periods,
+            fwd_by_period=fwd_by_period, val_idx=val_idx,
+            values_by_mark=research_values.get(name))
+        for name in chosen}
+
     fwd_s += provider.load_s
     elapsed = time.time() - t0
 
     xsec_sizes = [len(scored_by_mark[d0]) for d0, _d1 in periods]
-    return {
+    out = {
         "experiment": EXPERIMENT,
         "pool": pool,
         "start": start,
@@ -597,11 +839,80 @@ def run_factor_ic(conn: sqlite3.Connection, *, pool: str, start: str, end: str,
         "fallback_note": signal.FALLBACK_NOTE,
         "replay_raw_price_note": signal.REPLAY_RAW_PRICE_NOTE,
     }
+    if chosen:
+        # **只增键**（L4/L8）：缺省路径一个都不出现 ⇒ 缺省报告逐字节不变。
+        verdicts = {name: promoted[name]["verdict"] for name in chosen}
+        out["selected_factors"] = list(chosen)
+        out["factor_tag"] = factor_tag(chosen)
+        out["factor_sources"] = {name: FACTOR_SOURCES[name] for name in chosen}
+        out["verdict"] = _most_conservative(verdicts)
+        out["research"] = {
+            "selected": list(chosen),
+            "verdict": out["verdict"],
+            "family_size": len(chosen),
+            "family_note": _family_note(len(chosen)),
+            "note": _research_note(chosen),
+            "factors": promoted,
+        }
+    return out
 
 
 # ---------------------------------------------------------------------------
 # 报告
 # ---------------------------------------------------------------------------
+
+#: 顶层 verdict 的保守序（左 = 最保守）。`LOW_COVERAGE`/`INCONCLUSIVE` 都是「测不出」，
+#: 比任何方向性读数更保守（不许把「测不出」读成「没效果」）。
+_VERDICT_CONSERVATISM = ("LOW_COVERAGE", "INCONCLUSIVE", "IC_NOT_SIGNIFICANT",
+                         "IC_SIGNIFICANT")
+
+
+def _most_conservative(verdicts: Mapping[str, str | None]) -> str | None:
+    """多个被选因子的顶层 verdict = **最保守**的一个（L4 的聚合规则）。"""
+    rank = {v: i for i, v in enumerate(_VERDICT_CONSERVATISM)}
+    known = [v for v in verdicts.values() if v in rank]
+    if not known:
+        return None
+    return min(known, key=lambda v: rank[v])
+
+
+def _family_note(n: int) -> str:
+    """族大小的一句话（P95 §3.2 / §9 拍板点 7：族大小必须显式写进报告）。"""
+    return (f"本次预注册选定的因子族大小 = {n}。这些 verdict 是**未做多重比较校正**的"
+            f"单因子读数（P95 §3.2）：族越大，「跑 k 个挑 1 个显著」的假发现率越高 "
+            f"（1 − 0.95^k ≈ {100 * (1 - 0.95 ** n):.1f}%，k={n}）。"
+            f"类内校正与检验力折扣由**预注册的 `rule`** 写死，本度量不作校正。")
+
+
+def _research_note(chosen: Sequence[str]) -> str:
+    """`research.note`：取值来源 ＋（若适用）两种 kind 的解释 ＋（多个）聚合规则。"""
+    sentences = [
+        "被选因子的取值来源（`factor_sources`）："
+        + "、".join(f"`{name}`→`{FACTOR_SOURCES[name]}`" for name in chosen) + "。",
+        RESEARCH_SOURCE_NOTE,
+    ]
+    if any(name in SECONDARY_FACTORS for name in chosen):
+        sentences.append(TWO_KINDS_NOTE)
+    if len(chosen) > 1:
+        sentences.append(CONSERVATIVE_VERDICT_NOTE)
+    return " ".join(sentences)
+
+
+def factor_tag(chosen: Sequence[str]) -> str:
+    """`--factor` 的产物 tag（L8）：`"_".join(sorted(chosen))`，非法字符换 `_`。
+
+    `[^A-Za-z0-9._-]` 一律换成 `_` —— 产物名要能当文件名用（不许出现 `/`、空格等）。
+    """
+    return re.sub(r"[^A-Za-z0-9._-]", "_", "_".join(sorted(chosen)))
+
+
+def _report_stem(report: Mapping) -> str:
+    """产物名主干（L8）：缺省 `<end>-factor-ic-<universe_id>`（**一个字不改**）；
+    给了 `--factor` ⇒ 再挂 `-<tag>`（防「换因子 + 同 end/universe」静默覆盖）。"""
+    stem = f"{report['end']}-factor-ic-{report['universe_id']}"
+    tag = report.get("factor_tag")
+    return f"{stem}-{tag}" if tag else stem
+
 
 def _num(x: float | None, fmt: str = "{:+.4f}") -> str:
     return "—" if x is None else fmt.format(x)
@@ -627,7 +938,71 @@ def summary_line(report: Mapping) -> str:
             f"{report['start']}~{report['end']} universe={report['universe_id']} "
             + " ".join(parts)
             + f" | 裁剪日比P50={_num(cd['ratio_p50'], '{:.4f}')}"
-            + " | 次读数 " + " ".join(second))
+            + " | 次读数 " + " ".join(second)
+            + _summary_research(report))
+
+
+def _summary_research(report: Mapping) -> str:
+    """`research` 段的一行（**缺省时返回空串** ⇒ 缺省 summary 逐字节不变）。"""
+    research = report.get("research")
+    if not research:
+        return ""
+    parts = []
+    for name in research["selected"]:
+        f = research["factors"][name]
+        parts.append(f"{name}[source={report['factor_sources'][name]} "
+                     f"n={f['n_dates']}/{f['n_validate']} "
+                     f"IC={_num(f['mean_validate'])} {f['verdict']}]")
+    return (f" | research: selected={list(research['selected'])} "
+            f"family_size={research['family_size']} "
+            f"verdict={research['verdict']} " + " ".join(parts))
+
+
+def _render_research_section(report: Mapping) -> list[str]:
+    """`## 6.1 研究侧被选因子` 一段（**只增句**；缺省路径不出现）。"""
+    research = report["research"]
+    lines = [
+        "",
+        "## 6.1 研究侧被选因子（`--factor`：升格 / 新取值器）",
+        "",
+        f"- 被选因子：{'、'.join(f'`{n}`' for n in research['selected'])}"
+        f"（`factor_tag` = `{report['factor_tag']}`）",
+        f"- 取值来源（`factor_sources`）："
+        + "、".join(f"`{n}`→`{report['factor_sources'][n]}`"
+                    for n in research["selected"]),
+        f"- 族大小 `family_size` = **{research['family_size']}**；"
+        f"顶层 `verdict` = **{research['verdict']}**",
+        f"- {research['family_note']}",
+        f"- {research['note']}",
+        "",
+        "| 因子 | 取值来源 | 有效日期 n | 验证段均值 | 验证段 t | verdict |",
+        "|---|---|---|---|---|---|",
+    ]
+    for name in research["selected"]:
+        f = research["factors"][name]
+        lines.append(
+            f"| `{name}` | `{report['factor_sources'][name]}` | {f['n_dates']} | "
+            f"{_num(f['mean_validate'], '{:+.5f}')} | "
+            f"{_num(f['validate']['t'], '{:+.3f}')} | **{f['verdict']}** |")
+    for name in research["selected"]:
+        f = research["factors"][name]
+        lines += [
+            "",
+            f"### `{name}` 细节",
+            "",
+            f"- `kind` = `{f['kind']}`（`exploratory` = {f['exploratory']}）、"
+            f"跳过日 {f['n_dates_skipped']} 个、"
+            f"非空覆盖度日 P50 = {f['value_coverage_p50']}",
+            f"- 分层各层平均前向收益 "
+            + "、".join(f"L{k} {_num(f['layers']['mean_by_layer'][str(k)], '{:+.5f}')}"
+                        for k in range(1, report['n_layers'] + 1)),
+            f"- `spread = layer1 − layer{report['n_layers']}`："
+            f"n={f['layers']['spread']['n_days']} 天，均值 "
+            f"{_num(f['layers']['spread']['mean'], '{:+.5f}')}，95% CI "
+            f"[{_num(f['layers']['spread']['ci_low'])}, "
+            f"{_num(f['layers']['spread']['ci_high'])}]",
+        ]
+    return lines
 
 
 def render_md(report: Mapping) -> str:
@@ -639,6 +1014,16 @@ def render_md(report: Mapping) -> str:
         f"# factor-ic 报告（{report['pool']} 池，{report['start']} ~ "
         f"{report['end']}，宇宙 `{report['universe_id']}`）",
         "",
+    ]
+    if report.get("research"):
+        names = "、".join(f"`{n}`" for n in report["selected_factors"])
+        lines += [
+            f"> **本次由 `--factor` 选定主读数因子**：{names}"
+            f"（产物 tag = `{report['factor_tag']}`，`selected_factors` / "
+            f"`factor_sources` / `research` 见本报告新增段）。",
+            "",
+        ]
+    lines += [
         "> 本报告由 `research factor-ic` 只读生成：**未写任何表**，产物只在 "
         "`reports/`。因子值取自**打分用的同一个 ctx**（`score_pipeline` 现算、只读），"
         "本站**不出任何信号、不改任何阈值/公式/参数** —— 它是度量基建。",
@@ -761,12 +1146,17 @@ def render_md(report: Mapping) -> str:
     lines += [f"- {item}" for item in report.get("non_pit_universe_items", ())]
     lines += ["", f"- {report['selection_bias_note']}", "",
               f"- {report['universe_note']}", "",
-              f"- {report['replay_raw_price_note']}", "",
+              f"- {report['replay_raw_price_note']}", ""]
+    if report.get("research"):
+        lines += _render_research_section(report)
+    lines += [
               "## 7. 复现与耗时", "",
               "```bash",
               ".venv/bin/python -m stocklab.cli.main research factor-ic \\",
               f"    --pool {report['pool']} --start {report['start']} \\",
               f"    --universe {report['universe_id']} \\",
+              *[f"    --factor {name} \\"
+                for name in report.get("selected_factors", ())],
               f"    --prereg {report['prereg_path']} --out reports/research/",
               "```",
               "",
@@ -779,13 +1169,15 @@ def render_md(report: Mapping) -> str:
 
 
 def write_report(report: Mapping, out_dir: Path) -> tuple[Path, Path]:
-    """落 `<out>/<end>-factor-ic-<universe_id>.{json,md}`，返回两个路径。
+    """落 `<out>/<stem>.{json,md}`，返回两个路径（`stem` 见 `_report_stem`）。
 
     **文件名必须带宇宙 id**（与 `rank-ic` 同规矩：不带时换宇宙重跑同一个 end 会
-    静默覆盖上一份产物）。
+    静默覆盖上一份产物）。**给了 `--factor` 还要带 tag**（P97 / L8）—— 否则换一个
+    因子、同一个 `--end` / `--universe` 会**覆盖上一份产物、读数直接丢**
+    （P60 已有同类前科，见 `docs/experiments/README.md` 2026-09-25 那条）。
     """
     out_dir.mkdir(parents=True, exist_ok=True)
-    stem = f"{report['end']}-factor-ic-{report['universe_id']}"
+    stem = _report_stem(report)
     json_path = out_dir / f"{stem}.json"
     md_path = out_dir / f"{stem}.md"
     json_path.write_text(

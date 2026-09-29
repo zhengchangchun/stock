@@ -5765,6 +5765,12 @@ def build_parser() -> argparse.ArgumentParser:
     rsrch_f.add_argument("--universe", default=None,
                          help="宇宙 id（默认 None ⇒ seed21 主干常量）；"
                               "本站预注册**必填** universe，不一致即 exit 2")
+    rsrch_f.add_argument("--factor", action="append", default=None,
+                         metavar="NAME",
+                         help="把 NAME 当主读数评（可重复）。缺省＝现状（mom20/vr15 "
+                              "出 verdict，5 个财务因子只报不判）。可选值 = "
+                              "MAIN_FACTORS ∪ SECONDARY_FACTORS ∪ PROMOTABLE_FACTORS "
+                              "∪ RESEARCH_FACTORS")
     rsrch_f.add_argument("--db")
     rsrch_f.set_defaults(func=cmd_research_factor_ic)
 

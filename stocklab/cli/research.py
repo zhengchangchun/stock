@@ -201,6 +201,13 @@ def cmd_research_factor_ic(args) -> int:
         print(f"--start 不得早于 {factor.MIN_START}（收到 {args.start!r}）："
               "窗口即结论，跑完不许改", file=sys.stderr)
         return 2
+    # `--factor` 的名字必须在 `FACTOR_SOURCES` 里（未登记 ⇒ 既不是既有因子、也没有
+    # 取值器）。**在开库之前**判掉 —— 与 `--pool` / `--start` 同一条防线（零输出）。
+    try:
+        factor.selected_factors(args.factor)
+    except factor.PreregError as exc:
+        print(f"--factor 校验失败：{exc}", file=sys.stderr)
+        return 2
 
     # ── ② 预注册（纯文件 IO） ────────────────────────────────────────
     prereg_path = Path(args.prereg)
@@ -209,7 +216,8 @@ def cmd_research_factor_ic(args) -> int:
         factor.validate_prereg(
             data, pool=args.pool, start=args.start,
             horizon=replay.REBALANCE_DAYS[args.pool],
-            universe=getattr(args, "universe", None))
+            universe=getattr(args, "universe", None),
+            factors=args.factor)
     except xsec.PreregError as exc:
         print(f"预注册校验失败：{exc}", file=sys.stderr)
         return 2
@@ -229,7 +237,8 @@ def cmd_research_factor_ic(args) -> int:
             report = factor.run_factor_ic(
                 conn, pool=args.pool, start=args.start, end=end,
                 prereg_path=prereg_path,
-                universe=getattr(args, "universe", None))
+                universe=getattr(args, "universe", None),
+                factors=args.factor)
         except xsec.PreregError as exc:
             print(f"预注册校验失败：{exc}", file=sys.stderr)
             return 2
@@ -252,6 +261,10 @@ def cmd_research_factor_ic(args) -> int:
           f"xsec_p50={cov['xsec_size_p50']} "
           f"fallback={report['n_fwd_fallback']} "
           f"n_no_fwd_ret={cov['n_no_fwd_ret']}")
+    if report.get("research"):
+        print(f"factor_tag={report['factor_tag']} "
+              f"selected={report['selected_factors']} "
+              f"verdict={report['verdict']}")
     print(f"json={json_path}")
     print(f"md={md_path}")
     print(factor.summary_line(report))
