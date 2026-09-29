@@ -21,12 +21,14 @@ from __future__ import annotations
 import itertools
 import json
 import plistlib
+import time
 from pathlib import Path
 
 from stocklab.cli.main import main
 from stocklab.ops import chain, journal, schedule
 from stocklab.ops.chain import CLOSE_STEP_ORDER, MONTHLY_STEP_ORDER
 from stocklab.ops.patrol import ro_connect
+from stocklab.ops.runner import RETRY_ATTEMPTS
 from stocklab.ops.runner import default_runner  # noqa: F401  （形态对照，未直接用）
 from stocklab.predict.version import MODEL_VERSION
 from stocklab.store.db import connect
@@ -520,15 +522,22 @@ def test_monthly_candidate_review_is_not_blocking(tmp_path, monkeypatch):
 
 
 def test_monthly_a_blocking_step_failure_is_still_fatal(tmp_path, monkeypatch):
-    """非阻断是**逐步骤**的属性，不是「整条链不在乎失败」—— 对照组。"""
+    """非阻断是**逐步骤**的属性，不是「整条链不在乎失败」—— 对照组。
+
+    P100 后这条采集步**可重试**：牙齿不变（链停在这一步、退出码 2、后面的步一步都
+    没跑），但「一步 = 一次调用」改成了「一步 = `RETRY_ATTEMPTS` 次调用」。重试间隔
+    打桩成 0 —— 这里要测的是停止线，不是真睡 30 s（同 `test_ops_chain_retry.py`）。
+    """
     db = _green(tmp_path)
     _default_db(monkeypatch, db)
+    monkeypatch.setattr(time, "sleep", lambda _s: None)
     runner = FakeRunner(codes={"ingest_financials": 2})
     payload = chain.run_monthly(db_path=db, now="2026-09-23T08:00:00+08:00",
                                 runner=runner, report_dir=tmp_path / "reports")
     assert payload["exit_code"] == 2
     stop = MONTHLY_STEP_ORDER.index("ingest_financials")
-    assert [c["step"] for c in runner.calls] == list(MONTHLY_STEP_ORDER[:stop + 1])
+    assert [c["step"] for c in runner.calls] == (
+        list(MONTHLY_STEP_ORDER[:stop]) + ["ingest_financials"] * RETRY_ATTEMPTS)
 
 
 # ---------- 调度（plist） ----------
