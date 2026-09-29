@@ -4358,3 +4358,40 @@ rc=1（耗时 1 s —— 是首次跑，不是重跑）
 `ru_maxrss` 只能回答「有没有把峰值顶上去」，**不能**回答「这次调用用了多少」。
 要在写入侧的分档读数上看到 MB 量级，得换量具（RSS 采样 / `tracemalloc`），
 那是另一个决定 —— 本档如实记录这个边界，不把 0 当「没问题」也不当「量具坏了」。
+
+## #86 一次瞬时 DNS 失败把一整天的链判死（P100）
+
+**现象**：2026-09-28 15:30 收盘链 `exit=2 steps=9/14`。`ingest_index` 与
+`ingest_index_500` 各 exit 1（`NameResolutionError: Failed to resolve
+'proxy.finance.qq.com'`），`predict_run` exit 2（`2026-09-28 不在 trading_calendar
+（日历最早 2007-01-15、最晚 2026-09-24）—— 非交易日，拒绝出预测`）
+⇒ `aborted={"kind":"step_fatal","step":"predict_run"}` ⇒ 后面 5 步一步没跑。
+当天无 live 预测、无复盘报告、`paper step` 没跑；18:30 的 AI 操盘手日更拿到
+`unknown` 而 7.6 s 结束、**零决策零净值**。次日 09:06 的 `ops patrol --fix` 自愈了
+日历并补出预测行与报告（09-29 09:55 落库），但**那一天的实时口径与决策时段回不来**。
+
+**根本原因（不是 DNS）**：`ingest index` 是 `trading_calendar` 的**唯一**来源
+（ADR-001 B4）；它挂了 ⇒ 日历不前滚 ⇒ `assert_session` 的 fail-closed 判「非交易日」
+——**判据每一步都对，链条整体仍然是对的**，缺的是「一次瞬时失败不许当终局」。
+`run_steps` 原来的形状是「每步一次、失败即定级」，全链**一次重试都没有**。
+
+**修法（P100）**：给 `run_steps` 加**可选** `retry_plan`（缺省 `None` ⇒ 逐字节不变），
+只给幂等且联网的 `ingest *` 步挂重试（3 次尝试 / 间隔 15 s）；`timeout` 不重试；
+等待装不进整轮 deadline ⇒ 按 `budget_exhausted` 收尾；`exit_code` 仍是最后一次的值，
+只增 `attempts`/`retried`/`exit_codes`/`retried_steps` 与 `step_retried` anomaly，
+并在日历没前滚时点名「`ingest_index` 是日历唯一来源，它失败会连带 `predict_run`」。
+`assert_session` / `bars_finalized_on` / 三条停止线 / `cross_db_refusal` **一个字没动**。
+
+**教训**：
+
+1. **区分「这一次失败了」与「这件事失败了」。** 判据（日历）与采集（`ingest *`）
+   的可恢复性完全不同：判据必须 fail-closed，采集必须可重试。把两者按同一种
+   「失败即定级」处理，代价就是这里的一整天。
+2. **瞬时故障的形状要落成代码里的一个词**：幂等 ＋ 联网络 ⇒ 可重试；其余 ⇒ 不重试
+   （重试 `predict run` 这类 append-only 写路径只会多几条噪声、并**掩盖**真问题）。
+3. **自愈的时机决定损失量级。** 这里自愈发生在**下一个交易日早上**（白天 60 轮巡检
+   都看不见：`latest_closed` 被钉在前一天 ⇒ 日历经报 `ok`）⇒ 「当场重试」比
+   「次日补跑」便宜得多：后者补得回数据、补不回决策与净值时段。
+4. **回执要点名因果，不只报状态。** `ingest_index=1` 与 `predict_run` 判非交易日
+   在原回执里是两条各自正确的行，读者要自己串起来 —— 现在回执里多一条
+   `calendar_not_forward_rolled` 把这句话说出来。

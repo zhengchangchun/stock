@@ -36,6 +36,17 @@ docs/
   `ops schedule generate|install|status|kickstart|uninstall` 的完整命令、三条任务的
   label/窗口/argv、**已知阻塞（macOS TCC 不让 launchd 进程访问 `~/Documents`）的两条解法**、
   以及**撤 nanobot 三条的 5 步前置条件**（含「两边同时跑会撞 SQLite 写锁」）
+- [`ops/2026-09-28-收盘链瞬时故障与补跑.md`](ops/2026-09-28-收盘链瞬时故障与补跑.md) — **事故 runbook**：
+  2026-09-28 15:30 一刻 DNS 挂了 ⇒ `ingest index` 失败 ⇒ **日历没前滚** ⇒ `predict run`
+  判「非交易日」⇒ 收盘链停在 9/14 步、当天预测/复盘/AI 决策全丢（次日早上才自愈）。
+  §1 形状（回执与 `job_runs` 逐字实录）、§2 因果链、§3 事后只读读数、§4 **补跑姿势**
+  （`ops close --now <那天>T16:00:00+08:00`，以及为什么 `bars_finalized_on` 在次日补跑时
+  不参与判 + 同一个坑在「当天重跑」时会怎么咬人）、§5 P100 之后的代码变化与它**救不了**什么
+- [`decisions/2026-09-29-ADR-046-采集步重试与fail-closed边界.md`](decisions/2026-09-29-ADR-046-采集步重试与fail-closed边界.md)
+  — **只给 `ingest *` 挂重试、不放开 `assert_session`**：重试是链声明的可选参数（缺省 `None`
+  ⇒ 逐字节不变）、3 次 × 15 s、`timeout` 不重试、等待装不进 deadline 按 `budget_exhausted`
+  收尾；只增键（`attempts`/`retried`/`exit_codes`/`retried_steps`/`step_retried`/
+  `calendar_not_forward_rolled`）＋ 有重试才出现的 `retried=N` 摘要尾巴
 - [`decisions/2026-09-22-ADR-020-调度载体改用系统launchd.md`](decisions/2026-09-22-ADR-020-调度载体改用系统launchd.md)
   — **调度载体**：项目只生成 plist、只留回执（`reports/ops/latest-*.json` + `job_runs` + `data/logs/`），
   时钟归 launchd；新页面 **`/lab/ops`**（导航「定时任务」）只读回执、
