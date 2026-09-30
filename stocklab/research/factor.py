@@ -54,7 +54,8 @@ P83 的因子值一律**来自打分用的同一个 `ctx`**。P97 起多了一�
 无关** —— 因此它们的读数**不能说「这就是插桩用的因子」**（`mom20`/`vr15` 才能说）。
 
 - `RESEARCH_FACTORS`：**只有需要新取值器的**才登记在这里（`mf_ratio_5d` ＋
-  P101 补的 `ep_ttm` ＋ P102 补的 `ann_count_5d` ＋ P103 补的 `mf_net_surprise_20d`）。
+  P101 补的 `ep_ttm` ＋ P102 补的 `ann_count_5d` ＋ P103 补的 `mf_net_surprise_20d`
+  ＋ P104 补的 `pe_pct_756`）。
   **不许**塞进 `FACTOR_FEATURE_KEYS` —— 那个常量是**打分载荷**（`ctx["features"]`）的
   形状真源，往里加名字等于改生产载荷形状（`tests/test_research_factor.py:233-234` 钉死）。
 - `PROMOTABLE_FACTORS`：值**已经在 `ctx` 里**、只是当前只报不判的因子（`gm_yoy_pp`）。
@@ -119,11 +120,12 @@ SECONDARY_FACTORS: tuple[str, ...] = FACTOR_FEATURE_KEYS
 #: 研究侧新因子（P97 / L3）：**值不来自 `ctx`**、走研究侧取值器的那一类。
 #: 只有**需要新取值器**的因子才登记在这里。P97 落了 P95 §5.1 的 MF-A
 #: （`mf_ratio_5d`）；P101 补 P95 §5.2 的 VAL-A（`ep_ttm`）；P102 再补 P95 §5.4 的
-#: EV-A（`ann_count_5d`）；本档（P103）补 P95 §5.1 MF-B（`mf_net_surprise_20d`）。
+#: EV-A（`ann_count_5d`）；P103 补 P95 §5.1 MF-B（`mf_net_surprise_20d`）；
+#: 本档（P104）补 P95 §5.2 VAL-B（`pe_pct_756`）—— 候选池的最后一项。
 #: **不许**塞进 `FACTOR_FEATURE_KEYS`：那是打分载荷（`ctx["features"]`）的形状真源，
 #: 往里加名字 = 改生产路径的载荷形状（`tests/test_research_factor.py:233-234` 钉死）。
 RESEARCH_FACTORS: tuple[str, ...] = ("mf_ratio_5d", "ep_ttm", "ann_count_5d",
-                                     "mf_net_surprise_20d")
+                                     "mf_net_surprise_20d", "pe_pct_756")
 
 #: 可升格的既有因子（P97 / L3）：值**已经在 `ctx` 里**、当前只报不判的因子。
 #: 升格 = 换 `kind`（`secondary` → `main`），**取值器零新增**（复用 `secondary_value`）。
@@ -148,6 +150,16 @@ MF_WINDOW_TRADING_DAYS = 5
 #: 资金流时序标准化窗口（P95 §5.1 MF-B）：**最近 20 个交易日**（不是 20 自然日）。
 #: 与 MF-A 同为「交易日窗」，但本因子是**时序标准化**（只与自身历史比），不是求均值。
 SURPRISE_WINDOW_TRADING_DAYS = 20
+
+#: 自身历史分位窗口（P95 §5.2 VAL-B）：**最近 756 个交易日**（≈3 年，不是自然日）。
+#: 与 `MF_WINDOW_TRADING_DAYS` / `SURPRISE_WINDOW_TRADING_DAYS` 同为「交易日窗」，
+#: 但本因子是**时序自比**（当前 PE 在自身这段历史里的 ECDF 百分位）。
+PE_PCT_WINDOW_TRADING_DAYS = 756
+
+#: 参照集 `S` 的最小有效样本数（P95 §5.2 VAL-B **逐字**）：窗内 `pe_ttm > 0` 的
+#: 样本少于这个数 ⇒ 判缺失（要求至少 1 年有效样本）。门槛闸在「有效样本数」上，
+#: **不是**「窗长」—— 窗不满 756 日用实际存在的交易日，可判定性完全由本条表达。
+PE_PCT_MIN_SAMPLES = 252
 
 #: 公告窗口（P95 §5.4 EV-A）：`notice_date ∈ (d₋₅, d₀]`，`d₀ = asof`，
 #: `d₋₅` = `trading_calendar` 里 `<= asof` 的第 **6** 个交易日（`_recent_trading_dates`
@@ -532,6 +544,97 @@ def mf_net_surprise_20d(conn: sqlite3.Connection, code: str,
     return _mf_net_surprise_20d_map(conn, asof).get(code)
 
 
+def _pe_pct_756_map(conn: sqlite3.Connection, asof: str) -> dict[str, float]:
+    """`{code: #{s ∈ S : s <= x} / |S|}`（P95 §5.2 VAL-B，自身历史的 ECDF 百分位）。
+
+    **逐字公式**（P95 §5.2 VAL-B）：`rank_pct( pe_ttm[asof] )` 在**自身最近 756 个
+    交易日**的 `pe_ttm` 样本内 —— 即「当前 PE 处于自身 3 年区间的百分位」。
+
+        x = pe_ttm[code, d0]                       # 当前值
+        S = { pe_ttm[code, d] : d ∈ W756 且该值非空且 > 0 }   # 参照集，**含 x 自身**
+        pe_pct_756 = #{ s ∈ S : s <= x } / |S|
+
+    **ECDF 口径（P95 §5.2 的三条歧义一次锁死）**：① **含** `x` 自身（P95 原话是
+    「当前 PE 处于**自身 3 年区间**的百分位」⇒ 日常读法就是把当前值也放进去排名）；
+    ② 右闭 **`<=`**（不是 `<`）；③ 并列**不取平均名次**（直接数 `<=` 的个数）——
+    `pe_ttm` 是连续量、并列极罕见，平均名次只会在不同实现间制造小数歧义。
+    ⇒ 值域 **`(0, 1]`**：最大值样本 = `1.0`、最小值样本 = `1/|S|`（**不为 0** —— `0`
+    会让 `zero_ratio` 误报）。`<=` 与升序 `rank_pct` 同向：PE 越高、越接近 `1.0`。
+
+    窗口序（**口径**）：`_recent_trading_dates` 返回**倒序**（最近的在前）⇒ 本函数把
+    它翻成**升序**，于是 `d0 = window[-1]` 就是最靠 `asof` 的那个交易日（与 P103
+    `_mf_net_surprise_20d_map` 同一裁定；`IN` 白名单与顺序无关，翻序只决定「谁是 `d0`」）。
+    `asof` 本身允许不是交易日（P103 L2 同规，比 VAL-A 的 `date == asof` 等式更宽）。
+
+    **缺失语义（三条，缺一不可，一律 `None` 不补 0）**：
+    ① **`x` 为 `NULL` 或 `<= 0` ⇒ 该标的算不出** —— 负 PE（亏损）不是「很便宜」，
+       放在参照集里会把整段历史的分位压歪；当前值为负更不可能有「百分位」的日常
+       含义。**不取绝对值、不截断、不当 0**（与 VAL-A 的 `pe_ttm <= 0 ⇒ 缺失` 同规）；
+    ② **`|S| < 252` ⇒ 算不出**（P95 §5.2 逐字：要求至少 1 年有效样本 —— 长期亏损 /
+       停牌的标的参照集太小，分位会被少数样本支配）；
+    ③ 窗内样本里 `NULL` 与 `<= 0` 的值**只从 `S` 里剔除**（**不补 0、不取绝对值**），
+       不进分子也不进分母；它们不影响该标的是否有值的判断（只看 ① 与 ②）。
+    ⇒ 返回 `dict[str, float]`，**有键才有值**（与 `_mf_ratio_5d_map` / `_ep_ttm_map` /
+    `_mf_net_surprise_20d_map` 同规），**不做 winsorize**（rank IC 对单调变换不变）。
+
+    窗不满 756 日的处理（**本档与 MF-A/B 不同**）：`len(W756) < 756`（日历覆盖不足）
+    ⇒ **用实际存在的那些交易日**（不返回 `{}`），可判定性完全由 `|S| >= 252` 表达。
+
+    **PIT 锚与只读列**：`valuation_daily.date <= asof`；**只读 `pe_ttm` 一列**
+    （`pb` / `ps_ttm` / `total_mv` / `total_shares` / `close_price` / `change_rate`
+    一律不读）。
+
+    **批量友好**：每个 `asof` 只发 **2 条 SQL**（日历 1 条 ＋ 窗口 1 条），一次覆盖该
+    `asof` 下**全部**标的 —— **禁止**逐标的一条 SQL。复杂度 `O(窗口行数)`（窗口 =
+    756 个交易日 × 全市场标的，`date IN (…)` 走全表扫描：`valuation_daily` 的 PK 是
+    `(code, date)`、**没有独立 `date` 索引**）＋ `O(标的数)` 的 Python 归并。
+    调用方要一次性取 800 只就调本函数（**不要**逐只调 `pe_pct_756`）。
+
+    已知事实（**只作注释，不作断言**）：`valuation_daily` 首行 **2018-01-02**、
+    2018+ 宇宙内 800/800 只 / 1,530,952 行 `pe_ttm` 100% 非空，取值域
+    **[−114,501.7, +27,816.5]**。⇒ 首行 + 756 个交易日 ⇒ **实际可用起点 ≈2021-02-08**；
+    再叠加 `|S| >= 252` 可能更晚 ⇒ 全窗实验的**训练段被砍、验证段有效日期数可能 < 120
+    ⇒ 可能 `INCONCLUSIVE`**（P95 §8 第 471 行已预判）。
+    """
+    window = list(reversed(_recent_trading_dates(
+        conn, asof=asof, n=PE_PCT_WINDOW_TRADING_DAYS)))
+    if not window:
+        return {}                           # 日历里没有 <= asof 的交易日 ⇒ 算不出
+    d0 = window[-1]                         # 升序末尾 = 最靠 asof 的那个交易日
+    placeholders = ",".join("?" * len(window))
+    rows = conn.execute(
+        f"SELECT code, date, pe_ttm FROM valuation_daily"
+        f" WHERE date IN ({placeholders})", window).fetchall()
+    by_code: dict[str, dict[str, float]] = {}
+    for code, date_, pe in rows:
+        if pe is None:
+            continue                        # NULL ⇒ 只从参照集剔除（不当 0）
+        v = float(pe)
+        if v > 0.0:                         # <= 0 ⇒ 只从参照集剔除（不取绝对值）
+            by_code.setdefault(str(code), {})[str(date_)] = v
+    out: dict[str, float] = {}
+    for code, positive in by_code.items():
+        x = positive.get(d0)
+        if x is None:
+            continue                        # ① x 缺失 / <= 0 ⇒ 整只算不出
+        n = len(positive)
+        if n < PE_PCT_MIN_SAMPLES:
+            continue                        # ② 有效样本不足 1 年 ⇒ 整只算不出
+        out[code] = sum(1 for s in positive.values() if s <= x) / n
+    return out
+
+
+def pe_pct_756(conn: sqlite3.Connection, code: str, asof: str) -> float | None:
+    """单只标的的 `pe_pct_756`（`None` = 算不出）。
+
+    便捷封装；批量取数请直接调 `_pe_pct_756_map`（同一 `asof` 一次 SQL）。
+    口径见 `_pe_pct_756_map`（P95 §5.2 VAL-B：当前 `pe_ttm` 在自身最近 756 个交易日
+    的**正值**样本里的 ECDF 百分位；含自身 ＋ 右闭 `<=` ⇒ 值域 `(0, 1]`；
+    `x <= 0` 或 `|S| < 252` ⇒ `None`，**不补 0、不取绝对值**）。
+    """
+    return _pe_pct_756_map(conn, asof).get(code)
+
+
 def _ep_ttm_map(conn: sqlite3.Connection, asof: str) -> dict[str, float]:
     """`{code: 1 / pe_ttm}`（P95 §5.2 VAL-A）。
 
@@ -649,9 +752,9 @@ def _research_map(conn: sqlite3.Connection, asof: str,
     `name` 必须是 `RESEARCH_FACTORS` 里登记过、且**有取值器**的那个；否则 `PreregError`
     （fail-closed：未登记的名字不许悄悄走到这里）。
 
-    缺失语义**按因子而异**：`mf_ratio_5d` / `ep_ttm` / `mf_net_surprise_20d` 算不出的
-    标的**不在**结果里（`None` 不进截面）；`ann_count_5d` 的「没有公告」是**真 0**
-    ⇒ 结果里**每个成员都有值**（见 `_ann_count_5d_map`）。
+    缺失语义**按因子而异**：`mf_ratio_5d` / `ep_ttm` / `mf_net_surprise_20d` /
+    `pe_pct_756` 算不出的标的**不在**结果里（`None` 不进截面）；`ann_count_5d` 的
+    「没有公告」是**真 0** ⇒ 结果里**每个成员都有值**（见 `_ann_count_5d_map`）。
 
     `members` 只对 `ann_count_5d` 有意义（补 0 的成员集合），其余分支**忽略**它。
     **`members is None` ⇒ 按空成员集处理** ⇒ 该分支只返回「有公告的标的一行」——
@@ -667,6 +770,9 @@ def _research_map(conn: sqlite3.Connection, asof: str,
     if name == "mf_net_surprise_20d":
         # 与另两个行情类分支同形：**忽略 `members`**（该参数只对 `ann_count_5d` 有意义）。
         return _mf_net_surprise_20d_map(conn, asof)
+    if name == "pe_pct_756":
+        # 同为行情类分支：**忽略 `members`**（该参数只对 `ann_count_5d` 有意义）。
+        return _pe_pct_756_map(conn, asof)
     raise PreregError(f"研究侧因子 {name!r} 没有取值器（登记在 RESEARCH_FACTORS 的"
                       f"名字必须在这里有分支）：{list(RESEARCH_FACTORS)}")
 
@@ -687,11 +793,16 @@ def _research_value(conn: sqlite3.Connection, code: str, asof: str,
     **`mf_net_surprise_20d` 走 `mf_net_surprise_20d(conn, code, asof)`** —— 返回注解
     保持 `float | None`（算不出即 `None`，**不补 0**）；与兜底那条 `_research_map`
     路径同值，本分支只是把口径写显式。
+
+    **`pe_pct_756` 走 `pe_pct_756(conn, code, asof)`** —— 同上：返回注解保持
+    `float | None`（`x <= 0` 或 `|S| < 252` ⇒ `None`，**不补 0、不取绝对值**）。
     """
     if name == "ann_count_5d":
         return ann_count_5d(conn, code, asof)
     if name == "mf_net_surprise_20d":
         return mf_net_surprise_20d(conn, code, asof)
+    if name == "pe_pct_756":
+        return pe_pct_756(conn, code, asof)
     return _research_map(conn, asof, name, members).get(code)
 
 
