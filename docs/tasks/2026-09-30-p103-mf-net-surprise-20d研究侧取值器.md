@@ -166,12 +166,12 @@ def mf_net_surprise_20d(conn: sqlite3.Connection, code: str,
 
 | # | 事项 | 状态 |
 |---|---|---|
-| T1 | 取值器 `_mf_net_surprise_20d_map` / `mf_net_surprise_20d` | ☐ |
-| T2 | 登记 + `_research_map`/`_research_value` 分派 | ☐ |
-| T3 | 核对诊断键自动生效（零改动，§3） | ☐ |
-| T4 | 用例 C1–C11 | ☐ |
-| T5 | ADR-045 追加段 + ai-pipeline + §7/§9 | ☐ |
-| T6 | 自跑全量 pytest ＋ `scripts/verify.sh` ＋ 真库 sha 跑前/跑后 | ☐ |
+| T1 | 取值器 `_mf_net_surprise_20d_map` / `mf_net_surprise_20d` | ✅ |
+| T2 | 登记 + `_research_map`/`_research_value` 分派 | ✅ |
+| T3 | 核对诊断键自动生效（零改动，§3） | ✅ |
+| T4 | 用例 C1–C11 | ✅（新增 13 个用例，`tests/test_research_factor_p103.py`） |
+| T5 | ADR-045 追加段 + ai-pipeline + §7/§9 | ✅ |
+| T6 | 自跑全量 pytest ＋ `scripts/verify.sh` ＋ 真库 sha 跑前/跑后 | ✅（见 §9） |
 
 ## §8 风险（预登记）
 
@@ -189,8 +189,98 @@ def mf_net_surprise_20d(conn: sqlite3.Connection, code: str,
 
 ## §9 实施记录（站填）
 
-（站收工时填写：改动文件清单（显式路径）／代码位置表／用例数与实测耗时／偏离任务书处逐条点名／
-提交（分笔、显式路径、`git commit -F`、消息无反引号）／收工 `git status --porcelain` 为空。）
+**站**：Claude Code（分支 `feat/financials`）｜**开工基线**：HEAD `f5367d0`（工作区干净）。
+
+### 9.1 改动文件清单（显式路径）
+
+| 文件 | 性质 |
+|---|---|
+| `stocklab/research/factor.py` | 取值器 ＋ 登记 ＋ 分派 ＋ 两处注释同步 |
+| `tests/test_research_factor_p103.py` | **新增**（C1–C11，13 个用例） |
+| `tests/test_research_factor_p97.py` | L9 集合钉同步（1 处） |
+| `tests/test_research_factor_ep_ttm.py` | L9 集合钉同步（1 处）＋ ⑥ 参数表同步（1 处） |
+| `docs/decisions/2026-09-29-ADR-045-研究侧因子注册表与factor开关.md` | P103 追加段（不新开编号） |
+| `docs/architecture/ai-pipeline.md` | 研究侧因子那句补第四个名字 |
+| `docs/tasks/2026-09-30-p103-mf-net-surprise-20d研究侧取值器.md` | §7 勾 ＋ 本 §9 |
+
+`candidate/` `plugin/` `predict/` `paper/` `m2/` `ops/` `data/` `config/` `store/` `cli/`
+`research/signal.py` `candidate/replay.py` **零 diff**（`git status --porcelain` 只剩上表）。
+
+### 9.2 代码位置表（`stocklab/research/factor.py`）
+
+| 位置 | 内容 |
+|---|---|
+| `:125-126` | `RESEARCH_FACTORS` 追加 `"mf_net_surprise_20d"` |
+| `:148-151` | 新常数 `SURPRISE_WINDOW_TRADING_DAYS = 20`（紧邻 `MF_WINDOW_TRADING_DAYS`） |
+| `:461-521` | `_mf_net_surprise_20d_map(conn, asof)`（`mf_ratio_5d` 之后、`_ep_ttm_map` 之前 —— 同数据类两口径相邻） |
+| `:524-532` | `mf_net_surprise_20d(conn, code, asof) -> float | None` |
+| `:667-669` | `_research_map` 新增分支（**忽略 `members`**，末尾 `PreregError` 兜底保留） |
+| `:693-694` | `_research_value` 新增分支（返回注解保持 `float | None`） |
+
+`run_factor_ic` 的调用点**未动**：`:1033-1034` 仍传 `member_codes`（`ann_count_5d` 行为不变）。
+
+### 9.3 用例数与实测耗时
+
+- 新增 **13** 个用例（C1、C2、C2b、C3、C4、C5、C6、C7、C7b、C8、C9、C10、C11）
+  → 全量 **3969 passed / 2 skipped, rc=0**（266.25 s），基线 3956/2 ⇒ **+13，≥ 基线**。
+- `bash scripts/verify.sh`：**✅ exit 0**；回归红线三项（`predict_synthetic` /
+  `predict_real_2026-09-14` / `backfill_real_2013-12-23_2026-09-14`）**全部成立**；
+  脚本内 pytest 同读数（267.39 s）。
+- T3 实测核对（两条独立证据）：① 代码 —— `run_factor_ic:1049-1051` 的
+  `if FACTOR_SOURCES[name] == "research"` 循环按注册表自动覆盖新因子，**本档零代码改动**；
+  ② 真数据冒烟 —— 新因子块里 `zero_ratio_p50` / `tie_ratio_p50` **都在**，`mom20` 块**都没有**。
+- 真库**单 `asof`** 取数实测（`/tmp/p98/copy.db` 只读副本）：0.21 / 0.22 / 0.23 / 0.25 / 1.28 s
+  （5 个 `asof` 采样，首调冷缓存），覆盖 507–805 只 ⇒ **均 < 2 s，未动 schema、未加索引**。
+- **≤6 个月冒烟**（`2026-03-01~2026-09-24`，`csi300-500`，**`/tmp/p98/copy.db` 副本**，
+  `/tmp` 一次性预注册）：exit 0、702.5 s；读数
+  `mf_net_surprise_20d[source=research n=28/9 IC=-0.1222 INCONCLUSIVE]`，
+  诊断键 `zero_ratio_p50=0.0 / tie_ratio_p50=0.0`、`value_coverage_p50=800.0`。
+  ⚠️ **验证段仅 9 个周期（< 120）⇒ 样本不足，仅供观察，不作任何结论**；产物只落 `/tmp`。
+
+### 9.4 真库 sha 跑前/跑后
+
+| 时刻 | sha256 | mtime |
+|---|---|---|
+| 跑前 | `103f847dbfd1fcc17c93b1841e24cd1e95e989fede461cc9ef07ceda8f692d2f` | 2026-09-30 15:32:02 |
+| 跑后 | `103f847dbfd1fcc17c93b1841e24cd1e95e989fede461cc9ef07ceda8f692d2f` | 2026-09-30 15:32:02 |
+
+**逐字节相同、mtime 未变 ⇒ 真库零写入，无差异需归因。**
+
+### 9.5 偏离任务书处（逐条点名，不美化）
+
+1. **⚠️ L2 内部冲突：`window[-1]` 的序（唯一实质性偏离）**。L2 写「`window[-1]`
+   （= 最靠 `asof` 的那个交易日）」，但 `_recent_trading_dates` 的实现是
+   `ORDER BY date DESC` ⇒ 返回**倒序**，`window[-1]` 实为**最旧**那天 —— 两半不可能同时成立。
+   **裁定**：以 P95 §5.1 的逐字公式 `main_net[asof]`（= 最靠 `asof` 的交易日）为**硬约束**，
+   把 `_recent_trading_dates` 的结果**翻成升序**后再取 `vals[-1]`。若照 L2 字面直接用倒序的
+   `window[-1]`，`x_now` 会取到 **20 个交易日之前**那天的 `main_net`，公式语义反了。
+   旁证：`_ann_count_5d_map` 用 `window[-1]` 作**开区间左端** `d₋₅`（最旧那天），说明既有
+   代码知道它是倒序。`IN` 白名单与顺序无关 ⇒ 翻序只决定「谁是 `vals[-1]`」。
+   用例 C1（窗外极值不许泄漏）＋ C2（手算 `(20−10.5)/√35` 逐位对拍）把裁定钉死。
+2. **`test_research_factor_ep_ttm.py` ⑥ 参数表**：原表含 `"mf_net_surprise_20d"`（当时未登记、
+   期望 `PreregError`）。本档登记后该参数**必然变红** ⇒ 换成仍未登记的近似名
+   `"mf_net_surprise_10d"`。此改动**不在** L9 字面点名的三处里，但属同一类「与新增登记
+   不可能同时成立」的断言；**未放松任何规则类断言**（fail-closed / 兜底 / 重叠规则一字未动）。
+3. **`test_research_factor_p102.py` 未改**：L9 的条件句是「p102 内同名断言**若存在**」——
+   全文 grep `RESEARCH_FACTORS` 后确认 p102 **无** `set(...) == …` 写死断言 ⇒ 零改动。
+4. **`stocklab/research/factor.py` 两处注释顺带同步**（非任务书点名）：模块 docstring 的
+   `RESEARCH_FACTORS` 名单句、常量上方注释 —— 各补第四个名字，避免文档漂移。
+5. **`_research_value` 多一条显式分支**（任务书 §2.3 明确要求）：该分支与兜底
+   `_research_map(...).get(code)` **同值**（都落到 `_mf_net_surprise_20d_map`），按字面新增、
+   把口径写显式；用例 C7 钉住「单只 == 批量」。
+
+### 9.6 未决 / 留给 nanobot
+
+- **全窗实验由 nanobot 跑**（L12/L14）：本档**未**跑 >6 个月的 `factor-ic`，**不写**预注册/实验文档。
+- 预注册需点名：`stdev` ddof=1 的口径选择（§0.5 L4）；缺失来自**行缺失**（`main_net` 零 NULL）；
+  口径与 P102「0 是真值」**相反**；相关风险按 P95 §5.1 的「低-中」仍需报 `ρ̄`。
+- 本档**不下任何「因子有效/无效」结论**。
+
+### 9.7 提交
+
+分笔提交（**显式路径**，禁 `git add -A`；`git commit -F <file>`；消息**无反引号**）：
+① 代码 ＋ 用例一笔；② 文档一笔。收工 `git status --porcelain` 为空（`.gitignore` 已覆盖的
+`data/` `reports/` `.venv/` 不计）。
 
 ## §10 复核（nanobot 独立复核，不采信自报）
 

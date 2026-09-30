@@ -271,9 +271,9 @@ v1/v2/v3 的历史行一个字不改、读数**不可混引**。
 - **因子度量的取值口径（P97 / ADR-045）**：`research factor-ic` 的因子值**原先一律取自打分用的同一个 `ctx`**（`mom20`/`vr15`
   ＋ 5 个财务因子只报不判）。P97 起新增 `--factor NAME`：被选因子**升格**为主读数（`kind="main"`，出 verdict）。
   值走哪条路由注册表 `research/factor.py::FACTOR_SOURCES` 决定 —— `ctx`（复用既有 `secondary_value`，如 `gm_yoy_pp`）
-  或 **`research`（研究侧取值器 `_research_value`，如 `mf_ratio_5d`、`ep_ttm`、`ann_count_5d`）**。后者是 P83 之后**第一次「因子值不来自 `ctx`」**：
+  或 **`research`（研究侧取值器 `_research_value`，如 `mf_ratio_5d`、`ep_ttm`、`ann_count_5d`、`mf_net_surprise_20d`）**。后者是 P83 之后**第一次「因子值不来自 `ctx`」**：
   它**只读库**（`money_flow_daily` / `valuation_daily` / `announcements` 等）、**只被 `research/` 调用**，`candidate/` / `plugin/` **一行不碰**（ADR-038 决定五继续成立），
-  因此它的读数**不能说「这就是插桩用的因子」**。缺失语义按因子而异：`mf_ratio_5d` / `ep_ttm` 算不出即 `None`（不进截面），
+  因此它的读数**不能说「这就是插桩用的因子」**。缺失语义按因子而异：`mf_ratio_5d` / `ep_ttm` / `mf_net_surprise_20d` 算不出即 `None`（不进截面），
   而 `ann_count_5d` 的「窗口内没公告」是**真 0**（`0.0`，非 `None`）⇒ 其 `value_coverage_p50` 恒等于宇宙成员数、
   `LOW_COVERAGE` 闸门永不触发（ADR-045 P102 追加段点名披露）。`--factor` 缺省 ⇒ 因子名单、报告 JSON、`render_md`、`summary_line`
   **逐字节不变**（第一判据）；给了 ⇒ 只增键（`research` 段等）＋ 产物名挂 `-<tag>` 防静默覆盖。
