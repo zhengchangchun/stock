@@ -284,4 +284,84 @@ def mf_net_surprise_20d(conn: sqlite3.Connection, code: str,
 
 ## §10 复核（nanobot 独立复核，不采信自报）
 
-（由 nanobot 在站收工后填写：自跑判据表／独立口径对拍／真库写入归因／偏离裁决／结论。）
+复核时间 2026-09-30 18:0x；范围＝`5bc97d0..HEAD`（3 笔：`5bc97d0` 任务书 ＋ `2fe185d` feat ＋ `dff8657` docs）。
+站收工读数（`/tmp/p103/station.log` 尾行 result JSON）：`is_error=false`／`subtype=success`／
+`terminal_reason=completed`／`num_turns=72`／`duration_ms=1991612`（≈33 min）／`total_cost_usd=$3.9830`；
+`permission_denials=[]`。
+
+### 10.1 自跑判据（不采信站自报）
+
+| 判据 | 实测 | 与基线 |
+|---|---|---|
+| `.venv/bin/python -m pytest -o addopts="" -q` | **3969 passed / 2 skipped, rc=0**（271.14 s） | 基线 3956/2 ⇒ **＋13** ＝ §9 一致 |
+| `bash scripts/verify.sh` | **exit 0**（内含红线三目标 ＋ 「工作区干净」） | 通过 |
+| `scripts/check_redlines.py` | **rc=0**；`0acf35c90f54ab6a…`／`73ffbfb136e8620d…`／`ddac0a889c623d75…` 逐位 == `docs/baselines/redlines.json`（sha256 `b64af324…`）；叶子 175／1330／171 一致 | **未 regen** |
+| 真库 `data/stocklab.db` | `103f847dbfd1fcc17c93b1841e24cd1e95e989fede461cc9ef07ceda8f692d2f`；`size 2,557,165,568`、mtime **2026-09-30 15:32:02**（早于站开工 17:01） ⇒ 站收工后**零写入** | 与我跑前读数同值 |
+| 改动面 | **7 文件**：`stocklab/research/factor.py`（+109/−31 内）＋ 新增 `tests/test_research_factor_p103.py`（385 行）＋ `tests/test_research_factor_ep_ttm.py`／`test_research_factor_p97.py`（L9 允许的集合钉同步）＋ 3 份 docs | 见 10.4 |
+| 禁改路径 | `stocklab/research/signal.py`／`stocklab/store/schema.sql`／`candidate/replay.py`／`stocklab/{paper,m2,predict,verify,candidate,plugin,ops}/`／`config/`／`scripts/` **零 diff**；ADR-045 判据 2 点名「一字未动」的 `tests/test_research_factor.py` **零改动** | 通过 |
+
+### 10.2 独立口径对拍（我在真库 APFS 副本上自跑，不采信 §9 自报）
+
+在 `/tmp/p98/copy.db`（`mode=ro`）直接调新实现 `_mf_net_surprise_20d_map`，并用**自写 SQL** 重算一遍对拍
+（脚本 `/tmp/p103/audit.py`）：
+
+| 项 | 读数 |
+|---|---|
+| `asof` | `2026-09-28`（副本 `MAX(money_flow_daily.date)`；09-25–27 中秋休市） |
+| 窗口 | `2026-08-31 → 2026-09-28`（20 个交易日，升序） |
+| 实现覆盖标的数 | **21**（＝当日只有 21 只种子有行 ⇒ **不是**取值器漏标的） |
+| 手工重算覆盖 | **21**，**键集合完全一致** |
+| 逐键最大绝对差 | **0.0**（例：`000333 −0.6198093550`／`000651 +0.0810095345`／`000858 −0.2694052016`） |
+| 窗内行数 <20 的标的 | 实测样例 `000001/000002/000009/000021/000027` 各 **19** 行 ⇒ **全部正确缺席**（无一个误入结果集） |
+
+**覆盖度（决定后续全窗实验的样本量）**：`asof=2026-09-24` 时当日有行 **805**、**窗内满 20 个交易日 = 805**
+（`money_flow_daily` 副本 2,455,236 行、起 2010-03-01）⇒ 候选 #5 的验证窗**不会**像 `ep_ttm` 那样被覆盖缺口
+砍短（#3 `n=127` vs #1/#2/#4 `n=170/171`），**预期 `n_validate = 171`**。
+
+**代码只读复核**（`git diff` 逐段看过）：① 窗口 = `reversed(_recent_trading_dates(asof, n=20))`、
+`IN (<20 个占位符>)` 白名单 ＋ Python 归并，**未**用 `BETWEEN`／`>=`；② 只读 `main_net` 一列
+（`close`／`turnover`／`xl_net`／`ratio_amount` 不出现在本因子任何 SQL）；③ `statistics.stdev`（ddof=1）
+＋ `fmean`，`sigma == 0.0` ⇒ `continue`（**不返回 0.0**）；④ 缺失一律 `continue`（`NULL` 行、行数 ≠20、`σ==0`）
+⇒ `out` 是「有键才有值」形状，与 `_mf_ratio_5d_map`／`_ep_ttm_map` 同规；⑤ `RESEARCH_FACTORS` 追加为
+`("mf_ratio_5d","ep_ttm","ann_count_5d","mf_net_surprise_20d")`、`FACTOR_SOURCES` 同步（四者 `research`），
+`PROMOTABLE_FACTORS` 仍只 `gm_yoy_pp`、无重叠；⑥ 诊断键零代码改动、靠 `source=research` 分支自动生效。
+
+### 10.3 真库写入归因
+
+两次 sha 读数同值、mtime 停在 **15:32:02** ⇒ 差值不需要归因（**站确实零写库**）。该 mtime 对应的写入是
+launchd 当日收盘链：`job_runs` `run_id=692`（`job_name=close`、`started_at=2026-09-30T15:30:05+08:00`、
+`status=ok`、`detail` ＝ `close: exit=0 asof=2026-09-30 steps=14/14 bad=- after=0 anomalies=0`），
+其子步 `run_id=689/690/691`（`ingest_valuation`／`ingest_moneyflow` 各 `21/21 ok`、`session_tick`
+`snapshots+17 verify_inserted+17 anomalies=0`）。⇒ **09-30 收盘链 14/14 全绿、anomalies=0**（节前最后一个交易日的实战读数）。
+
+### 10.4 对 §9.5 五条偏离的裁决
+
+**五条全部接受**，逐条理由：
+
+1. **L2 内部冲突的裁定（最重要的一条）** —— **接受，且裁定正确**。任务书 §0.5／§1 写「`window[-1]`＝最靠 `asof`
+   的那个交易日」，而 `_recent_trading_dates` 是 `ORDER BY date DESC`（倒序）⇒ 两半不可能同时成立。
+   P95 §5.1 的**逐字公式** `main_net[asof]` 是上游硬约束、`_recent_trading_dates` 是既有实现 ⇒ 只能改「谁读 `[-1]`」：
+   站翻成升序后取 `vals[-1]`，语义回到「最靠 asof」；旁证=`_ann_count_5d_map` 用的正是倒序 `window[-1]` 当左端 `d₋5`。
+   若照字面用倒序索引，本因子会读到 **20 个交易日之前**的 `main_net`（公式反了）。用例 C1/C2/C2b 已钉住此裁定。
+   **留档**：这是我任务书 §0.5／§1 的措辞缺陷（同一个 `[-1]` 指两个方向），责任在任务书不在站。
+2. **`test_research_factor_ep_ttm.py` ⑥ 参数表换名 ＋ 两处注释 ＋ `_research_value` 显式分支** —— 接受；
+   属同步事实、无行为改变，且 `_research_value` 明确分支比「落到末支 `PreregError`」更可读（兜底一字未动）。
+3. **`test_research_factor_p102.py` 零改动** —— 接受（站已核实无同名集合断言，不必凑数改文件）。
+4. **两个 L9 既有用例文件的集合钉同步** —— 接受；与 P102 同因：把「候选 #5 未登记」写死的断言
+   与 L9 不可能同时成立，按最小改动对齐事实正确。
+5. **本档任务书由站回填并提交** —— 接受（`dff8657` 含 §7/§9）；§10 由我写、另笔提交，与 P102 同规。
+
+### 10.5 结论
+
+**P103 通过**。取值器可进 P98 系列的 harness；**候选 #5 `mf_net_surprise_20d` 的预注册与全窗实验由 nanobot（我）负责，站不动**。
+三条必须在预注册里写死的披露：
+
+1. **缺失语义与 `ann_count_5d` 相反**：本因子**没有「0 是真值」**——`NULL`／行缺失／行数 <20／`σ == 0`
+   一律是 `None`（不进截面）⇒ `value_coverage_p50` **会**是实数、`LOW_COVERAGE` 闸门**可能**触发，
+   判读时须与 `n_dates_skipped` 并排读；
+2. **`σ==0` 判缺失会让一批「连续 20 日资金流完全不动」的标的（长期停牌／一字板）静默退出截面**，
+   这不是缺陷但要在预注册里点名，且**不许**改成「返回 0.0」；
+3. **冗余门必须报**：本因子与 `mom20`／`vr15` 的 `|ρ̄|` 要按预注册规则读（>0.5 淘汰／0.3–0.5 另立残差实验）；
+   P95 判相关风险「低-中」（时序标准化已消掉规模项），但**不许**据此跳过量测。
+
+§9.6「未决（全窗实验、预注册、`ρ̄` 相关风险、任何因子有效性结论）」**由我承接**，站一律未做、未下 —— 裁定正确。
