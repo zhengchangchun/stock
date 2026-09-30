@@ -850,3 +850,107 @@ def test_k1_the_reviews_write_touches_no_other_table(db):
     finally:
         c.close()
     assert after == before
+
+
+# ---------- P105：metric 腿的比对基准＝上下文展示值 ----------
+#
+# 2026-09-30 18:34 的事故：库真值 cum_return = -0.011548，模型在上下文里看到的是
+# -0.0115（`own_history._round4` 截到 4 位小数），载荷照抄 -0.0115 却被「与库值差
+# 4.8e-05 > 1e-6」拒收 ⇒ 当日复盘零写入。根因是**写侧舍入**与**校验基准**不自洽，
+# 不是模型编数。修法：metric 腿与 market 腿同构，基准改为 `round(库真值, DISPLAY_DP)`，
+# 容差 `TOL = 1e-6` 一字不放宽。
+
+#: 一个「小数第 5 位非 0」的库真值 —— 展示值必然是 -0.0115，与真值差 4.8e-05。
+INCIDENT_RAW = -0.011548
+INCIDENT_SHOWN = -0.0115
+INCIDENT_DAY = "2026-09-28"
+
+
+def _insert_nav(conn, date, *, arm=ARM, cum_return=0.0) -> None:
+    """给该臂补一行净值（真值可带 >4 位小数 —— 正是事故的形状）。"""
+    conn.execute(
+        "INSERT INTO paper_nav_daily (account_id, date, cash, positions_json,"
+        " market_value, nav, drawdown, cum_cost, cum_return, net_deposits,"
+        " index_300_level, index_300_asof, created_at)"
+        " VALUES (?,?,19604.59,'[]',29818.0,49422.59,0.0,44.46,?,50000.0,4400.0,?,?)",
+        (arm, date, cum_return, date, NOW))
+    conn.commit()
+
+
+def _metric_payload(asof, value, *, metric="cum_return", date=None, arm=ARM) -> dict:
+    ev: dict = {"kind": "metric", "metric": metric, "value": value}
+    if date is not None:
+        ev["date"] = date
+    return {"asof": asof, "arm": arm, "kind": "daily",
+            "items": [{"claim": f"{asof} 的 {metric}", "evidence": ev}],
+            "lessons": []}
+
+
+def _record(conn, asof, payload, *, arm=ARM):
+    return review.record_review(conn, arm=arm, asof=asof, payload=payload,
+                                model_id="manual", prompt_sha256="p" * 64,
+                                context_sha256="c" * 64, now=NOW)
+
+
+def test_p105_incident_replay_the_display_reading_is_accepted(conn):
+    """用例 1：库真值 -0.011548 ⇒ 载荷报展示值 -0.0115 **必须通过**（落 1 行）。
+
+    同时点名：这个差值 4.8e-05 远超旧口径的 1e-6 —— 即旧实现必拒（回归的鉴别力在此）。
+    """
+    _insert_nav(conn, INCIDENT_DAY, cum_return=INCIDENT_RAW)
+    assert abs(INCIDENT_SHOWN - INCIDENT_RAW) > review.TOL   # 旧口径下必然被拒
+    receipt = _record(conn, INCIDENT_DAY, _metric_payload(INCIDENT_DAY, INCIDENT_SHOWN))
+    assert receipt["written"] is True and receipt["review_id"] == 1
+    assert _n_rows(conn) == 1
+
+
+def test_p105_a_fabricated_reading_is_still_rejected_with_zero_writes(conn):
+    """用例 2：同一行报 -0.0116（离展示值 -0.0115 差 1e-04）⇒ 拒、**零写入**。"""
+    _insert_nav(conn, INCIDENT_DAY, cum_return=INCIDENT_RAW)
+    with pytest.raises(review.ReviewValidationError) as exc:
+        _record(conn, INCIDENT_DAY, _metric_payload(INCIDENT_DAY, -0.0116))
+    assert exc.value.field == "items[0].value"
+    assert "读数不许编" in str(exc.value)
+    assert _n_rows(conn) == 0
+
+
+def test_p105_the_message_shows_both_the_displayed_and_the_stored_reading(conn):
+    """D3：失败文案要同时给出**展示值**与**库真值**，让人一眼看出怎么改。"""
+    _insert_nav(conn, INCIDENT_DAY, cum_return=INCIDENT_RAW)
+    with pytest.raises(review.ReviewValidationError) as exc:
+        _record(conn, INCIDENT_DAY, _metric_payload(INCIDENT_DAY, -0.0116))
+    msg = str(exc.value)
+    assert "上下文" in msg and "展示为" in msg and "库真值" in msg
+    assert f"{INCIDENT_SHOWN!r}" in msg and f"{INCIDENT_RAW!r}" in msg
+
+
+#: 真实形态的读数（净值/成交/累计列）＋ 事故值。
+_SHAPES = (-0.011548, 0.1905, -4.3872, -34.9256, 49422.59, 19604.59,
+           44.46, 50000.0, 0.0, -0.007208, 86.8, 30035.0, 0.123456789)
+
+
+def test_p105_round_display_is_within_half_a_display_unit():
+    """用例 3：按展示值比对的偏差上界＝半个展示单位（对每一列、若干真实取值）。"""
+    bound = 0.5 * 10 ** -review.DISPLAY_DP
+    for metric in review.METRIC_COLUMNS:
+        for x in _SHAPES:
+            shown = review.round_display(x)
+            assert abs(shown - x) <= bound, (metric, x)
+    assert review.DISPLAY_DP == 4      # 精度来源变了就必须重新审视这条上界
+
+
+def test_p105_round_display_matches_own_history_round4():
+    """用例 4：`own_history._round4` 与 `review.round_display` 用的是**同一个 dp**（D2）。"""
+    for x in _SHAPES:
+        assert own_history._round4(x) == review.round_display(x)
+    assert own_history._round4(None) is review.round_display(None) is None
+
+
+def test_p105_the_market_leg_message_is_untouched(conn):
+    """用例 5（回归）：`market` 腿拿的是块里的展示值，本次改动不碰它 —— 文案逐字不变。"""
+    payload = _payload(conn, D2)
+    payload["items"][3]["evidence"]["value"] += 0.5          # 编一个市场读数
+    with pytest.raises(review.ReviewValidationError) as exc:
+        _record(conn, D2, payload)
+    assert "与当日 market 块的读数不一致" in str(exc.value)
+    assert "读数不许编" in str(exc.value)

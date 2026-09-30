@@ -93,7 +93,7 @@ def _has_table(conn: sqlite3.Connection, name: str) -> bool:
 
 
 def _round4(x: object) -> float | None:
-    return None if x is None else round(float(x), 4)
+    return None if x is None else round(float(x), review.DISPLAY_DP)
 
 
 def _names(conn: sqlite3.Connection, codes: list[str]) -> dict[str, str]:

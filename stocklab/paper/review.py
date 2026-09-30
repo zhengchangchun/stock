@@ -10,8 +10,14 @@ append-only 台账，而且**每一句都要带能在库里核到的证据指针
 
 `K3` 四种指针（`decision` / `trade` / `metric` / `market`）在**写入口**逐条核对：
 `decision_id` 得真存在且属于这条臂、`trade_id` 得真存在且账户相符、`metric.value`
-得与 `paper_nav_daily` 那一行的读数**逐值对得上**（容差 1e-6）、`market.field` 得
-真在**当日 `market` 块**里且值对得上。任何一条不成立 ⇒ 拒绝、**零写入**。
+得与**上下文展示的**读数（`round(库真值, DISPLAY_DP)`）逐值对得上（容差 1e-6）、
+`market.field` 得真在**当日 `market` 块**里且值对得上。任何一条不成立 ⇒ 拒绝、**零写入**。
+
+比对基准是**展示值**而不是未舍入的库真值（P105 / D1）：模型在上下文里只能看到按
+`DISPLAY_DP` 位小数展示的读数（净值/成交见 `own_history._round4`、`market` 块见
+`market_view` 的同值展示），拿 1e-6 去比未舍入的库值在数学上不可能满足 ——
+4 位小数必带 ≤5e-5 的舍入误差 ⇒ 凡该列小数第 5 位非 0，这条复盘必被误拒。
+`market` 腿一直按块里的展示值比对，`metric` 腿与它同构。
 
 为什么值得这么严：复盘是**下一轮的输入**。一句「我这周回撤 3%」如果和
 `paper_nav_daily` 对不上，它就会作为一个假事实进入模型自己的历史叙事 ——
@@ -71,8 +77,16 @@ LESSON_KINDS: tuple[str, ...] = ("fact", "habit")
 FACT_LIMIT = 10
 REVIEW_LIMIT = 3
 
-#: 读数比对的容差（K3 逐字：1e-6）。
+#: 读数比对的容差（K3 逐字：1e-6）。**不放宽** —— 放宽会同时放过真编的读数。
 TOL = 1e-6
+
+#: 上下文里读数的**展示精度**（P105 / D1：口径真源就在这里）。
+#:
+#: 模型只能看到按本值（当前 4）位小数展示的读数 —— `own_history._round4`（净值/成交
+#: 序列）与 `market_view` 的同值展示（`market` 块）都是这一口径。故 `metric` 腿的
+#: 比对基准是**展示值** `round_display(库真值)`，与 `market` 腿同构。
+#: 定义在此而非 `own_history`：后者已 import 本模块，反向不会成环。
+DISPLAY_DP: int = 4
 
 #: `lessons[].text` 的字符上限（K2）。
 TEXT_MAX = 200
@@ -138,6 +152,14 @@ def _fail(field: str, value: object, reason: str):
 def _is_number(value: object) -> bool:
     """`bool` 不算数（`True` 是个整数，但把它当读数比对是错的 —— 同 `agent_decide._num`）。"""
     return not isinstance(value, bool) and isinstance(value, (int, float))
+
+
+def round_display(x: object) -> float | None:
+    """模型在上下文里**实际看到的**读数：`round(x, DISPLAY_DP)`（`None` 透传）。
+
+    这是 `metric` 腿的比对基准，也是 `own_history._round4` 的口径（同一 dp，P105 / D2）。
+    """
+    return None if x is None else round(float(x), DISPLAY_DP)
 
 
 # ---------- K3：四种证据指针 ----------
@@ -224,10 +246,12 @@ def _check_metric(conn, *, arm: str, asof: str, ptr: dict, where: str) -> None:
     if reading is None:
         _fail(f"{where}.value", value,
               f"{row['date']} 那行的 {metric} 是 NULL —— 没有读数可引用（不拿 0 顶替）")
-    if abs(float(value) - float(reading)) > TOL:
+    shown = round_display(reading)
+    if abs(float(value) - float(shown)) > TOL:
         _fail(f"{where}.value", value,
-              f"与库里的读数不一致：{row['date']} 的 {metric} = {float(reading)!r}"
-              f"（差 {abs(float(value) - float(reading)):.6g} > {TOL:g}）—— 读数不许编")
+              f"与上下文里的读数不一致：{row['date']} 的 {metric} 展示为 {float(shown)!r}"
+              f"（库真值 {float(reading)!r}）（差 "
+              f"{abs(float(value) - float(shown)):.6g} > {TOL:g}）—— 读数不许编")
 
 
 def _leaf_paths(obj, prefix: str = ""):
@@ -601,6 +625,7 @@ def derive_facts(conn: sqlite3.Connection, *, arm: str, asof: str,
 __all__: list[str] = [
     "KIND_DAILY", "KINDS", "TABLE", "METRIC_COLUMNS", "EVIDENCE_KINDS",
     "LESSON_KINDS", "FACT_LIMIT", "REVIEW_LIMIT", "TOL", "TEXT_MAX",
+    "DISPLAY_DP", "round_display",
     "ReviewError", "ReviewValidationError", "ReviewConflict",
     "validate_review", "canonical_payload", "record_review", "load_reviews",
     "derive_facts",
