@@ -8,9 +8,9 @@
    `asof` 那行（且**只有** `asof` 那行能取到 —— 前一天的值再诱人也不许泄漏）。
 4. 批量 vs 单只一致：`_ep_ttm_map` 与逐只 `ep_ttm` 逐键相同。
 5. **SQL 条数不随标的数增长**：连接级 `set_trace_callback` 证明只发 1 条业务 SQL。
-6. 未登记名字仍 fail-closed：`pe_pct_756` / `mf_net_surprise_20d` / … 本档都没有
-   登记 ⇒ `selected_factors` 一律 `PreregError`（`ann_count_5d` 本档仍未登记，
-   P102 才补上，故 P102 已把它从参数表里移出）。
+6. 未登记名字仍 fail-closed：`pe_pct_756` / `pe_pct_756` 一类候选名本档都还没
+   登记 ⇒ `selected_factors` 一律 `PreregError`（`ann_count_5d` 于 P102 登记、
+   `mf_net_surprise_20d` 于 P103 登记，两者都已从参数表里移出）。
 7. 登记完整性：`RESEARCH_FACTORS` 里每个名字在 `_research_map` 都有分支 ——
    反向自检（把假名字临时塞进常量后调 `_research_map` 必抛，P97 的既有手法）。
 8. 缺省逐位不变（L7）：不传 `--factor` 时 report JSON / `render_md` / `summary_line`
@@ -189,13 +189,14 @@ def test_ep_ttm_map_issues_exactly_one_sql_for_the_whole_cross_section(tmp_db):
 # 6. 未登记名字仍 fail-closed（本档只登记 ep_ttm）
 # ---------------------------------------------------------------------------
 
-@pytest.mark.parametrize("name", ["pe_pct_756", "mf_net_surprise_20d",
+@pytest.mark.parametrize("name", ["pe_pct_756", "mf_net_surprise_10d",
                                   "ep_ttm_x", "ann_count_20d"])
 def test_unregistered_research_names_still_fail_closed(name):
     """⑥ 本档只登记 `ep_ttm`：其余候选名字一律 `PreregError`（exit 2、零输出）。
 
-    P102 起 `ann_count_5d` 已登记，故本档把它从参数表里移出（改钉一个仍未登记的
-    近似名 `ann_count_20d`）。
+    P102 起 `ann_count_5d` 已登记、P103 起 `mf_net_surprise_20d` 也已登记，故本档
+    把两者从参数表里移出（改钉仍未登记的近似名 `ann_count_20d` /
+    `mf_net_surprise_10d`）。
     """
     assert name not in factor.FACTOR_SOURCES
     with pytest.raises(xsec.PreregError):
@@ -203,9 +204,11 @@ def test_unregistered_research_names_still_fail_closed(name):
 
 
 def test_research_names_versus_p97():
-    """⑥ 续：`RESEARCH_FACTORS` 相对 P97 多 `ep_ttm`（P101），P102 再追加 `ann_count_5d`。"""
+    """⑥ 续：`RESEARCH_FACTORS` 相对 P97 多 `ep_ttm`（P101），P102 追加 `ann_count_5d`，
+    P103 追加 `mf_net_surprise_20d`。"""
     assert set(factor.RESEARCH_FACTORS) == {"mf_ratio_5d", "ep_ttm",
-                                           "ann_count_5d"}
+                                            "ann_count_5d",
+                                            "mf_net_surprise_20d"}
     assert factor.FACTOR_SOURCES["ep_ttm"] == "research"
     assert "ep_ttm" not in factor.FACTOR_FEATURE_KEYS
 

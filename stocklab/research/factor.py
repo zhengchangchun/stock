@@ -54,7 +54,7 @@ P83 的因子值一律**来自打分用的同一个 `ctx`**。P97 起多了一�
 无关** —— 因此它们的读数**不能说「这就是插桩用的因子」**（`mom20`/`vr15` 才能说）。
 
 - `RESEARCH_FACTORS`：**只有需要新取值器的**才登记在这里（`mf_ratio_5d` ＋
-  P101 补的 `ep_ttm` ＋ P102 补的 `ann_count_5d`）。
+  P101 补的 `ep_ttm` ＋ P102 补的 `ann_count_5d` ＋ P103 补的 `mf_net_surprise_20d`）。
   **不许**塞进 `FACTOR_FEATURE_KEYS` —— 那个常量是**打分载荷**（`ctx["features"]`）的
   形状真源，往里加名字等于改生产载荷形状（`tests/test_research_factor.py:233-234` 钉死）。
 - `PROMOTABLE_FACTORS`：值**已经在 `ctx` 里**、只是当前只报不判的因子（`gm_yoy_pp`）。
@@ -118,11 +118,12 @@ SECONDARY_FACTORS: tuple[str, ...] = FACTOR_FEATURE_KEYS
 
 #: 研究侧新因子（P97 / L3）：**值不来自 `ctx`**、走研究侧取值器的那一类。
 #: 只有**需要新取值器**的因子才登记在这里。P97 落了 P95 §5.1 的 MF-A
-#: （`mf_ratio_5d`）；P101 补 P95 §5.2 的 VAL-A（`ep_ttm`）；本档（P102）再补
-#: P95 §5.4 的 EV-A（`ann_count_5d`）—— 本档补 EV-A。
+#: （`mf_ratio_5d`）；P101 补 P95 §5.2 的 VAL-A（`ep_ttm`）；P102 再补 P95 §5.4 的
+#: EV-A（`ann_count_5d`）；本档（P103）补 P95 §5.1 MF-B（`mf_net_surprise_20d`）。
 #: **不许**塞进 `FACTOR_FEATURE_KEYS`：那是打分载荷（`ctx["features"]`）的形状真源，
 #: 往里加名字 = 改生产路径的载荷形状（`tests/test_research_factor.py:233-234` 钉死）。
-RESEARCH_FACTORS: tuple[str, ...] = ("mf_ratio_5d", "ep_ttm", "ann_count_5d")
+RESEARCH_FACTORS: tuple[str, ...] = ("mf_ratio_5d", "ep_ttm", "ann_count_5d",
+                                     "mf_net_surprise_20d")
 
 #: 可升格的既有因子（P97 / L3）：值**已经在 `ctx` 里**、当前只报不判的因子。
 #: 升格 = 换 `kind`（`secondary` → `main`），**取值器零新增**（复用 `secondary_value`）。
@@ -143,6 +144,10 @@ FACTOR_SOURCES: dict[str, str] = {
 
 #: 资金流窗口（P95 §5.1 MF-A）：**最近 5 个交易日**（不是 5 自然日）。
 MF_WINDOW_TRADING_DAYS = 5
+
+#: 资金流时序标准化窗口（P95 §5.1 MF-B）：**最近 20 个交易日**（不是 20 自然日）。
+#: 与 MF-A 同为「交易日窗」，但本因子是**时序标准化**（只与自身历史比），不是求均值。
+SURPRISE_WINDOW_TRADING_DAYS = 20
 
 #: 公告窗口（P95 §5.4 EV-A）：`notice_date ∈ (d₋₅, d₀]`，`d₀ = asof`，
 #: `d₋₅` = `trading_calendar` 里 `<= asof` 的第 **6** 个交易日（`_recent_trading_dates`
@@ -453,6 +458,80 @@ def mf_ratio_5d(conn: sqlite3.Connection, code: str, asof: str) -> float | None:
     return _mf_ratio_5d_map(conn, asof).get(code)
 
 
+def _mf_net_surprise_20d_map(conn: sqlite3.Connection,
+                             asof: str) -> dict[str, float]:
+    """`{code: (main_net[窗口末] − mean(窗)) / stdev(窗)}`（P95 §5.1 MF-B）。
+
+    **逐字公式**（P95 §5.1 MF-B）：`( main_net[asof] − mean(main_net[asof−19..asof]) )
+    / std( main_net[asof−19..asof] )` —— **时序标准化**，只与自身历史比。`asof` 那一端
+    取的是 `trading_calendar` 里 `is_open = 1 AND date <= asof` 的**最后一个交易日**
+    （`window[-1]`，`asof` 本身可以不是交易日），记作 `x_now`；`μ`/`σ` 取**同一 20 个
+    交易日**（**含** `x_now` 自身）的 `main_net`。单位是「元」，除法消掉量纲。
+
+    窗口序（**口径**）：`_recent_trading_dates` 返回**倒序**（最近的在前）⇒ 本函数把它
+    翻成**升序**，于是 `window[-1]` 就是最靠 `asof` 的那个交易日。`IN` 白名单与顺序无关，
+    翻序只影响「谁是 `vals[-1]`」。
+
+    - `stdev` 用 **`statistics.stdev`（样本标准差，`ddof=1`，分母 `n−1`）** —— 与仓内既有
+      约定一致（`research/signal.py` / `verify/report.py` / `experiments/*` 全是 `stdev`，
+      无一处 `pstdev`）；20 个样本上二者差约 2.6%。
+    - **缺失语义**（与 P102 的「0 是真值」**相反**，见 ADR-045 追加段）：窗内任一
+      `main_net` 为 `NULL`、或该 (code, date) 行**缺失**、或该 code 在窗内的行数 < 20
+      ⇒ 该标的**不进结果集**（= 缺失，**不补 0**）；`σ == 0`（含 `±0.0`）**也判缺失**
+      ⇒ **不返回 `0.0`**（给 0 会被读成「无异动」，真实语义是「分母为 0、比值无定义」）。
+      ⇒ 返回 `dict[str, float]`，**有键才有值**（与 `_mf_ratio_5d_map` / `_ep_ttm_map`
+      同规，**不是** `ann_count_5d` 的「每个成员都给值」形状）。
+    - 不足 20 个交易日 ⇒ 返回 `{}`（不拿「有几日算几日」顶替，与 MF-A 同规）。
+    - **PIT 锚 = `money_flow_daily.date`**，一律 `date <= asof`；**只读 `main_net`
+      一列**（`ratio_amount` 是 MF-A 的输入；`close` / `turnover` / `xl_net` 本因子
+      一律不读）。
+    - **批量友好**（L7）：每个 `asof` 只发 **2 条 SQL**（日历 1 条 ＋ 窗口 1 条），一次
+      覆盖该 `asof` 下**全部**标的 —— **禁止**逐标的一条 SQL。复杂度 `O(窗口行数)`
+      （窗口 = 20 个交易日 × 全市场标的）＋ `O(标的数)` 的 Python 归并。调用方要一次性
+      取 800 只就调本函数（**不要**逐只调 `mf_net_surprise_20d`）。
+
+    已知事实（**只作注释，不作断言**）：`money_flow_daily` 全史 2,455,257 行、
+    2010-03-01 起、`main_net` **零 NULL**、`MAX(date) = 2026-09-29` ⇒ 缺失主要来自
+    「新上市 / 停牌导致的**行缺失**」，不是 NULL ⇒ 两种缺失都必须按缺失处理。
+    """
+    window = list(reversed(_recent_trading_dates(
+        conn, asof=asof, n=SURPRISE_WINDOW_TRADING_DAYS)))
+    if len(window) < SURPRISE_WINDOW_TRADING_DAYS:
+        # 不足 20 个交易日 ⇒ 算不出（不拿「有几日算几日」顶替，与 MF-A 同规）。
+        return {}
+    placeholders = ",".join("?" * len(window))
+    rows = conn.execute(
+        f"SELECT code, date, main_net FROM money_flow_daily"
+        f" WHERE date IN ({placeholders})", window).fetchall()
+    acc: dict[str, dict[str, float]] = {}
+    for code, date_, value in rows:
+        if value is None:
+            continue                      # NULL 的行等于「这一天没有数据」
+        acc.setdefault(str(code), {})[str(date_)] = float(value)
+    out: dict[str, float] = {}
+    for code, by_date in acc.items():
+        if len(by_date) != SURPRISE_WINDOW_TRADING_DAYS:
+            continue                      # 窗内行缺失 ⇒ 该标的算不出（不进结果集）
+        # 按 window 的（升序）顺序取，`vals[-1]` 即最靠 asof 那天的 main_net。
+        vals = [by_date[d] for d in window]
+        sigma = statistics.stdev(vals)
+        if sigma == 0.0:
+            continue                      # 分母为 0 ⇒ 比值无定义（**不给 0.0**）
+        out[code] = (vals[-1] - statistics.fmean(vals)) / sigma
+    return out
+
+
+def mf_net_surprise_20d(conn: sqlite3.Connection, code: str,
+                        asof: str) -> float | None:
+    """单只标的的 `mf_net_surprise_20d`（`None` = 算不出）。
+
+    便捷封装；批量取数请直接调 `_mf_net_surprise_20d_map`（同一 `asof` 一次 SQL）。
+    口径见 `_mf_net_surprise_20d_map`（P95 §5.1 MF-B：20 个交易日的时序标准化；
+    缺失 / `σ == 0` ⇒ `None`，**不补 0**）。
+    """
+    return _mf_net_surprise_20d_map(conn, asof).get(code)
+
+
 def _ep_ttm_map(conn: sqlite3.Connection, asof: str) -> dict[str, float]:
     """`{code: 1 / pe_ttm}`（P95 §5.2 VAL-A）。
 
@@ -570,13 +649,14 @@ def _research_map(conn: sqlite3.Connection, asof: str,
     `name` 必须是 `RESEARCH_FACTORS` 里登记过、且**有取值器**的那个；否则 `PreregError`
     （fail-closed：未登记的名字不许悄悄走到这里）。
 
-    缺失语义**按因子而异**：`mf_ratio_5d` / `ep_ttm` 算不出的标的**不在**结果里
-    （`None` 不进截面）；`ann_count_5d` 的「没有公告」是**真 0** ⇒ 结果里**每个
-    成员都有值**（见 `_ann_count_5d_map`）。
+    缺失语义**按因子而异**：`mf_ratio_5d` / `ep_ttm` / `mf_net_surprise_20d` 算不出的
+    标的**不在**结果里（`None` 不进截面）；`ann_count_5d` 的「没有公告」是**真 0**
+    ⇒ 结果里**每个成员都有值**（见 `_ann_count_5d_map`）。
 
-    `members` 只对 `ann_count_5d` 有意义（补 0 的成员集合）。**`members is None`
-    ⇒ 按空成员集处理** ⇒ 该分支只返回「有公告的标的一行」—— 这条路径**仅供
-    `ann_count_5d()` 之外的探测用**，正常调用（`run_factor_ic`）一律显式传成员。
+    `members` 只对 `ann_count_5d` 有意义（补 0 的成员集合），其余分支**忽略**它。
+    **`members is None` ⇒ 按空成员集处理** ⇒ 该分支只返回「有公告的标的一行」——
+    这条路径**仅供 `ann_count_5d()` 之外的探测用**，正常调用（`run_factor_ic`）
+    一律显式传成员。
     """
     if name == "mf_ratio_5d":
         return _mf_ratio_5d_map(conn, asof)
@@ -584,6 +664,9 @@ def _research_map(conn: sqlite3.Connection, asof: str,
         return _ep_ttm_map(conn, asof)
     if name == "ann_count_5d":
         return _ann_count_5d_map(conn, asof, members or ())
+    if name == "mf_net_surprise_20d":
+        # 与另两个行情类分支同形：**忽略 `members`**（该参数只对 `ann_count_5d` 有意义）。
+        return _mf_net_surprise_20d_map(conn, asof)
     raise PreregError(f"研究侧因子 {name!r} 没有取值器（登记在 RESEARCH_FACTORS 的"
                       f"名字必须在这里有分支）：{list(RESEARCH_FACTORS)}")
 
@@ -600,9 +683,15 @@ def _research_value(conn: sqlite3.Connection, code: str, asof: str,
     （没公告就是真 `0.0`），所以这一支的返回类型是 `float`、**永不 `None`**（例外
     落在 `ann_count_5d` 自己的类型注解上）；`members` 对本支无意义（单只入口只
     需要 `code`）。
+
+    **`mf_net_surprise_20d` 走 `mf_net_surprise_20d(conn, code, asof)`** —— 返回注解
+    保持 `float | None`（算不出即 `None`，**不补 0**）；与兜底那条 `_research_map`
+    路径同值，本分支只是把口径写显式。
     """
     if name == "ann_count_5d":
         return ann_count_5d(conn, code, asof)
+    if name == "mf_net_surprise_20d":
+        return mf_net_surprise_20d(conn, code, asof)
     return _research_map(conn, asof, name, members).get(code)
 
 

@@ -134,12 +134,14 @@ def test_registry_overlap_rules_are_exactly_l2():
     """`gm_yoy_pp` 可与 `SECONDARY_FACTORS` 重叠，**不许**与 `RESEARCH_FACTORS` 重叠。
 
     P101 起 `RESEARCH_FACTORS` 含两个名字（`mf_ratio_5d` ＋ `ep_ttm`），P102 再追加
-    `ann_count_5d` —— 本用例只把「集合内容」对齐到事实，其余重叠规则（新名字不进
-    `SECONDARY_FACTORS` / `MAIN_FACTORS` / `PROMOTABLE_FACTORS`）一字不改。
+    `ann_count_5d`、P103 再追加 `mf_net_surprise_20d` —— 本用例只把「集合内容」对齐
+    到事实，其余重叠规则（新名字不进 `SECONDARY_FACTORS` / `MAIN_FACTORS` /
+    `PROMOTABLE_FACTORS`）一字不改。
     """
     assert set(factor.PROMOTABLE_FACTORS) == {"gm_yoy_pp"}
     assert set(factor.RESEARCH_FACTORS) == {"mf_ratio_5d", "ep_ttm",
-                                            "ann_count_5d"}
+                                            "ann_count_5d",
+                                            "mf_net_surprise_20d"}
     assert "gm_yoy_pp" in factor.SECONDARY_FACTORS
     assert "gm_yoy_pp" not in factor.RESEARCH_FACTORS
     assert "mf_ratio_5d" not in factor.SECONDARY_FACTORS
