@@ -53,8 +53,8 @@ P83 的因子值一律**来自打分用的同一个 `ctx`**。P97 起多了一�
 （ADR-045）：研究侧因子的取数口径、PIT 锚、缺失语义由取值器自己负责，**与打分路径
 无关** —— 因此它们的读数**不能说「这就是插桩用的因子」**（`mom20`/`vr15` 才能说）。
 
-- `RESEARCH_FACTORS`：**只有需要新取值器的**才登记在这里（当前 `mf_ratio_5d` ＋
-  P101 补的 `ep_ttm`）。
+- `RESEARCH_FACTORS`：**只有需要新取值器的**才登记在这里（`mf_ratio_5d` ＋
+  P101 补的 `ep_ttm` ＋ P102 补的 `ann_count_5d`）。
   **不许**塞进 `FACTOR_FEATURE_KEYS` —— 那个常量是**打分载荷**（`ctx["features"]`）的
   形状真源，往里加名字等于改生产载荷形状（`tests/test_research_factor.py:233-234` 钉死）。
 - `PROMOTABLE_FACTORS`：值**已经在 `ctx` 里**、只是当前只报不判的因子（`gm_yoy_pp`）。
@@ -80,7 +80,7 @@ import sqlite3
 import statistics
 import time
 from pathlib import Path
-from typing import Callable, Mapping, Sequence
+from typing import Callable, Iterable, Mapping, Sequence
 
 from stocklab.candidate import replay
 from stocklab.candidate.run import FACTOR_FEATURE_KEYS
@@ -118,10 +118,11 @@ SECONDARY_FACTORS: tuple[str, ...] = FACTOR_FEATURE_KEYS
 
 #: 研究侧新因子（P97 / L3）：**值不来自 `ctx`**、走研究侧取值器的那一类。
 #: 只有**需要新取值器**的因子才登记在这里。P97 落了 P95 §5.1 的 MF-A
-#: （`mf_ratio_5d`）；本档（P101）再补 P95 §5.2 的 VAL-A（`ep_ttm`）。
+#: （`mf_ratio_5d`）；P101 补 P95 §5.2 的 VAL-A（`ep_ttm`）；本档（P102）再补
+#: P95 §5.4 的 EV-A（`ann_count_5d`）—— 本档补 EV-A。
 #: **不许**塞进 `FACTOR_FEATURE_KEYS`：那是打分载荷（`ctx["features"]`）的形状真源，
 #: 往里加名字 = 改生产路径的载荷形状（`tests/test_research_factor.py:233-234` 钉死）。
-RESEARCH_FACTORS: tuple[str, ...] = ("mf_ratio_5d", "ep_ttm")
+RESEARCH_FACTORS: tuple[str, ...] = ("mf_ratio_5d", "ep_ttm", "ann_count_5d")
 
 #: 可升格的既有因子（P97 / L3）：值**已经在 `ctx` 里**、当前只报不判的因子。
 #: 升格 = 换 `kind`（`secondary` → `main`），**取值器零新增**（复用 `secondary_value`）。
@@ -142,6 +143,13 @@ FACTOR_SOURCES: dict[str, str] = {
 
 #: 资金流窗口（P95 §5.1 MF-A）：**最近 5 个交易日**（不是 5 自然日）。
 MF_WINDOW_TRADING_DAYS = 5
+
+#: 公告窗口（P95 §5.4 EV-A）：`notice_date ∈ (d₋₅, d₀]`，`d₀ = asof`，
+#: `d₋₅` = `trading_calendar` 里 `<= asof` 的第 **6** 个交易日（`_recent_trading_dates`
+#: 取 `n=6` 的最后一个作**开区间左端**）。**不是**「最近 5 个交易日的**闭集**」——
+#: `announcements` 里 19.5% 的行 `notice_date` 落在周末，闭集读法会把这批公告
+#: 静默丢弃（P102 §0.6 实测）。
+ANN_WINDOW_TRADING_DAYS = 6
 
 #: 预注册 json 的**必填字段**，与 `docs/experiments/2026-09-26-factor-ic-short-csi300-500.md`
 #: §0 那段 json 的键**逐字一致**（比 `rank-ic` 多 `factors` / `secondary_factors` /
@@ -354,6 +362,41 @@ def clip_diag(scored_by_mark: Mapping[str, list[dict]]) -> dict:
     }
 
 
+def zero_tie_diag(values_by_mark: Mapping[str, Mapping[str, float]],
+                  periods: Sequence[tuple[str, str]]) -> dict:
+    """逐调仓日的「零值占比 / 并列占比」中位数（L8，**只报不判**）。
+
+    分不开的两个分辨率问题在这里量化（P95 §5.4：`ann_count_5d` 的零值会是多数 ⇒
+    仿 `clip_diag` 单独报）：
+
+    - `zero_ratio_p50`：该调仓日截面里**值等于 0** 的标的占比，再对调仓日取中位数；
+    - `tie_ratio_p50`：该调仓日截面里**与 ≥1 个其它标的取值完全相同**（rank 并列）
+      的标的占比，再对调仓日取中位数。
+
+    分母 = 当日截面标的数（含 0 值的那些 —— 「0 是真值」，不是缺失）。值为整数
+    计数 ⇒ 浮点比较用 `==` 即可，无容差问题。**这两个键不参与任何 verdict**
+    （判据一个都不许动）；它们只是分辨率披露。截面为空的日子不进统计。
+    """
+    zero_ratios: list[float] = []
+    tie_ratios: list[float] = []
+    for d0, _d1 in periods:
+        values = list(values_by_mark.get(d0, {}).values())
+        n = len(values)
+        if not n:
+            continue
+        zero_ratios.append(sum(1 for v in values if v == 0) / n)
+        counts: dict[float, int] = {}
+        for v in values:
+            counts[v] = counts.get(v, 0) + 1
+        tie_ratios.append(sum(c for c in counts.values() if c >= 2) / n)
+    return {
+        "zero_ratio_p50": (float(statistics.median(zero_ratios))
+                           if zero_ratios else None),
+        "tie_ratio_p50": (float(statistics.median(tie_ratios))
+                          if tie_ratios else None),
+    }
+
+
 # ---------------------------------------------------------------------------
 # 研究侧取值器层（P97 / L5：**只读库**、只被 `research/` 调用）
 # ---------------------------------------------------------------------------
@@ -452,29 +495,115 @@ def ep_ttm(conn: sqlite3.Connection, code: str, asof: str) -> float | None:
     return _ep_ttm_map(conn, asof).get(code)
 
 
+def _ann_count_5d_map(conn: sqlite3.Connection, asof: str,
+                      members: Iterable[str]) -> dict[str, float]:
+    """`{code: 窗口内公告条数}`，窗口 = `(d₋₅, d₀]`（P95 §5.4 EV-A）。
+
+    **逐字公式**：`ann_count_5d = #{announcements : notice_date ∈ (d₋₅, d₀]}`，
+    其中 `d₀ = asof`、`d₋₅` = `trading_calendar` 里 `is_open = 1 AND date <= asof`
+    的第 **6** 个交易日（`_recent_trading_dates(conn, asof=asof, n=6)[-1]`）。
+    左端**开**、右端**闭** —— 这是**日期区间**读法，不是「最近 5 个交易日的闭集」：
+    `announcements` 里 19.5% 的行 `notice_date` 落在周六/周日（P102 §0.6 实测），
+    闭集读法会让这批公告永远落不进任何窗口。
+
+    **PIT 锚 = `notice_date`**（DDL 注释即为「公告日（PIT 锚）」）。**`display_time`
+    一律不参与任何筛选**（P88 D2 / P96 §7.7：它带毫秒抖动、只作留痕）。本因子是
+    **全类型**公告计数 —— 不过 `title` / `column_name` 任何筛（`ev_回购` 是另一个
+    尚未立项的因子）。
+
+    **「0 是真值」例外（本档与其它研究侧因子不同）**：窗口内没有公告 ⇒ `0.0`，
+    **不是** `None`。`members` 里的每个成员都会拿到一个值（库外 code 也是 `0.0`）。
+    ⇒ `value_coverage_p50` 恒等于宇宙成员数、`LOW_COVERAGE` 闸门对本因子永不触发；
+    这是本因子的固有性质（数量确实是 0，不是「算不出」），不是 bug —— 必须在
+    ADR / 预注册里点名披露。
+
+    已知事实（**只作注释，不作断言**）：`announcements` 的 `MIN(notice_date)` =
+    `2014-12-19`（P96 的 `--days 4300` cutoff）⇒ 更早的 `asof` 窗口左边被截断。
+    零值占比实测 0.156–0.626（P102 §0.6）⇒ 分辨率要单独报（见 `zero_tie_diag`）。
+
+    **批量友好**（L5）：每个 `asof` 只发 **2 条 SQL**（日历 1 条 ＋ 窗口 1 条），
+    一次覆盖全市场标的 —— **禁止**逐标的一条 SQL。复杂度 `O(窗口行数)`（窗口 =
+    该 6 个交易日的区间，引擎走 `idx_announcements_code_notice` 的 covering scan）
+    ＋ `O(成员数)` 的 Python 补 0。
+
+    `members is None` 的调用点**不存在**（`_research_map` 传 `members or ()`）：
+    传空成员集时返回的是「**有公告的**标的行」，该路径只供探测用（裁决/裁剪由
+    `run_factor_ic` 的宇宙裁剪负责，见 L7）。
+    """
+    window = _recent_trading_dates(conn, asof=asof, n=ANN_WINDOW_TRADING_DAYS)
+    if len(window) < ANN_WINDOW_TRADING_DAYS:
+        # 不足 6 个交易日 ⇒ 窗口算不出（不拿「有几日算几日」顶替，与 MF-A 同规）。
+        return {}
+    left = window[-1]                       # 第 6 个交易日 = 开区间左端 d₋₅
+    out: dict[str, float] = {str(code): 0.0 for code in members}
+    rows = conn.execute(
+        "SELECT code, COUNT(*) FROM announcements"
+        " WHERE notice_date > ? AND notice_date <= ? GROUP BY code",
+        (left, asof)).fetchall()
+    for code, cnt in rows:
+        out[str(code)] = float(cnt)
+    return out
+
+
+def ann_count_5d(conn: sqlite3.Connection, code: str, asof: str) -> float:
+    """单只标的的 `ann_count_5d`（**真 0**，永不 `None`）。
+
+    口径见 `_ann_count_5d_map`（P95 §5.4 EV-A：`notice_date ∈ (d₋₅, d₀]` 的公告条数）。
+    便捷封装；批量取数请直接调 `_ann_count_5d_map`（同一 `asof` 一次 SQL）。
+    空窗（`asof` 前不足 6 个交易日）或窗口内零公告 ⇒ `0.0`。
+    """
+    window = _recent_trading_dates(conn, asof=asof, n=ANN_WINDOW_TRADING_DAYS)
+    if len(window) < ANN_WINDOW_TRADING_DAYS:
+        return 0.0
+    row = conn.execute(
+        "SELECT COUNT(*) FROM announcements"
+        " WHERE notice_date > ? AND notice_date <= ? AND code = ?",
+        (window[-1], asof, code)).fetchone()
+    return float(row[0])
+
+
 def _research_map(conn: sqlite3.Connection, asof: str,
-                  name: str) -> Mapping[str, float]:
-    """研究侧因子的**批量**取值：`{code: value}`（`None` 的标的**不在**结果里）。
+                  name: str,
+                  members: Iterable[str] | None = None) -> Mapping[str, float]:
+    """研究侧因子的**批量**取值：`{code: value}`。
 
     `name` 必须是 `RESEARCH_FACTORS` 里登记过、且**有取值器**的那个；否则 `PreregError`
     （fail-closed：未登记的名字不许悄悄走到这里）。
+
+    缺失语义**按因子而异**：`mf_ratio_5d` / `ep_ttm` 算不出的标的**不在**结果里
+    （`None` 不进截面）；`ann_count_5d` 的「没有公告」是**真 0** ⇒ 结果里**每个
+    成员都有值**（见 `_ann_count_5d_map`）。
+
+    `members` 只对 `ann_count_5d` 有意义（补 0 的成员集合）。**`members is None`
+    ⇒ 按空成员集处理** ⇒ 该分支只返回「有公告的标的一行」—— 这条路径**仅供
+    `ann_count_5d()` 之外的探测用**，正常调用（`run_factor_ic`）一律显式传成员。
     """
     if name == "mf_ratio_5d":
         return _mf_ratio_5d_map(conn, asof)
     if name == "ep_ttm":
         return _ep_ttm_map(conn, asof)
+    if name == "ann_count_5d":
+        return _ann_count_5d_map(conn, asof, members or ())
     raise PreregError(f"研究侧因子 {name!r} 没有取值器（登记在 RESEARCH_FACTORS 的"
                       f"名字必须在这里有分支）：{list(RESEARCH_FACTORS)}")
 
 
 def _research_value(conn: sqlite3.Connection, code: str, asof: str,
-                    name: str) -> float | None:
+                    name: str,
+                    members: Iterable[str] | None = None) -> float | None:
     """研究侧取值器的**单只**入口：`(conn, code, asof, name) -> float | None`（L5）。
 
     `None` = 算不出（**不补 0**），与 `factor_values` 同规：不进截面。
     批量路径请用 `_research_map`（本函数内部就是它 + 一次 `.get`）。
+
+    **例外：`ann_count_5d` 走 `ann_count_5d(conn, code, asof)`** —— 它「永远有值」
+    （没公告就是真 `0.0`），所以这一支的返回类型是 `float`、**永不 `None`**（例外
+    落在 `ann_count_5d` 自己的类型注解上）；`members` 对本支无意义（单只入口只
+    需要 `code`）。
     """
-    return _research_map(conn, asof, name).get(code)
+    if name == "ann_count_5d":
+        return ann_count_5d(conn, code, asof)
+    return _research_map(conn, asof, name, members).get(code)
 
 
 # ---------------------------------------------------------------------------
@@ -798,11 +927,13 @@ def run_factor_ic(conn: sqlite3.Connection, *, pool: str, start: str, end: str,
         for name in SECONDARY_FACTORS}
 
     #: 被选因子按 `FACTOR_SOURCES` 那条路取值、**以 `kind="main"` 评**（升格）。
-    #: `research` 那一路的值在**每个调仓日预计算一次**（`_research_map` 一次 SQL
-    #: 覆盖该日全部标的，不许逐只查），并按**宇宙成员**裁剪 —— 否则
-    #: `value_coverage_p50`（= 当日取到值的标的数）会算进宇宙外的标的，
+    #: `research` 那一路的值在**每个调仓日预计算一次**（`_research_map` 传
+    #: `member_codes`：一次 SQL 覆盖该日全部标的，不许逐只查），并按**宇宙成员**
+    #: 裁剪 —— 否则 `value_coverage_p50`（= 当日取到值的标的数）会算进宇宙外的标的，
     #: 与 `ctx` 那一路（载荷本来就只有宇宙成员）**不同规**，
     #: 且会把 `LOW_COVERAGE` 闸门（口径是「**在短池上**基本取不到值」）放松。
+    #: 裁剪**不是**「靠取值器自己裁」：`_ann_count_5d_map` 按定义会把宇宙外的
+    #: 有公告标的也带出来（L6），所以这道裁剪必须留在这里（L7）。
     #: `ctx` 那一路复用既有 `accessors`（零新增）。
     member_codes = {inst.code for inst in members}
     research_values: dict[str, dict[str, Mapping[str, float]]] = {}
@@ -810,7 +941,8 @@ def run_factor_ic(conn: sqlite3.Connection, *, pool: str, start: str, end: str,
         if FACTOR_SOURCES[name] == "research":
             research_values[name] = {
                 d0: {code: value
-                     for code, value in _research_map(conn, d0, name).items()
+                     for code, value in _research_map(conn, d0, name,
+                                                      member_codes).items()
                      if code in member_codes}
                 for d0, _d1 in periods}
     promoted = {
@@ -821,6 +953,13 @@ def run_factor_ic(conn: sqlite3.Connection, *, pool: str, start: str, end: str,
             fwd_by_period=fwd_by_period, val_idx=val_idx,
             values_by_mark=research_values.get(name))
         for name in chosen}
+    #: 研究侧取值器因子再加两个**只增键**（L8，仿 `clip_diag` 的分辨率披露）：
+    #: `zero_ratio_p50` / `tie_ratio_p50` 与 `n`/`ic`/`ci` 同级，**不参与 verdict**。
+    #: 只对 `source=research` 的因子算（只有它们有 `values_by_mark` 这个逐日截面）。
+    for name in chosen:
+        if FACTOR_SOURCES[name] == "research":
+            promoted[name].update(
+                zero_tie_diag(research_values.get(name, {}), periods))
 
     fwd_s += provider.load_s
     elapsed = time.time() - t0
